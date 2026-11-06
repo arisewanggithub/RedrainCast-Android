@@ -11,6 +11,10 @@ on:
         required: true
         type: boolean
         default: false
+      reviewed_commit:
+        description: "Full 40-character SHA of the reviewed current private main commit"
+        required: true
+        type: string
       publish:
         description: "Upload a DRAFT public prerelease (requires scoped publisher token)"
         required: true
@@ -23,17 +27,21 @@ concurrency:
   cancel-in-progress: false
 jobs:
   release:
+    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' && github.repository == 'arisewanggithub/RedrainCast-Android'
     runs-on: ubuntu-latest
     timeout-minutes: 45
     env:
       RELEASE_REPOSITORY: arisewanggithub/RedrainCast-Releases
       RELEASE_TAG: ${{ inputs.tag }}
       SOURCE_VALIDATED: ${{ inputs.source_validated }}
+      REVIEWED_COMMIT: ${{ inputs.reviewed_commit }}
       PUBLISH: ${{ inputs.publish }}
       RELEASE_CERT_SHA256: 79f906220de117d61c2d15bdfcef179a4e3e48cfa0c76b637c7af986c037fad3
       PYTHONDONTWRITEBYTECODE: '1'
     steps:
       - uses: actions/checkout@v4
+      - name: Check exact reviewed private main revision
+        run: python3 -B tools/release-guard.py
       - name: Check required configuration
         env:
           KEYSTORE: ${{ secrets.ANDROID_RELEASE_KEYSTORE_BASE64 }}
@@ -76,6 +84,7 @@ jobs:
           KEY_ALIAS: ${{ secrets.ANDROID_RELEASE_KEY_ALIAS }}
         run: |
           set -euo pipefail
+          python3 -B tools/release-guard.py
           umask 077
           key="$RUNNER_TEMP/release.jks"
           trap 'rm -f "$key"' EXIT
@@ -121,6 +130,7 @@ jobs:
           GH_TOKEN: ${{ secrets.RELEASE_PUBLISH_TOKEN }}
         run: |
           set -euo pipefail
+          python3 -B tools/release-guard.py
           gh release create "$RELEASE_TAG" "$RUNNER_TEMP/public-assets/"* \
             --repo "$RELEASE_REPOSITORY" --draft --prerelease \
             --title "RedrainCast $RELEASE_TAG (testing)" \

@@ -89,9 +89,15 @@ publishing; mechanical checks are not legal advice.
 ## Publishing
 
 1. Finish and validate the application changes first. Select the exact committed
-   revision; do not sign an unfinished audio/rendering candidate as ready.
+   revision on private `main`; do not sign an unfinished audio/rendering
+   candidate as ready. Only manual dispatch in the private repository on
+   `refs/heads/main` can start the release job, never PRs, forks or tags.
 2. Run the workflow manually with `tag` matching the APK version,
-   `source_validated=true`, and **`publish=false`** (the default).
+   `source_validated=true`, `reviewed_commit` containing the full 40-character
+   SHA of current `main`, and **`publish=false`** (the default).
+   Checkout, dispatch and live remote `main` must all equal that reviewed SHA;
+   this is rechecked before signing and public draft upload. If `main` moves,
+   review the new revision and restart instead of approving stale artifacts.
    It tests/lints, builds/signs the optimized APK, pins the certificate,
    alignment-checks it and creates/smokes the relink kit.
 3. Review the private `signed-testing-candidate` artifact (7-day retention):

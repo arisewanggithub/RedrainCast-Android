@@ -9,6 +9,9 @@ from unittest.mock import patch
 spec = importlib.util.spec_from_file_location("kit", Path(__file__).with_name("release-kit.py"))
 kit = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(kit)
+guard_spec = importlib.util.spec_from_file_location("guard", Path(__file__).with_name("release-guard.py"))
+guard = importlib.util.module_from_spec(guard_spec)
+guard_spec.loader.exec_module(guard)
 
 RULE = """build /build/libscreencopy_resampler.so: CXX_SHARED_LIBRARY_LINKER__screencopy_resampler_RelWithDebInfo object.o
   LANGUAGE_COMPILE_FLAGS = -g -O2 -DNDEBUG -march=armv7-a -mthumb
@@ -19,6 +22,40 @@ RULE = """build /build/libscreencopy_resampler.so: CXX_SHARED_LIBRARY_LINKER__sc
 
 
 class ReleaseTests(unittest.TestCase):
+    def test_exact_reviewed_private_main_is_accepted(self):
+        sha = "a" * 40
+        environment = {
+            "GITHUB_EVENT_NAME": "workflow_dispatch",
+            "GITHUB_REPOSITORY": "arisewanggithub/RedrainCast-Android",
+            "GITHUB_REF": "refs/heads/main", "GITHUB_SHA": sha, "REVIEWED_COMMIT": sha,
+        }
+        guard.validate_revision(environment, sha, sha)
+
+    def test_forks_pull_requests_branches_and_unreviewed_revisions_are_rejected(self):
+        sha = "a" * 40
+        environment = {
+            "GITHUB_EVENT_NAME": "workflow_dispatch",
+            "GITHUB_REPOSITORY": "arisewanggithub/RedrainCast-Android",
+            "GITHUB_REF": "refs/heads/main", "GITHUB_SHA": sha, "REVIEWED_COMMIT": sha,
+        }
+        invalid = [
+            {"GITHUB_EVENT_NAME": "pull_request"},
+            {"GITHUB_EVENT_NAME": "pull_request_target"},
+            {"GITHUB_REPOSITORY": "another-owner/RedrainCast-Android"},
+            {"GITHUB_REF": "refs/heads/unfinished"},
+            {"GITHUB_REF": "refs/tags/v0.4.6"},
+            {"GITHUB_SHA": "b" * 40},
+            {"REVIEWED_COMMIT": ""},
+            {"REVIEWED_COMMIT": "a" * 7},
+            {"REVIEWED_COMMIT": "b" * 40},
+        ]
+        for change in invalid:
+            with self.subTest(change=change), self.assertRaises(ValueError):
+                guard.validate_revision(dict(environment, **change), sha, sha)
+        for checkout, main in (("b" * 40, sha), (sha, "b" * 40)):
+            with self.subTest(checkout=checkout, main=main), self.assertRaises(ValueError):
+                guard.validate_revision(environment, checkout, main)
+
     def metadata(self, text):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "build.ninja"
