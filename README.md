@@ -185,7 +185,8 @@ developer machines and application CI consume that same package without a
 GitHub Packages read token. Only a native source/toolchain/configuration change
 requires rebuilding the published package. End users still install one universal
 APK, not a separate APK per ABI.
-CI installs the stable/base `platforms;android-37.0` package. Android 17 permission
+CI installs the stable/base `platforms;android-37.0` package. SDK setup requests
+`platform-tools`, not the obsolete Android `tools` package. Android 17 permission
 grant/denial is covered by targeted policy/UI tests; SDK-30 Robolectric simulation
 does not claim full Android-17 platform enforcement. Receiving remains a visible
 Activity, sending starts its projection/microphone foreground service from the
