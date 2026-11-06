@@ -76,7 +76,7 @@ class MainActivity : Activity(), TextureView.SurfaceTextureListener {
     private var networkPermissionRequested = false
     private var networkPermissionDenied = false
     private var muteRecoveryPending = true
-    private val sessionOrientation = SessionOrientation({ requestedOrientation }, { requestedOrientation = it })
+    private lateinit var sessionOrientation: SessionOrientation
     private var dialog: AlertDialog? = null
     private var settingsDialog: AlertDialog? = null
     private lateinit var updateCheck: LaunchUpdateCheck
@@ -93,6 +93,7 @@ class MainActivity : Activity(), TextureView.SurfaceTextureListener {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        sessionOrientation = SessionOrientation.forActivity(this)
         networkPermissionRequested = savedInstanceState?.getBoolean("networkPermissionRequested") ?: false
         networkPermissionDenied = savedInstanceState?.getBoolean("networkPermissionDenied") ?: false
         if (CastState.roles.role() != RoleOwner.Role.SEND) window.addFlags(WindowManager.LayoutParams.FLAG_SECURE)
