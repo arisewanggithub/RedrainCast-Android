@@ -4,13 +4,13 @@ Public Android APKs, checksums, signing certificates, notices and LGPL relink
 materials belong in this repository. Application source remains private; the
 automatic GitHub source archives contain only this public download documentation.
 
-**No APK has been published yet.** Dedicated production signing is configured;
-the release infrastructure generates exact-build LGPL relink materials and
-requires explicit approval of the application revision. Public upload still
-requires a repository-scoped publisher credential. Initial uploads are draft
-testing prereleases for review, not automatic stable releases.
+Testing prereleases, when available, are listed under
+[Releases](https://github.com/arisewanggithub/RedrainCast-Releases/releases).
+Every release requires explicit source and asset review, production signing
+and exact-build LGPL relink materials. Drafts are not public downloads;
+nothing automatically publishes a stable release.
 
-## When a testing release is published
+## Download and verify testing releases
 
 - Download the universal `RedrainCast-<version>.apk` from **Releases**. It supports
   Android 11/API 30 or newer on arm64-v8a, armeabi-v7a and x86_64.

@@ -111,3 +111,48 @@ Do not publish a stable release while the first-rotation rendering issue remains
 unresolved or claim unverified Windows interoperability. Draft upload does not
 mean the candidate is approved. The workflow cannot create a scoped PAT without
 the owner's external authorization. Missing prerequisites fail explicitly.
+
+## Initial manual publication with existing local authorization
+
+A maintainer explicitly authorized to publish may use their existing local
+`gh` login for the initial release without installing that broad login token
+in Actions. This does **not** configure automatic cross-repository publication;
+`RELEASE_PUBLISH_TOKEN` still requires a separately approved scoped credential.
+
+First run the private-candidate workflow with `publish=false` and the exact
+reviewed current-main SHA. Require its successful tests/lint/signing and all
+three ABI relink checks. Download only `signed-testing-candidate`; verify its
+complete checksums, APK version/code/certificate/ABIs and kit manifest binding
+to that exact signed APK, native objects and source revision. Never rebuild a
+dirty newer working tree under an older version or borrow mismatched objects.
+
+For the reviewed v0.4.6 baseline, use these **five explicit asset names** from
+the verified private candidate directory, not a wildcard over local files:
+
+```powershell
+$assets = @(
+    "$candidate\RedrainCast-0.4.6.apk",
+    "$candidate\SHA256SUMS",
+    "$candidate\signing-certificate.txt",
+    "$candidate\licenses.tar.gz",
+    "$candidate\android-lgpl-relink.tar.gz"
+)
+gh release create v0.4.6 @assets --repo arisewanggithub/RedrainCast-Releases `
+    --target main --draft --prerelease --title "RedrainCast v0.4.6 (testing)" `
+    --notes-file .\tools\release-notes-v0.4.6.md
+```
+
+Stop if that release/tag unexpectedly exists; do not overwrite another
+publisher's work. Inspect the draft and download its assets using authorized
+`gh` access, rechecking every hash against the private candidate. Only then
+publish it as a **prerelease**, not stable. Draft assets cannot be fetched
+anonymously; after publishing, download all five assets anonymously (for
+example with `curl.exe -q`, without authentication headers), compare their
+hashes again and verify APK signing/version/ABIs and the licensing/relink kit.
+If published bytes fail verification, return the release to draft and report
+the failure rather than advertising a successful download.
+
+Do not upload keystores, credential files, base64/PFX exports, private source,
+build logs or debug/test APKs. Signing exports stay outside Git and release
+asset directories. Preserve the known rendering issue and signing-migration
+warnings in the release notes.
