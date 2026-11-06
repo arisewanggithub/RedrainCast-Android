@@ -43,12 +43,16 @@ the workflow pins and checks it after signing. Key rotation requires explicit
 review and breaks normal in-place updates without a signing-lineage plan.
 
 Create a fine-grained PAT using
-[GitHub token settings](https://github.com/settings/personal-access-tokens/new?name=RedrainCast%20release%20publisher&description=Upload%20reviewed%20Android%20testing%20drafts&target_name=arisewanggithub&repository_ids=1447663050&contents=write).
+[GitHub token settings](https://github.com/settings/personal-access-tokens/new?name=RedrainCast%20release%20publisher&description=Upload%20reviewed%20Android%20testing%20drafts&target_name=arisewanggithub&expires_in=30&contents=write).
 Select **only RedrainCast-Releases**, Contents read/write, and a short expiry.
 Set it as `RELEASE_PUBLISH_TOKEN` in the private application's Actions secrets
 (for example, `gh secret set RELEASE_PUBLISH_TOKEN --repo
 arisewanggithub/RedrainCast-Android`, entering it interactively). The settings
-link is only a preset: verify selected repositories and permissions yourself.
+link prefills the owner, permission and 30-day expiry, **not repository
+selection**: select only the public downloads repository yourself, then verify
+the permissions before creating it. GitHub's documented
+[template parameters](https://docs.github.com/en/authentication/keeping-your-account-and-data-secure/managing-your-personal-access-tokens#pre-filling-fine-grained-personal-access-token-details-using-url-parameters)
+do not include repository selection.
 Never copy the existing broad `gh` login token into Actions. A properly scoped
 GitHub App installation token is also acceptable, but account consent cannot be
 manufactured by the workflow.
