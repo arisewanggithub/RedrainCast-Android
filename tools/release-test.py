@@ -22,6 +22,33 @@ RULE = """build /build/libscreencopy_resampler.so: CXX_SHARED_LIBRARY_LINKER__sc
 
 
 class ReleaseTests(unittest.TestCase):
+    def test_sdk37_and_legacy_signer_certificates_are_accepted(self):
+        digest = "a" * 64
+        for label in ("Signer #1", "V2 Signer:", "V3 Signer:", "V3.1 Signer:"):
+            with self.subTest(label=label):
+                self.assertEqual(digest, guard.validate_certificate(
+                    label + " certificate SHA-256 digest: " + digest + "\n", digest))
+        report = ("V2 Signer: certificate SHA-256 digest: " + digest.upper() + "\n" +
+                  "V3 Signer: certificate SHA-256 digest: " + digest + "\n")
+        self.assertEqual(digest, guard.validate_certificate(report, digest))
+
+    def test_wrong_or_additional_signer_is_rejected(self):
+        report = ("V2 Signer: certificate SHA-256 digest: " + "a" * 64 + "\n" +
+                  "V3 Signer: certificate SHA-256 digest: " + "b" * 64 + "\n")
+        with self.assertRaises(ValueError):
+            guard.validate_certificate(report, "a" * 64)
+        with self.assertRaises(ValueError):
+            guard.validate_certificate("Signer #1 certificate SHA-256 digest: " + "b" * 64, "a" * 64)
+
+    def test_missing_signer_or_source_stamp_alone_is_rejected(self):
+        for report in ("", "Source Stamp certificate SHA-256 digest: " + "a" * 64):
+            with self.subTest(report=report), self.assertRaises(ValueError):
+                guard.validate_certificate(report, "a" * 64)
+
+    def test_invalid_approved_certificate_is_rejected(self):
+        with self.assertRaises(ValueError):
+            guard.validate_certificate("V2 Signer: certificate SHA-256 digest: " + "a" * 64, "short")
+
     def test_exact_reviewed_private_main_is_accepted(self):
         sha = "a" * 40
         environment = {

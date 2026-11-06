@@ -113,12 +113,8 @@ jobs:
             echo "::error::A development debug signing certificate cannot be published as a production release"
             exit 1
           fi
-          fingerprint=$(sed -n 's/^Signer #1 certificate SHA-256 digest: //p' "$RUNNER_TEMP/public-assets/signing-certificate.txt")
-          if [[ "$fingerprint" != "$RELEASE_CERT_SHA256" ]]; then
-            echo "::error::Unexpected production certificate SHA-256: $fingerprint"
-            exit 1
-          fi
-          echo "Production APK certificate verified: $fingerprint"
+          python3 -B tools/release-guard.py \
+            --certificate-report "$RUNNER_TEMP/public-assets/signing-certificate.txt"
           "$tools/zipalign" -c -P 16 4 "$apk"
           tar -czf "$RUNNER_TEMP/public-assets/licenses.tar.gz" -C app/src/main/assets NOTICE.txt OPUS-NOTICE.txt licenses
       - name: Build and smoke-test exact-build LGPL relink kit
