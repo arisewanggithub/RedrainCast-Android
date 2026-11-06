@@ -19,6 +19,8 @@ internal object SenderFailureDiagnostics {
 
     fun type(error: Throwable): String = when (error) {
         is SessionCancelledException -> "CANCELLED"
+        is ReceiverReportedFailure -> "RECEIVER_ERROR"
+        is MediaConnectionFailure -> "MEDIA_TRANSPORT"
         is SocketTimeoutException -> "TIMEOUT"
         is IOException -> "IO"
         is InterruptedException -> "INTERRUPTED"

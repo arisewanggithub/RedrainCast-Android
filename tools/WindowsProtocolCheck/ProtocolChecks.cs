@@ -39,6 +39,69 @@ internal static class ProtocolChecks
             !RecoveryAudio.Covers(new[] { (0L, 960), (20022L, 960) }, 0, 40000) &&
             !RecoveryAudio.Covers(new[] { (1L, 960) }, 0, 19000), "Preroll first/subsequent coverage differs.");
         Pass("shared recovery matches Android AAC/sample-trim/coverage rounding");
+        {
+            var deadline = new RecoveryDeadline();
+            deadline.Begin(100);
+            deadline.Begin(9000);
+            deadline.Check(10099);
+            deadline.Complete(10099);
+            Require(!deadline.Pending, "Timely recovery completion did not clear the deadline.");
+            deadline.Check(100000);
+            Pass("shared recovery completion before original deadline clears pending");
+        }
+        foreach (var now in new[] { 10100L, 10101L })
+        {
+            var deadline = new RecoveryDeadline();
+            deadline.Begin(100);
+            deadline.Begin(9000);
+            var rejected = false;
+            try { deadline.Complete(now); }
+            catch (TimeoutException) { rejected = true; }
+            Require(rejected && deadline.Pending, "Late completion cleared or bypassed the original deadline.");
+            deadline.Begin(now);
+            rejected = false;
+            try { deadline.Check(now); }
+            catch (TimeoutException) { rejected = true; }
+            Require(rejected && deadline.Pending, "A repeated begin extended an expired recovery deadline.");
+            Pass($"shared recovery completion at monotonic {now} rejects and retains pending");
+        }
+        Require(RecoveryAudio.Coverage(Array.Empty<(long Pts, int Frames)>(), 0, 20000) == RecoveryAudioCoverage.Wait &&
+            RecoveryAudio.Coverage(new[] { (0L, 960) }, 0, 20000) == RecoveryAudioCoverage.Wait,
+            "Missing audio or a packet ending at the key must wait.");
+        Pass("shared recovery absent/not-yet-covering audio waits");
+        Require(RecoveryAudio.Coverage(new[] { (1L, 960) }, 0, 19000) == RecoveryAudioCoverage.Lost &&
+            RecoveryAudio.Coverage(new[] { (0L, 960), (20022L, 960) }, 0, 40000) == RecoveryAudioCoverage.Lost &&
+            RecoveryAudio.Coverage(new[] { (0L, 1024), (21355L, 1024) }, 0, 40000) == RecoveryAudioCoverage.Lost,
+            "Monotonic RAW/AAC prefix gaps must prove loss.");
+        Pass("shared recovery monotonic RAW/AAC missing prefix and gaps are lost");
+        var reversedPrefix = new[] { (Pts: 1L, Frames: 960), (Pts: 0L, Frames: 960) };
+        Require(RecoveryAudio.Coverage(reversedPrefix, 0, 19000, allowsPtsReversal: true) == RecoveryAudioCoverage.Wait &&
+            reversedPrefix.Select(packet => packet.Pts).SequenceEqual(new[] { 1L, 0L }) &&
+            RecoveryAudio.Coverage(new[] { (0L, 960), (20022L, 960) }, 0, 40000,
+                allowsPtsReversal: true) == RecoveryAudioCoverage.Wait,
+            "An apparent Opus gap must wait without sorting its source timestamps.");
+        Pass("shared recovery apparent Opus prefix/gap waits without reordering");
+        using (var stream = typeof(ProtocolChecks).Assembly.GetManifestResourceStream("OpusPtsOrderFixture") ??
+            throw new InvalidDataException("Missing embedded Opus source-order fixture."))
+        using (var fixture = await JsonDocument.ParseAsync(stream))
+        {
+            var root = fixture.RootElement;
+            var frames = RecoveryAudio.Frames("opus", Convert.FromHexString(root.GetProperty("opusPacketHex").GetString()!));
+            var accepted = 0;
+            foreach (var item in root.GetProperty("cases").EnumerateArray())
+            {
+                if (item.GetProperty("codec").GetString() != "opus" || !item.GetProperty("accepted").GetBoolean()) continue;
+                var points = item.GetProperty("ptsUs").EnumerateArray().Select(point => point.GetInt64()).ToArray();
+                Require(points.Length > 0, "Empty Opus PTS fixture.");
+                var packets = points.Select(point => (Pts: point, Frames: frames)).ToArray();
+                Require(RecoveryAudio.Coverage(packets, points[0], points[0], allowsPtsReversal: true) ==
+                    RecoveryAudioCoverage.Covered && packets.Select(packet => packet.Pts).SequenceEqual(points),
+                    $"Opus fixture lost arrival/decode order: {item.GetProperty("name").GetString()}.");
+                accepted++;
+                Pass($"shared recovery Opus fixture order: {item.GetProperty("name").GetString()}");
+            }
+            Require(accepted == 3, "The three accepted Opus source-order fixtures were not all checked.");
+        }
         foreach (var type in Enum.GetValues<PacketType>())
         {
             var packet = type switch

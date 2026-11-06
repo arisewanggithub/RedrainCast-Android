@@ -3,7 +3,7 @@
 Application source stays in the private RedrainCast-Android repository. Public
 APKs and distribution materials go only to
 [RedrainCast-Releases](https://github.com/arisewanggithub/RedrainCast-Releases).
-The manually triggered `Public Android prerelease` workflow never publishes a
+The manually triggered `Public Android release candidate` workflow never publishes a
 source archive, debug APK, instrumentation APK, build log or signing keystore.
 GitHub's automatic source links in that public repository contain only its public
 download documentation, not this application.
@@ -88,6 +88,37 @@ publishing; mechanical checks are not legal advice.
 
 ## Publishing
 
+### Version identity for future releases
+
+Use the same full version everywhere:
+
+| Kind | Embedded `versionName` | GitHub tag | APK asset |
+|---|---|---|---|
+| Release candidate | `0.5.0-rc.1` | `v0.5.0-rc.1` | `RedrainCast-0.5.0-rc.1.apk` |
+| Beta | `0.5.0-beta.2` | `v0.5.0-beta.2` | `RedrainCast-0.5.0-beta.2.apk` |
+| Alpha | `0.5.0-alpha.1` | `v0.5.0-alpha.1` | `RedrainCast-0.5.0-alpha.1.apk` |
+| Stable | `0.5.0` | `v0.5.0` | `RedrainCast-0.5.0.apk` |
+
+Supported versions have three canonical numeric components and an optional
+`-alpha.N`, `-beta.N` or `-rc.N` suffix, where N starts at 1 without leading
+zeroes. Underscore suffixes, build metadata, and bare `-rc` are not accepted.
+Set the embedded version in `app/build.gradle.kts` before reviewing/committing
+the release source; the workflow does not rewrite it from the requested tag.
+Every distributed build must increase Android's numeric `versionCode`, including
+RC-to-stable transitions (for example: RC1 code 21, RC2 code 22, stable code 23).
+Removing a suffix alone does not make an APK installable over a higher code.
+
+The workflow derives GitHub's prerelease flag from the suffix rather than an
+independent toggle. It validates the exact embedded APK/tag identity, preserves
+the suffix in the APK filename and relink manifest, and always uploads a
+**draft**. Only suffixed versions receive `--prerelease`; a bare version creates
+a stable-designated draft requiring separate final review before publication.
+The stable-only app updater accepts installed prerelease versions and considers
+their matching final stable version newer, but never offers another prerelease.
+
+The already published plain-version `v0.4.6` testing release is a historical
+exception. Do not retag, rename its assets, rebuild it or rewrite its checksums.
+
 1. Finish and validate the application changes first. Select the exact committed
    revision on private `main`; do not sign an unfinished audio/rendering
    candidate as ready. Only manual dispatch in the private repository on
@@ -103,7 +134,7 @@ publishing; mechanical checks are not legal advice.
 3. Review the private `signed-testing-candidate` artifact (7-day retention):
    production APK, checksums, certificate, licenses and relink kit.
 4. With the scoped publisher configured, repeat at the same reviewed revision
-   with `publish=true` to create a public-repository **draft prerelease**.
+   with `publish=true` to create a public-repository **draft** of the inferred kind.
    Review that newly built candidate too. No release is automatically made live.
    Manually publish only after final asset/compliance/runtime review.
 
@@ -126,26 +157,34 @@ complete checksums, APK version/code/certificate/ABIs and kit manifest binding
 to that exact signed APK, native objects and source revision. Never rebuild a
 dirty newer working tree under an older version or borrow mismatched objects.
 
-For the reviewed v0.4.6 baseline, use these **five explicit asset names** from
-the verified private candidate directory, not a wildcard over local files:
+For future releases, use these **five explicit asset names** from the verified
+private candidate directory, not a wildcard over local files. The example uses
+an RC; for stable candidates remove the suffix in the committed app version and
+tag, increment versionCode, and complete stable-readiness review first:
 
 ```powershell
+$tag = "v0.5.0-rc.1"
+$version = $tag.Substring(1)
+$kind = python3 -B .\tools\release-guard.py --release-tag $tag --apk-version $version
+if ($LASTEXITCODE -ne 0) { throw "Invalid release version identity" }
+$options = @("--draft")
+if ($kind -eq "prerelease") { $options += "--prerelease" }
 $assets = @(
-    "$candidate\RedrainCast-0.4.6.apk",
+    "$candidate\RedrainCast-$version.apk",
     "$candidate\SHA256SUMS",
     "$candidate\signing-certificate.txt",
     "$candidate\licenses.tar.gz",
     "$candidate\android-lgpl-relink.tar.gz"
 )
-gh release create v0.4.6 @assets --repo arisewanggithub/RedrainCast-Releases `
-    --target main --draft --prerelease --title "RedrainCast v0.4.6 (testing)" `
-    --notes-file .\tools\release-notes-v0.4.6.md
+gh release create $tag @assets --repo arisewanggithub/RedrainCast-Releases `
+    --target main @options --title "RedrainCast $tag" --notes-file $reviewedNotes
 ```
 
 Stop if that release/tag unexpectedly exists; do not overwrite another
 publisher's work. Inspect the draft and download its assets using authorized
 `gh` access, rechecking every hash against the private candidate. Only then
-publish it as a **prerelease**, not stable. Draft assets cannot be fetched
+publish it with that same inferred kind; do not promote an RC to stable merely
+by toggling GitHub's flag or renaming its asset. Draft assets cannot be fetched
 anonymously; after publishing, download all five assets anonymously (for
 example with `curl.exe -q`, without authentication headers), compare their
 hashes again and verify APK signing/version/ABIs and the licensing/relink kit.

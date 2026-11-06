@@ -9,5 +9,6 @@
   <ItemGroup>
     <Compile Include="$(WindowsRoot)\src\ScrcpyReceive.Core\*.cs" Link="WindowsCore\%(Filename)%(Extension)" />
     <Compile Include="$(WindowsRoot)\src\RedrainCast.Protocol\StreamRecovery.cs" Link="WindowsProtocol\StreamRecovery.cs" />
+    <EmbeddedResource Include="..\..\protocol\fixtures\opus-pts-order.json" LogicalName="OpusPtsOrderFixture" />
   </ItemGroup>
 </Project>

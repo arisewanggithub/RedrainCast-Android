@@ -53,6 +53,7 @@ class AudioPlayer(
     @Volatile internal var recoveryCutoffUs: Long? = null
     internal var onFirstSubmitted: (Long) -> Unit = {}
     private var submittedReported = false
+    private var startupCatchup = true
 
     val decoderDescription: String
         get() = when (format.codec) {
@@ -91,7 +92,10 @@ class AudioPlayer(
             flushPending()
         }
         pumpOutput(allowSilence = false)
-        if (format.codec == "aac") stepAac()
+        if (startupCatchup && regulator.bufferedFrames >= regulator.targetFrames) {
+            stage = "STARTUP_OUTPUT_WAIT"
+            Thread.sleep(2)
+        } else if (format.codec == "aac") stepAac()
         else next()?.let { packet ->
             stage = if (opus != null) "OPUS_DECODE" else "PCM_DECODE"
             val samples = opus?.decode(packet.bytes) ?: pcm16(packet.bytes)
@@ -241,6 +245,11 @@ class AudioPlayer(
             // A source gap keeps the existing small silence cushion, never fills the route.
             if (chunk == null) break
         }
+        // Admission locking must not precede writable output servicing.
+        if (startupCatchup &&
+            presentation.presentedUs(timing.presentedFrames) >= regulator.targetFrames * 1_000_000L / format.sampleRate &&
+            queuedPackets() == 0)
+            startupCatchup = false
         val finished = clock.monotonicNs()
         if (finished - lastOutputProgressNs > 250_000_000L && pendingOutput) {
             stage = "OUTPUT_WRITE"

@@ -7,6 +7,19 @@ import java.net.SocketException
 
 internal class SessionCancelledException(cause: Throwable? = null) : IOException("Session cancelled", cause)
 
+internal class MediaConnectionFailure(cause: IOException) : IOException(
+    if (cause is java.net.SocketTimeoutException) "TIMEOUT: media connection timed out"
+    else "PROTOCOL: media connection closed", cause)
+
+internal class ReceiverReportedFailure(val code: String, detail: String) : IOException("$code: $detail") {
+    init {
+        if (code !in setOf("VERSION", "BUSY", "UNSUPPORTED_CONFIG", "PROTOCOL", "CAPTURE_FAILED",
+                "AUDIO_FAILED", "DECODER_FAILED", "TIMEOUT", "CONGESTION", "INTERNAL"))
+            throw IOException("PROTOCOL: unknown receiver error code")
+        if (detail.length > 2048) throw IOException("PROTOCOL: oversized receiver error")
+    }
+}
+
 /** Stop commits its terminal intent atomically; cancellation cannot replace a real earlier fault. */
 internal class SessionOutcome {
     enum class Origin { STARTUP, CAPTURE, RECEIVER_READ, RECEIVER_WRITE, WATCHDOG, CLEANUP }
@@ -29,7 +42,13 @@ internal class SessionOutcome {
     }
     fun record(error: Exception, origin: Origin, closing: Boolean = false): Boolean = synchronized(lock) {
         if ((stopping || closing) && cancellation(error)) return false
-        if (first != null) return false
+        val previous = first
+        if (previous != null) {
+            if (previous.error !is MediaConnectionFailure || error !is ReceiverReportedFailure) return false
+            first = Failure(error, origin)
+            if (atStop === previous) atStop = first
+            return true
+        }
         first = Failure(error, origin)
         true
     }
@@ -40,6 +59,10 @@ internal class SessionOutcome {
         else Wire.control(if (remoteStop) Wire.SESSION_END else Wire.STOP, session, Wire.obj("reason" to "user"))
     }
     private fun cancellation(error: Exception): Boolean {
+        if (error is MediaConnectionFailure) {
+            val cause = error.cause
+            if (cause is Exception) return cancellation(cause)
+        }
         if (error is InterruptedException || error is InterruptedIOException || error is EOFException || error is SocketException)
             return true
         var cause: Throwable? = error

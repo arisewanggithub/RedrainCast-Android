@@ -34,6 +34,33 @@ TCP listener ports are dynamic; 27184 is not an implicit receiver endpoint.
    ends the session. A lost media connection terminates its owning session.
    Cleanup closes all three sockets and retires playback/capture ownership.
 
+Control connects before the token-bound media lanes. Graceful teardown keeps
+its reader alive after Stop or media EOF: send the terminal intent, retire both
+media sockets, drain the peer's ERROR/STOP/SESSION_END, and close control last.
+The sender's existing two-second teardown deadline bounds that drain, including
+terminal write/capture cleanup; an absent acknowledgement fails explicitly.
+Intentional startup cancellation can abort transport before playback is ready
+without requiring an acknowledgement on that deliberately closed connection.
+This exception records the startup-abort intent before closing; a generic
+closed control socket or an unexplained peer EOF is not exempt.
+A media transport failure is provisional: a valid fatal receiver ERROR received
+during draining supersedes that fallback, but never an earlier capture, codec or
+congestion failure. Matching user-stop cancellation stays nonfatal.
+
+For handled receiver playback/media failures, ERROR is queued before media
+retirement. A serialized receiver retirement worker cleans up playback, drains
+the control writer and closes control last, waking the reader. Broken
+control transport and hard watchdog deadlines still force aborts. These rules
+cannot guarantee delivery after a native crash, OS kill or network loss.
+Sender diagnostics retain the receiver error code/origin without dumping
+arbitrary peer text or application payloads; the bounded error message remains
+available to the local user.
+Receiver media EOF leaves a 500 ms control-priority grace interval for a Stop
+already in flight on the independent control socket. Media admission closes
+immediately; the session lease remains held. Without a terminal control message,
+the existing timer reports an explicit media failure after that grace instead
+of hiding the disconnect or waiting indefinitely.
+
 Receiver session errors belong only to the connection that acquired the active
 session. A connection that ends before SESSION_REQUEST must not replace the
 receiver's status or report that a cast disconnected, including immediately
@@ -225,7 +252,10 @@ Picture PTS and rotation remain associated unchanged through decode/presentation
 
 Allow dependent video after the verified key so the decoder can produce output.
 KEY acknowledges decoded output at/after that key, not merely packet admission.
-An obsolete KEY proof (>250 ms at sender receipt) causes another bounded attempt.
+KEY proof is validated by the live generation and exact sent key PTS, not its
+wall-clock age at sender receipt. Legitimate network/decode/control-return delay
+does not invalidate a key that met source freshness at admission. KEY and
+COMPLETE still cannot arrive at or after the first-unresolved 10-second deadline.
 
 ### Audio resynchronization
 
@@ -240,8 +270,26 @@ On KEY, retain enough **duration-aware** prefix for PCM (zero preroll), Opus
 (negotiated 80 ms), or AAC-LC (one 960/1024-sample AU). Derive Opus durations from
 TOC (including 60/120 ms packets), AAC from ASC and PCM from aligned sample count.
 Release compressed audio only with contiguous preroll coverage (one sample of
-timestamp rounding tolerance) and a packet extending past key PTS. If missing,
-continue bounded buffering; a stale key/window triggers another attempt.
+timestamp rounding tolerance) and a packet extending past key PTS. If audio has
+not arrived or has not yet reached the key, continue bounded buffering under the
+original deadline. Do not reset just because 250 ms of wall-clock time elapsed.
+A present AAC prefix starting after its required preroll start, a known gap in
+that monotonic prefix, or RAW first-source audio beyond key + 250 ms requires a
+new bounded attempt. Opus source PTS may move backward, so an apparent prefix
+gap is WAITING, not proof that the source window is LOST. Coverage is checked
+in original admission order, not as a reordered interval union; an unproven
+Opus prefix remains bounded by the existing caps and original deadline.
+Queue limits do not grow to retain an obsolete source window.
+Local cap-pressure eviction of a packet intersecting the selected key's required
+Opus decode window is explicit loss evidence, not an inference from PTS order.
+The removed decode-chain packet is the evidence even if later equal/reversed
+intervals cover the same timestamps; do not reconstruct that chain by sorting
+or an interval union.
+Latch that evidence for the selected key until its proof is handled; then retry
+under the original deadline. Evictions ending at/before the preroll start do not
+count. Clear the evidence when retiring the attempt, and collect fresh preroll
+before selecting the next compressed-audio key. This is local state only, with
+no new wire fields or packet reordering.
 Discard packets whose **end** is at/before the preroll window, not just by
 start PTS. Decode retained Opus/AAC packets in order to preserve overlap/state,
 then discard decoded samples strictly before key PTS. Trim PCM on sample-frame
@@ -254,6 +302,14 @@ Filter lookahead and converted frame ratios retain their original source spans;
 completion/presentation use mapped source timestamps, not nominal output-frame
 counts. Each retired native audio epoch releases its resampler, and the next
 starts with fresh filter state while the wire audio generation stays unchanged.
+During startup catch-up Android pauses decoding at its existing decoded-FIFO
+target while continuing output servicing and the no-progress check, including
+after the first source submission. A temporarily full native ring must not
+drain a held burst into source-dropping FIFO overflow; remaining packets stay
+in the bounded encoded queue. Catch-up ends after the encoded queue drains and
+one target's worth of original source audio has actually been presented.
+Steady-state low-latency decoded trimming and compensation remain unchanged;
+network admission and all caps stay bounded.
 
 COMPLETE proves the first actual source-audio sample submission (not inserted
 silence), with its sample-aligned original `audioPtsUs` at/after key and no more
@@ -262,6 +318,9 @@ The sender clears the unresolved deadline only after this matching proof.
 This is admission/startup resynchronization, not permission to skip compressed
 dependencies within a retained epoch. Long-idle/no-fresh-media recovery still
 times out; disabled audio does not wait for an audio proof.
+This is a recovery-v1 semantic correction without new fields/types. Older peers
+may retain the stricter receipt-age behavior; negotiation alone does not prove
+that their implementation includes the correction.
 
 ### Bounds, Stop and failures
 

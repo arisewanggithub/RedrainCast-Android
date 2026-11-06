@@ -18,6 +18,8 @@ import dev.screencopy.sender.ReceiverTarget
 import dev.screencopy.sender.Settings
 import org.junit.Assert.*
 import org.junit.Test
+import org.junit.Before
+import org.junit.After
 import org.junit.runner.RunWith
 import org.robolectric.Robolectric
 import org.robolectric.RobolectricTestRunner
@@ -33,6 +35,10 @@ import java.net.Socket
 @GraphicsMode(GraphicsMode.Mode.LEGACY)
 @ConscryptMode(ConscryptMode.Mode.OFF)
 class MainActivityTest {
+    private val previousUpdateFactory = MainActivity.updateFactory
+    @Before fun disableRealUpdateRequests() { MainActivity.updateFactory = ::noUpdateCheck }
+    @After fun restoreUpdateFactory() { MainActivity.updateFactory = previousUpdateFactory }
+
     @Test fun recreationBeforeConsentCancelsReservationWithoutLaunchingCapture() {
         val controller = Robolectric.buildActivity(MainActivity::class.java).setup()
         val original = controller.get()

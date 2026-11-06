@@ -4,6 +4,8 @@ import java.io.IOException
 import java.util.ArrayDeque
 import org.screencopy.receiver.protocol.AudioPacketTiming
 
+internal enum class RecoveryAudioCoverage { WAITING, READY, LOST }
+
 /** Capture readers wait only for bounded local admission, never while holding a network writer lock. */
 class MediaBudget internal constructor(private val withAudio: Boolean, private val clock: () -> Long,
                                        private val admissionNanos: Long) {
@@ -27,6 +29,7 @@ class MediaBudget internal constructor(private val withAudio: Boolean, private v
     private var started = false
     private var ending = false
     private var recoveryAudioHeld = false
+    private var evictedRecoveryKeyPts: Long? = null
     private val pendingWrites = arrayOfNulls<Entry>(3)
     private val writing = BooleanArray(3)
     private val writerBytes = IntArray(3)
@@ -44,6 +47,7 @@ class MediaBudget internal constructor(private val withAudio: Boolean, private v
 
     internal fun discardMediaForRecovery() = synchronized(monitor) {
         recoveryAudioHeld = true
+        evictedRecoveryKeyPts = null
         for (queue in listOf(video, audio)) {
             val entries = queue.iterator()
             while (entries.hasNext()) {
@@ -57,12 +61,17 @@ class MediaBudget internal constructor(private val withAudio: Boolean, private v
         monitor.notifyAll()
     }
 
-    internal fun holdRecoveryAudio(message: Wire.Message, timing: AudioPacketTiming): SenderQueueFailure? = synchronized(monitor) {
+    internal fun holdRecoveryAudio(message: Wire.Message, timing: AudioPacketTiming,
+                                   recoveryKeyPts: Long? = null): SenderQueueFailure? = synchronized(monitor) {
         require(message.type == Wire.AUDIO_PACKET && message.track == 2)
         timing.endPts(message.pts, message.payload)
         var pressure = tryOfferMedia(message)
         while (pressure != null) {
             val oldest = audio.firstOrNull { it.message.type == Wire.AUDIO_PACKET } ?: break
+            if (timing.codec == "opus" && recoveryKeyPts != null &&
+                oldest.message.pts <= recoveryKeyPts &&
+                timing.endPts(oldest.message.pts, oldest.message.payload) > timing.windowStart(recoveryKeyPts))
+                evictedRecoveryKeyPts = recoveryKeyPts
             audio.remove(oldest)
             mediaBytes -= oldest.message.payload.size
             pressure = tryOfferMedia(message)
@@ -70,7 +79,8 @@ class MediaBudget internal constructor(private val withAudio: Boolean, private v
         pressure
     }
 
-    internal fun releaseRecoveryAudio(cutoff: Long, timing: AudioPacketTiming): Boolean = synchronized(monitor) {
+    internal fun releaseRecoveryAudio(cutoff: Long, timing: AudioPacketTiming): RecoveryAudioCoverage = synchronized(monitor) {
+        if (evictedRecoveryKeyPts == cutoff) return@synchronized RecoveryAudioCoverage.LOST
         val start = timing.windowStart(cutoff)
         while (true) {
             val oldest = audio.firstOrNull { it.message.type == Wire.AUDIO_PACKET } ?: break
@@ -79,21 +89,27 @@ class MediaBudget internal constructor(private val withAudio: Boolean, private v
             mediaBytes -= oldest.message.payload.size
         }
         val packets = audio.filter { it.message.type == Wire.AUDIO_PACKET }
-        if (packets.isEmpty() || timing.prerollUs > 0 && packets.first().message.pts > start ||
-            packets.none { timing.endPts(it.message.pts, it.message.payload) > cutoff }) return@synchronized false
+        if (packets.isEmpty()) return@synchronized RecoveryAudioCoverage.WAITING
+        val missingCoverage = if (timing.codec == "opus") RecoveryAudioCoverage.WAITING else RecoveryAudioCoverage.LOST
+        if (timing.prerollUs > 0 && packets.first().message.pts > start ||
+            timing.prerollUs == 0L && packets.first().message.pts > cutoff &&
+            packets.first().message.pts - cutoff > 250_000)
+            return@synchronized missingCoverage
         if (timing.prerollUs > 0) {
             var covered = start
             val sampleUs = (1_000_000L + timing.rate - 1) / timing.rate
             for (entry in packets) {
                 if (entry.message.pts > covered && entry.message.pts - covered > sampleUs)
-                    return@synchronized false
+                    return@synchronized missingCoverage
                 covered = maxOf(covered, timing.endPts(entry.message.pts, entry.message.payload))
                 if (covered > cutoff) break
             }
         }
+        if (packets.none { timing.endPts(it.message.pts, it.message.payload) > cutoff })
+            return@synchronized RecoveryAudioCoverage.WAITING
         recoveryAudioHeld = false
         monitor.notifyAll()
-        true
+        RecoveryAudioCoverage.READY
     }
 
     private fun offerInternal(message: Wire.Message, waitNanos: Long) = synchronized(monitor) {

@@ -106,6 +106,28 @@ Presentation ownership, the cast session and control heartbeats remain alive.
 Native decoder resets are limited to one per second; sync requests are spaced
 at least 500 ms apart. The ten-second deadline starts at the **first unresolved
 recovery** and cannot be extended by more resets, readiness or keyframes.
+Source key admission remains at most 250 ms old. Decoded-key proofs match the
+live generation and exact sent key PTS; 350-800 ms of legitimate decode/control
+transit does not invalidate them. Audio waits for actual contiguous source
+coverage under that same deadline, not a 250 ms wall-clock timer. A provably lost
+RAW/AAC source window retries without increasing queue caps. An apparent Opus
+prefix gap waits because its source timestamps may move backward; packet/decode
+order is never rewritten to make the coverage appear contiguous.
+An actual local cap eviction of a packet in the selected key's required Opus
+preroll is separate loss evidence; eviction of only obsolete packets is not.
+The loss is of retained decode-chain data, even when later equal/reversed
+timestamps appear to cover the same interval; overlap cannot reconstruct it.
+That evidence is scoped to the current key/attempt and cleared on reset. A
+compressed-audio retry first collects fresh preroll under the unchanged
+first-unresolved deadline.
+The first source-audio sample must
+still lie within key PTS through key PTS + 250 ms. Older recovery-v1 peers may
+still apply the stricter receipt-age rule and need an implementation update.
+Regression coverage fills the actual 500 ms held-audio queue through an 1100 ms
+proof delay: evicting the required RAW prefix causes exactly one new attempt,
+then matching source audio completes it. Entirely absent PCM instead waits in
+one generation through deadline minus one nanosecond and fails at exactly the
+original ten-second deadline, without a reset storm.
 Stop retires pending work and cannot produce late readiness or
 start new audio output. Audio format changes require a new capture session.
 An unsupported or non-acknowledging peer retains the strict congestion policy;
@@ -177,7 +199,7 @@ prebuilts fail explicitly; there is no automatic slow source-build fallback. See
 Ordinary release builds are optimized and **unsigned**. The manually triggered
 [public prerelease workflow](tools/RELEASING.md) signs and publishes only after
 production signing, cross-repository access and reviewed LGPL relink materials
-are configured. No production signing key or auto-updater is included.
+are configured. No production key material or in-app APK installer is included.
 Debug installation is side-by-side with existing applications.
 Ordinary push/PR CI runs validation only; public publication is manual and gated.
 The separate public
@@ -197,6 +219,42 @@ to respect Android 17's background-audio restrictions.
 Mute ownership is process-wide: Activity recovery must not unmute a live
 projection or clear its durable restoration marker. Owner cleanup restores the
 previous state; failed cleanup leaves the marker available for a later recovery.
+
+### Startup update checks
+
+Like PartialCast, each new Activity launch checks the public GitHub release
+metadata anonymously on a background worker; configuration recreation retains
+the same check and ordinary resume does not repeat it. Only a **newer stable
+release** with a completed, version-matching universal APK in
+`arisewanggithub/RedrainCast-Releases` can prompt. Drafts and testing prereleases
+are excluded, including the currently published 0.4.6 preview. Until a stable
+release is published, GitHub's `/releases/latest` endpoint returns 404; this is
+logged without presenting an update or affecting casting.
+Future testing versions use an explicit `-alpha.N`, `-beta.N` or `-rc.N`
+suffix in the embedded app version, GitHub tag and APK filename. An installed
+`0.5.0-rc.1` can recognize stable `0.5.0` as newer, while still ignoring other
+prereleases. Android versionCode must increase for that transition. The existing
+0.4.6 preview is left unchanged; see [release versioning](tools/RELEASING.md#version-identity-for-future-releases).
+
+The prompt waits for a resumed, focused, idle home with no active Send/Receive
+role or permission/settings dialog. Incoming casting takes priority, and
+backgrounding/recreation does not count as choosing "Later." Update failures
+are logged without blocking discovery or capture consent.
+An error arriving after the update prompt appears withdraws that prompt too;
+the update remains available after the user dismisses the actual error, without
+starting another metadata request.
+
+"Download in browser" opens the validated release page only after an explicit
+press, so the user can read warnings and download its APK through the browser.
+There is no background APK download, automatic installation, unknown-sources
+permission request or silent uninstall. Android still controls installation and
+signing compatibility; a production-signed release cannot replace a debug-signed
+development install in place.
+
+Metadata responses are bounded to 256 KiB with connection/read timeouts,
+cancellation and rate-limit cooldown. Redirects and cross-repository release
+or APK URLs are rejected. No credentials, capture content, microphone data or
+device identifiers are sent by the update checker.
 
 ### Manual synthetic rendering diagnostics
 
@@ -225,6 +283,42 @@ locked receiver. Compilation is not a valid native pixel-rendering baseline.
 
 ### Verified locally
 
+- Latest review follow-up passed the **478-test full JVM suite** with zero
+  failures/errors/skips, lint, and all APK builds. Stop after acceptance but
+  before playback records an intentional startup abort rather than requiring
+  an acknowledgement on a deliberately closed connection. Non-startup closure
+  still fails explicitly. New application/sender errors withdraw an existing
+  update modal; dismissing the real error makes that same update available
+  again without another metadata request. The unpublished candidate remains
+  **0.4.10/code 20**; no phone or public release was changed.
+- Future prerelease naming passed **16 focused updater tests**, the
+  **474-test full JVM suite**, **26 release-tooling tests**, workflow lint, and
+  all APK builds (Android lint: zero errors, 10 existing warnings). A temporary
+  release build embedded `0.4.10-rc.1`; its matching tag was accepted and a
+  mismatched stable tag rejected. The ordinary `0.4.10` APK and output metadata
+  were restored by hash afterward. Existing public releases were not changed.
+- Startup browser update checks **0.4.10/code 20** passed **39 focused tests**
+  and the **470-test full JVM suite**, lint (zero errors, 10 existing warnings),
+  and debug/optimized unsigned release/androidTest APK builds. Metadata tests
+  cover stable-only selection, numeric version comparison, strict public-repo
+  links, completed APK assets, response limits, HTTP failures, cancellation and
+  rate-limit cooldown. Lifecycle tests cover one check across recreation,
+  foreground/focus and active-role deferral, "Later", late results, off-main
+  networking and explicit browser navigation without an installer/service.
+  No APK was downloaded automatically, no phone was modified, and this candidate
+  has not been published.
+- Control-last teardown **0.4.9/code 19** passed **19 focused tests** and the
+  **447-test full JVM suite**, lint (zero errors, 10 existing warnings), and
+  debug/optimized unsigned release/androidTest APK builds. The sender retains
+  control reading through a bounded two-second drain; both media sockets close
+  before control. A valid receiver fatal error can supersede a provisional
+  media-disconnect diagnosis, but not an earlier genuine capture/codec failure.
+  Real-TCP tests cover delayed Stop acknowledgement and receiver ERROR, cleanup
+  PINGs, missing terminal response, and playback retirement before control close.
+  A 500 ms receiver control-priority grace handles media EOF arriving before an
+  in-flight Stop without hiding genuine unexplained disconnects. These are JVM
+  protocol tests, not live JMGO/projector acceptance. No phone was modified and
+  no public release was published for this candidate.
 - Non-finishing destruction follow-up **0.4.6/code 16** passed the **419-test
   full JVM suite**, lint (zero errors, 10 existing warnings), and debug/optimized
   unsigned release builds. Launched consent survives framework destruction
@@ -336,12 +430,17 @@ locked receiver. Compilation is not a valid native pixel-rendering baseline.
   not a claim of sustained mixed-video/network or Windows casting acceptance.
 - Eighteen golden framing fixtures round-tripped against actual Windows Wire,
   retaining the original eight unchanged and adding rotation HELLOs and all
-  key/nonkey orientations. The helper also passed 204 protocol/shared-helper cases: actual
+  key/nonkey orientations. The helper also passed 213 protocol/shared-helper cases: actual
   ReceiverServer loopback negotiation/admission and strict reader/writer flags.
   Playback is explicitly fake/headless; no native/GPU or live casting is claimed.
   Shared Windows recovery helper checks independently cover Android's PCM 120 ms
   cap, malformed Opus packet boundaries, AAC preroll rounding, sample-frame
-  cutoff and first/subsequent coverage tolerance.
+  cutoff and first/subsequent coverage tolerance. They also call
+  `RecoveryDeadline.Complete(monotonicMs)` at the original deadline boundary,
+  require late completion to retain pending state, and distinguish absent audio,
+  monotonic source loss and unproven Opus coverage. The canonical Opus source-order
+  JSON fixture is embedded in the checker, so both verification and generation
+  into a fresh directory check equal and large reversed PTS without sorting.
 
 These are build/protocol/install results, not live capture/interoperability or
 optimized-release device-runtime acceptance. The old Android checkouts remain
@@ -399,6 +498,16 @@ partial writes preserve samples/PTS and the existing 250 ms no-progress limit.
 Pre-input servicing never inserts silence ahead of already-queued PCM; the small
 silence cushion is considered only after input/decode servicing finds a gap.
 No decoded-FIFO, native-buffer, network-queue, rate or quality limit is enlarged.
+During startup catch-up, decoding pauses whenever the FIFO reaches its existing
+50 ms target, including after the first actual source-sample write. This keeps
+a held startup burst from discarding source samples while the native ring is
+temporarily full. Additional source packets stay in the existing bounded encoded
+queue. Startup catch-up ends only after that queue drains and at least one
+target's worth of original source audio has actually been presented.
+Output servicing and the 250 ms no-progress deadline continue while waiting;
+network admission remains independent and bounded. Packet-local overflow and
+steady-state compensation/overflow retain their existing behavior, including
+bounded decoded trimming to recover low latency after repeated short gaps.
 Regression tests exercise a 3921-frame native ring with a 1920-frame mixer
 quantum, PCM refill before input admission, partial/zero writes and bounded
 silence. These establish servicing behavior, not a claim that every possible
@@ -445,8 +554,26 @@ underruns, including a run with frequent timestamp queries (maximum query time
 about 0.75 ms). These probes motivated the software-compensation path above;
 neither disabling compensation nor increasing limits was shipped as a fallback.
 A live official scrcpy capture baseline and sustained mixed-video acceptance
-still need approval. The separate recovery proof-age/transport-latency issue is
-not silently changed by adopting FFmpeg.
+still need approval. Recovery proof-age/transport-latency handling is corrected
+separately from FFmpeg adoption, without retiming source PTS or enlarging queues.
+The separate intermittent OnePlus startup probe loss (3982 original source
+frames in reported two- and fifteen-second runs) is not established as fixed by
+that recovery correction. Exact source accounting excludes frames still held
+in the FFmpeg filter; native probes retain their exact submission/presentation
+assertions. A fresh 0.4.6 probe lost 2062 source frames; a 0.4.7 probe with only
+the first-write guard lost 6862. The latter processed all 115200 input frames,
+submitted its first source sample at the original 1000000 us, and reported
+exactly 6862 decoded-FIFO dropped output frames. This isolates those observed
+losses to decoding past writable output capacity after the first write, rather
+than missing capture packets or unaccounted filter delay. Bounded startup
+catch-up pacing at the existing FIFO target addresses that path without
+increasing buffers, relaxing the loss threshold, or disabling steady-state
+low-latency gap recovery; sustained mixed-video acceptance remains separate.
+The native probe logs the first submitted source PTS, processed source frames
+and observed decoded-FIFO drops to distinguish startup trimming from filter delay.
+The startup catch-up correction passes the JVM regressions, including unchanged
+steady-state gap recovery, but its exact real-AudioTrack probe rerun is still
+pending. Do not treat those unit results as native or live-casting acceptance.
 
 Arbitrarily dropping queued compressed H.264/H.265/AV1 packets is not safe:
 subsequent pictures may reference them. The receiver can skip presentation of

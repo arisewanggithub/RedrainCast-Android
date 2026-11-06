@@ -24,6 +24,101 @@ import dev.screencopy.sender.StreamRecoverySender
 import dev.screencopy.sender.Wire as SenderWire
 
 class StreamRecoveryPipelineTest {
+    @Test(timeout = 10_000) fun fatalErrorIsDeliveredWhileControlWaitsForPlaybackRetirement() {
+        val retiring = CountDownLatch(1)
+        val release = CountDownLatch(1)
+        ReceiverServer.forProtocolTests("Receiver",
+            onPresentationStart = { AutoCloseable { retiring.countDown(); check(release.await(3, TimeUnit.SECONDS)) } },
+            videoFactory = { format, clock, failed, generation ->
+                val decoder = Decoder(false)
+                VideoPlayer(format, clock, failed, object : VideoDecoder by decoder {
+                    override fun queueInput(index: Int, size: Int, ptsUs: Long, keyFrame: Boolean) {
+                        throw PlaybackException("Synthetic decoder output failure")
+                    }
+                }, generation)
+            },
+            audioFactory = { format, clock, failed ->
+                testAudioPlayer(format, clock, failed, { Output() }, opusFactory = {
+                    object : OpusPacketDecoder {
+                        override fun decode(packet: ByteArray) = ShortArray(1920)
+                        override fun close() {}
+                    }
+                })
+            }).use { server ->
+            try {
+                session(server) { peer, media ->
+                    Wire.write(media.video.outputStream, frame(1_000_000, key = true))
+                    val error = expect(peer, Type.ERROR)
+                    assertEquals("DECODER_FAILED", error.json().getString("code"))
+                    val retirementStarted = retiring.await(1, TimeUnit.SECONDS)
+                    assertTrue("Playback retirement did not start: " + if (retirementStarted) "" else
+                        Thread.getAllStackTraces().entries.filter { (thread, stack) ->
+                            thread.name.startsWith("ScreenCopy") || stack.any { it.className.contains("ReceiverServer") }
+                        }.joinToString("\n") { (thread, stack) ->
+                            "${thread.name}: ${stack.joinToString(" <- ") { "${it.className}.${it.methodName}:${it.lineNumber}" }}"
+                        }, retirementStarted)
+                    assertEquals(-1, media.video.inputStream.read())
+                    assertEquals(-1, media.audio.inputStream.read())
+                    peer.soTimeout = 100
+                    assertThrows(java.net.SocketTimeoutException::class.java) { peer.inputStream.read() }
+                    release.countDown()
+                    peer.soTimeout = 3000
+                    assertEquals(-1, peer.inputStream.read())
+                }
+            } finally { release.countDown() }
+        }
+    }
+
+    @Test(timeout = 10_000) fun delayedDecodedKeyAndSourceAudioCompleteTheSameLiveRecoveryGeneration() {
+        for (delayMs in listOf(350L, 800L)) {
+            val failures = ConcurrentLinkedQueue<String>()
+            val pressure = AtomicInteger()
+            ReceiverServer.forProtocolTests("Receiver", onFailure = { failures.add(it.logMessage()) },
+                videoFactory = { format, clock, failed, generation ->
+                    val decoder = Decoder(false)
+                    val delayed = AtomicBoolean()
+                    VideoPlayer(format, clock, failed, object : VideoDecoder by decoder {
+                        override fun dequeueOutput(): VideoOutput? {
+                            val output = decoder.dequeueOutput() ?: return null
+                            if (delayed.compareAndSet(false, true)) Thread.sleep(delayMs)
+                            return output
+                        }
+                    }, generation)
+                },
+                audioFactory = { format, clock, failed ->
+                    testAudioPlayer(format, clock, failed, { Output() }, opusFactory = {
+                        object : OpusPacketDecoder {
+                            override fun decode(packet: ByteArray) = ShortArray(1920)
+                            override fun close() {}
+                        }
+                    })
+                }).use { server ->
+                session(server) { peer, media ->
+                    Wire.write(media.video.outputStream, frame(1_000_000, key = true))
+                    val key = expect(peer, Type.STATUS).json()
+                    assertEquals(StreamRecoveryProtocol.KEY, key.getString("state"))
+                    assertEquals(1, key.getInt("generation"))
+                    assertEquals("1000000", key.getString("keyPtsUs"))
+                    Thread.sleep(delayMs)
+                    sendControl(peer, Type.PING, JSONObject().put("nonce", 902))
+                    assertEquals(902, expect(peer, Type.PONG).json().getInt("nonce"))
+                    Wire.write(media.audio.outputStream,
+                        Message(Type.AUDIO_PACKET, 41, 2, 1, 1_000_000, 0, byteArrayOf(8, 1)))
+                    val complete = expect(peer, Type.STATUS).json()
+                    if (complete.getString("state") == StreamRecoveryProtocol.REQUEST) pressure.incrementAndGet()
+                    assertEquals(StreamRecoveryProtocol.COMPLETE, complete.getString("state"))
+                    assertEquals(1, complete.getInt("generation"))
+                    assertEquals("1000000", complete.getString("keyPtsUs"))
+                    assertEquals("1006500", complete.getString("audioPtsUs"))
+                    sendControl(peer, Type.STOP, JSONObject().put("reason", "delayed recovery complete"))
+                    expect(peer, Type.SESSION_END)
+                }
+            }
+            assertEquals(0, pressure.get())
+            assertTrue(failures.toString(), failures.isEmpty())
+        }
+    }
+
     @Test(timeout = 10_000) fun senderStopDeadlineStartsAtStopWhilePresentationRetires() {
         val entered = CountDownLatch(1)
         val release = CountDownLatch(1)
