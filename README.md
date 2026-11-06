@@ -174,10 +174,12 @@ prebuilts fail explicitly; there is no automatic slow source-build fallback. See
 .\gradlew.bat :app:testDebugUnitTest :app:lintDebug :app:assembleDebug :app:assembleRelease --console=plain
 ```
 
-The release variant is optimized and **unsigned**. No production signing keys,
-keystores, publication, auto-updater, or release workflow are included.
+Ordinary release builds are optimized and **unsigned**. The manually triggered
+[public prerelease workflow](tools/RELEASING.md) signs and publishes only after
+production signing, cross-repository access and reviewed LGPL relink materials
+are configured. No production signing key or auto-updater is included.
 Debug installation is side-by-side with existing applications.
-The private application's CI runs validation only; it does not publish binaries.
+Ordinary push/PR CI runs validation only; public publication is manual and gated.
 The separate public
 [RedrainCast-Native repository](https://github.com/arisewanggithub/RedrainCast-Native)
 owns manual, parallel ABI builds and immutable native-package releases. Both

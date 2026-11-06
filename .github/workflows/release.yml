@@ -1,0 +1,108 @@
+name: Public Android prerelease
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag matching the APK version, e.g. v0.4.6"
+        required: true
+        type: string
+      relink_run_id:
+        description: "Successful private workflow run containing reviewed android-lgpl-relink artifact"
+        required: true
+        type: string
+permissions:
+  contents: read
+  actions: read
+concurrency:
+  group: public-android-release
+  cancel-in-progress: false
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      RELEASE_REPOSITORY: arisewanggithub/RedrainCast-Releases
+      RELEASE_TAG: ${{ inputs.tag }}
+      RELINK_RUN_ID: ${{ inputs.relink_run_id }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check required configuration
+        env:
+          KEYSTORE: ${{ secrets.ANDROID_RELEASE_KEYSTORE_BASE64 }}
+          STORE_PASSWORD: ${{ secrets.ANDROID_RELEASE_STORE_PASSWORD }}
+          KEY_PASSWORD: ${{ secrets.ANDROID_RELEASE_KEY_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.ANDROID_RELEASE_KEY_ALIAS }}
+          PUBLISH_TOKEN: ${{ secrets.RELEASE_PUBLISH_TOKEN }}
+        run: |
+          set -euo pipefail
+          [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "::error::Invalid release tag"; exit 1; }
+          [[ "$RELINK_RUN_ID" =~ ^[0-9]+$ ]] || { echo "::error::Invalid relink workflow run ID"; exit 1; }
+          for name in KEYSTORE STORE_PASSWORD KEY_PASSWORD KEY_ALIAS PUBLISH_TOKEN; do
+            [[ -n "${!name}" ]] || { echo "::error::Missing required release configuration: $name"; exit 1; }
+          done
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+      - uses: android-actions/setup-android@v3
+        with:
+          packages: platform-tools
+      - uses: gradle/actions/setup-gradle@v4
+      - name: Install build tools
+        run: sdkmanager "platforms;android-37.0" "build-tools;37.0.0" "ndk;27.2.12479018" "cmake;3.22.1"
+      - name: Validate and assemble optimized unsigned APK
+        env:
+          JAVA_TOOL_OPTIONS: -Djava.util.concurrent.ForkJoinPool.common.parallelism=3
+        run: bash ./gradlew :app:testDebugUnitTest :app:lintDebug :app:assembleRelease --console=plain
+      - name: Download reviewed LGPL relink materials
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh run view "$RELINK_RUN_ID" --repo "$GITHUB_REPOSITORY" --json conclusion --jq '.conclusion' | grep -qx success
+          gh run download "$RELINK_RUN_ID" --repo "$GITHUB_REPOSITORY" --name android-lgpl-relink --dir "$RUNNER_TEMP/relink"
+          test -s "$RUNNER_TEMP/relink/android-lgpl-relink.tar.gz"
+          test "$(cat "$RUNNER_TEMP/relink/version.txt")" = "${RELEASE_TAG#v}"
+          cd "$RUNNER_TEMP/relink"
+          sha256sum --check SHA256SUMS
+      - name: Sign, verify and prepare public assets
+        env:
+          KEYSTORE: ${{ secrets.ANDROID_RELEASE_KEYSTORE_BASE64 }}
+          STORE_PASSWORD: ${{ secrets.ANDROID_RELEASE_STORE_PASSWORD }}
+          KEY_PASSWORD: ${{ secrets.ANDROID_RELEASE_KEY_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.ANDROID_RELEASE_KEY_ALIAS }}
+        run: |
+          set -euo pipefail
+          umask 077
+          key="$RUNNER_TEMP/release.jks"
+          trap 'rm -f "$key"' EXIT
+          printf '%s' "$KEYSTORE" | base64 --decode > "$key"
+          tools="$ANDROID_HOME/build-tools/37.0.0"
+          unsigned=app/build/outputs/apk/release/app-release-unsigned.apk
+          version=$("$tools/aapt" dump badging "$unsigned" | sed -n "s/.*versionName='\([^']*\)'.*/\1/p" | head -n 1)
+          test "v$version" = "$RELEASE_TAG"
+          mkdir -p "$RUNNER_TEMP/public-assets"
+          apk="$RUNNER_TEMP/public-assets/RedrainCast-$version.apk"
+          "$tools/zipalign" -P 16 -f 4 "$unsigned" "$RUNNER_TEMP/aligned.apk"
+          "$tools/apksigner" sign --ks "$key" --ks-key-alias "$KEY_ALIAS" \
+            --ks-pass env:STORE_PASSWORD --key-pass env:KEY_PASSWORD \
+            --out "$apk" "$RUNNER_TEMP/aligned.apk"
+          "$tools/apksigner" verify --verbose --print-certs "$apk" > "$RUNNER_TEMP/public-assets/signing-certificate.txt"
+          if grep -q 'CN=Android Debug' "$RUNNER_TEMP/public-assets/signing-certificate.txt"; then
+            echo "::error::A development debug signing certificate cannot be published as a production release"
+            exit 1
+          fi
+          "$tools/zipalign" -c -P 16 4 "$apk"
+          cp "$RUNNER_TEMP/relink/android-lgpl-relink.tar.gz" "$RUNNER_TEMP/public-assets/"
+          tar -czf "$RUNNER_TEMP/public-assets/licenses.tar.gz" -C app/src/main/assets NOTICE.txt OPUS-NOTICE.txt licenses
+          cd "$RUNNER_TEMP/public-assets"
+          sha256sum ./*.apk ./*.tar.gz signing-certificate.txt > SHA256SUMS
+      - name: Publish public testing release
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_PUBLISH_TOKEN }}
+        run: |
+          set -euo pipefail
+          gh release create "$RELEASE_TAG" "$RUNNER_TEMP/public-assets/"* \
+            --repo "$RELEASE_REPOSITORY" --prerelease \
+            --title "RedrainCast $RELEASE_TAG (testing)" \
+            --notes "Testing release. One universal APK supports arm64-v8a, armeabi-v7a and x86_64; Android 11/API 30 or newer. The intermittent first-rotation tiny-strip rendering bug remains unresolved. A production-signed APK cannot update earlier debug-signed installations in place. Checksums, signing certificate, licenses and reviewed LGPL relink materials are attached. Application source remains private."
