@@ -16,6 +16,9 @@ import zipfile
 spec = importlib.util.spec_from_file_location("relink", Path(__file__).with_name("release-relink.py"))
 relink = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(relink)
+guard_spec = importlib.util.spec_from_file_location("guard", Path(__file__).with_name("release-guard.py"))
+guard = importlib.util.module_from_spec(guard_spec)
+guard_spec.loader.exec_module(guard)
 ASSETS = {
     "ffmpeg-pcm-android-7.1.3-r1.aar":
         "6157824cb3f8238a3879b3d22ddf6cc2be61abb26f2cb6ac742131f2abde462b",
@@ -93,8 +96,7 @@ def collect_object(repo, host, abi, shipped, destination, scratch):
 
 
 def build(args):
-    if not re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", args.version):
-        raise ValueError("Invalid version")
+    guard.is_prerelease(args.version)
     repo, output, cache = args.repo.resolve(), args.output.resolve(), args.cache.resolve()
     if output.exists():
         raise ValueError("Output must not already exist")

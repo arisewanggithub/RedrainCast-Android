@@ -22,6 +22,53 @@ import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
 
 class ReceiverServerTest {
+    @Test fun mediaEofBeforeControlStopDoesNotMisreportAnOrderlySessionAsFailure() {
+        val failures = ConcurrentLinkedQueue<org.screencopy.receiver.ui.FailureDiagnostic>()
+        ReceiverServer.forProtocolTests("Receiver", onFailure = failures::add).use { server ->
+            server.start()
+            connect(server).use { peer ->
+                hello(peer)
+                send(peer, Type.SESSION_REQUEST, settings(), 77)
+                MediaSockets.attach(server, read(peer)).use { media ->
+                    media.video.close()
+                    Thread.sleep(100)
+                    send(peer, Type.PING, JSONObject().put("nonce", 123), 77)
+                    assertEquals(Type.PONG, read(peer).type)
+                    Thread.sleep(200)
+                    send(peer, Type.STOP, JSONObject().put("reason", "user"), 77)
+                    assertEquals(Type.SESSION_END, read(peer).type)
+                    assertEquals(-1, peer.inputStream.read())
+                }
+            }
+            await { !server.busyForUpdate }
+            assertTrue(failures.toString(), failures.isEmpty())
+        }
+    }
+
+    @Test fun mediaEofWithoutControlTerminalStillReportsAnExplicitBoundedFailure() {
+        val failures = ConcurrentLinkedQueue<org.screencopy.receiver.ui.FailureDiagnostic>()
+        ReceiverServer.forProtocolTests("Receiver", onFailure = failures::add).use { server ->
+            server.start()
+            connect(server).use { peer ->
+                hello(peer)
+                send(peer, Type.SESSION_REQUEST, settings(), 77)
+                MediaSockets.attach(server, read(peer)).use { media ->
+                    val started = System.nanoTime()
+                    media.video.close()
+                    val error = read(peer)
+                    val elapsedMs = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - started)
+                    assertEquals(Type.ERROR, error.type)
+                    assertEquals("PROTOCOL", error.json().string("code"))
+                    assertTrue("Unexpected media EOF must leave a control-drain opportunity", elapsedMs >= 400)
+                    assertTrue("Media disconnect diagnosis must remain bounded", elapsedMs < 2500)
+                    assertEquals(-1, peer.inputStream.read())
+                }
+            }
+            await { !server.busyForUpdate }
+            assertEquals(1, failures.size)
+        }
+    }
+
     @Test fun listeningIsIdleAndOutgoingReservationRejectsIncomingWithoutDecoderSetup() {
         val roles = dev.redrain.cast.RoleOwner()
         val validated = AtomicInteger()

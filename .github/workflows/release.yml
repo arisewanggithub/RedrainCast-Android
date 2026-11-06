@@ -1,13 +1,13 @@
-name: Public Android prerelease
+name: Public Android release candidate
 on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Release tag matching the APK version, e.g. v0.4.6"
+        description: "Exact APK tag: v0.5.0 or v0.5.0-rc.1 (also alpha.N/beta.N)"
         required: true
         type: string
       source_validated:
-        description: "I reviewed this exact source revision and authorize a signed testing candidate"
+        description: "I reviewed this exact source revision and authorize a signed release candidate"
         required: true
         type: boolean
         default: false
@@ -16,7 +16,7 @@ on:
         required: true
         type: string
       publish:
-        description: "Upload a DRAFT public prerelease (requires scoped publisher token)"
+        description: "Upload a public DRAFT; prerelease status follows the version suffix (requires scoped token)"
         required: true
         type: boolean
         default: false
@@ -51,7 +51,7 @@ jobs:
           PUBLISH_TOKEN: ${{ secrets.RELEASE_PUBLISH_TOKEN }}
         run: |
           set -euo pipefail
-          [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "::error::Invalid release tag"; exit 1; }
+          python3 -B tools/release-guard.py --release-tag "$RELEASE_TAG"
           [[ "$SOURCE_VALIDATED" = true ]] || { echo "::error::Exact source revision must be reviewed before signing"; exit 1; }
           for name in KEYSTORE STORE_PASSWORD KEY_PASSWORD KEY_ALIAS; do
             [[ -n "${!name}" ]] || { echo "::error::Missing required release configuration: $name"; exit 1; }
@@ -92,10 +92,7 @@ jobs:
           tools="$ANDROID_HOME/build-tools/37.0.0"
           unsigned=app/build/outputs/apk/release/app-release-unsigned.apk
           version=$("$tools/aapt" dump badging "$unsigned" | sed -n "s/.*versionName='\([^']*\)'.*/\1/p" | head -n 1)
-          if [[ "v$version" != "$RELEASE_TAG" ]]; then
-            echo "::error::APK version v$version does not match approved release $RELEASE_TAG"
-            exit 1
-          fi
+          python3 -B tools/release-guard.py --release-tag "$RELEASE_TAG" --apk-version "$version"
           echo "Unsigned APK version verified: $version"
           mkdir -p "$RUNNER_TEMP/public-assets"
           apk="$RUNNER_TEMP/public-assets/RedrainCast-$version.apk"
@@ -133,14 +130,19 @@ jobs:
           path: ${{ runner.temp }}/public-assets/
           retention-days: 7
           if-no-files-found: error
-      - name: Upload public draft testing release
+      - name: Upload public draft release
         if: inputs.publish
         env:
           GH_TOKEN: ${{ secrets.RELEASE_PUBLISH_TOKEN }}
         run: |
           set -euo pipefail
           python3 -B tools/release-guard.py
+          kind="$(python3 -B tools/release-guard.py --release-tag "$RELEASE_TAG")"
+          options=(--draft)
+          if [[ "$kind" = prerelease ]]; then
+            options+=(--prerelease)
+          fi
           gh release create "$RELEASE_TAG" "$RUNNER_TEMP/public-assets/"* \
-            --repo "$RELEASE_REPOSITORY" --draft --prerelease \
-            --title "RedrainCast $RELEASE_TAG (testing)" \
-            --notes "Testing candidate, not a stable release. One universal APK supports arm64-v8a, armeabi-v7a and x86_64; Android 11/API 30 or newer. The intermittent first-rotation tiny-strip rendering bug remains unresolved; live Windows interoperability is not verified. A production-signed APK cannot update earlier debug-signed installations in place. Checksums, signing certificate, licenses and exact-build LGPL relink materials are attached. Application source remains private. Review all assets before manually publishing this draft."
+            --repo "$RELEASE_REPOSITORY" "${options[@]}" \
+            --title "RedrainCast $RELEASE_TAG (candidate)" \
+            --notes "Draft release candidate; version suffix determines prerelease status. One universal APK supports arm64-v8a, armeabi-v7a and x86_64; Android 11/API 30 or newer. The intermittent first-rotation tiny-strip rendering bug remains unresolved; live Windows interoperability is not verified. A production-signed APK cannot update earlier debug-signed installations in place. Checksums, signing certificate, licenses and exact-build LGPL relink materials are attached. Application source remains private. Review all assets, runtime acceptance and stability before manually publishing this draft."

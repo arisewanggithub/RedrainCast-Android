@@ -3,6 +3,7 @@
 import importlib.util
 from pathlib import Path
 import tempfile
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
@@ -22,6 +23,43 @@ RULE = """build /build/libscreencopy_resampler.so: CXX_SHARED_LIBRARY_LINKER__sc
 
 
 class ReleaseTests(unittest.TestCase):
+    def test_release_suffix_infers_prerelease_status(self):
+        for version in ("0.5.0-alpha.1", "0.5.0-beta.2", "0.5.0-rc.1"):
+            with self.subTest(version=version):
+                self.assertTrue(guard.is_prerelease(version))
+                self.assertTrue(guard.validate_release_tag("v" + version, version))
+        for version in ("0.0.0", "0.5.0", "1.10.100"):
+            with self.subTest(version=version):
+                self.assertFalse(guard.is_prerelease(version))
+                self.assertFalse(guard.validate_release_tag("v" + version, version))
+
+    def test_noncanonical_or_unsafe_release_versions_are_rejected(self):
+        for version in ("0.5.0_pre-release", "0.5.0-rc", "0.5.0-rc.0", "0.5.0-rc.01",
+                        "00.5.0", "0.05.0", "0.5.00", "0.5.0-RC.1", "v0.5.0",
+                        "0.5.0+build", "0.5.0-rc.1/../../", "1" * 80 + ".0.0"):
+            with self.subTest(version=version), self.assertRaises(ValueError):
+                guard.is_prerelease(version)
+
+    def test_tag_and_embedded_apk_version_cannot_have_different_channels(self):
+        for tag, apk in (("v0.5.0-rc.1", "0.5.0"), ("v0.5.0", "0.5.0-rc.1"),
+                         ("v0.5.0-rc.1", "0.5.0-rc.2"), ("v0.5.0-beta.1", "0.5.0-rc.1"),
+                         ("0.5.0", "0.5.0")):
+            with self.subTest(tag=tag, apk=apk), self.assertRaises(ValueError):
+                guard.validate_release_tag(tag, apk)
+
+    def test_relink_kit_accepts_the_same_stable_and_prerelease_versions(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            output = root / "existing.tar.gz"
+            output.write_bytes(b"existing")
+            for version in ("0.5.0", "0.5.0-rc.1"):
+                with self.subTest(version=version), self.assertRaisesRegex(ValueError, "Output must not already exist"):
+                    kit.build(SimpleNamespace(version=version, repo=root, output=output, cache=root / "cache"))
+
+    def test_relink_kit_rejects_bad_versions_before_download_or_filesystem_access(self):
+        with self.assertRaises(ValueError):
+            kit.build(SimpleNamespace(version="0.5.0_pre-release"))
+
     def test_sdk37_and_legacy_signer_certificates_are_accepted(self):
         digest = "a" * 64
         for label in ("Signer #1", "V2 Signer:", "V3 Signer:", "V3.1 Signer:"):

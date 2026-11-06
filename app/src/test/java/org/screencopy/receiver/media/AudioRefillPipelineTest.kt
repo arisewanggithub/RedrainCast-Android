@@ -8,6 +8,48 @@ import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.atomic.AtomicReference
 
 class AudioRefillPipelineTest {
+    @Test fun startupBacklogAfterTheFirstNativeWriteDoesNotDiscardDecodedSourceFrames() {
+        Fixture().use { fixture ->
+            repeat(13) { index ->
+                fixture.packet(960, 1_000_000 + index * 20_000L, index * 1920)
+            }
+            repeat(13) { fixture.step() }
+            assertEquals(3921L, fixture.player.sourceSubmittedFrames)
+            repeat(20) {
+                fixture.output.mix(fixture.output.buffered.toInt())
+                fixture.step()
+            }
+            assertEquals(13 * 960L, fixture.player.sourceSubmittedFrames)
+            assertEquals((0 until 13 * 1920).map(Int::toShort),
+                fixture.output.samples.take(13 * 1920))
+            assertTrue(fixture.output.maximumBuffered <= 3921)
+        }
+    }
+
+    @Test fun aHeldStartupBurstPreservesItsSourcePrefixUntilTheFirstNativeWrite() {
+        Fixture(zeroAfter = 0).use { fixture ->
+            val proofs = mutableListOf<Long>()
+            fixture.player.onFirstSubmitted = proofs::add
+            repeat(13) { index ->
+                fixture.packet(960, 1_000_000 + index * 20_000L, index * 1920)
+            }
+            repeat(13) { fixture.step() }
+            assertEquals(0L, fixture.player.sourceSubmittedFrames)
+            assertTrue(proofs.isEmpty())
+
+            fixture.output.zeroAfter = Int.MAX_VALUE
+            repeat(20) {
+                fixture.step()
+                fixture.output.mix(fixture.output.buffered.toInt())
+            }
+            assertEquals(13 * 960L, fixture.player.sourceSubmittedFrames)
+            assertEquals(listOf(1_000_000L), proofs)
+            assertEquals((0 until 13 * 1920).map(Int::toShort),
+                fixture.output.samples.take(13 * 1920))
+            assertTrue(fixture.output.maximumBuffered <= 3921)
+        }
+    }
+
     @Test fun oneDecodeStepServicesAWholeFortyMillisecondMixerQuantum() {
         Fixture().use { fixture ->
             fixture.packet(2880)
@@ -103,9 +145,9 @@ class AudioRefillPipelineTest {
         val player = testAudioPlayer(AudioFormat("pcm", 48000, 2, byteArrayOf()), clock,
             { code, detail -> fail("$code: $detail") }, { output })
         private val step = AudioPlayer::class.java.getDeclaredMethod("step").apply { isAccessible = true }
-        fun packet(frames: Int, pts: Long = 1_000_000) {
+        fun packet(frames: Int, pts: Long = 1_000_000, firstSample: Int = 0) {
             val bytes = ByteBuffer.allocate(frames * 4).order(ByteOrder.LITTLE_ENDIAN)
-            repeat(frames * 2) { bytes.putShort(it.toShort()) }
+            repeat(frames * 2) { bytes.putShort((firstSample + it).toShort()) }
             player.offer(AccessUnit(pts, bytes.array()))
         }
         fun step() { step.invoke(player) }

@@ -18,6 +18,7 @@ class ReceiverLink(private val target: ReceiverTarget) : Closeable {
     private val gates = Array(3) { Any() }
     private val timer = Executors.newSingleThreadScheduledExecutor()
     private val closed = AtomicBoolean()
+    private val mediaClosed = AtomicBoolean()
     @Volatile private var attached = false
     @Volatile private var activeSession = 0L
     var videoRotation: Boolean = false
@@ -151,14 +152,20 @@ class ReceiverLink(private val target: ReceiverTarget) : Closeable {
         throw IOException("PROTOCOL: unexpected media track reply")
     }
 
+    internal fun closeMedia() {
+        if (!mediaClosed.compareAndSet(false, true)) return
+        var failure: IOException? = null
+        for (lane in 1..2) try { sockets[lane].close() } catch (error: IOException) {
+            if (failure == null) failure = error else failure?.addSuppressed(error)
+        }
+        failure?.let { throw it }
+    }
+
     override fun close() {
         if (!closed.compareAndSet(false, true)) return
-        var failure: IOException? = null
-        sockets.forEach { try { it.close() } catch (error: IOException) {
-            if (failure == null) failure = error else failure?.addSuppressed(error)
-        } }
-        timer.shutdownNow()
-        failure?.let { throw it }
+        try { closeMedia() } finally {
+            try { sockets[0].close() } finally { timer.shutdownNow() }
+        }
     }
 
     private fun reject(message: Wire.Message) {

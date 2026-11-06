@@ -38,6 +38,11 @@
     <string name="rc_dismiss">Dismiss</string>
     <string name="rc_help">Connection help</string>
     <string name="rc_version">RedrainCast · Version %1$s</string>
+    <string name="rc_update_title">Update available</string>
+    <string name="rc_update_message">RedrainCast %1$s is available. Open its release page in your browser to read the notes and download the APK. Android will ask you to confirm installation.</string>
+    <string name="rc_update_later">Later</string>
+    <string name="rc_update_open">Download in browser</string>
+    <string name="rc_update_browser_unavailable">No browser could open the release page. Enable a browser or open %1$s on another device.</string>
     <string name="rc_settings_description">Use exactly the quality and audio you select. Unsupported configurations report an error; they are never silently replaced.</string>
     <string name="rc_video_heading">Video</string>
     <string name="rc_video_codec">Video codec</string>

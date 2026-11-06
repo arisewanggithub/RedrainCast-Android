@@ -6,6 +6,7 @@ import org.junit.Test
 import org.junit.runner.RunWith
 import java.util.concurrent.ConcurrentLinkedQueue
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicLong
 
 @RunWith(AndroidJUnit4::class)
 class SilentAudioClockTest {
@@ -44,6 +45,8 @@ class SilentAudioClockTest {
     private fun playback(packets: Int, scripted: Boolean) {
         val failures = ConcurrentLinkedQueue<String>()
         val compensations = ConcurrentLinkedQueue<AudioCompensation>()
+        val regulation = ConcurrentLinkedQueue<AudioRegulationDiagnostic>()
+        val firstSubmittedPts = AtomicLong(-1)
         val format = AudioFormat("pcm", 48000, 2, byteArrayOf())
         val output = PlatformAudioOutput(format) { code, detail -> failures.add("$code: $detail") }
         val clock = PlaybackClock().apply { audioExpected = true; anchorVideo(1_000_000) }
@@ -60,7 +63,9 @@ class SilentAudioClockTest {
             override fun setSpeed(speed: Float) = fail("AudioTrack rate must stay nominal during PCM compensation")
         }
         val player = AudioPlayer(format, clock, { code, detail -> failures.add("$code: $detail") },
-            { stableOutput }, resamplerFactory = { _, _ -> resampler })
+            { stableOutput }, onRegulation = regulation::add, resamplerFactory = { _, _ -> resampler }).apply {
+                onFirstSubmitted = firstSubmittedPts::set
+            }
         try {
             player.start()
             val started = System.nanoTime()
@@ -89,6 +94,10 @@ class SilentAudioClockTest {
                 failures.isEmpty() && System.nanoTime() < deadline) Thread.sleep(2)
             android.util.Log.i("ScreenCopyReceiver", "event=FFMPEG_PCM_PROBE scripted=$scripted" +
                 " source_frames=${player.sourceSubmittedFrames} expected_frames=$expected" +
+                " processed_source_frames=${player.processedSourceFrames}" +
+                " first_source_pts_us=${firstSubmittedPts.get()}" +
+                " observed_dropped_output_frames=${regulation.lastOrNull()?.droppedFrames ?: "unobserved"}" +
+                " queued_packets=${player.queuedPackets()}" +
                 " filter_frames=${converter.delayFrames} compensation_updates=${compensations.size}" +
                 " warmup_underruns=$warmupUnderruns steady_underruns=$steadyUnderruns" +
                 " after_input_end_underruns=${output.underrunCount}")

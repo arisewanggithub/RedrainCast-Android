@@ -79,9 +79,14 @@ class MainActivity : Activity(), TextureView.SurfaceTextureListener {
     private val sessionOrientation = SessionOrientation({ requestedOrientation }, { requestedOrientation = it })
     private var dialog: AlertDialog? = null
     private var settingsDialog: AlertDialog? = null
+    private lateinit var updateCheck: LaunchUpdateCheck
+    private var updateDialog: AlertDialog? = null
+    private var resumed = false
+    private var windowFocused = false
     private val refresh = object : Runnable {
         override fun run() {
             reconcile()
+            showUpdateIfIdle()
             main.postDelayed(this, 400)
         }
     }
@@ -121,6 +126,11 @@ class MainActivity : Activity(), TextureView.SurfaceTextureListener {
             insets
         }
         render()
+        @Suppress("DEPRECATION")
+        val retained = lastNonConfigurationInstance as? LaunchUpdateCheck
+        updateCheck = retained ?: updateFactory(BuildConfig.VERSION_NAME)
+        updateCheck.attach(::showUpdateIfIdle)
+        updateCheck.start()
     }
 
     private fun dp(value: Int) = (value * resources.displayMetrics.density + 0.5f).toInt()
@@ -128,6 +138,8 @@ class MainActivity : Activity(), TextureView.SurfaceTextureListener {
     private fun showError(error: Exception) {
         android.util.Log.e("RedrainCast", "Operation failed", error)
         problem = error.message ?: error.javaClass.simpleName
+        updateDialog?.dismiss()
+        updateDialog = null
         if (::home.isInitialized) render()
     }
 
@@ -277,6 +289,8 @@ class MainActivity : Activity(), TextureView.SurfaceTextureListener {
                 detail = getString(if (event.addresses.isEmpty()) R.string.flow_no_network else R.string.flow_ready)
             }
             ReceiverScreenEvent.Connecting -> {
+                updateDialog?.dismiss()
+                updateDialog = null
                 problem = null
                 CastState.failure = null
                 readiness = "CONNECTING"
@@ -328,6 +342,7 @@ class MainActivity : Activity(), TextureView.SurfaceTextureListener {
     }
 
     private fun prepareSend(target: ReceiverTarget) {
+        if (updateDialog?.isShowing == true) return
         if (!LocalNetworkPermission.granted(this)) {
             requestLocalNetworkPermission()
             return
@@ -586,11 +601,60 @@ class MainActivity : Activity(), TextureView.SurfaceTextureListener {
 
     override fun onResume() {
         super.onResume()
+        resumed = true
         if (muteRecoveryPending) {
             muteRecoveryPending = false
             try { PlaybackMute.create(this).restore() } catch (error: Exception) { showError(error) }
         }
+        showUpdateIfIdle()
     }
+
+    override fun onWindowFocusChanged(hasFocus: Boolean) {
+        super.onWindowFocusChanged(hasFocus)
+        windowFocused = hasFocus
+        if (hasFocus) showUpdateIfIdle()
+    }
+
+    override fun onPause() {
+        resumed = false
+        updateDialog?.dismiss()
+        updateDialog = null
+        super.onPause()
+    }
+
+    private fun showUpdateIfIdle() {
+        if (!::updateCheck.isInitialized) return
+        if (CastState.roles.role() != null || playing || problem != null || CastState.failure != null) {
+            updateDialog?.dismiss()
+            updateDialog = null
+            return
+        }
+        if (!resumed || !windowFocused || isFinishing || isDestroyed ||
+            updateCheck.handled || updateDialog?.isShowing == true ||
+            dialog?.isShowing == true || settingsDialog?.isShowing == true) return
+        val update = updateCheck.available ?: return
+        val prompt = AlertDialog.Builder(this).setTitle(R.string.rc_update_title)
+            .setMessage(getString(R.string.rc_update_message, update.version))
+            .setNegativeButton(R.string.rc_update_later) { _, _ -> updateCheck.dismiss() }
+            .setPositiveButton(R.string.rc_update_open) { _, _ ->
+                updateCheck.dismiss()
+                try {
+                    startActivity(Intent(Intent.ACTION_VIEW, android.net.Uri.parse(update.page))
+                        .addCategory(Intent.CATEGORY_BROWSABLE))
+                } catch (error: android.content.ActivityNotFoundException) {
+                    showError(IllegalStateException(getString(R.string.rc_update_browser_unavailable, update.page), error))
+                } catch (error: SecurityException) {
+                    showError(IllegalStateException(getString(R.string.rc_update_browser_unavailable, update.page), error))
+                }
+            }.create()
+        prompt.setOnCancelListener { updateCheck.dismiss() }
+        prompt.setOnDismissListener { if (updateDialog === prompt) updateDialog = null }
+        updateDialog = prompt
+        prompt.show()
+    }
+
+    @Deprecated("Activity non-configuration retention")
+    override fun onRetainNonConfigurationInstance(): Any = updateCheck
 
     override fun onStart() {
         super.onStart()
@@ -625,6 +689,12 @@ class MainActivity : Activity(), TextureView.SurfaceTextureListener {
     }
 
     override fun onDestroy() {
+        if (::updateCheck.isInitialized) {
+            updateCheck.detach()
+            if (!isChangingConfigurations) updateCheck.close()
+        }
+        updateDialog?.dismiss()
+        updateDialog = null
         if (isFinishing || pendingRequest()?.consentStarted != true)
             cancelPending(getString(R.string.flow_send_cancelled))
         texture.surfaceTextureListener = null
@@ -635,5 +705,9 @@ class MainActivity : Activity(), TextureView.SurfaceTextureListener {
         worker.shutdown()
         main.removeCallbacksAndMessages(null)
         super.onDestroy()
+    }
+
+    companion object {
+        internal var updateFactory: (String) -> LaunchUpdateCheck = { LaunchUpdateCheck(GitHubUpdateSource(), it) }
     }
 }

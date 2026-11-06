@@ -261,6 +261,8 @@ class ReceiverServer private constructor(
         private val playbackError = AtomicReference<String?>()
         private val firstFailure = AtomicReference<FailureDiagnostic?>()
         private val connectionError = AtomicReference<Pair<String, String>?>()
+        private val mediaDisconnect = AtomicReference<Pair<Exception, Long>?>()
+        private val failureRetirement = AtomicBoolean()
         private val playbackLock = Any()
         private val playbackOperations = Any()
         private val recoveryExecutor = Executors.newSingleThreadExecutor()
@@ -425,6 +427,18 @@ class ReceiverServer private constructor(
 
         private fun mediaFailed(error: Exception) {
             if (!running.get() || stopping.get() || !accepted) return
+            if (error is EOFException || error is SocketException) {
+                if (mediaDisconnect.compareAndSet(null, error to now())) {
+                    onDiscoveryDiagnostic("event=MEDIA_DISCONNECT_AWAITING_CONTROL exception=${error.javaClass.simpleName}")
+                    closeMedia()
+                }
+                return
+            }
+            terminateMediaFailure(error)
+        }
+
+        private fun terminateMediaFailure(error: Exception) {
+            if (!running.get() || stopping.get()) return
             val code = when (error) {
                 is ProtocolException -> error.code
                 is PlaybackException -> error.code
@@ -434,9 +448,9 @@ class ReceiverServer private constructor(
             }
             val detail = "Media connection failed: ${error.message ?: error.javaClass.simpleName}"
             if (!connectionError.compareAndSet(null, code to detail)) return
-            terminalError = true
             stopAt = now()
-            stopping.set(true)
+            if (!stopping.compareAndSet(false, true)) return
+            terminalError = true
             reportFailure(code, detail, when {
                 error is ReceiverOrientationException -> FailureOrigin.PRESENTATION
                 initializingTrack == 1 -> FailureOrigin.VIDEO
@@ -448,8 +462,7 @@ class ReceiverServer private constructor(
             onStatus("Session error: $code", "$detail\nReconnect after correcting the sender settings or network.")
             try {
                 send(Type.ERROR, JSONObject().put("code", code).put("message", detail).put("fatal", true))
-                writer?.close()
-            } finally { abort() }
+            } finally { retireFailedSession() }
         }
 
         fun run() {
@@ -910,24 +923,49 @@ class ReceiverServer private constructor(
             if (active.get() === this) reportFailure(code, reason, if (code == "AUDIO_FAILED") FailureOrigin.AUDIO else origin)
             try {
                 send(Type.ERROR, JSONObject().put("code", code).put("message", reason).put("fatal", true))
-                writer?.close()
             } catch (e: Exception) {
                 onStatus("Playback failed", "$reason; could not notify sender (${e.javaClass.simpleName})")
             } finally {
-                abort()
+                retireFailedSession()
+            }
+        }
+
+        private fun retireFailedSession() {
+            closeMedia()
+            if (!failureRetirement.compareAndSet(false, true)) return
+            try {
+                recoveryExecutor.execute {
+                    try {
+                        stopPlayback()
+                    } catch (error: Exception) {
+                        onStatus("Playback cleanup failed", error.message ?: error.javaClass.simpleName)
+                        reportFailure("INTERNAL", "Playback cleanup failed", FailureOrigin.CLEANUP)
+                    } finally {
+                        try {
+                            writer?.close()
+                        } catch (error: Exception) {
+                            onStatus("Connection cleanup failed", error.message ?: error.javaClass.simpleName)
+                            reportFailure("INTERNAL", "Connection cleanup failed", FailureOrigin.CLEANUP)
+                        } finally { socket.close() }
+                    }
+                }
+            } catch (error: java.util.concurrent.RejectedExecutionException) {
+                onStatus("Session cleanup failed", "Playback retirement worker is unavailable")
+                reportFailure("INTERNAL", "Playback retirement worker is unavailable", FailureOrigin.CLEANUP)
+                socket.close()
             }
         }
 
         fun requestStop(reason: String) {
             stopAt = now()
             if (!stopping.compareAndSet(false, true)) return
-            closeMedia()
             try {
                 send(Type.STOP, JSONObject().put("reason", reason))
             } catch (e: Exception) {
                 onStatus("Disconnect error", "${e.message ?: e.javaClass.simpleName}; connection closed")
-                socket.close()
+                abort()
             } finally {
+                closeMedia()
                 try {
                     stopPlayback()
                 } catch (e: Exception) {
@@ -967,6 +1005,11 @@ class ReceiverServer private constructor(
                     mediaOwner?.mediaFailed(ProtocolException("TIMEOUT", "Media HELLO write blocked"))
                     socket.close()
                 }
+                return
+            }
+            val disconnected = mediaDisconnect.get()
+            if (!stopping.get() && disconnected != null && time - disconnected.second >= 500) {
+                terminateMediaFailure(disconnected.first)
                 return
             }
             when {

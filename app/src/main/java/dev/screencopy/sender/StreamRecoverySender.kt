@@ -23,6 +23,7 @@ internal class StreamRecoverySender(
     private var videoConfig: JSONObject? = null
     private var audioTiming: AudioPacketTiming? = null
     private var unresolvedAt: Long? = null
+    private var attemptAt: Long? = null
     private var lastKeyRequest: Long? = null
     private var minimumKeyPts = 0L
     private var sentKeyPts: Long? = null
@@ -43,7 +44,9 @@ internal class StreamRecoverySender(
             audioTiming = AudioPacketTiming.fromConfig(config)
         } else {
             videoConfig = JSONObject(config.toString())
-            if (unresolvedAt == null) unresolvedAt = now()
+            val started = now()
+            if (unresolvedAt == null) unresolvedAt = started
+            attemptAt = started
             if (wireGeneration[1] > 0) budget.discardMediaForRecovery()
             sentKeyPts = null
             state = State.WAIT_READY
@@ -56,7 +59,7 @@ internal class StreamRecoverySender(
         if (state != State.WAIT_READY || !budget.allReady()) return false
         state = State.WAIT_KEY
         val preroll = if (withAudio) checkNotNull(audioTiming).prerollUs else 0
-        minimumKeyPts = maxOf(now() / 1000, checkNotNull(unresolvedAt) / 1000 + preroll)
+        minimumKeyPts = maxOf(now() / 1000, checkNotNull(attemptAt) / 1000 + preroll)
         return retryKeyFrame()
     }
 
@@ -68,15 +71,16 @@ internal class StreamRecoverySender(
     }
 
     @Synchronized fun keyProved(generation: Int, pts: Long) {
+        requireWithinDeadline()
         if (!acknowledgement(generation, pts)) return
         if (state == State.ACTIVE || state == State.WAIT_AUDIO || state == State.WAIT_COMPLETE) return
         if (state != State.WAIT_KEY_PROOF) throw IOException("PROTOCOL: unexpected decoded-key proof")
-        if (now() / 1000 - pts > 250_000) { reset("stale-key-proof"); return }
         state = if (withAudio) State.WAIT_AUDIO else State.WAIT_COMPLETE
         releaseAudioIfReady()
     }
 
     @Synchronized fun completed(generation: Int, pts: Long, audioPts: Long?) {
+        requireWithinDeadline()
         if (!acknowledgement(generation, pts)) return
         if (state == State.ACTIVE) {
             if (audioPts != completedAudioPts) throw IOException("PROTOCOL: conflicting recovery completion proof")
@@ -109,7 +113,7 @@ internal class StreamRecoverySender(
         sourcePts[track] = packet.pts
         val mapped = packet.copy(generation = wireGeneration[track])
         if (track == 2 && state != State.ACTIVE && state != State.WAIT_COMPLETE) {
-            val pressure = budget.holdRecoveryAudio(mapped, checkNotNull(audioTiming))
+            val pressure = budget.holdRecoveryAudio(mapped, checkNotNull(audioTiming), sentKeyPts)
             if (pressure != null) reset("audio-preroll-capacity")
             releaseAudioIfReady()
             return
@@ -139,14 +143,21 @@ internal class StreamRecoverySender(
     private fun releaseAudioIfReady() {
         if (state != State.WAIT_AUDIO) return
         val key = checkNotNull(sentKeyPts)
-        if (now() / 1000 - key > 250_000) { reset("stale-audio-window"); return }
-        if (budget.releaseRecoveryAudio(key, checkNotNull(audioTiming))) state = State.WAIT_COMPLETE
+        when (budget.releaseRecoveryAudio(key, checkNotNull(audioTiming))) {
+            RecoveryAudioCoverage.READY -> state = State.WAIT_COMPLETE
+            RecoveryAudioCoverage.LOST -> reset("audio-source-window-lost")
+            RecoveryAudioCoverage.WAITING -> Unit
+        }
     }
 
     @Synchronized fun checkDeadline() {
+        requireWithinDeadline()
+        releaseAudioIfReady()
+    }
+
+    private fun requireWithinDeadline() {
         if (unresolvedAt?.let { now() - it >= 10_000_000_000L } == true)
             throw IOException("TIMEOUT: stream recovery did not complete within ten seconds of the first unresolved request")
-        releaseAudioIfReady()
     }
 
     @Synchronized fun retryKeyFrame(): Boolean {
@@ -158,7 +169,9 @@ internal class StreamRecoverySender(
 
     private fun reset(reason: String) {
         val config = videoConfig ?: throw IOException("PROTOCOL: recovery preceded video configuration")
-        if (unresolvedAt == null) unresolvedAt = now()
+        val started = now()
+        if (unresolvedAt == null) unresolvedAt = started
+        attemptAt = started
         budget.discardMediaForRecovery()
         wireGeneration[1] = next(wireGeneration[1])
         sentKeyPts = null

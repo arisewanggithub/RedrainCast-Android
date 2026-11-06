@@ -36,9 +36,11 @@ class SenderSession internal constructor(
     private val threads = mutableListOf<Thread>()
     private val terminalSent = CountDownLatch(1)
     private val receiverReleased = CountDownLatch(1)
+    private val receiverTerminal = AtomicBoolean()
     private val sizeSwitch = SizeSwitchAuthorization()
     private val captureCleanup = Any()
     @Volatile private var linkClosed = false
+    @Volatile private var startupTransportAborted = false
     @Volatile private var playing = false
     @Volatile private var cleanupComplete = false
     @Volatile private var cleanupSucceeded = true
@@ -86,6 +88,7 @@ class SenderSession internal constructor(
             if (!playing) {
                 if (requestSent) try { terminalSent.await(500, TimeUnit.MILLISECONDS) }
                 catch (e: InterruptedException) { Thread.currentThread().interrupt(); fail(e, SessionOutcome.Origin.CLEANUP) }
+                startupTransportAborted = true
                 closeLink()
             }
             abortCapture()
@@ -122,6 +125,11 @@ class SenderSession internal constructor(
         }
     }
     fun captureFailed(error: Exception) = fail(error, SessionOutcome.Origin.CAPTURE)
+    internal fun recordMediaFailure(error: Exception, origin: SessionOutcome.Origin) {
+        val transport = error is java.io.EOFException || error is java.net.SocketException ||
+            error is java.io.InterruptedIOException
+        fail(if (transport && error is IOException) MediaConnectionFailure(error) else error, origin)
+    }
     fun validateSizeSwitch(requested: Settings): Settings {
         check()
         val capture = backend ?: throw IOException("CAPTURE_FAILED: receiver capture mode is not negotiated")
@@ -181,7 +189,7 @@ class SenderSession internal constructor(
                 worker("receiver-media-write-$track") { writeLoop(track) }
                 worker("receiver-media-read-$track") {
                     try { connected.watchMedia(track) }
-                    catch (e: Exception) { fail(e, SessionOutcome.Origin.RECEIVER_READ) }
+                    catch (e: Exception) { recordMediaFailure(e, SessionOutcome.Origin.RECEIVER_READ) }
                 }
             }
             phase("StartingCapture", SessionStopTrace.Phase.CAPTURE_START)
@@ -194,22 +202,7 @@ class SenderSession internal constructor(
             fail(e, SessionOutcome.Origin.STARTUP)
             if (e is InterruptedException) Thread.currentThread().interrupt()
         } finally {
-            closing = true; trace.phase(SessionStopTrace.Phase.CLEANUP)
-            phaseDeadline = now() + 2_000_000_000L; status("Stopping")
-            trace.mark(SessionStopTrace.Stage.CLOSING)
-            queueTerminal()
-            closeCapture()
-            if (requestSent) try { terminalSent.await(500, TimeUnit.MILLISECONDS) }
-            catch (e: InterruptedException) { Thread.currentThread().interrupt(); fail(e, SessionOutcome.Origin.CLEANUP) }
-            if (sizeSwitch.requested) try {
-                if (!receiverReleased.await(2000, TimeUnit.MILLISECONDS))
-                    fail(IOException("TIMEOUT: size change receiver cleanup was not acknowledged"), SessionOutcome.Origin.CLEANUP)
-            } catch (e: InterruptedException) {
-                Thread.currentThread().interrupt()
-                fail(IOException("Size change cleanup interrupted", e), SessionOutcome.Origin.CLEANUP)
-            }
-            trace.mark(SessionStopTrace.Stage.RECEIVER_DRAIN_DONE)
-            closeLink()
+            retireTransport()
             timer.shutdownNow()
             threads.forEach(Thread::interrupt)
             for (thread in threads) if (thread != Thread.currentThread()) {
@@ -226,6 +219,38 @@ class SenderSession internal constructor(
             trace.mark(SessionStopTrace.Stage.FINISHED)
             cleanupComplete = true
             finished()
+        }
+    }
+
+    internal fun retireTransport() {
+        closing = true
+        trace.phase(SessionStopTrace.Phase.CLEANUP)
+        phaseDeadline = now() + 2_000_000_000L
+        status("Stopping")
+        trace.mark(SessionStopTrace.Stage.CLOSING)
+        queueTerminal()
+        closeCapture()
+        try {
+            if (requestSent) terminalSent.await(minOf(500_000_000L,
+                (phaseDeadline - now()).coerceAtLeast(0)), TimeUnit.NANOSECONDS)
+            try { link?.closeMedia() } catch (error: IOException) { fail(error, SessionOutcome.Origin.CLEANUP) }
+            if (acceptedSession) {
+                val drained = receiverReleased.await((phaseDeadline - now()).coerceAtLeast(0), TimeUnit.NANOSECONDS)
+                if (!drained) fail(IOException("TIMEOUT: receiver terminal response did not arrive within two seconds"),
+                    SessionOutcome.Origin.CLEANUP)
+                else if (!receiverTerminal.get() && !startupTransportAborted && outcome.failure == null)
+                    fail(IOException("PROTOCOL: receiver closed control before terminal acknowledgement"),
+                        SessionOutcome.Origin.CLEANUP)
+                if (sizeSwitch.requested && !sizeSwitch.receiverClosed)
+                    fail(IOException("TIMEOUT: size change receiver cleanup was not acknowledged"),
+                        SessionOutcome.Origin.CLEANUP)
+            }
+        } catch (error: InterruptedException) {
+            Thread.currentThread().interrupt()
+            fail(IOException("Control teardown interrupted", error), SessionOutcome.Origin.CLEANUP)
+        } finally {
+            trace.mark(SessionStopTrace.Stage.RECEIVER_DRAIN_DONE)
+            closeLink()
         }
     }
 
@@ -274,11 +299,12 @@ class SenderSession internal constructor(
     private fun readLoop() {
         try {
             val connected = checkNotNull(link) { "Receiver connection missing" }
-            while (!linkClosed && (!closing || sizeSwitch.requested)) {
+            while (!linkClosed) {
                 val message = connected.receive()
                 lastIncoming = now()
                 if (message.session != session) throw IOException("PROTOCOL: wrong session")
                 val json = message.json()
+                if (closing && message.type !in setOf(Wire.ERROR, Wire.STOP, Wire.SESSION_END)) continue
                 when (message.type) {
                     Wire.STREAM_READY -> {
                         if (!Json.bool(json, "ok")) throw IOException("DECODER_FAILED: track not ready")
@@ -321,15 +347,23 @@ class SenderSession internal constructor(
                     }
                     Wire.ERROR -> {
                         val code = Json.string(json, "code"); val text = Json.string(json, "message")
-                        if (Json.bool(json, "fatal")) throw IOException("$code: $text")
+                        val error = ReceiverReportedFailure(code, text)
+                        if (Json.bool(json, "fatal")) {
+                            receiverTerminal.set(true)
+                            diagnostic("receiver_session_error ${Wire.obj("code" to code, "fatal" to true)}")
+                            throw error
+                        }
                         status("Receiver warning: $code: $text")
                     }
                     Wire.SESSION_END -> {
                         Json.string(json, "reason")
+                        receiverTerminal.set(true)
                         if (sizeSwitch.requested) sizeSwitch.acknowledge()
-                        else { remoteStop = true; stop() }
+                        else { remoteStop = true; stop(); return }
                     }
-                    Wire.STOP -> { Json.string(json, "reason"); remoteStop = true; stop() }
+                    Wire.STOP -> {
+                        Json.string(json, "reason"); receiverTerminal.set(true); remoteStop = true; stop(); return
+                    }
                     else -> throw IOException("PROTOCOL: unexpected receiver message ${message.type}")
                 }
             }
@@ -364,7 +398,8 @@ class SenderSession internal constructor(
                 if (closing && terminalSent.count == 0L) return
             }
         } catch (e: Exception) {
-            fail(e, SessionOutcome.Origin.RECEIVER_WRITE)
+            if (lane == 0) fail(e, SessionOutcome.Origin.RECEIVER_WRITE)
+            else recordMediaFailure(e, SessionOutcome.Origin.RECEIVER_WRITE)
             if (lane == 0) terminalSent.countDown()
         }
     }

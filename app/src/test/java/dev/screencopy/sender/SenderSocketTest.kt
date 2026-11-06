@@ -14,6 +14,19 @@ import java.util.concurrent.ExecutionException
 import java.util.concurrent.TimeUnit
 
 class SenderSocketTest {
+    @Test fun localCloseRetiresBothMediaSocketsBeforeControl() {
+        val link = ReceiverLink(ReceiverTarget("127.0.0.1", 1))
+        val sockets = ReceiverLink::class.java.getDeclaredField("sockets").apply { isAccessible = true }
+            .get(link) as Array<*>
+        val closed = mutableListOf<Int>()
+        for (lane in 0..2) java.lang.reflect.Array.set(sockets, lane, object : Socket() {
+            override fun close() { closed.add(lane) }
+        })
+        link.close()
+        link.close()
+        assertEquals(listOf(1, 2, 0), closed)
+    }
+
     private val session = 71L
     private val token = "aB".repeat(32)
     private fun hello(rotation: Boolean? = true) = Wire.control(Wire.HELLO, 0,
