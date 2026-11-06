@@ -1,0 +1,15 @@
+{
+  "session": 1,
+  "sequence": [
+    {"direction":"sender","type":"STREAM_CONFIG","track":1,"generation":1,"pts":-1,"payload":{"codec":"h264","width":640,"height":480,"csd":["AAAAAWdCAByVqCgPaA==","AAAAAWjOBuI="]}},
+    {"direction":"sender","type":"STREAM_CONFIG","track":2,"generation":1,"pts":-1,"payload":{"codec":"opus","sampleRate":48000,"channels":2,"csd":["T3B1c0hlYWQBAjgBgLsAAAAAAA=="],"codecDelayNs":6500000,"seekPrerollNs":80000000}},
+    {"direction":"receiver","type":"STREAM_READY","track":1,"generation":1,"pts":-1,"payload":{"ok":true}},
+    {"direction":"assert","type":"MEDIA_BLOCKED","reason":"Audio not ready"},
+    {"direction":"receiver","type":"STREAM_READY","track":2,"generation":1,"pts":-1,"payload":{"ok":true}},
+    {"direction":"assert","type":"MEDIA_ALLOWED","tracks":[1,2]},
+    {"direction":"sender","type":"STREAM_CONFIG","track":1,"generation":2,"pts":-1,"payload":{"codec":"h264","width":480,"height":640,"csd":["AAAAAWdCAByVqCgPaA==","AAAAAWjOBuI="]}},
+    {"direction":"assert","type":"MEDIA_BLOCKED","tracks":[1],"reason":"Video generation 2 not ready; audio generation 1 stays ready"},
+    {"direction":"receiver","type":"STREAM_READY","track":1,"generation":2,"pts":-1,"payload":{"ok":true}}
+  ],
+  "note":"CSD here is illustrative schema data, not a decodability fixture; adapter tests generate dimension-matching SPS."
+}

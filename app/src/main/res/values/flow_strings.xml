@@ -1,0 +1,28 @@
+<resources>
+    <string name="flow_receive_paused">Receiving pauses while you share your screen.</string>
+    <string name="flow_network_permission_title">LOCAL NETWORK PERMISSION REQUIRED</string>
+    <string name="flow_network_permission_detail">Allow local network access to discover, send to and receive from your devices. This does not grant screen capture or microphone access.</string>
+    <string name="flow_network_permission_action">Allow local network</string>
+    <string name="flow_network_permission_denied">Local network access was denied. Allow it to use Send and Receive. If Android no longer shows a prompt, use this app’s permissions in Android Settings.</string>
+    <string name="flow_starting">Opening the listener…</string>
+    <string name="flow_ready">Listening for connections on your trusted local network.</string>
+    <string name="flow_no_network">Connect to Wi-Fi or Ethernet to receive.</string>
+    <string name="flow_connecting">Preparing the incoming video…</string>
+    <string name="flow_listener_failed">Receiving is unavailable. Reopen RedrainCast to retry. Sending remains available.</string>
+    <string name="flow_receive_problem">Incoming cast failed: %1$s. Check the sender settings and connection.</string>
+    <string name="flow_discovery_failed">Nearby discovery is unavailable: %1$s. Connect by IP : Port instead.</string>
+    <string name="flow_busy">Another cast is active or still finishing. Wait for it to stop.</string>
+    <string name="flow_self_target">Choose another device, not this device’s own receiver.</string>
+    <string name="flow_waiting_consent">Waiting for Android screen-sharing approval…</string>
+    <string name="flow_send_cancelled">Sharing cancelled. Receiving resumes when this app is open.</string>
+    <string name="flow_notifications_denied">Notifications denied. Use in-app Stop or Android’s active-app controls.</string>
+    <string name="flow_audio_denied">Audio permission denied. Explicitly turn off audio in Settings to send video only.</string>
+    <string name="flow_capture_denied">Screen sharing was not approved. Receiving is ready again.</string>
+    <string name="flow_host">Receiver IP or hostname</string>
+    <string name="flow_port">Current TCP port shown by the receiver</string>
+    <string name="flow_manual_title">Connect by IP : Port</string>
+    <string name="flow_send">Send</string>
+    <string name="flow_help_title">Connect on a trusted local network</string>
+    <string name="flow_help">Open RedrainCast on both devices. Nearby receivers update automatically. Choose Send, or enter the IP and current TCP port shown by the receiver.\n\nReceiving starts automatically while this app is open. It pauses before Android screen-sharing consent and resumes after sending stops, fails, or is cancelled. Only one cast is active at a time.\n\nIncoming video fills the screen without an in-app overlay. Use Stop on the sender to end the cast and return the receiver to its home screen. Android Back/Home still lets you leave the app, which closes its receiver; sending can continue through its foreground service.\n\nWhen both peers support stream recovery, brief backlog stalls discard an obsolete dependency chain and resume at a fresh keyframe, keeping the session alive. The same codec, requested quality and bounded buffers are retained. Peers without that capability keep strict congestion errors. Failed decoders, broken connections or recovery timeouts still report errors.\n\nThe receiver uses an OS-assigned TCP port, which may change when listening restarts. UDP 27183 discovers receivers. Use only a trusted LAN; the connection is not encrypted.\n\nAndroid requires your screen-sharing approval. Source apps may block playback-audio capture. No codec, quality or audio fallback is applied.</string>
+    <string name="flow_notices">Third-party notices</string>
+</resources>

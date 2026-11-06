@@ -1,0 +1,19 @@
+{
+  "session": 19,
+  "accept": {
+    "mediaToken": "469acc27161537af7796b17e349c1106ffb0ac146808687bd059117af21ceef24",
+    "tracks": [1]
+  },
+  "videoHello": {
+    "role": "media",
+    "channel": "video",
+    "token": "469acc27161537af7796b17e349c1106ffb0ac146808687bd059117af21ceef24"
+  },
+  "audioHello": {
+    "role": "media",
+    "channel": "audio",
+    "token": "469acc27161537af7796b17e349c1106ffb0ac146808687bd059117af21ceef24"
+  },
+  "videoAck": {"channel": "video"},
+  "audioAck": {"channel": "audio"}
+}

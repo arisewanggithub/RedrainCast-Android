@@ -1,0 +1,45 @@
+FFmpeg 7.1.3: libswresample and libavutil
+Copyright FFmpeg contributors. https://ffmpeg.org/
+Used under the GNU Lesser General Public License, version 2.1 or later.
+The complete license is FFmpeg-LGPL-2.1.txt; upstream licensing notices are
+FFmpeg-Upstream-Notices.txt, beside this notice.
+
+The receiver's screencopy_resampler JNI library statically includes these
+two FFmpeg libraries. No FFmpeg codecs, demuxers, networking, GPL, nonfree,
+version-3 components or third-party external libraries are enabled.
+Assembly is disabled; there is no runtime resampler/codec fallback.
+
+Unmodified official FFmpeg source:
+https://ffmpeg.org/releases/ffmpeg-7.1.3.tar.xz
+SHA-256:
+f0bf043299db9e3caacb435a712fc541fbb07df613c4b893e8b77e67baf3adbe
+
+Project: https://github.com/arisewanggithub/RedrainCast-Android
+Native build/package project:
+https://github.com/arisewanggithub/RedrainCast-Native
+The application consumes the pinned public ffmpeg-pcm-android 7.1.3-r1
+AAR/Prefab package. GitHub Actions builds that package for each ABI;
+normal local and application CI builds do not compile FFmpeg from source.
+The package release includes upstream source/configuration/provenance
+and checksums. The application verifies the complete AAR checksum.
+
+The corresponding-source materials accompanying a binary release must
+include third_party/ffmpeg-7.1.3.tar.xz and its checksum,
+third_party/build-ffmpeg.sh, third_party/FFMPEG.md, the JNI source
+app/src/main/cpp/resampler_jni.cpp and CMakeLists.txt, and any modifications.
+The archive preserves individual source-file copyrights/notices.
+Build: Android NDK 27.2.12479018, CMake 3.22.1, API 30, static libc++.
+Supported ABIs: arm64-v8a, armeabi-v7a and x86_64.
+
+Release distributors must also accompany the binary with the matching
+unstripped resampler_jni.cpp.o for every ABI, its link command and the
+corresponding-source/build materials, so recipients can rebuild the LGPL
+libraries, relink screencopy_resampler, replace it in the APK, and re-sign
+and reinstall the modified application. See third_party/FFMPEG.md for
+object paths and extraction of the exact Ninja link command.
+These materials need not be embedded inside the APK, but must be provided
+with the distribution through an LGPL-compliant mechanism.
+
+Modification for your own use and reverse engineering for debugging such
+modifications are permitted. No notice here restricts rights under the LGPL.
+This software is provided WITHOUT ANY WARRANTY; see the full license.

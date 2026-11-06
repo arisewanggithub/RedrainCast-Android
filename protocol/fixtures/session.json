@@ -1,0 +1,1 @@
+{"senderHello":{"role":"sender","versions":[3],"name":"ScreenCopy Sender"},"receiverHello":{"role":"receiver","versions":[3],"name":"Fixture receiver"},"requestSessionId":19,"busyReject":{"code":"BUSY","message":"Receiver already playing"}}

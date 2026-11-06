@@ -1,0 +1,27 @@
+<resources>
+    <style name="Theme.RedrainCast" parent="android:style/Theme.Material.NoActionBar">
+        <item name="android:fontFamily">sans</item>
+        <item name="android:colorAccent">@color/rc_accent</item>
+        <item name="android:windowBackground">@color/rc_background</item>
+        <item name="android:colorBackground">@color/rc_background</item>
+        <item name="android:textColorPrimary">@color/rc_text</item>
+        <item name="android:textColorSecondary">@color/rc_text_secondary</item>
+        <item name="android:colorControlNormal">@color/rc_text_secondary</item>
+        <item name="android:colorControlActivated">@color/rc_accent</item>
+        <item name="android:windowLightStatusBar">false</item>
+        <item name="android:windowLightNavigationBar">false</item>
+        <item name="android:statusBarColor">@color/rc_background</item>
+        <item name="android:navigationBarColor">@color/rc_background</item>
+        <item name="android:alertDialogTheme">@style/Theme.RedrainCast.Dialog</item>
+        <item name="android:buttonStyle">@style/Widget.RedrainCast.Button</item>
+        <item name="android:windowActionModeOverlay">true</item>
+    </style>
+    <style name="Theme.RedrainCast.Dialog" parent="android:style/Theme.Material.Dialog.Alert">
+        <item name="android:colorAccent">@color/rc_accent</item>
+        <item name="android:colorBackground">@color/rc_surface</item>
+        <item name="android:textColorPrimary">@color/rc_text</item>
+        <item name="android:textColorSecondary">@color/rc_text_secondary</item>
+        <item name="android:colorControlNormal">@color/rc_text_secondary</item>
+        <item name="android:colorControlActivated">@color/rc_accent</item>
+    </style>
+</resources>

@@ -1,0 +1,21 @@
+{
+  "session": 1456789123,
+  "packets": [
+    {"name":"sender-hello","type":1,"session":0,"body":{"role":"sender","name":"Android fixed-natural","versions":[3],"videoRotation":true}},
+    {"name":"receiver-hello","type":1,"session":0,"body":{"role":"receiver","name":"Android receiver","versions":[3],"videoRotation":true}},
+    {"name":"session-accept","type":4,"body":{"mediaToken":"469acc27161537af7796b17e349c1106ffb0ac146808687bd059117af21ceef24","tracks":[1,2]}},
+    {"name":"video-attach","type":1,"body":{"role":"media","channel":"video","token":"469acc27161537af7796b17e349c1106ffb0ac146808687bd059117af21ceef24"}},
+    {"name":"audio-attach","type":1,"body":{"role":"media","channel":"audio","token":"469acc27161537af7796b17e349c1106ffb0ac146808687bd059117af21ceef24"}},
+    {"name":"video-ack","type":1,"body":{"channel":"video"}},
+    {"name":"audio-ack","type":1,"body":{"channel":"audio"}},
+    {"name":"video-config","type":6,"track":1,"generation":2,"body":{"codec":"h264","width":1080,"height":1920,"csd":["AAAAAWdkACg="]}},
+    {"name":"audio-config","type":6,"track":2,"generation":1,"body":{"codec":"raw","sampleRate":48000,"channels":2,"sampleFormat":"s16le","csd":[]}},
+    {"name":"video-ready","type":7,"track":1,"generation":2,"body":{"ok":true}},
+    {"name":"audio-ready","type":7,"track":2,"generation":1,"body":{"ok":true}},
+    {"name":"rotation-video","type":8,"track":1,"generation":2,"ptsUs":"8000000123456","flags":7,"hex":"00000001658884"},
+    {"name":"audio","type":9,"track":2,"generation":1,"ptsUs":"8000000129956","hex":"00000100ffff7f00"},
+    {"name":"rotation-status-envelope","type":10,"body":{"state":"Capturing","message":"Fixed-natural raster; clockwise presentation rotation 270 degrees"}},
+    {"name":"ping","type":12,"body":{"nonce":2147483647}},
+    {"name":"pong","type":13,"body":{"nonce":2147483647}}
+  ]
+}

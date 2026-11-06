@@ -1,0 +1,22 @@
+{
+  "description": "Optional v3 top-level SESSION_REQUEST receiverOrientation; merge present values into baseRequest, or leave absent. Only receiver presentation changes; video.orientation and all media fields stay identical.",
+  "baseRequest": {
+    "video": {"codec":"h264","encoder":"","bitrate":8000000,"maxSize":1920,"maxFps":60,"displayId":0,"orientation":"0","crop":null,"codecOptions":""},
+    "audio": {"enabled":true,"codec":"opus","encoder":"","bitrate":192000,"source":"output","codecOptions":""}
+  },
+  "cases": [
+    {"name":"legacy-absent","present":false,"valid":true,"expected":"auto"},
+    {"name":"automatic","present":true,"value":"auto","valid":true,"expected":"auto"},
+    {"name":"landscape","present":true,"value":"landscape","valid":true,"expected":"landscape"},
+    {"name":"portrait","present":true,"value":"portrait","valid":true,"expected":"portrait"},
+    {"name":"empty","present":true,"value":"","valid":false},
+    {"name":"case-sensitive","present":true,"value":"Landscape","valid":false},
+    {"name":"not-capture-rotation","present":true,"value":"90","valid":false},
+    {"name":"trailing-space","present":true,"value":"auto ","valid":false},
+    {"name":"null","present":true,"value":null,"valid":false},
+    {"name":"boolean","present":true,"value":true,"valid":false},
+    {"name":"integer","present":true,"value":90,"valid":false},
+    {"name":"object","present":true,"value":{},"valid":false},
+    {"name":"array","present":true,"value":[],"valid":false}
+  ]
+}

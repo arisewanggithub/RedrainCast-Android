@@ -1,0 +1,14 @@
+<resources>
+    <color name="rc_background">#14171D</color>
+    <color name="rc_surface">#20252D</color>
+    <color name="rc_surface_secondary">#292F39</color>
+    <color name="rc_border">#454E5D</color>
+    <color name="rc_text">#F4F6FA</color>
+    <color name="rc_text_secondary">#BCC6D5</color>
+    <color name="rc_accent">#88C6FF</color>
+    <color name="rc_on_accent">#082C4C</color>
+    <color name="rc_ready">#96E6AF</color>
+    <color name="rc_ready_surface">#193B2B</color>
+    <color name="rc_error">#FFB3B7</color>
+    <color name="rc_error_surface">#44272D</color>
+</resources>

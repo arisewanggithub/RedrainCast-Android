@@ -1,0 +1,470 @@
+# RedrainCast for Android
+
+One native Android app for **Send** or **Receive**, with one active role at a time.
+Display name: **RedrainCast**. Application ID: `dev.redrain.cast`.
+Android 11/API 30 or later is required for the unified capture/hardware-codec
+policy; there is no migration from the retired applications.
+
+## Use
+
+- Opening the app **automatically starts receiving readiness and discovery**.
+  The receiver card shows READY and its OS-assigned TCP endpoints, with copy
+  buttons; availability is advertised on UDP 27183. Readiness is not an active
+  receiving session and never requests capture or microphone permission.
+  On Android 17/API 37 and later, Android additionally requires **local network
+  access** (in the Nearby devices permission group) for LAN discovery, sending
+  and receiving. The app asks before opening LAN sockets. Denial keeps networking
+  stopped and shows an Allow local network action; permanently denied permission
+  can be changed through the app's Android settings. This never approves capture
+  or microphone access, and older Android versions do not receive this prompt.
+- The Windows-inspired home has **Send screen** and **Receive screen** cards:
+  stacked on portrait phones, side-by-side on landscape viewports at least
+  600 dp wide, and side-by-side on wide displays (840 dp or more) regardless of
+  orientation. Very narrow split-screen windows remain stacked. Main headings,
+  **Nearby receivers**, **Send**/**Stop**, **Settings**, and **Connection help**
+  follow Windows terminology; capture-permission help stays Android-specific.
+  Nearby receivers update automatically; this app's current and retired self endpoints are excluded.
+  Choose Send on a receiver row, or **Connect by IP : Port** for manual entry.
+- Sending reserves the outgoing role and **fully closes the local listener
+  before requesting Android consent**. Receiving shows PAUSED. Cancellation,
+  denial, startup failure, and normal sender teardown release the reservation;
+  listening automatically resumes while the app is foregrounded. A restarted
+  listener can get a different port, so its displayed/advertised endpoints refresh.
+- **Sharing settings** are accessed through the header settings button and saved
+  only on Save. Codec, size, FPS, bitrate, orientation and audio are the primary
+  controls; crop and detailed audio options are under Advanced. Selection fields
+  open standard Android single-choice dialogs with the current option checked.
+  Selecting updates only the draft; cancelling a choice retains its prior value,
+  and cancelling Sharing settings discards all edits. Child dialogs close with
+  their parent, and the settings scroll position is retained.
+  Only codecs with
+  an eligible hardware video encoder on this device are offered. An unsupported
+  saved codec requires an explicit supported selection; it is not silently
+  replaced. Encoder names are selected automatically, including when loading
+  older saved manual overrides. Raw PCM hides the encoded-audio bitrate control
+  and uses fixed 48 kHz stereo s16le instead.
+  Invalid settings and persistence failures stay visible without codec/quality/
+  audio fallback. Errors appear at the top; each new home error is brought into
+  view once, rather than repeatedly stealing scroll position during updates.
+  Cancel does not change saved settings.
+- Android's screen-sharing consent is required for every new sending session.
+  Audio permission is requested only when sending with audio enabled. Playback
+  capture is subject to Android's source-app capture policy; DRM/protected content
+  cannot be captured. Microphone capture uses the microphone foreground-service
+  type. Notification Stop remains available when the activity is backgrounded.
+- The receiver uses GPU-composited TextureView presentation with secure-window
+  protection. Decoded video alone triggers fullscreen playback, with no initial
+  banner, local stop button, or touch/D-pad overlay. The sender controls normal
+  session start/stop. A sender stop returns the receiver to readiness without
+  closing its healthy listener.
+  Leaving the activity retires the listener and playback resources; it does not
+  create a background receiver service. An outgoing cast can continue in its
+  foreground service, and readiness resumes when the app returns after it ends.
+  Listen only on a trusted LAN: discovery and casting are not encrypted or
+  authenticated remote-access services.
+- While sending, RedrainCast's own controls are capturable rather than redacted
+  to black. Secure-window protection is restored before receiving resumes.
+  Other apps' protected windows/DRM content can still appear black by Android
+  policy; the app does not bypass those protections.
+
+The sender uses MediaProjection, hardware MediaCodec video encoding, an EGL
+natural-coordinate mapping/crop, and a **fixed encoder raster across rotations**.
+Picture-PTS-associated rotation metadata rotates presentation, not the encoder.
+Compressed frames are never arbitrarily removed from a retained dependency
+chain. With mutually negotiated stream recovery, obsolete chains are discarded
+as a unit and playback restarts from a fresh keyframe on the same connection.
+Queues retain their explicit byte/time limits and requested quality; genuine
+codec, transport and recovery-timeout errors remain terminal and visible.
+
+## Bounded stream recovery
+
+Android peers offer and explicitly acknowledge Boolean `streamRecovery:true`
+**and integer `streamRecoveryVersion:1`** in HELLO. Both peers must be updated;
+the unfrozen 0.3.0 prototype's Boolean-only ACK is incompatible.
+On receiver queue pressure the TCP readers continue consuming framed data rather
+than waiting on decoder admission. The receiver requests recovery and discards
+the obsolete epoch. Sender-side queue pressure can initiate the same recovery.
+
+The sender does not cancel partially written packets. It discards unsent
+obsolete media, sends cached video configuration at the next sequential video
+generation on the video socket, and waits for readiness. It then requests a
+hardware keyframe and suppresses dependent video until a verified random-access
+picture whose original capture PTS is at or after readiness. Audio remains held
+in the existing bounded queue until an explicit decoded-key proof. Codec, bitrate, raster,
+rotation metadata and timestamps are not substituted or rewritten.
+
+The receiver rebuilds video and audio outputs on a dedicated playback worker,
+then acknowledges the new video generation. Audio wire generation is unchanged;
+local audio playback gets a fresh clock/output epoch, without reapplying initial
+Opus pre-skip. After decoded-key proof, packet-end-aware admission preserves
+Opus's 80 ms/AAC's one-AU preroll and overlapping packets; decoded PCM is trimmed
+on sample boundaries before key PTS. Old audio cannot leak into the new epoch.
+An explicit completion proof requires actual source-audio submission, not silence
+(or decoded video alone with audio disabled).
+Presentation ownership, the cast session and control heartbeats remain alive.
+
+Native decoder resets are limited to one per second; sync requests are spaced
+at least 500 ms apart. The ten-second deadline starts at the **first unresolved
+recovery** and cannot be extended by more resets, readiness or keyframes.
+Stop retires pending work and cannot produce late readiness or
+start new audio output. Audio format changes require a new capture session.
+An unsupported or non-acknowledging peer retains the strict congestion policy;
+Windows rotation-only builds currently do not negotiate this recovery extension.
+See [the exact recovery v1 contract](protocol/README.md#optional-bounded-stream-recovery-v1)
+for schemas, duplicate/stale rules, partial-write protection and A/V cutoff policy.
+
+## Windows compatibility boundary
+
+The transport follows the **actual current RedrainCast Windows implementation**,
+not the retired Android single-socket layout: control, video, and audio TCP
+connections use the same listener port, with session/token attachment. Both media
+connections are associated even when audio is disabled.
+
+**Current Windows receiver source supports negotiated per-picture rotation.**
+It echoes Boolean `videoRotation:true` only when the sender offers true and its
+playback factory supports rotation. Android's sender still requires that HELLO
+acknowledgement: old/noncapable peers must be rejected explicitly rather than
+switching raster modes or silently showing incorrectly rotated pictures.
+Windows-to-Android receive does not need this extension: Windows' logical-raster
+frames display at rotation zero. Android-to-Android negotiates the extension.
+Source support and local protocol checks are not a claim of full Windows parity.
+The existing dirty Windows worktree is intentionally not modified here.
+
+Live Android/Windows interoperability and user-approved screen capture must be
+validated on idle, consenting devices before calling this app production-ready.
+Socket/codec-fixture tests alone are **not** live interoperability.
+
+### Live acceptance still required
+
+On idle, explicitly approved devices, start with **H.264**, not an automatic H.265
+cast. Install the new package side-by-side; do not uninstall the existing apps.
+
+1. Android-to-Android: approve sending through Android's own consent UI. Use an
+   asymmetric off-center crop with distinct corner content. Rotate through all
+   four orientations and verify the same natural region, unchanged encoder
+   width/height, correct per-picture presentation, and no compressed-frame loss.
+2. Verify video-only, then requested playback/microphone audio, lip sync, explicit
+   unsupported-codec errors, and restoration of the previous local mute state.
+3. Stop from each endpoint, revoke projection, background the receiver, and change
+   networks; confirm sockets/codecs/audio resources retire before role switching.
+4. Windows-to-Android: use the actual Windows app and its discovered listener
+   addresses. Confirm picture/audio playback, heartbeat, stop and reconnect.
+5. Android-to-Windows: use a rotation-capable Windows receiver and confirm the
+   Boolean HELLO acknowledgement before capture. Verify all four orientations,
+   unchanged encoder raster, audio, stop and reconnect. Old/noncapable receivers
+   must still fail explicitly. Live acceptance remains unverified.
+
+Receiver `FLAG_SECURE` is intentional. Do not disable it for screenshots;
+presentation pixel checks must use a separate synthetic instrumentation fixture.
+
+## Build and tests
+
+Uses the checked-in Gradle 9.8.1 wrapper, AGP 9.4.1 (built-in Kotlin), JDK 21,
+Android SDK/API 37 (`compileSdk` and `targetSdk`), Build-Tools 37.0.0,
+NDK 27.2.12479018 and CMake 3.22.1. Minimum Android remains API 30.
+Set `JAVA_HOME` and `ANDROID_HOME` to your installed toolchains.
+FFmpeg's minimal LGPL-only `libavutil`/`libswresample` libraries are consumed
+as a pinned, SHA-256-verified public AAR/Prefab package. Fresh clones and cleared
+native caches download the package rather than compile FFmpeg. Local and app-CI
+builds compile the small JNI wrapper and existing bundled Opus only. Missing
+prebuilts fail explicitly; there is no automatic slow source-build fallback. See
+[FFmpeg build and source/relink information](third_party/FFMPEG.md).
+
+```powershell
+.\gradlew.bat :app:testDebugUnitTest :app:lintDebug :app:assembleDebug :app:assembleRelease --console=plain
+```
+
+The release variant is optimized and **unsigned**. No production signing keys,
+keystores, publication, auto-updater, or release workflow are included.
+Debug installation is side-by-side with existing applications.
+The private application's CI runs validation only; it does not publish binaries.
+The separate public
+[RedrainCast-Native repository](https://github.com/arisewanggithub/RedrainCast-Native)
+owns manual, parallel ABI builds and immutable native-package releases. Both
+developer machines and application CI consume that same package without a
+GitHub Packages read token. Only a native source/toolchain/configuration change
+requires rebuilding the published package. End users still install one universal
+APK, not a separate APK per ABI.
+CI installs the stable/base `platforms;android-37.0` package. Android 17 permission
+grant/denial is covered by targeted policy/UI tests; SDK-30 Robolectric simulation
+does not claim full Android-17 platform enforcement. Receiving remains a visible
+Activity, sending starts its projection/microphone foreground service from the
+user-approved Activity flow, and durable mute recovery runs after Activity resume
+to respect Android 17's background-audio restrictions.
+Mute ownership is process-wide: Activity recovery must not unmute a live
+projection or clear its durable restoration marker. Owner cleanup restores the
+previous state; failed cleanup leaves the marker available for a later recovery.
+
+### Manual synthetic rendering diagnostics
+
+Debug builds include a non-exported `SyntheticVideoProbeActivity`; release builds
+do not. Its instrumented tests use synthetic colors, a hardware H.265 encoder,
+the production decoder and GPU presentation, including first-rotation/Auto
+window-resize races and a separate sender normalization probe.
+
+These are opt-in diagnostics, not automatic casting tests. Never install or run
+instrumentation during a cast. First verify the requested device identity,
+no active projection/session/services, and an unlocked, awake screen. Install
+the diagnostic debug and androidTest APKs only after that gate. The explicit
+`syntheticVideoProbe=true` argument is required; omit these tests from ordinary
+instrumentation runs unless the manual safety gate has been satisfied.
+
+```text
+adb -s <verified-device> shell am instrument -w -e syntheticVideoProbe true -e class org.screencopy.receiver.SyntheticVideoRenderingDiagnosticTest#firstHevcQuarterTurnRacesAutoWindowResizeAcrossFreshStarts dev.redrain.cast.test/androidx.test.runner.AndroidJUnitRunner
+adb -s <verified-device> shell am instrument -w -e syntheticVideoProbe true -e class org.screencopy.receiver.SyntheticVideoRenderingDiagnosticTest#firstProjectionResizeRacesAutoWindowWithIndependentCropAcrossFreshStarts dev.redrain.cast.test/androidx.test.runner.AndroidJUnitRunner
+```
+
+PixelCopy reads only the isolated synthetic window, never protected production
+content. Restore the previous app APK and remove the test helper afterward.
+The intermittent tiny-strip rendering issue is still unresolved: the initial
+diagnostic Activity setup crash was corrected, but the retry was blocked by a
+locked receiver. Compilation is not a valid native pixel-rendering baseline.
+
+### Verified locally
+
+- Non-finishing destruction follow-up **0.4.6/code 16** passed the **419-test
+  full JVM suite**, lint (zero errors, 10 existing warnings), and debug/optimized
+  unsigned release builds. Launched consent survives framework destruction
+  without an explicit Activity finish, including the "Don't keep activities"
+  scenario; explicit finishes still cancel. Both idle phones were updated and
+  their installed hashes matched the signed debug APK. No permission/capture
+  automation, commits or pushes were performed.
+- Consent-lifecycle fix **0.4.5/code 15** passed **20 focused lifecycle/request
+  tests** and the **417-test full JVM suite** with zero failures/errors/skips.
+  Lint has zero errors and 10 existing warnings; debug and optimized unsigned
+  release builds passed. Recreation cancels unlaunched reservations without
+  restarting consent, preserves launched permission/projection results, and
+  cannot let stale Activity cancellation overwrite an adopted service's status.
+  Both identity-verified idle phones were updated and their installed hashes
+  matched the signed debug APK. No app launch or permission/capture automation
+  was performed.
+- Review fixes **0.4.4/code 14** passed all **7 new focused regressions** and
+  the **411-test full JVM suite**, with zero failures/errors/skips. Lint reports
+  zero errors and 10 existing warnings; debug and optimized unsigned release
+  builds passed. Activity recovery cannot restore a live projection's mute,
+  failed owner restoration remains recoverable, and decoder replacement joins
+  retired workers outside the callback-facing lifecycle lock. A new receive
+  session clears stale errors without hiding genuine current-session failures.
+  Both identity-verified idle phones were updated and their installed APK hashes
+  matched the signed debug build. No app launch, permission grant, or live
+  casting/capture automation was performed.
+- Receiver error-reporting fix **0.4.3/code 13** passed all **24 receiver
+  protocol/lifecycle tests**, lint, and debug/optimized unsigned release builds.
+  Two new real-TCP regressions failed before the fix with the false
+  `Session error: PROTOCOL` status. Unowned setup connections can no longer
+  publish cast errors after a clean Stop; peer ERROR replies and structured
+  diagnostics remain, and genuine active-session disconnects remain fatal.
+  Both phones were updated while idle and their installed APK hashes verified.
+  No app launch or permission/capture automation was used. These are protocol
+  regressions, not a new live MediaProjection casting/Stop acceptance run.
+- Prebuilt integration **0.4.2/code 12** passed **402 JVM tests** with zero
+  failures/errors/skips, lint with zero errors (10 existing warnings), and
+  debug/optimized unsigned release builds. The release retains all three ABIs,
+  FFmpeg notices and 16 KiB native ZIP alignment.
+  An isolated source snapshot with empty native outputs and no cached FFmpeg
+  package downloaded the pinned public AAR and built all three native Debug ABIs
+  in **4 minutes 27 seconds**. Existing non-native Gradle downloads were reused;
+  this was not a literal fresh Git clone or an entirely empty toolchain cache.
+  Compile-command audits found only the app's JNI and bundled Opus sources,
+  with **zero FFmpeg C compilation**. The cached offline native rebuild passed
+  in 90 seconds. Scratch-only wrong-checksum and missing-package tests both
+  failed explicitly without source fallback. All five core FFmpeg native tests
+  passed on the identity-verified idle OnePlus with the installed, hash-matched
+  0.4.2 APK. The temporary test package was removed; no capture/mic/LAN consent
+  was automated. This validates package consumption and core JNI behavior,
+  not resolution of the previously observed audio-startup issue below.
+- SDK update **0.4.1/code 11** compiles/targets API 37 with Build-Tools 37.0.0
+  and retains min API 30. **402 JVM tests** (including 18 targeted home/
+  permission/lifecycle tests), lint and all APK variants passed. Both installed
+  debug APKs were checksum-verified on idle devices.
+  Galaxy runs API 37 and displayed the OS local-network permission prompt;
+  it was left for the user, not approved through ADB. OnePlus/API 33 passed the
+  five native FFmpeg tests. Its 2-second PCM confirmation passed on retry, but
+  the 15-second confirmation reported 3982 missing submitted source frames;
+  native audio acceptance is therefore not claimed for this SDK update.
+  This remains an open audio/startup investigation, separate from the verified
+  SDK metadata and LAN permission gate. No buffer limits were relaxed.
+- The preceding **0.4.0 full run passed 398 tests**, with zero failures/errors/skips.
+  Added coverage includes filter-delay/source-span accounting, compensated
+  source/output ratios, fractional partial writes, explicit resampler failures
+  and fixed nominal native playback during software compensation.
+  Recovery v1 coverage includes decoded-key/completion proofs, the first-request
+  deadline across resets, codec-aware preroll, sample-accurate production PCM
+  submission, actual-output raster guards and stale admission/Stop races.
+  Coverage includes native choices, measured landscape card layout, fixed-natural
+  geometry, bounded queues, three-socket lifecycle, golden fixtures, per-lane
+  diagnostics, real-socket media-admission isolation in both directions, and
+  negotiated sender-to-receiver keyframe recovery without releasing the session.
+  Recovery tests use real TCP and explicitly fake codecs/outputs; they cover
+  queue pressure, original PTS/rotation, audio epoch/pre-skip reset, live control
+  during decoder reconstruction, stopped-epoch admission, Stop races and genuine
+  decoder failure. They are not live hardware capture/recovery acceptance.
+  The blocked-video/audio-progress regression failed before the receiver lock
+  correction and passed afterward. Run with
+  `JAVA_TOOL_OPTIONS=-Djava.util.concurrent.ForkJoinPool.common.parallelism=3`;
+  the initial tests/lint/debug/release/native-test-APK build with FFmpeg took
+  27 minutes 17 seconds on Windows ARM64; final JNI rebuilds reused the archives.
+- Android lint, debug APK, and optimized unsigned release APK builds passed.
+  APK metadata confirms `RedrainCast`, `dev.redrain.cast`, min SDK 30, and
+  arm64-v8a/armeabi-v7a/x86_64 native libraries.
+- The **0.4.0 debug APK (code 10)** passed signature verification and was installed
+  and checksum-verified on both identity-verified idle phones. OnePlus resumed
+  its home after native tests (receiver surface readiness still requires an awake,
+  foreground Activity); Galaxy was safely stopped with no app service/projection
+  and was updated in the background without changing the user's foreground.
+  Both peers must acknowledge recovery v1 for this feature to negotiate.
+  No active cast was interrupted and no capture consent was automated. Live
+  user-approved recovery/interoperability validation remains unverified.
+- Historically, on the real OnePlus AudioTrack, the silent-PCM single-step test failed on
+  0.3.1 with **240 submitted frames instead of 2880**, then passed on 0.3.2.
+  The native refill test and continuous silent-PCM clock/rate test passed on
+  **both phones** (two tests each). Only synthetic silent PCM was played; no
+  screen capture, microphone recording or H.265 cast was started. Temporary
+  instrumentation packages were removed. Sustained user-cast acceptance remains
+  separate from this demonstrated native refill fix.
+- The FFmpeg JNI conversion/continuity/lifecycle tests and stable-AudioTrack PCM
+  tests passed on **both phones (10 tests each)**. Both completed a 120-second
+  scripted software-compensation run with **zero steady-input underruns**,
+  119 compensation updates and exact source accounting: 5759983 source frames
+  submitted plus 17 retained filter frames equals 5760000 input frames.
+  Physical playback rate stayed nominal. Tests distinguish steady input from
+  the artificial source-ended tail; that tail can report underruns and is not
+  included in the steady-input assertion. This is native silent-PCM evidence,
+  not a claim of sustained mixed-video/network or Windows casting acceptance.
+- Eighteen golden framing fixtures round-tripped against actual Windows Wire,
+  retaining the original eight unchanged and adding rotation HELLOs and all
+  key/nonkey orientations. The helper also passed 204 protocol/shared-helper cases: actual
+  ReceiverServer loopback negotiation/admission and strict reader/writer flags.
+  Playback is explicitly fake/headless; no native/GPU or live casting is claimed.
+  Shared Windows recovery helper checks independently cover Android's PCM 120 ms
+  cap, malformed Opus packet boundaries, AAC preroll rounding, sample-frame
+  cutoff and first/subsequent coverage tolerance.
+
+These are build/protocol/install results, not live capture/interoperability or
+optimized-release device-runtime acceptance. The old Android checkouts remain
+clean at the source baseline commits, and Windows sources were not edited.
+
+With the sibling Windows checkout present, regenerate or verify the golden
+framing fixtures against its **actual** protocol writer/reader:
+
+```powershell
+dotnet run --project .\tools\WindowsProtocolCheck\WindowsProtocolCheck.csproj -- verify .\protocol\fixtures
+```
+
+The Android cross-engine tests consume the same golden frames. The helper links
+the portable Windows receiver Core sources and shared
+`src\RedrainCast.Protocol\StreamRecovery.cs` into its own build, not a project reference;
+it does not modify that checkout or write its build caches. Its loopback cases
+attach both token-authenticated media sockets even for video-only sessions and
+exercise capability negotiation, readiness, equal PTS, generation changes,
+unnegotiated rotation rejection and STOP/cleanup.
+Its headless playback factory explicitly leaves stream recovery unsupported;
+rotation-only fixtures do not acknowledge or exercise native recovery.
+Use `-p:WindowsRoot=...` to point MSBuild at a different Windows checkout.
+
+### Reading congestion diagnostics
+
+The sender's media budget bounds queued per-track PTS span to 500 ms and local
+admission waiting to 500 ms, independently of its 8 MiB byte limit. A video
+`PTS_SPAN` failure can therefore occur with only about 1 MiB queued; it is not an
+out-of-memory failure. A receiver `origin=PEER` report means the peer raised the
+error, not that the local decoder reported a fault.
+
+Control, video and audio have independent TCP writers. In-flight duration,
+admitted age and last-write duration are now tracked separately for each lane.
+Older shared-writer diagnostics could incorrectly show `inflight=NONE` after an
+unrelated lane completed while video remained blocked. Queue limits, timestamps,
+requested bitrates and compressed dependencies are unchanged by this diagnostic
+correction. Socket backpressure alone does not distinguish Wi-Fi transport stalls
+from receiver admission/drain stalls; do not claim a particular root cause without
+correlated evidence.
+
+Receiver media admission is also independent per track. Ownership, generation
+and packet validation remain under a short shared lifecycle lock, but a bounded
+queue wait occurs outside it. Each media socket has one serial reader, so its
+configuration cannot overtake its own in-progress admission; stopped workers reject
+late admission during cleanup. Holding the shared lock while waiting on one
+track would block the other track and defeat the three-socket transport.
+Real-socket fault-injection tests cover both directions of this failure.
+
+Receiver PCM servicing is independent of input arrival. Before waiting for
+another encoded packet, and after decoding, the audio worker refills the
+currently writable native output capacity in bounded chunks. Five milliseconds
+is a write-chunk/silence-cushion size, not a per-step refill quota: native mixers
+may require a complete 40 ms block. A zero nonblocking write yields immediately;
+partial writes preserve samples/PTS and the existing 250 ms no-progress limit.
+Pre-input servicing never inserts silence ahead of already-queued PCM; the small
+silence cushion is considered only after input/decode servicing finds a gap.
+No decoded-FIFO, native-buffer, network-queue, rate or quality limit is enlarged.
+Regression tests exercise a 3921-frame native ring with a 1920-frame mixer
+quantum, PCM refill before input admission, partial/zero writes and bounded
+silence. These establish servicing behavior, not a claim that every possible
+native/network underrun has been eliminated.
+Prior art: scrcpy's
+[`audio_player.c`](https://github.com/Genymobile/scrcpy/blob/a60891aea193d92e7e5c3942700eca63f9d19a5f/app/src/audio_player.c)
+satisfies the audio device's whole requested amount through bounded chunks.
+
+### FFmpeg audio compensation
+
+Version 0.4.0 bundles pinned FFmpeg 7.1.3 `libswresample`/`libavutil` through JNI.
+Decoded PCM passes through a persistent resampler; bounded clock compensation
+changes its output sample count instead of repeatedly reconfiguring AudioTrack.
+AudioTrack is prepared once at nominal rate and stays at that rate. Hardware
+video encoding, audio codec choices, wire PTS and all existing queue/buffer
+ceilings remain unchanged; there is no native-failure identity fallback.
+
+Original source spans survive filter lookahead, packet boundaries and changing
+conversion ratios. Presentation maps accepted output frames back to fractional
+source-sample positions, with explicit silence spans; partial writes cannot
+accumulate per-chunk rounding loss. Retired sessions discard their owned filter
+state, and every new audio epoch gets a fresh resampler. Source frames retained
+in the filter are accounted for rather than mislabeled as packet loss.
+
+### Investigation leading to the new audio path
+
+The refill fix is not a claim that the live cutout problem is fully solved.
+Reference comparison uses official scrcpy 5.0.1, tag commit
+`a60891aea193d92e7e5c3942700eca63f9d19a5f`, with its Apache-2.0 license retained.
+scrcpy waits for its target PCM preroll, fills the whole output request (including
+accounted underrun silence), and uses FFmpeg resampling for compensation.
+RedrainCast 0.3.2 started from its first synchronized packet, kept a small
+native silence cushion, and updated Android playback parameters for compensation.
+These are different output/control architectures, not interchangeable queue code.
+
+Controlled 15-second local silent-PCM probes reproduced remaining gaps without
+Wi-Fi, capture, or video decoding. On OnePlus, repeated nominal native rate calls
+produced 22 underruns and a roughly 160 ms positive-write gap; suppressing
+unchanged calls reduced this to three underruns and preserved all 720000 source
+frames in that run. Increasing the native ring to the existing 130 ms ceiling or
+using audio thread priority did not independently eliminate the problem.
+Direct continuously supplied AudioTrack output ran for ten seconds with zero
+underruns, including a run with frequent timestamp queries (maximum query time
+about 0.75 ms). These probes motivated the software-compensation path above;
+neither disabling compensation nor increasing limits was shipped as a fallback.
+A live official scrcpy capture baseline and sustained mixed-video acceptance
+still need approval. The separate recovery proof-age/transport-latency issue is
+not silently changed by adopting FFmpeg.
+
+Arbitrarily dropping queued compressed H.264/H.265/AV1 packets is not safe:
+subsequent pictures may reference them. The receiver can skip presentation of
+already-decoded pictures without breaking dependencies. Negotiated recovery
+instead discards the obsolete chain and rebuilds decoder/audio state before
+accepting a fresh keyframe. It does not enlarge or silently disable queue limits.
+
+## Source and notices
+
+Media/capture code is derived from the merged ScrcpySend baseline
+`6a9370c4a1101b4830b49c0e773e72cf9ca46743`
+and ScrcpyReceive `6606b7b22054b65a0e72e9bc39501d65c240d9cd`.
+Original internal package names are retained for media-engine provenance and JNI
+binding stability; they do not define the new application identity.
+No Shizuku, ADB capture, legacy single-socket transport, or old-app data migration
+is part of this app.
+
+Bundled Opus source archive/checksum and required third-party notices/licenses are
+preserved. See the in-app **Third-party notices** and `third_party/`.
+FFmpeg is built with GPL, nonfree and version-3 code disabled. Its LGPL-2.1 text,
+upstream notices, pinned source and relinking/build information are included;
+see [FFmpeg distribution obligations](third_party/FFMPEG.md) before distributing
+APK binaries outside this development setup.
+No new license grant for the private application source is implied.

@@ -1,0 +1,17 @@
+{
+  "description": "Coordinated v3 Opus source-PTS compatibility: packet order is arrival/decode order, not source-PTS order. No framing or configuration fields are added.",
+  "wireVersion": 3,
+  "session": 1,
+  "generation": 1,
+  "opusConfig": {"codec":"opus","sampleRate":48000,"channels":2,"csd":["T3B1c0hlYWQBAjgBgLsAAAAAAA=="],"codecDelayNs":6500000,"seekPrerollNs":80000000},
+  "opusPacketHex": "f8fffe",
+  "cases": [
+    {"name":"opus-second-packet-minus-449","codec":"opus","track":2,"ptsUs":[1000000,999551,1020000],"accepted":true},
+    {"name":"opus-later-large-reversals","codec":"opus","track":2,"ptsUs":[1000000,1020000,1040000,700000,720000,710000],"accepted":true},
+    {"name":"opus-equal-source-observations","codec":"opus","track":2,"ptsUs":[1000000,1000000,999551,999551],"accepted":true},
+    {"name":"aac-stays-monotonic","codec":"aac","track":2,"ptsUs":[1000000,999551],"accepted":false},
+    {"name":"pcm-stays-monotonic","codec":"raw","track":2,"ptsUs":[1000000,999551],"accepted":false},
+    {"name":"video-stays-monotonic","codec":"h264","track":1,"ptsUs":[1000000,999551],"accepted":false},
+    {"name":"opus-negative-is-invalid","codec":"opus","track":2,"ptsUs":[1000000,-1],"accepted":false}
+  ]
+}

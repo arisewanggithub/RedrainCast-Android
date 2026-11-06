@@ -1,0 +1,17 @@
+RedrainCast third-party notices
+
+Receiver: libopus 1.5.2, Xiph.Org and contributors.
+Complete copyright, redistribution conditions and disclaimer:
+assets/OPUS-NOTICE.txt. The pinned source archive and checksum are in third_party/.
+JNI packages and library names are retained from ScrcpyReceive.
+
+Sender: AndroidX Media3 common/container 1.11.1, Android Open Source Project.
+Apache License 2.0. https://github.com/androidx/media/tree/1.11.1
+The unmodified AV1 OBU/sequence parser validates encoded Custom TCP media.
+Complete Apache license: assets/licenses/Media3-Apache-2.0.txt.
+Transitive Guava is Apache-2.0; preserve its dependency/source notices.
+
+AndroidX annotations 1.9.1, Android Open Source Project (Apache-2.0).
+Kotlin standard library / JetBrains annotations (Apache-2.0).
+Gradle wrapper is Apache-2.0 build tooling.
+No codec patent or app-store approval is granted by these licenses.
