@@ -38,13 +38,13 @@ policy; there is no migration from the retired applications.
   and cancelling Sharing settings discards all edits. Child dialogs close with
   their parent, and the settings scroll position is retained.
   Receiver orientation follows the displayed video in Auto mode on phones and
-  tablets; explicit Portrait/Landscape overrides still apply there. On Android TV,
-  Leanback devices and displays declaring landscape-only support, the receiver
-  window stays landscape in every mode. Portrait pictures and per-picture rotation
-  still fit the window without stretching. This avoids disruptive portrait-window
-  transitions on fixed-landscape projectors; it does not change the sender raster,
-  codec or quality. Devices without these platform declarations retain the
-  phone/tablet behavior.
+  tablets; explicit Portrait/Landscape overrides still apply there. Displays
+  declaring only landscape or only portrait support keep their supported axis
+  in every mode. Android TV and Leanback receivers otherwise keep their startup
+  window axis. Pictures and per-picture rotation still fit either window without
+  stretching. This avoids unsupported window transitions on fixed-axis receivers;
+  it does not change the sender raster, codec or quality. Devices without these
+  platform declarations retain the phone/tablet behavior.
   Only codecs with
   an eligible hardware video encoder on this device are offered. An unsupported
   saved codec requires an explicit supported selection; it is not silently

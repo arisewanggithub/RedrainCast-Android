@@ -10,9 +10,14 @@ import org.screencopy.receiver.protocol.ReceiverOrientation
 internal class SessionOrientation(
     private val current: () -> Int,
     private val request: (Int) -> Unit,
-    private val fixedLandscape: Boolean
+    private val fixedOrientation: Int?
 ) {
-    constructor(current: () -> Int, request: (Int) -> Unit) : this(current, request, false)
+    constructor(current: () -> Int, request: (Int) -> Unit) : this(current, request, null)
+
+    init {
+        require(fixedOrientation == null || fixedOrientation == ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE ||
+            fixedOrientation == ActivityInfo.SCREEN_ORIENTATION_PORTRAIT)
+    }
 
     private var owner: Any? = null
     private var mode: ReceiverOrientation? = null
@@ -29,7 +34,7 @@ internal class SessionOrientation(
         }
         mode = requested
         videoPolicy = null
-        val target = if (fixedLandscape) ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE else when (requested) {
+        val target = fixedOrientation ?: when (requested) {
             ReceiverOrientation.AUTO -> checkNotNull(previousPolicy)
             ReceiverOrientation.LANDSCAPE -> ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE
             ReceiverOrientation.PORTRAIT -> ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
@@ -39,7 +44,7 @@ internal class SessionOrientation(
 
     fun followVideo(aspect: Double, rotation: Int) {
         require(aspect.isFinite() && aspect > 0 && rotation in listOf(0, 90, 180, 270))
-        if (owner == null || mode != ReceiverOrientation.AUTO || fixedLandscape) return
+        if (owner == null || mode != ReceiverOrientation.AUTO || fixedOrientation != null) return
         val displayedAspect = if (rotation % 180 == 0) aspect else 1.0 / aspect
         val target = when {
             displayedAspect > 1.0 -> ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE
@@ -69,11 +74,17 @@ internal class SessionOrientation(
             @Suppress("DEPRECATION")
             val leanback = features.hasSystemFeature(PackageManager.FEATURE_LEANBACK) ||
                 features.hasSystemFeature(PackageManager.FEATURE_TELEVISION)
-            val landscapeOnly = features.hasSystemFeature(PackageManager.FEATURE_SCREEN_LANDSCAPE) &&
-                !features.hasSystemFeature(PackageManager.FEATURE_SCREEN_PORTRAIT)
-            val fixedLandscape = television || leanback || landscapeOnly
-            android.util.Log.i("ScreenCopyReceiver", "event=RECEIVER_ORIENTATION_POLICY fixed_landscape=$fixedLandscape")
-            return SessionOrientation({ activity.requestedOrientation }, { activity.requestedOrientation = it }, fixedLandscape)
+            val landscape = features.hasSystemFeature(PackageManager.FEATURE_SCREEN_LANDSCAPE)
+            val portrait = features.hasSystemFeature(PackageManager.FEATURE_SCREEN_PORTRAIT)
+            val fixedOrientation = when {
+                landscape && !portrait -> ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE
+                portrait && !landscape -> ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
+                television || leanback -> if (activity.resources.configuration.orientation == Configuration.ORIENTATION_PORTRAIT)
+                    ActivityInfo.SCREEN_ORIENTATION_PORTRAIT else ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE
+                else -> null
+            }
+            android.util.Log.i("ScreenCopyReceiver", "event=RECEIVER_ORIENTATION_POLICY fixed_orientation=$fixedOrientation")
+            return SessionOrientation({ activity.requestedOrientation }, { activity.requestedOrientation = it }, fixedOrientation)
         }
     }
 }

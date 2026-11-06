@@ -5,15 +5,16 @@ embedded version is `0.4.10-rc.2` (version code 22).
 
 ## Changes since v0.4.10-rc.1
 
-- TV, Leanback and declared landscape-only receivers keep their application
-  window landscape, including when the sender selects Auto or Portrait receiver
-  orientation. Portrait pictures remain aspect-fitted; per-picture rotation,
-  encoder raster, codecs and quality are unchanged.
+- Declared landscape-only and portrait-only receivers keep their supported
+  window axis in every receiver orientation mode. TV and Leanback receivers
+  otherwise keep their startup window axis. Pictures remain aspect-fitted;
+  per-picture rotation, encoder raster, codecs and quality are unchanged.
 - Phones and tablets retain automatic orientation following the displayed
   video, explicit Portrait/Landscape overrides and restoration of their prior
   orientation policy after the session.
-- Regression coverage checks platform classification, every receiver mode,
-  all four picture rotations, fitted bounds and session ownership/cleanup.
+- Regression coverage checks both fixed axes, platform classification, every
+  receiver mode, all four picture rotations, fitted bounds and session
+  ownership/cleanup.
 
 ## Projector findings and acceptance limits
 
@@ -21,10 +22,10 @@ embedded version is `0.4.10-rc.2` (version code 22).
   connects while Auto and Portrait disconnect. Video-only H.264 also reproduced
   the disconnect; audio is not required to trigger it. These observations
   identify the orientation trigger, not the projector's underlying exception.
-- The new fixed-landscape guard passed 37 focused JVM tests plus build/lint
-  checks before release preparation. It still needs a physical projector retry;
-  no live success of this new build is claimed.
-- Detection uses Android's TV/Leanback or landscape-only declarations. Devices
+- The fixed-axis guard passed 41 focused JVM tests plus build/lint checks. It
+  still needs a physical projector retry; no live success of this new build is
+  claimed.
+- Detection uses Android's TV/Leanback or single-axis declarations. Devices
   without those declarations retain phone/tablet behavior; selecting Landscape
   remains the workaround for affected vendor devices.
 - The intermittent tiny-strip picture after rotation remains unresolved.

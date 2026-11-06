@@ -21,25 +21,44 @@ import org.screencopy.receiver.protocol.ReceiverOrientation
 @GraphicsMode(GraphicsMode.Mode.LEGACY)
 @ConscryptMode(ConscryptMode.Mode.OFF)
 class ReceiverDisplayOrientationTest {
-    @Test fun leanbackAndLegacyTelevisionFeaturesKeepTheReceiverLandscape() {
+    @Test @Config(qualifiers = "land")
+    fun leanbackAndLegacyTelevisionFeaturesKeepTheReceiverLandscape() {
         @Suppress("DEPRECATION")
         val televisionFeatures = listOf(PackageManager.FEATURE_LEANBACK, PackageManager.FEATURE_TELEVISION)
         for (feature in televisionFeatures) withActivity { activity ->
             shadowOf(activity.packageManager).setSystemFeature(feature, true)
-            verifyFixedLandscape(activity)
+            verifyFixed(activity, ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE)
             shadowOf(activity.packageManager).setSystemFeature(feature, false)
         }
     }
 
-    @Test @Config(qualifiers = "television")
+    @Test @Config(qualifiers = "land-television")
     fun televisionUiModeKeepsLandscapeWithoutFeatureDeclarations() = withActivity { activity ->
-        verifyFixedLandscape(activity)
+        verifyFixed(activity, ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE)
+    }
+
+    @Test @Config(qualifiers = "port-television")
+    fun televisionUiModeKeepsPortraitWithoutFeatureDeclarations() = withActivity { activity ->
+        verifyFixed(activity, ActivityInfo.SCREEN_ORIENTATION_PORTRAIT)
     }
 
     @Test fun landscapeOnlyDisplayKeepsLandscapeWithoutTelevisionFeatures() = withActivity { activity ->
         shadowOf(activity.packageManager).setSystemFeature(PackageManager.FEATURE_SCREEN_LANDSCAPE, true)
         shadowOf(activity.packageManager).setSystemFeature(PackageManager.FEATURE_SCREEN_PORTRAIT, false)
-        verifyFixedLandscape(activity)
+        verifyFixed(activity, ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE)
+    }
+
+    @Test fun portraitOnlyDisplayKeepsPortraitWithoutTelevisionFeatures() = withActivity { activity ->
+        shadowOf(activity.packageManager).setSystemFeature(PackageManager.FEATURE_SCREEN_LANDSCAPE, false)
+        shadowOf(activity.packageManager).setSystemFeature(PackageManager.FEATURE_SCREEN_PORTRAIT, true)
+        verifyFixed(activity, ActivityInfo.SCREEN_ORIENTATION_PORTRAIT)
+    }
+
+    @Test @Config(qualifiers = "land-television")
+    fun declaredPortraitOnlyAxisWinsOverTelevisionWindowConfiguration() = withActivity { activity ->
+        shadowOf(activity.packageManager).setSystemFeature(PackageManager.FEATURE_SCREEN_LANDSCAPE, false)
+        shadowOf(activity.packageManager).setSystemFeature(PackageManager.FEATURE_SCREEN_PORTRAIT, true)
+        verifyFixed(activity, ActivityInfo.SCREEN_ORIENTATION_PORTRAIT)
     }
 
     @Test fun portableDisplayStillFollowsVideoAndHonorsExplicitPortrait() = withActivity { activity ->
@@ -55,33 +74,44 @@ class ReceiverDisplayOrientationTest {
     }
 
     @Test fun fixedLandscapePreservesFittedPortraitPicturesAndQuarterTurns() = withActivity { activity ->
-        shadowOf(activity.packageManager).setSystemFeature(PackageManager.FEATURE_LEANBACK, true)
+        shadowOf(activity.packageManager).setSystemFeature(PackageManager.FEATURE_SCREEN_LANDSCAPE, true)
+        shadowOf(activity.packageManager).setSystemFeature(PackageManager.FEATURE_SCREEN_PORTRAIT, false)
+        verifyFittedPictures(activity, 1920, 1080, 9.0 / 16, ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE)
+    }
+
+    @Test fun fixedPortraitPreservesFittedLandscapePicturesAndQuarterTurns() = withActivity { activity ->
+        shadowOf(activity.packageManager).setSystemFeature(PackageManager.FEATURE_SCREEN_LANDSCAPE, false)
+        shadowOf(activity.packageManager).setSystemFeature(PackageManager.FEATURE_SCREEN_PORTRAIT, true)
+        verifyFittedPictures(activity, 1080, 1920, 16.0 / 9, ActivityInfo.SCREEN_ORIENTATION_PORTRAIT)
+    }
+
+    private fun verifyFittedPictures(activity: Activity, boxWidth: Int, boxHeight: Int, aspect: Double, axis: Int) {
         val policy = SessionOrientation.forActivity(activity)
         policy.begin(Any(), ReceiverOrientation.AUTO)
-        val box = FrameLayout(activity).apply { layout(0, 0, 1920, 1080) }
+        val box = FrameLayout(activity).apply { layout(0, 0, boxWidth, boxHeight) }
         val texture = TextureView(activity)
         box.addView(texture)
         for (rotation in listOf(0, 90, 180, 270)) {
-            policy.followVideo(9.0 / 16, rotation)
-            VideoPresentation.fit(texture, box, 9.0 / 16, rotation)
-            assertEquals(ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE, activity.requestedOrientation)
+            policy.followVideo(aspect, rotation)
+            VideoPresentation.fit(texture, box, aspect, rotation)
+            assertEquals(axis, activity.requestedOrientation)
             assertEquals(rotation.toFloat(), texture.rotation, 0f)
             val width = if (rotation % 180 == 0) texture.layoutParams.width else texture.layoutParams.height
             val height = if (rotation % 180 == 0) texture.layoutParams.height else texture.layoutParams.width
-            assertTrue(width in 1..1920)
-            assertTrue(height in 1..1080)
-            assertEquals(if (rotation % 180 == 0) 9.0 / 16 else 16.0 / 9, width.toDouble() / height, 0.002)
+            assertTrue(width in 1..boxWidth)
+            assertTrue(height in 1..boxHeight)
+            assertEquals(if (rotation % 180 == 0) aspect else 1.0 / aspect, width.toDouble() / height, 0.002)
         }
         policy.restore()
     }
 
-    private fun verifyFixedLandscape(activity: Activity) {
+    private fun verifyFixed(activity: Activity, axis: Int) {
         val policy = SessionOrientation.forActivity(activity)
         for (mode in ReceiverOrientation.entries) {
             val owner = Any()
             policy.begin(owner, mode)
             policy.followVideo(9.0 / 16, 0)
-            assertEquals(ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE, activity.requestedOrientation)
+            assertEquals(axis, activity.requestedOrientation)
             policy.restore(owner)
             assertEquals(ActivityInfo.SCREEN_ORIENTATION_USER, activity.requestedOrientation)
         }

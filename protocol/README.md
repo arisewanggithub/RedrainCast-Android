@@ -146,9 +146,11 @@ Android physical-to-logical conventions. Receiver decoder output is rendered by
 TextureView and presented using that picture's rotation. Late UI callbacks must
 still own the live session/generation. On portable displays, automatic Activity
 orientation follows the displayed aspect and explicit orientation wins. Android
-TV, Leanback and declared landscape-only displays keep the Activity landscape in
-all receiver orientation modes; picture rotation and aspect-preserving fitting
-remain unchanged. Teardown restores the prior Activity policy in both cases.
+TV and Leanback receivers keep their startup window axis; declared landscape-only
+or portrait-only displays use their supported axis in all receiver orientation
+modes, taking precedence over the TV default. Picture rotation and
+aspect-preserving fitting remain unchanged. Teardown restores the prior Activity
+policy in both cases.
 
 Current Windows receiver source supports this extension: HELLO acknowledges true
 only for a Boolean true offer and a rotation-capable playback factory. Absent or

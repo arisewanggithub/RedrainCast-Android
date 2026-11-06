@@ -129,41 +129,45 @@ class SessionOrientationTest {
         assertNull(policy.previousPolicy)
     }
 
-    @Test fun fixedLandscapeKeepsEveryNegotiatedModeOffThePortraitActivityPath() {
-        for (mode in ReceiverOrientation.entries) {
-            val device = Device(ActivityInfo.SCREEN_ORIENTATION_USER)
-            val policy = device.policy(fixedLandscape = true)
-            val owner = Any()
-            policy.begin(owner, mode)
-            repeat(3) {
-                for (rotation in listOf(0, 90, 180, 270))
-                    policy.followVideo(1080.0 / 1920, rotation)
+    @Test fun fixedDisplaysKeepEveryNegotiatedModeOnTheirSupportedAxis() {
+        for (axis in listOf(ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE, ActivityInfo.SCREEN_ORIENTATION_PORTRAIT)) {
+            for (mode in ReceiverOrientation.entries) {
+                val device = Device(ActivityInfo.SCREEN_ORIENTATION_USER)
+                val policy = device.policy(fixedOrientation = axis)
+                val owner = Any()
                 policy.begin(owner, mode)
+                repeat(3) {
+                    for (rotation in listOf(0, 90, 180, 270))
+                        policy.followVideo(1080.0 / 1920, rotation)
+                    policy.begin(owner, mode)
+                }
+                assertEquals(listOf(axis), device.writes)
+                policy.restore(owner)
+                assertEquals(listOf(axis, ActivityInfo.SCREEN_ORIENTATION_USER), device.writes)
             }
-            assertEquals(listOf(ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE), device.writes)
-            policy.restore(owner)
-            assertEquals(listOf(ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE, ActivityInfo.SCREEN_ORIENTATION_USER), device.writes)
         }
     }
 
-    @Test fun fixedLandscapePreservesOwnershipAndOriginalPolicyAcrossSessions() {
-        val device = Device(ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED)
-        val policy = device.policy(fixedLandscape = true)
-        val first = Any()
-        policy.begin(first, ReceiverOrientation.PORTRAIT)
-        val second = Any()
-        policy.begin(second, ReceiverOrientation.AUTO)
-        policy.restore(first)
-        assertEquals(ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE, device.current)
-        assertEquals(ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED, policy.previousPolicy)
-        policy.restore(second)
-        assertEquals(ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED, device.current)
-        assertFalse(device.writes.contains(ActivityInfo.SCREEN_ORIENTATION_PORTRAIT))
+    @Test fun fixedDisplaysPreserveOwnershipAndOriginalPolicyAcrossSessions() {
+        for (axis in listOf(ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE, ActivityInfo.SCREEN_ORIENTATION_PORTRAIT)) {
+            val device = Device(ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED)
+            val policy = device.policy(fixedOrientation = axis)
+            val first = Any()
+            policy.begin(first, ReceiverOrientation.PORTRAIT)
+            val second = Any()
+            policy.begin(second, ReceiverOrientation.AUTO)
+            policy.restore(first)
+            assertEquals(axis, device.current)
+            assertEquals(ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED, policy.previousPolicy)
+            policy.restore(second)
+            assertEquals(ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED, device.current)
+            assertTrue(device.writes.all { it == axis || it == ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED })
+        }
     }
 
     private class Device(var current: Int) {
         val writes = mutableListOf<Int>()
-        fun policy(fixedLandscape: Boolean = false) =
-            SessionOrientation({ current }, { writes.add(it); current = it }, fixedLandscape)
+        fun policy(fixedOrientation: Int? = null) =
+            SessionOrientation({ current }, { writes.add(it); current = it }, fixedOrientation)
     }
 }
