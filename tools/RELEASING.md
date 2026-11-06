@@ -138,10 +138,12 @@ exception. Do not retag, rename its assets, rebuild it or rewrite its checksums.
    Review that newly built candidate too. No release is automatically made live.
    Manually publish only after final asset/compliance/runtime review.
 
-Do not publish a stable release while the first-rotation rendering issue remains
-unresolved or claim unverified Windows interoperability. Draft upload does not
-mean the candidate is approved. The workflow cannot create a scoped PAT without
-the owner's external authorization. Missing prerequisites fail explicitly.
+Stable publication requires explicit owner approval, including acceptance of
+any documented known limitations. Keep unresolved rendering, shutdown and native
+acceptance limits in the release notes; approval does not establish unverified
+Windows interoperability or prove those issues fixed. Draft upload does not mean
+the candidate is approved. The workflow cannot create a scoped PAT without the
+owner's external authorization. Missing prerequisites fail explicitly.
 
 ## Initial manual publication with existing local authorization
 

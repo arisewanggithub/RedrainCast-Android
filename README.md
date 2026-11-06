@@ -235,9 +235,9 @@ metadata anonymously on a background worker; configuration recreation retains
 the same check and ordinary resume does not repeat it. Only a **newer stable
 release** with a completed, version-matching universal APK in
 `arisewanggithub/RedrainCast-Releases` can prompt. Drafts and testing prereleases
-are excluded, including the currently published 0.4.6 preview. Until a stable
-release is published, GitHub's `/releases/latest` endpoint returns 404; this is
-logged without presenting an update or affecting casting.
+are excluded, including the historical 0.4.6 preview and the 0.4.10 RC builds.
+When no stable release is available, GitHub's `/releases/latest` endpoint returns
+404; this is logged without presenting an update or affecting casting.
 Future testing versions use an explicit `-alpha.N`, `-beta.N` or `-rc.N`
 suffix in the embedded app version, GitHub tag and APK filename. An installed
 `0.5.0-rc.1` can recognize stable `0.5.0` as newer, while still ignoring other
