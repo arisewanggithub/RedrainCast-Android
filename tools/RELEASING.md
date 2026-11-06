@@ -10,7 +10,8 @@ download documentation, not this application.
 
 ## Required configuration
 
-Publication is intentionally blocked until a maintainer configures:
+Signing is blocked unless all four signing secrets are configured. Public
+draft upload additionally requires the scoped publisher secret:
 
 - `ANDROID_RELEASE_KEYSTORE_BASE64`: a dedicated production keystore.
 - `ANDROID_RELEASE_STORE_PASSWORD`, `ANDROID_RELEASE_KEY_PASSWORD`,
@@ -25,33 +26,78 @@ the debug certificate used on the development phones; switching certificates
 requires uninstalling that existing app and loses its local data. Do not
 uninstall or change device signing automatically.
 
-## LGPL distribution prerequisite
+On Windows, `tools\release-signing.ps1 -Directory <outside-Git-directory>
+-ConfigureSecrets` creates a dedicated RSA-3072 JKS key (CN=RedrainCast,
+10,000-day validity) only if neither key nor credentials exists, or reuses the
+existing matching pair. Set `JAVA_HOME` to JDK 21 first. It protects only its
+new files/staging directory for the current Windows user and SYSTEM, never the
+whole destination folder. Passwords come from the OS CSPRNG; keytool receives
+them through environment variables and `gh secret set` through stdin.
+Never commit, upload as an artifact, or log the key/credential file. A temporary
+Downloads directory is **not** an independent durable backup. Back up both
+files securely before publishing.
 
-Provide a reviewed `android-lgpl-relink` artifact in a successful workflow run
-of this private repository. It must contain:
+The configured production certificate SHA-256 is
+`79f906220de117d61c2d15bdfcef179a4e3e48cfa0c76b637c7af986c037fad3`;
+the workflow pins and checks it after signing. Key rotation requires explicit
+review and breaks normal in-place updates without a signing-lineage plan.
 
-- `android-lgpl-relink.tar.gz`: corresponding FFmpeg source/build configuration,
-  licenses, and the application-native object files and reproducible instructions
-  needed to relink the shipped FFmpeg-linked JNI libraries with modified LGPL
-  libraries for all three ABIs.
-- `version.txt`: exact APK version such as `0.4.6`.
-- `SHA256SUMS`: checksums covering both files.
+Create a fine-grained PAT using
+[GitHub token settings](https://github.com/settings/personal-access-tokens/new?name=RedrainCast%20release%20publisher&description=Upload%20reviewed%20Android%20testing%20drafts&target_name=arisewanggithub&repository_ids=1447663050&contents=write).
+Select **only RedrainCast-Releases**, Contents read/write, and a short expiry.
+Set it as `RELEASE_PUBLISH_TOKEN` in the private application's Actions secrets
+(for example, `gh secret set RELEASE_PUBLISH_TOKEN --repo
+arisewanggithub/RedrainCast-Android`, entering it interactively). The settings
+link is only a preset: verify selected repositories and permissions yourself.
+Never copy the existing broad `gh` login token into Actions. A properly scoped
+GitHub App installation token is also acceptable, but account consent cannot be
+manufactured by the workflow.
 
-Review that archive before uploading it: no private Kotlin/Java source,
-credentials, absolute developer paths, device identifiers or unrelated files.
-The public native-package release supplies FFmpeg source/build materials, but
-does not by itself supply the application-specific relink kit. The workflow
-checks version and hashes; those checks do not replace the maintainer's
-licensing/privacy review. No relink artifact producer is configured yet.
+## Automatic LGPL relink materials
+
+`release-kit.py` now produces `android-lgpl-relink.tar.gz` from the **same**
+release build, after signing; no external artifact run ID is needed. It:
+
+- Pins/downloads the public AAR, corresponding complete FFmpeg source,
+  configuration/build helpers and compliance materials by SHA-256. It does not
+  compile FFmpeg or access the private native-build checkout.
+- Proves each original JNI ELF matches the APK byte-for-byte after the same
+  `llvm-strip --strip-unneeded` operation, refusing ambiguous/missing objects.
+- Packages the three matching relocatable JNI application objects, removing
+  only debug metadata to avoid publishing private source/build paths. It
+  rejects private-path/credential-shaped object or metadata contents.
+- Preserves CMake link flags, static C++ runtime, exact NDK/API/ABI, static
+  archive order, soname and 16 KiB alignment. Unexpected dependencies/flags
+  fail instead of silently falling back.
+- Relinks all three ABIs using the packaged objects/public FFmpeg libraries,
+  checks ELF machines/LOAD alignment and the exact APK's JNI export sets, and
+  refuses unresolved symbols. This is a link/ELF smoke, not a device test.
+- Includes a manifest binding APK/object/source hashes and commit, internal
+  checksums, and `relink.py` accepting explicit **modified** FFmpeg archives.
+
+The archive includes no private application source, raw Ninja/compile-command
+files, logs, signing material or developer paths. Full headers/configuration
+are in the included public AAR and build materials. See
+[kit instructions](release-kit-README.md), including modified-APK signing.
+Maintainers must still review the candidate's licensing/privacy contents before
+publishing; mechanical checks are not legal advice.
 
 ## Publishing
 
-Run the workflow manually with `tag` matching the APK's version and
-`relink_run_id` referencing the successful run holding the reviewed artifact.
-It runs unit tests/lint, builds the optimized release APK, checks the package
-version, signs/verifies/alignment-checks it, and creates a public **prerelease**
-with APK, checksums, certificate, notices and relink kit.
+1. Finish and validate the application changes first. Select the exact committed
+   revision; do not sign an unfinished audio/rendering candidate as ready.
+2. Run the workflow manually with `tag` matching the APK version,
+   `source_validated=true`, and **`publish=false`** (the default).
+   It tests/lints, builds/signs the optimized APK, pins the certificate,
+   alignment-checks it and creates/smokes the relink kit.
+3. Review the private `signed-testing-candidate` artifact (7-day retention):
+   production APK, checksums, certificate, licenses and relink kit.
+4. With the scoped publisher configured, repeat at the same reviewed revision
+   with `publish=true` to create a public-repository **draft prerelease**.
+   Review that newly built candidate too. No release is automatically made live.
+   Manually publish only after final asset/compliance/runtime review.
 
 Do not publish a stable release while the first-rotation rendering issue remains
-unresolved. The initial setup does not generate a production key, configure a
-publishing token, or upload an APK. Missing prerequisites fail explicitly.
+unresolved or claim unverified Windows interoperability. Draft upload does not
+mean the candidate is approved. The workflow cannot create a scoped PAT without
+the owner's external authorization. Missing prerequisites fail explicitly.

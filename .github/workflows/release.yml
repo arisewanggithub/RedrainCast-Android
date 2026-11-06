@@ -6,24 +6,32 @@ on:
         description: "Release tag matching the APK version, e.g. v0.4.6"
         required: true
         type: string
-      relink_run_id:
-        description: "Successful private workflow run containing reviewed android-lgpl-relink artifact"
+      source_validated:
+        description: "I reviewed this exact source revision and authorize a signed testing candidate"
         required: true
-        type: string
+        type: boolean
+        default: false
+      publish:
+        description: "Upload a DRAFT public prerelease (requires scoped publisher token)"
+        required: true
+        type: boolean
+        default: false
 permissions:
   contents: read
-  actions: read
 concurrency:
   group: public-android-release
   cancel-in-progress: false
 jobs:
   release:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 45
     env:
       RELEASE_REPOSITORY: arisewanggithub/RedrainCast-Releases
       RELEASE_TAG: ${{ inputs.tag }}
-      RELINK_RUN_ID: ${{ inputs.relink_run_id }}
+      SOURCE_VALIDATED: ${{ inputs.source_validated }}
+      PUBLISH: ${{ inputs.publish }}
+      RELEASE_CERT_SHA256: 79f906220de117d61c2d15bdfcef179a4e3e48cfa0c76b637c7af986c037fad3
+      PYTHONDONTWRITEBYTECODE: '1'
     steps:
       - uses: actions/checkout@v4
       - name: Check required configuration
@@ -36,10 +44,14 @@ jobs:
         run: |
           set -euo pipefail
           [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "::error::Invalid release tag"; exit 1; }
-          [[ "$RELINK_RUN_ID" =~ ^[0-9]+$ ]] || { echo "::error::Invalid relink workflow run ID"; exit 1; }
-          for name in KEYSTORE STORE_PASSWORD KEY_PASSWORD KEY_ALIAS PUBLISH_TOKEN; do
+          [[ "$SOURCE_VALIDATED" = true ]] || { echo "::error::Exact source revision must be reviewed before signing"; exit 1; }
+          for name in KEYSTORE STORE_PASSWORD KEY_PASSWORD KEY_ALIAS; do
             [[ -n "${!name}" ]] || { echo "::error::Missing required release configuration: $name"; exit 1; }
           done
+          if [[ "$PUBLISH" = true && -z "$PUBLISH_TOKEN" ]]; then
+            echo "::error::Missing required release configuration: scoped RELEASE_PUBLISH_TOKEN"
+            exit 1
+          fi
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
@@ -54,17 +66,8 @@ jobs:
         env:
           JAVA_TOOL_OPTIONS: -Djava.util.concurrent.ForkJoinPool.common.parallelism=3
         run: bash ./gradlew :app:testDebugUnitTest :app:lintDebug :app:assembleRelease --console=plain
-      - name: Download reviewed LGPL relink materials
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-          gh run view "$RELINK_RUN_ID" --repo "$GITHUB_REPOSITORY" --json conclusion --jq '.conclusion' | grep -qx success
-          gh run download "$RELINK_RUN_ID" --repo "$GITHUB_REPOSITORY" --name android-lgpl-relink --dir "$RUNNER_TEMP/relink"
-          test -s "$RUNNER_TEMP/relink/android-lgpl-relink.tar.gz"
-          test "$(cat "$RUNNER_TEMP/relink/version.txt")" = "${RELEASE_TAG#v}"
-          cd "$RUNNER_TEMP/relink"
-          sha256sum --check SHA256SUMS
+      - name: Test release tooling
+        run: python3 -B tools/release-test.py
       - name: Sign, verify and prepare public assets
         env:
           KEYSTORE: ${{ secrets.ANDROID_RELEASE_KEYSTORE_BASE64 }}
@@ -92,17 +95,33 @@ jobs:
             echo "::error::A development debug signing certificate cannot be published as a production release"
             exit 1
           fi
+          fingerprint=$(sed -n 's/^Signer #1 certificate SHA-256 digest: //p' "$RUNNER_TEMP/public-assets/signing-certificate.txt")
+          test "$fingerprint" = "$RELEASE_CERT_SHA256"
           "$tools/zipalign" -c -P 16 4 "$apk"
-          cp "$RUNNER_TEMP/relink/android-lgpl-relink.tar.gz" "$RUNNER_TEMP/public-assets/"
           tar -czf "$RUNNER_TEMP/public-assets/licenses.tar.gz" -C app/src/main/assets NOTICE.txt OPUS-NOTICE.txt licenses
+      - name: Build and smoke-test exact-build LGPL relink kit
+        run: |
+          set -euo pipefail
+          python3 -B tools/release-kit.py \
+            --ndk "$ANDROID_HOME/ndk/27.2.12479018" \
+            --apk "$RUNNER_TEMP/public-assets/RedrainCast-${RELEASE_TAG#v}.apk" \
+            --version "${RELEASE_TAG#v}" --cache "$RUNNER_TEMP/native-assets" \
+            --output "$RUNNER_TEMP/public-assets/android-lgpl-relink.tar.gz"
           cd "$RUNNER_TEMP/public-assets"
           sha256sum ./*.apk ./*.tar.gz signing-certificate.txt > SHA256SUMS
-      - name: Publish public testing release
+      - uses: actions/upload-artifact@v4
+        with:
+          name: signed-testing-candidate
+          path: ${{ runner.temp }}/public-assets/
+          retention-days: 7
+          if-no-files-found: error
+      - name: Upload public draft testing release
+        if: inputs.publish
         env:
           GH_TOKEN: ${{ secrets.RELEASE_PUBLISH_TOKEN }}
         run: |
           set -euo pipefail
           gh release create "$RELEASE_TAG" "$RUNNER_TEMP/public-assets/"* \
-            --repo "$RELEASE_REPOSITORY" --prerelease \
+            --repo "$RELEASE_REPOSITORY" --draft --prerelease \
             --title "RedrainCast $RELEASE_TAG (testing)" \
-            --notes "Testing release. One universal APK supports arm64-v8a, armeabi-v7a and x86_64; Android 11/API 30 or newer. The intermittent first-rotation tiny-strip rendering bug remains unresolved. A production-signed APK cannot update earlier debug-signed installations in place. Checksums, signing certificate, licenses and reviewed LGPL relink materials are attached. Application source remains private."
+            --notes "Testing candidate, not a stable release. One universal APK supports arm64-v8a, armeabi-v7a and x86_64; Android 11/API 30 or newer. The intermittent first-rotation tiny-strip rendering bug remains unresolved; live Windows interoperability is not verified. A production-signed APK cannot update earlier debug-signed installations in place. Checksums, signing certificate, licenses and exact-build LGPL relink materials are attached. Application source remains private. Review all assets before manually publishing this draft."
