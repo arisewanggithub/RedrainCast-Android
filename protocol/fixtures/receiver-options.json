@@ -1,0 +1,41 @@
+{
+  "description": "ReceiverOptions v1 raw JSON compatibility cases derived from Windows ReceiverOptionsTests; raw text preserves duplicate and numeric token distinctions.",
+  "capabilities": [
+    {"json":"{}", "enabled":false},
+    {"json":"{\"receiverOptions\":{\"version\":1,\"supported\":[]}}", "enabled":false},
+    {"json":"{\"receiverOptions\":{\"version\":1,\"supported\":[\"future\",\"playbackStats\"]}}", "enabled":true},
+    {"json":"{\"receiverOptions\":{\"version\":2,\"supported\":[\"playbackStats\"]}}", "enabled":false}
+  ],
+  "invalidCapabilities": [
+    "{\"receiverOptions\":{\"version\":1.0,\"supported\":[]}}",
+    "{\"receiverOptions\":{\"version\":1e0,\"supported\":[]}}",
+    "{\"receiverOptions\":{\"version\":\"1\",\"supported\":[]}}",
+    "{\"receiverOptions\":{\"version\":2147483648,\"supported\":[]}}",
+    "{\"receiverOptions\":{\"version\":0,\"supported\":[]}}",
+    "{\"receiverOptions\":{\"version\":-1,\"supported\":[]}}",
+    "{\"receiverOptions\":{\"version\":1,\"supported\":true}}",
+    "{\"receiverOptions\":{\"version\":1,\"supported\":[\"playbackStats\",\"playbackStats\"]}}",
+    "{\"receiverOptions\":{\"version\":1,\"version\":1,\"supported\":[]}}",
+    "{\"receiverOptions\":{\"version\":1,\"supported\":[true]}}",
+    "{\"receiverOptions\":{\"version\":1,\"supported\":[\"\"]}}",
+    "{\"receiverOptions\":{\"version\":1,\"supported\":[\"a\\u0001\"]}}",
+    "{\"receiverOptions\":{\"version\":1,\"supported\":[]},\"receiverOptions\":{\"version\":1,\"supported\":[]}}"
+  ],
+  "selections": [
+    {"json":"{\"receiverOptions\":{\"version\":1,\"playbackStats\":true}}", "enabled":true},
+    {"json":"{\"receiverOptions\":{\"version\":1,\"playbackStats\":false}}", "enabled":false},
+    {"json":"{\"receiverOptions\":{\"version\":1,\"playbackStats\":true,\"futureOption\":{\"mode\":42}}}", "enabled":true},
+    {"json":"{\"receiverOptions\":{\"version\":2,\"playbackStats\":true}}", "enabled":false},
+    {"json":"{\"receiverOptions\":{\"version\":1,\"futureOption\":true}}", "enabled":false}
+  ],
+  "invalidSelections": [
+    "{\"receiverOptions\":{\"version\":1,\"playbackStats\":1}}",
+    "{\"receiverOptions\":{\"version\":2,\"playbackStats\":\"true\"}}",
+    "{\"receiverOptions\":{\"version\":1,\"playbackStats\":null}}",
+    "{\"receiverOptions\":{\"version\":1,\"playbackStats\":true,\"playbackStats\":false}}",
+    "{\"receiverOptions\":{\"version\":1.0,\"playbackStats\":true}}",
+    "{\"receiverOptions\":{\"version\":1e0,\"playbackStats\":true}}",
+    "{\"receiverOptions\":{\"playbackStats\":true}}",
+    "{\"receiverOptions\":[]}"
+  ]
+}

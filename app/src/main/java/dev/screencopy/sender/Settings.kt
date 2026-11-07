@@ -22,6 +22,9 @@ class Settings {
     var audioSource = "playback"
     var audioOptions = ""
     var audioBitrate = 192_000
+    var showPlaybackStatistics = false
+
+    fun saved(): JSONObject = request().put("ShowPlaybackStatistics", showPlaybackStatistics)
 
     fun validate() {
         require(videoCodec in setOf("h264", "h265", "av1"), "Unknown video codec")
@@ -94,6 +97,10 @@ class Settings {
         }
 
         fun from(root: JSONObject, validate: Boolean = true): Settings = Settings().apply {
+            if (root.has("ShowPlaybackStatistics")) {
+                require(root.opt("ShowPlaybackStatistics") is Boolean, "ShowPlaybackStatistics must be Boolean")
+                showPlaybackStatistics = root.getBoolean("ShowPlaybackStatistics")
+            }
             require(!root.has("mediaTransportMode"), "Legacy media transport settings are not supported")
             if (root.has("receiverOrientation")) receiverOrientation = Json.string(root, "receiverOrientation")
             val v = root.getJSONObject("video")

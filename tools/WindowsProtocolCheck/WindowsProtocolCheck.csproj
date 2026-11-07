@@ -9,6 +9,10 @@
   <ItemGroup>
     <Compile Include="$(WindowsRoot)\src\ScrcpyReceive.Core\*.cs" Link="WindowsCore\%(Filename)%(Extension)" />
     <Compile Include="$(WindowsRoot)\src\RedrainCast.Protocol\StreamRecovery.cs" Link="WindowsProtocol\StreamRecovery.cs" />
+    <Compile Include="$(WindowsRoot)\src\RedrainCast.Protocol\ReceiverOptions.cs" Link="WindowsProtocol\ReceiverOptions.cs" />
+    <Compile Include="$(WindowsRoot)\src\RedrainCast.Protocol\MediaTiming.cs" Link="WindowsProtocol\MediaTiming.cs" />
+    <Compile Include="$(WindowsRoot)\src\RedrainCast.Protocol\ThreadTiming.cs" Link="WindowsProtocol\ThreadTiming.cs" />
     <EmbeddedResource Include="..\..\protocol\fixtures\opus-pts-order.json" LogicalName="OpusPtsOrderFixture" />
+    <EmbeddedResource Include="..\..\protocol\fixtures\receiver-options.json" LogicalName="ReceiverOptionsFixture" />
   </ItemGroup>
 </Project>

@@ -53,6 +53,9 @@ class AudioPlayer(
     @Volatile internal var recoveryCutoffUs: Long? = null
     internal var onFirstSubmitted: (Long) -> Unit = {}
     private var submittedReported = false
+    @Volatile internal var audioStatistics: AudioStatistics? = null
+        private set
+    private var statisticsAtNs = Long.MIN_VALUE
     private var startupCatchup = true
 
     val decoderDescription: String
@@ -210,6 +213,16 @@ class AudioPlayer(
         if (timing.submittedFrames - timing.consumedFrames !in 0..timing.bufferFrames.toLong())
             throw AudioClockException(AudioClockDiagnostic(AudioClockFault.CLIENT_BUFFER, timing))
         val now = clock.monotonicNs()
+        if (statisticsEnabled && (statisticsAtNs == Long.MIN_VALUE || now - statisticsAtNs >= 100_000_000)) {
+            statisticsAtNs = now
+            val diagnostic = regulator.diagnostic()
+            val rate = format.sampleRate.toDouble()
+            val source = if (timing.presentedFrames > 0) clock.cachedPlayedAudioObservation() else null
+            audioStatistics = AudioStatistics(diagnostic.bufferedFrames * 1000.0 / rate,
+                diagnostic.targetFrames * 1000.0 / rate, timing.bufferedUs / 1000.0,
+                diagnostic.silenceFrames * 1000.0 / rate, diagnostic.droppedFrames * 1000.0 / rate,
+                source?.ptsUs, timing.presentedUs / 1000.0, source?.observedAtNs)
+        }
         if (timing.consumedFrames > lastConsumedFrames) lastOutputProgressNs = now
         lastConsumedFrames = timing.consumedFrames
         var available = (timing.bufferFrames - (timing.submittedFrames - timing.consumedFrames)).toInt()

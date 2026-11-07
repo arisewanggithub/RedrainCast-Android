@@ -20,6 +20,10 @@ import org.screencopy.receiver.media.TrackStoppedException
 import org.screencopy.receiver.media.VideoPlaybackException
 import org.screencopy.receiver.media.VideoDiagnostic
 import org.screencopy.receiver.media.VideoFormat
+import org.screencopy.receiver.media.PlaybackStatisticsInput
+import org.screencopy.receiver.media.PlaybackStatisticsSampler
+import org.screencopy.receiver.media.PlaybackStatisticsSnapshot
+import org.screencopy.receiver.media.ControlStatistics
 import org.screencopy.receiver.protocol.*
 import org.screencopy.receiver.ui.ReceiverScreenEvent
 import org.screencopy.receiver.ui.FailureDiagnostic
@@ -72,7 +76,8 @@ class ReceiverServer private constructor(
     private val onVideoRotation: (Int, () -> Boolean) -> Unit = { _, _ -> },
     private val acquireSession: (() -> AutoCloseable?)? = null,
     private val instanceId: String = UUID.randomUUID().toString().replace("-", ""),
-    private val onFramePresented: (() -> Boolean) -> Unit = {}
+    private val onFramePresented: (() -> Boolean) -> Unit = {},
+    private val supportsPlaybackStatistics: Boolean = false
 ) : AutoCloseable {
     constructor(
         name: String, surface: Surface,
@@ -87,17 +92,32 @@ class ReceiverServer private constructor(
         onVideoRotation: (Int, () -> Boolean) -> Unit = { _, _ -> },
         acquireSession: (() -> AutoCloseable?)? = null,
         instanceId: String = UUID.randomUUID().toString().replace("-", ""),
-        onFramePresented: (() -> Boolean) -> Unit = {}
+        onFramePresented: (() -> Boolean) -> Unit = {},
+        supportsPlaybackStatistics: Boolean = false
     ) : this(name, surface, onStatus, onVideoSize, onListener, port, videoOutput, ::validateCapabilities, onScreenEvent,
         { android.util.Log.e("ScreenCopyReceiver", it.logMessage()) }, onPresentationStart, null,
         onDiscoveryDiagnostic = { android.util.Log.i("ScreenCopyReceiver", it) }, onVideoRotation = onVideoRotation,
-        acquireSession = acquireSession, instanceId = instanceId, onFramePresented = onFramePresented)
+        acquireSession = acquireSession, instanceId = instanceId, onFramePresented = onFramePresented,
+        supportsPlaybackStatistics = supportsPlaybackStatistics)
 
     private val name = name.take(80)
     private val running = AtomicBoolean(false)
     private val started = AtomicBoolean(false)
     private val active = AtomicReference<Connection?>()
     val busyForUpdate: Boolean get() = active.get() != null
+    val playbackStatisticsRequested: Boolean get() = active.get()?.statisticsRequested() == true
+    @Volatile var playbackStatistics: PlaybackStatisticsSnapshot? = null
+        get() = field?.takeIf {
+            statisticsVisible.get() && active.get()?.statisticsCurrent(it.input.session, it.input.generation, it.input.audioEpoch) == true
+        }
+        private set
+    private val statisticsVisible = AtomicBoolean(false)
+    fun showPlaybackStatistics(visible: Boolean) {
+        if (statisticsVisible.getAndSet(visible) != visible || !visible) {
+            playbackStatistics = null
+            active.get()?.resetStatistics()
+        }
+    }
     private val clients = ConnectionPool<Connection>({ it.abort() })
     private val timer = Executors.newSingleThreadScheduledExecutor()
     private var listener: ServerSocket? = null
@@ -273,7 +293,7 @@ class ReceiverServer private constructor(
         private var video: VideoPlayer? = null
         private var audio: AudioPlayer? = null
         private var presentation: AutoCloseable? = null
-        private var request: Request? = null
+        @Volatile private var request: Request? = null
         private var tracks: TrackState? = null
         private var requestSummary = ""
         private var actualVideo = ""
@@ -286,6 +306,26 @@ class ReceiverServer private constructor(
         @Volatile private var videoGeneration = 0L
         private var videoRotation = false
         private var streamRecovery = false
+        private var negotiatedOptions = ReceiverOptionCapabilities()
+        private val statisticsSampler = PlaybackStatisticsSampler()
+        private val receivedVideo = AtomicLong()
+        private val receivedAudio = AtomicLong()
+        private val videoPayload = AtomicLong()
+        private val audioPayload = AtomicLong()
+        @Volatile private var lastVideoPacketAt: Long? = null
+        @Volatile private var lastAudioPacketAt: Long? = null
+        @Volatile private var actualRotation = 0
+        private val controlStatistics = ControlStatistics(now())
+        fun resetStatistics() {
+            statisticsSampler.reset()
+            if (active.get() === this) playbackStatistics = null
+        }
+        fun statisticsCurrent(id: Long, generation: Long, epoch: Long): Boolean =
+            session == id && videoGeneration == generation && audioEpoch == epoch && accepted && tracksReady &&
+                !stopping.get() && !recovering && !terminalError && firstFailure.get() == null &&
+                request?.receiverOptions?.playbackStats == true
+        fun statisticsRequested(): Boolean = accepted && !stopping.get() && !terminalError &&
+            firstFailure.get() == null && request?.receiverOptions?.playbackStats == true
         @Volatile private var recovering = false
         private var awaitingRecoveryKey = false
         @Volatile private var recoveryAt = 0L
@@ -356,6 +396,17 @@ class ReceiverServer private constructor(
                 protocolRequire(accepted && !stopping.get(), "Session has ended")
                 protocolRequire(videoRotation || message.flags <= 1, "Video rotation was not negotiated")
                 checkNotNull(tracks).media(message)
+                if (request?.receiverOptions?.playbackStats == true) {
+                    if (message.track == 1) {
+                        receivedVideo.incrementAndGet()
+                        videoPayload.addAndGet(message.payload.size.toLong())
+                        lastVideoPacketAt = now()
+                    } else {
+                        receivedAudio.incrementAndGet()
+                        audioPayload.addAndGet(message.payload.size.toLong())
+                        lastAudioPacketAt = now()
+                    }
+                }
                 val audioEnd = if (streamRecovery && message.type == Type.AUDIO_PACKET)
                     checkNotNull(audioPacketTiming).endPts(packet.ptsUs, packet.bytes) else null
                 if (message.type == Type.AUDIO_PACKET && request?.audioCodec == "raw")
@@ -409,6 +460,7 @@ class ReceiverServer private constructor(
                 audioRecoveryOpen = false
                 phase = "Recovering"
                 phaseAt = recoveryAt
+                playbackStatistics = null
                 videoGeneration
             }
             onDiscoveryDiagnostic("event=STREAM_RECOVERY_REQUEST generation=$generation ${pressure.logMessage()}")
@@ -493,9 +545,13 @@ class ReceiverServer private constructor(
                 val version = if (h.has("streamRecoveryVersion")) h.integer("streamRecoveryVersion") else null
                 protocolRequire(version == null || version > 0, "Invalid stream recovery version")
                 streamRecovery = h.opt("streamRecovery") == true && version == StreamRecoveryProtocol.VERSION
+                negotiatedOptions = ReceiverOptionProtocol.capabilities(h).intersect(
+                    ReceiverOptionCapabilities(supportsPlaybackStatistics))
+                controlStatistics.validControl(now())
                 val response = JSONObject().put("role", "receiver").put("versions", JSONArray().put(Wire.VERSION)).put("name", name)
                 if (videoRotation) response.put("videoRotation", true)
                 if (streamRecovery) response.put("streamRecovery", true).put("streamRecoveryVersion", StreamRecoveryProtocol.VERSION)
+                if (negotiatedOptions.playbackStats) response.put("receiverOptions", negotiatedOptions.wireValue())
                 send(Type.HELLO, response)
                 phase = "Negotiating"
                 phaseAt = now()
@@ -514,7 +570,8 @@ class ReceiverServer private constructor(
                     }
                 }
                 onScreenEvent(ReceiverScreenEvent.Connecting)
-                request = Request.parse(negotiation.json())
+                request = Request.parse(negotiation.json(), negotiatedOptions)
+                controlStatistics.validControl(now())
                 val settings = checkNotNull(request)
                 validateRequest(settings)
                 requestSummary = settings.summary
@@ -538,7 +595,7 @@ class ReceiverServer private constructor(
                         Type.STREAM_CONFIG, Type.VIDEO_FRAME, Type.AUDIO_PACKET ->
                             throw ProtocolException("PROTOCOL", "Media and configuration require their dedicated connections")
                         Type.PING -> send(Type.PONG, JSONObject().put("nonce", message.json().integer("nonce")))
-                        Type.PONG -> message.json().integer("nonce")
+                        Type.PONG -> receivedPong(message.json().integer("nonce"))
                         Type.STATUS -> {
                             val json = message.json()
                             json.string("state", 80)
@@ -566,6 +623,7 @@ class ReceiverServer private constructor(
                         }
                         else -> throw ProtocolException("PROTOCOL", "Message is not allowed in current session state")
                     }
+                    controlStatistics.validControl(now())
                 }
             } catch (e: Exception) {
                 terminalError = true
@@ -657,9 +715,10 @@ class ReceiverServer private constructor(
                 protocolRequire(message.session == 0L, "Unexpected session before negotiation")
                 when (message.type) {
                     Type.PING -> send(Type.PONG, JSONObject().put("nonce", message.json().integer("nonce")))
-                    Type.PONG -> message.json().integer("nonce")
+                    Type.PONG -> receivedPong(message.json().integer("nonce"))
                     else -> throw ProtocolException("PROTOCOL", "Expected SESSION_REQUEST")
                 }
+                controlStatistics.validControl(now())
             }
         }
 
@@ -691,6 +750,8 @@ class ReceiverServer private constructor(
         }
 
         private fun configureInitial(message: Message) {
+            resetStatistics()
+            if (message.track == 1) lastVideoPacketAt = null else lastAudioPacketAt = null
             protocolRequire(accepted && !stopping.get(), "Session has ended")
             phase = "Initializing tracks"
             initializingTrack = message.track
@@ -732,6 +793,8 @@ class ReceiverServer private constructor(
         }
 
         private fun configureRecovery(message: Message) {
+            lastVideoPacketAt = null
+            lastAudioPacketAt = null
             val settings: Request
             val format: VideoFormat
             synchronized(playbackLock) {
@@ -846,8 +909,12 @@ class ReceiverServer private constructor(
                         }
                     }, generation, onRotation = { rotation ->
                         val current = { running.get() && !recovering && accepted && !stopping.get() && active.get() === this && videoGeneration == generation }
-                        if (videoRotation && current()) onVideoRotation(rotation, current)
+                        if (current()) {
+                            actualRotation = if (videoRotation) rotation else 0
+                            if (videoRotation) onVideoRotation(rotation, current)
+                        }
                     })).also {
+                    it.statisticsEnabled = request?.receiverOptions?.playbackStats == true
                     it.onDecoded = { pts -> proveVideoKey(generation, pts) }
                     it.start()
                 }
@@ -865,6 +932,7 @@ class ReceiverServer private constructor(
                 onOutputTiming = { android.util.Log.i("ScreenCopyReceiver", "event=AUDIO_OUTPUT_CLOCK stage=PCM_COMPENSATION ${it.logMessage()}") },
                 onUnderrunRecovery = { android.util.Log.w("ScreenCopyReceiver", it.logMessage()) },
                 onRegulation = { android.util.Log.i("ScreenCopyReceiver", it.logMessage()) })).also {
+                it.statisticsEnabled = request?.receiverOptions?.playbackStats == true
                 it.onFirstSubmitted = { pts -> completeAudio(epoch, pts) }
                 it.start()
             }
@@ -908,6 +976,7 @@ class ReceiverServer private constructor(
 
         private fun reportFailure(code: String, detail: String, origin: FailureOrigin, pressure: QueuePressure? = null,
             outputPreparation: OutputPreparationDiagnostic? = null, videoDiagnostic: VideoDiagnostic? = null) {
+            if (active.get() === this) playbackStatistics = null
             val diagnostic = FailureDiagnostic.classify(code, origin, phase, detail, pressure, outputPreparation, videoDiagnostic)
             if (!firstFailure.compareAndSet(null, diagnostic)) return
             onFailure(diagnostic)
@@ -957,6 +1026,7 @@ class ReceiverServer private constructor(
         }
 
         fun requestStop(reason: String) {
+            if (active.get() === this) playbackStatistics = null
             stopAt = now()
             if (!stopping.compareAndSet(false, true)) return
             try {
@@ -978,6 +1048,8 @@ class ReceiverServer private constructor(
         private fun stopPlayback() = synchronized(playbackOperations) { retirePlayers(true) }
 
         private fun retirePlayers(endSession: Boolean) {
+            playbackStatistics = null
+            resetStatistics()
             val retired = synchronized(playbackLock) {
                 tracksReady = false
                 val values = Triple(video, audio, if (endSession) presentation else null)
@@ -1000,6 +1072,7 @@ class ReceiverServer private constructor(
 
         fun tick() {
             val time = now()
+            sampleStatistics(time)
             if (mediaOwner != null) {
                 if (writer?.stalled(time) == true) {
                     mediaOwner?.mediaFailed(ProtocolException("TIMEOUT", "Media HELLO write blocked"))
@@ -1029,15 +1102,49 @@ class ReceiverServer private constructor(
                     socket.close()
                 }
                 writer != null && phase != "Setup" && time - lastWrite >= 2000 -> {
-                    send(Type.PING, JSONObject().put("nonce", (time % Int.MAX_VALUE).toInt()))
+                    val nonce = (time % Int.MAX_VALUE).toInt()
+                    controlStatistics.sentPing(nonce, time)
+                    send(Type.PING, JSONObject().put("nonce", nonce))
                 }
             }
         }
 
         fun abort() {
+            if (active.get() === this) playbackStatistics = null
             stopping.set(true)
             closeMedia()
             socket.close()
+        }
+
+        private fun receivedPong(nonce: Int) {
+            controlStatistics.pong(nonce, now())
+        }
+
+        private fun sampleStatistics(time: Long) {
+            if (active.get() !== this) return
+            val settings = request
+            if (!statisticsVisible.get() || settings?.receiverOptions?.playbackStats != true ||
+                stopping.get() || !accepted || recovering || !tracksReady || terminalError || firstFailure.get() != null) {
+                playbackStatistics = null
+                resetStatistics()
+                return
+            }
+            val (players, format, epochs) = synchronized(playbackLock) {
+                Triple(video to audio, activeVideoFormat, videoGeneration to audioEpoch)
+            }
+            val control = controlStatistics.snapshot(time)
+            val snapshot = statisticsSampler.sample(time, PlaybackStatisticsInput(
+                session, epochs.first, epochs.second, if (recoveryAt > 0) "Recovering" else phase,
+                settings.videoCodec, settings.audioCodec, format?.width, format?.height, settings.fps,
+                settings.videoBitrate, settings.audioBitrate, actualRotation, settings.receiverOrientation.wireValue,
+                receivedVideo.get(), receivedAudio.get(), videoPayload.get(), audioPayload.get(),
+                players.first?.videoStatistics(), players.second?.audioStatistics,
+                players.first?.queueStatistics(), players.second?.queueStatistics(), control.rttMs,
+                control.lastValidControlAgeMs,
+                lastVideoPacketAt?.let { (time - it).coerceAtLeast(0) },
+                lastAudioPacketAt?.let { (time - it).coerceAtLeast(0) }))
+            if (active.get() === this && statisticsCurrent(session, epochs.first, epochs.second) && statisticsVisible.get())
+                playbackStatistics = snapshot
         }
     }
 
@@ -1059,10 +1166,11 @@ class ReceiverServer private constructor(
             onVideoSize: (Int, Int) -> Unit = { _, _ -> },
             onVideoRotation: (Int, () -> Boolean) -> Unit = { _, _ -> },
             acquireSession: (() -> AutoCloseable?)? = null,
-            instanceId: String = UUID.randomUUID().toString().replace("-", "")) =
+            instanceId: String = UUID.randomUUID().toString().replace("-", ""),
+            supportsPlaybackStatistics: Boolean = false) =
             ReceiverServer(name, null, onStatus, onVideoSize, onListener, port, ResourceSlot(), validateRequest, onScreenEvent,
                 onFailure, onPresentationStart, videoFactory, audioFactory, clockFactory, onVideoRotation = onVideoRotation,
-                acquireSession = acquireSession, instanceId = instanceId)
+                acquireSession = acquireSession, instanceId = instanceId, supportsPlaybackStatistics = supportsPlaybackStatistics)
 
         private fun validateCapabilities(settings: Request) {
             val types = MediaCodecList(MediaCodecList.REGULAR_CODECS).codecInfos.filter { !it.isEncoder }.flatMap { it.supportedTypes.toList() }

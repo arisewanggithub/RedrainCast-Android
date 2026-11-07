@@ -8,11 +8,14 @@ import java.nio.ByteOrder
 import java.util.Base64
 
 data class Request(val videoCodec: String, val audioCodec: String?, val fps: Int, val summary: String,
-    val receiverOrientation: ReceiverOrientation = ReceiverOrientation.AUTO) {
+    val receiverOrientation: ReceiverOrientation = ReceiverOrientation.AUTO,
+    val receiverOptions: ReceiverOptions = ReceiverOptions(),
+    val videoBitrate: Int = 0, val audioBitrate: Int? = null) {
     val tracks: List<Int> get() = if (audioCodec == null) listOf(1) else listOf(1, 2)
 
     companion object {
-        fun parse(json: JSONObject): Request {
+        fun parse(json: JSONObject, negotiated: ReceiverOptionCapabilities = ReceiverOptionCapabilities()): Request {
+            val options = ReceiverOptionProtocol.selection(json, negotiated)
             protocolRequire(!json.has("mediaTransport"),
                 "Only custom TCP media is supported; omit mediaTransport", "UNSUPPORTED_CONFIG")
             val receiverOrientation = if (json.has("receiverOrientation")) ReceiverOrientation.parse(json.opt("receiverOrientation"))
@@ -45,7 +48,8 @@ data class Request(val videoCodec: String, val audioCodec: String?, val fps: Int
             return Request(codec, if (enabled) audioCodec else null, fps,
                 "Requested $codec ${video.integer("bitrate")} bps, max ${video.integer("maxSize")} px, $fps fps; " +
                     (if (enabled) "audio $audioCodec ${audio.integer("bitrate")} bps" else "audio disabled"),
-                receiverOrientation)
+                receiverOrientation, options, video.integer("bitrate"),
+                if (enabled && audioCodec != "raw") audio.integer("bitrate") else null)
         }
     }
 }

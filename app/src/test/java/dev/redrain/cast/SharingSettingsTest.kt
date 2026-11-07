@@ -35,6 +35,53 @@ import org.robolectric.shadows.ShadowAlertDialog
 @GraphicsMode(GraphicsMode.Mode.LEGACY)
 @ConscryptMode(ConscryptMode.Mode.OFF)
 class SharingSettingsTest {
+    @Test fun advancedFullDiagnosticsActionDoesNotSaveOrMutateDraftSettings() {
+        val controller = activity()
+        val current = Settings()
+        var saved = false
+        var opened = 0
+        val dialog = SharingSettings.show(controller.get(), current, { saved = true }, {}, inventory()) { opened++ }
+        latestDialog()
+        val diagnostics = field<Button>(dialog, "playbackDiagnostics")
+        assertFalse(diagnostics.isShown)
+        field<Button>(dialog, "advancedToggle").performClick()
+        shadowOf(Looper.getMainLooper()).idle()
+        assertTrue(diagnostics.isShown)
+        diagnostics.performClick()
+        assertEquals(1, opened)
+        assertFalse(saved)
+        assertFalse(current.showPlaybackStatistics)
+        dialog.dismiss()
+        controller.pause().stop().destroy()
+    }
+
+    @Test fun playbackStatisticsCheckboxDefaultsOffPersistsAndDoesNotMutateAnAlreadySelectedSession() {
+        val controller = activity()
+        val current = Settings()
+        var saved: Settings? = null
+        val dialog = show(controller.get(), current, { saved = it }, {})
+        latestDialog()
+        val checkbox = field<CheckBox>(dialog, "showPlaybackStatistics")
+        assertFalse(checkbox.isChecked)
+        assertFalse("Diagnostic option must start inside collapsed Advanced", checkbox.isShown)
+        val advanced = checkbox.parent as LinearLayout
+        assertEquals(advanced.childCount - 2, advanced.indexOfChild(checkbox))
+        assertEquals("playbackStatisticsHint", advanced.getChildAt(advanced.childCount - 1).tag)
+        field<Button>(dialog, "advancedToggle").performClick()
+        shadowOf(Looper.getMainLooper()).idle()
+        assertTrue(checkbox.isShown)
+        assertEquals(controller.get().getString(R.string.rc_playback_statistics_hint),
+            field<TextView>(dialog, "playbackStatisticsHint").text.toString())
+        checkbox.isChecked = true
+        click(dialog, AlertDialog.BUTTON_POSITIVE)
+        assertNotNull(field<TextView>(dialog, "settingsError").text.toString(), saved)
+        assertFalse(current.showPlaybackStatistics)
+        assertTrue(checkNotNull(saved).showPlaybackStatistics)
+        assertTrue(SharingSettings.load(controller.get()) { throw it }.showPlaybackStatistics)
+        assertFalse(checkNotNull(saved).request().has("receiverOptions"))
+        controller.pause().stop().destroy()
+    }
+
     class FailedWriteActivity : Activity() {
         var failWrites = false
 
@@ -166,7 +213,7 @@ class SharingSettingsTest {
             assertEquals("landscape", result.receiverOrientation)
             assertEquals("opus", result.audioCodec)
             assertEquals("playback", result.audioSource)
-            assertEquals(result.request().toString(), preferences.getString(SharingSettings.REQUEST, null))
+            assertEquals(result.saved().toString(), preferences.getString(SharingSettings.REQUEST, null))
         } finally {
             dialog.dismiss()
             controller.pause().stop().destroy()

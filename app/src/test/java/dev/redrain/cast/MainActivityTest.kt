@@ -39,6 +39,67 @@ class MainActivityTest {
     @Before fun disableRealUpdateRequests() { MainActivity.updateFactory = ::noUpdateCheck }
     @After fun restoreUpdateFactory() { MainActivity.updateFactory = previousUpdateFactory }
 
+    @Test fun connectingRetiresIdleDiagnosticsBeforeAnySessionSelectionOrPlayback() {
+        val controller = Robolectric.buildActivity(MainActivity::class.java).setup()
+        val activity = controller.get()
+        try {
+            org.robolectric.util.ReflectionHelpers.callInstanceMethod<Unit>(activity, "showPlaybackDiagnostics")
+            shadowOf(Looper.getMainLooper()).idle()
+            val dialog = org.robolectric.shadows.ShadowAlertDialog.getLatestAlertDialog()
+            assertTrue(dialog.isShowing)
+            org.robolectric.util.ReflectionHelpers.callInstanceMethod<Unit>(activity, "screenEvent",
+                org.robolectric.util.ReflectionHelpers.ClassParameter.from(
+                    org.screencopy.receiver.ui.ReceiverScreenEvent::class.java,
+                    org.screencopy.receiver.ui.ReceiverScreenEvent.Connecting))
+            assertFalse(dialog.isShowing)
+            assertNull(org.robolectric.util.ReflectionHelpers.getField<android.app.AlertDialog?>(activity, "statisticsDialog"))
+            assertNull(org.robolectric.util.ReflectionHelpers.getField<org.screencopy.receiver.ui.PlaybackStatisticsDetails?>(
+                activity, "statisticsDetails"))
+            assertNull(shadowOf(activity).nextStartedActivityForResult)
+            assertNull(shadowOf(activity).nextStartedService)
+        } finally { controller.pause().stop().destroy() }
+        await { activity.resourcesRetired }
+    }
+
+    @Test fun fullPlaybackDiagnosticsWithoutAnActiveCastIsInformationalAndClosesOnBackground() {
+        val controller = Robolectric.buildActivity(MainActivity::class.java).setup()
+        val activity = controller.get()
+        try {
+            org.robolectric.util.ReflectionHelpers.callInstanceMethod<Unit>(activity, "showPlaybackDiagnostics")
+            shadowOf(Looper.getMainLooper()).idle()
+            val dialog = org.robolectric.shadows.ShadowAlertDialog.getLatestAlertDialog()
+            assertTrue(dialog.isShowing)
+            val details = dialog.window!!.decorView.findViewWithTag<org.screencopy.receiver.ui.PlaybackStatisticsDetails>(
+                "playbackStatisticsDetails")
+            assertEquals(View.GONE, details.panel.visibility)
+            assertNull(shadowOf(activity).nextStartedActivityForResult)
+            assertNull(shadowOf(activity).nextStartedService)
+            assertNull(shadowOf(activity).lastRequestedPermission)
+            controller.pause()
+            assertFalse(dialog.isShowing)
+        } finally { controller.stop().destroy() }
+        await { activity.resourcesRetired }
+    }
+
+    @Test fun defaultOffStatisticsHasNoRecurringUiTimerAndBackgroundClearsOverlay() {
+        val controller = Robolectric.buildActivity(MainActivity::class.java).setup()
+        val activity = controller.get()
+        val handler = org.robolectric.util.ReflectionHelpers.getField<android.os.Handler>(activity, "main")
+        val refresh = org.robolectric.util.ReflectionHelpers.getField<Runnable>(activity, "statisticsRefresh")
+        val overlay = activity.findViewById<ViewGroup>(android.R.id.content)
+            .findViewWithTag<org.screencopy.receiver.ui.PlaybackStatisticsOverlay>("playbackStatistics")
+        try {
+            assertFalse(handler.hasCallbacks(refresh))
+            refresh.run()
+            assertFalse(handler.hasCallbacks(refresh))
+            assertEquals(View.GONE, overlay.visibility)
+            controller.pause()
+            assertFalse(handler.hasCallbacks(refresh))
+            assertEquals("", overlay.text)
+        } finally { controller.stop().destroy() }
+        await { activity.resourcesRetired }
+    }
+
     @Test fun recreationBeforeConsentCancelsReservationWithoutLaunchingCapture() {
         val controller = Robolectric.buildActivity(MainActivity::class.java).setup()
         val original = controller.get()

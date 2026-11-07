@@ -11,6 +11,8 @@ import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import org.screencopy.receiver.protocol.StreamRecoveryProtocol
+import org.screencopy.receiver.protocol.ReceiverOptionProtocol
+import org.screencopy.receiver.protocol.ReceiverOptionCapabilities
 
 /** Three plain TCP connections on a trusted LAN; the media token binds them to one session. */
 class ReceiverLink(private val target: ReceiverTarget) : Closeable {
@@ -24,6 +26,8 @@ class ReceiverLink(private val target: ReceiverTarget) : Closeable {
     var videoRotation: Boolean = false
         private set
     var streamRecovery: Boolean = false
+        private set
+    var receiverOptions = ReceiverOptionCapabilities()
         private set
 
     private fun connectSocket(socket: Socket) {
@@ -57,13 +61,20 @@ class ReceiverLink(private val target: ReceiverTarget) : Closeable {
                 send(Wire.control(Wire.HELLO, 0, Wire.obj(
                     "role" to "sender", "versions" to JSONArray().put(3),
                     "name" to "RedrainCast", "videoRotation" to true, "streamRecovery" to true,
-                    "streamRecoveryVersion" to StreamRecoveryProtocol.VERSION
+                    "streamRecoveryVersion" to StreamRecoveryProtocol.VERSION,
+                    "receiverOptions" to ReceiverOptionProtocol.IMPLEMENTED.wireValue()
                 )))
                 val hello = receive()
                 reject(hello)
                 if (hello.type != Wire.HELLO || hello.session != 0L)
                     throw IOException("PROTOCOL: receiver HELLO session zero required")
                 val json = hello.json()
+                receiverOptions = try {
+                    ReceiverOptionProtocol.capabilities(org.screencopy.receiver.protocol.StrictJson.decode(hello.payload))
+                        .intersect(ReceiverOptionProtocol.IMPLEMENTED)
+                } catch (error: org.screencopy.receiver.protocol.ProtocolException) {
+                    throw IOException("PROTOCOL: ${error.message}", error)
+                }
                 val name = Json.string(json, "name")
                 if (Json.string(json, "role") != "receiver" || name.isEmpty() || name.length > 80 || name.any(Char::isISOControl))
                     throw IOException("PROTOCOL: invalid receiver HELLO")

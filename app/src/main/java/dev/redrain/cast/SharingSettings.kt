@@ -58,11 +58,12 @@ object SharingSettings {
         )
     }
 
-    fun show(activity: Activity, current: Settings, onSave: (Settings) -> Unit, onNotices: () -> Unit): AlertDialog =
-        show(activity, current, onSave, onNotices, HardwareEncoderDiscovery.read())
+    fun show(activity: Activity, current: Settings, onSave: (Settings) -> Unit, onNotices: () -> Unit,
+        onDiagnostics: (() -> Unit)? = null): AlertDialog =
+        show(activity, current, onSave, onNotices, HardwareEncoderDiscovery.read(), onDiagnostics)
 
     internal fun show(activity: Activity, current: Settings, onSave: (Settings) -> Unit, onNotices: () -> Unit,
-        encoders: HardwareEncoders): AlertDialog {
+        encoders: HardwareEncoders, onDiagnostics: (() -> Unit)? = null): AlertDialog {
         appContext = activity.applicationContext
         val density = activity.resources.displayMetrics.density
         fun dp(value: Int) = (value * density + 0.5f).toInt()
@@ -259,6 +260,16 @@ object SharingSettings {
         }
         audioCodec.changed = ::updateAudioBitrate
         updateAudioBitrate()
+        if (onDiagnostics != null)
+            button(advanced, R.string.rc_playback_diagnostics, "playbackDiagnostics", onDiagnostics)
+        val playbackStatistics = CheckBox(activity).apply {
+            tag = "showPlaybackStatistics"
+            setText(R.string.rc_playback_statistics)
+            isChecked = current.showPlaybackStatistics
+            minimumHeight = dp(48)
+            advanced.addView(this, spacing(16))
+        }
+        label(advanced, R.string.rc_playback_statistics_hint).tag = "playbackStatisticsHint"
         button(body, R.string.rc_notices, "notices", onNotices)
         dialog = AlertDialog.Builder(activity)
             .setTitle(R.string.rc_settings)
@@ -289,7 +300,8 @@ object SharingSettings {
                 val next: Settings
                 try {
                     // Clone the entire request so hidden options and capture orientation survive edits.
-                    next = Settings.from(current.request(), validate = false).apply {
+                    next = Settings.from(current.saved(), validate = false).apply {
+                        showPlaybackStatistics = playbackStatistics.isChecked
                         this.videoCodec = requireNotNull(videoCodec.value) { activity.getString(R.string.rc_select_hardware_codec) }
                         encoders.resolve(this.videoCodec, "")
                         maxSize = number(size, R.string.rc_max_size)
@@ -309,7 +321,7 @@ object SharingSettings {
                         validate()
                     }
                     val saved = activity.getSharedPreferences(PREFERENCES, Context.MODE_PRIVATE)
-                        .edit().putString(REQUEST, next.request().toString()).commit()
+                        .edit().putString(REQUEST, next.saved().toString()).commit()
                     if (!saved) throw IOException(activity.getString(R.string.rc_settings_write_error))
                 } catch (exception: Exception) {
                     error.text = activity.getString(R.string.rc_settings_error, exception.message ?: exception.javaClass.simpleName)

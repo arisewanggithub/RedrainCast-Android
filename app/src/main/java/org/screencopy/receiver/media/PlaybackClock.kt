@@ -8,6 +8,9 @@ class PlaybackClock(
     private var baseNs = 0L
     private var audioPositionUs: (() -> Long)? = null
     private var audioSource: AudioSourceClock? = null
+    @Volatile private var observedAudio: SourceTimestampObservation? = null
+    internal fun cachedPlayedAudioSource(): Long? = observedAudio?.ptsUs
+    internal fun cachedPlayedAudioObservation(): SourceTimestampObservation? = observedAudio
     @Volatile var audioExpected = false
     @Volatile internal var recoveryStartup = false
     private var firstVideoPtsUs: Long? = null
@@ -98,13 +101,15 @@ class PlaybackClock(
         check(audioStartDelayUs(ptsUs) <= 0) { "Audio cannot start before its source presentation time" }
         audioPositionUs = positionUs
         audioSource = AudioSourceClock(ptsUs, sampleRate)
+        observedAudio = null
         audioStarted = true
     }
 
     @Synchronized
     internal fun audioPacket(sampleUs: Long, ptsUs: Long): AudioClockCorrection? {
         val source = checkNotNull(audioSource)
-        source.current(checkNotNull(audioPositionUs).invoke())
+        val observedPts = source.current(checkNotNull(audioPositionUs).invoke())
+        observedAudio = SourceTimestampObservation(observedPts, nanoTime())
         return source.packet(sampleUs, ptsUs)
     }
 
@@ -123,12 +128,17 @@ class PlaybackClock(
         } finally {
             audioPositionUs = null
             audioSource = null
+            observedAudio = null
         }
     }
 
     @Synchronized
     fun currentUs(): Long? {
-        audioPositionUs?.let { return checkNotNull(audioSource).current(it()) }
+        audioPositionUs?.let {
+            return checkNotNull(audioSource).current(it()).also { observed ->
+                observedAudio = SourceTimestampObservation(observed, nanoTime())
+            }
+        }
         if (basePtsUs < 0) return null
         return basePtsUs + (nanoTime() - baseNs) / 1000
     }

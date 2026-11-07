@@ -7,6 +7,62 @@ policy; there is no migration from the retired applications.
 
 ## Use
 
+**Playback statistics (default off):** Settings on the sending Android device
+has **Show playback statistics on receiver (next cast)** at the bottom of
+**Advanced**, with a diagnostic-use hint. Save it before starting
+the next cast. Updated Android/Windows receivers negotiate this optional v1
+feature; an older receiver continues casting without the overlay and the sender
+retains a nonfatal unavailable notice. Old senders never activate it.
+The display-only translucent overlay stays above receiver video/fullscreen,
+uses 16sp text on larger windows and dense 10sp diagnostic text on phones,
+refreshing cached typed counters once per second. Phone mode retains the full
+metrics rather than replacing them with a six-row summary. It uses measured,
+content-sized short labels, shared units and tighter spacing; the landscape
+panel is bounded to 65% of the player width. At the Galaxy-sized test viewport
+and 115% font scaling it covers less than half the screen area in either
+orientation. It respects system font scaling, without altering phone settings
+or automatically shrinking fonts to force a fit.
+Hold the receiving video for **Full playback diagnostics**, or open that action
+under Settings > Advanced. The separate diagnostics view scrolls to retain every
+metric on smaller viewports or larger accessibility font settings. It is unavailable
+until receiver statistics are actually selected and active; it never enables a
+cast or changes the sender preference.
+Larger windows keep the full aligned panel: four equal KPI cells, three equal
+current-generation totals with labels above numbers, VIDEO STREAM and AUDIO &
+SYNC label/value grids, and the connection/queue table. Numeric cells align to
+the right instead of padding strings. The full diagnostics view uses this same
+grid, stacking sections where needed, with a reachable footer rather than
+compressing text into the viewport.
+It distinguishes requested FPS/bitrate from measured payload and actual rendered
+frames, encoded queues from decoded PCM/device padding, and played source audio
+from the device clock. A/V sync is video minus played source audio (not latency);
+renderer skips are not network packet loss. Unavailable metrics show N/A.
+Skew is compared only when both cached source observations are at most 250 ms
+old and within 10 ms of one another. Otherwise it is N/A and does not increase
+the observed peak; cached PTS is never extrapolated across source-clock changes.
+The comparison has up to 10 ms observation-time separation, not sub-millisecond
+measurement precision. The incoming-session transition closes any idle full
+diagnostics dialog before playback starts.
+Media Last activity is the age of the last received packet, not oldest queue age.
+Queues contain waiting packets only, excluding dequeued codec work.
+Peak observed skew is the maximum absolute value sampled at 1 Hz since the
+current baseline, not a per-frame peak. Android's actual MediaCodec-rendered
+Presented values differ from Windows' accepted presentation API calls; neither
+claims screen scanout. Playback epoch and Occluded are N/A on Android because
+there is no equivalent lifetime/occlusion signal; Audio epoch and Scheduled
+frames remain separate Android details. Common labels/order/units are tested
+against `protocol/fixtures/playback-statistics-display.json`.
+Native-rendering tests inspect inner text bounds and the real reported Galaxy
+canvas dimensions at 450 dpi and 115% font scaling, including summary area and
+short-label wrapping. Full diagnostics tests scroll to the footer and retain the
+original receiver canvas value. Robolectric does not provide a
+Windows ARM64 native renderer; those tests require a supported host JVM (an x64
+Java process under Windows emulation works). This test-host choice does not
+change the app's Android ABI or require any phone installation.
+Stop/failure/background hides it; session/generation/audio-epoch/recovery changes
+reset baselines. No phone permissions, capture, network probes or audio/quality
+settings are changed by statistics.
+
 - Opening the app **automatically starts receiving readiness and discovery**.
   The receiver card shows READY and its OS-assigned TCP endpoints, with copy
   buttons; availability is advertised on UDP 27183. Readiness is not an active
@@ -438,7 +494,7 @@ locked receiver. Compilation is not a valid native pixel-rendering baseline.
   not a claim of sustained mixed-video/network or Windows casting acceptance.
 - Eighteen golden framing fixtures round-tripped against actual Windows Wire,
   retaining the original eight unchanged and adding rotation HELLOs and all
-  key/nonkey orientations. The helper also passed 213 protocol/shared-helper cases: actual
+  key/nonkey orientations. The helper also passed 251 protocol/shared-helper cases: actual
   ReceiverServer loopback negotiation/admission and strict reader/writer flags.
   Playback is explicitly fake/headless; no native/GPU or live casting is claimed.
   Shared Windows recovery helper checks independently cover Android's PCM 120 ms
@@ -449,6 +505,12 @@ locked receiver. Compilation is not a valid native pixel-rendering baseline.
   monotonic source loss and unproven Opus coverage. The canonical Opus source-order
   JSON fixture is embedded in the checker, so both verification and generation
   into a fresh directory check equal and large reversed PTS without sorting.
+  Receiver options add 30 shared raw-schema cases and eight actual Windows Core
+  negotiation/immutable-selection/Stop cases. Android statistics validation
+  includes real three-socket legacy/recovery fixtures, typed-counter baselines,
+  exact stats-on/off PCM identity and unchanged native-query counts, and
+  Robolectric setting/layout/input/background checks. These are not physical
+  phone, native rendered-pixel or live Android/Windows casting acceptance.
 
 These are build/protocol/install results, not live capture/interoperability or
 optimized-release device-runtime acceptance. The old Android checkouts remain

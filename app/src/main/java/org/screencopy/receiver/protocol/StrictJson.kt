@@ -12,6 +12,10 @@ fun protocolRequire(condition: Boolean, message: String, code: String = "PROTOCO
 }
 
 object StrictJson {
+    private val sizes = java.util.WeakHashMap<JSONObject, Int>()
+    fun encodedSize(value: JSONObject): Int = synchronized(sizes) {
+        sizes[value] ?: value.toString().toByteArray(Charsets.UTF_8).size
+    }
     fun decode(bytes: ByteArray): JSONObject {
         val text = try {
             Charsets.UTF_8.newDecoder().onMalformedInput(CodingErrorAction.REPORT)
@@ -37,6 +41,7 @@ object StrictJson {
             protocolRequire(position < text.length, "Truncated JSON")
             return when (text[position]) {
                 '{' -> {
+                    val start = position
                     position++
                     val obj = JSONObject()
                     val keys = HashSet<String>()
@@ -54,6 +59,7 @@ object StrictJson {
                         } while (consume(','))
                         protocolRequire(consume('}'), "Unterminated JSON object")
                     }
+                    synchronized(sizes) { sizes[obj] = text.substring(start, position).toByteArray(Charsets.UTF_8).size }
                     obj
                 }
                 '[' -> {

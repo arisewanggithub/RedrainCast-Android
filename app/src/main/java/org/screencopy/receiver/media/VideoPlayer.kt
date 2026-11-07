@@ -52,9 +52,16 @@ class VideoPlayer private constructor(
     private var lastInputPtsUs: Long? = null
     private var lastOutputPtsUs: Long? = null
     private var queuedFrames = 0L
-    private var decodedFrames = 0L
-    private var renderSubmitted = 0L
-    private var decodedSkipped = 0L
+    @Volatile private var decodedFrames = 0L
+    @Volatile private var renderSubmitted = 0L
+    @Volatile private var decodedSkipped = 0L
+    private val renderedFrames = java.util.concurrent.atomic.AtomicLong()
+    @Volatile private var renderedObservation: SourceTimestampObservation? = null
+    internal fun videoStatistics(): VideoStatistics {
+        val observed = renderedObservation
+        return VideoStatistics(decodedFrames, renderSubmitted, decodedSkipped,
+            if (decoder.supportsRenderedStatistics) renderedFrames.get() else null, observed?.ptsUs, observed?.observedAtNs)
+    }
     private var lateRendered = 0L
     private var pendingOutputAtNs: Long? = null
     private var lastPresentationEventNs: Long? = null
@@ -67,6 +74,12 @@ class VideoPlayer private constructor(
         require(format.width in 1..8192 && format.height in 1..8192 && format.frameRate in 1..240 &&
             format.rotation in listOf(0, 90, 180, 270) && generation > 0) { "Invalid video output format" }
         decoder = try { factory(format) { if (running.get()) onPresented() } } catch (e: Exception) { throw failure(e) }
+        decoder.renderedStatistics { pts, atNs ->
+            if (running.get() && statisticsEnabled) {
+                renderedObservation = SourceTimestampObservation(pts, atNs)
+                renderedFrames.incrementAndGet()
+            }
+        }
         stage = VideoStage.START
         try {
             report(decoder.description)

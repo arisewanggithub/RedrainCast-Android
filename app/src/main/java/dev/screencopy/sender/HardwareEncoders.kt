@@ -43,7 +43,7 @@ internal class HardwareEncoders(private val metadata: List<EncoderMetadata>) {
                 (if (hardware) "; no software/codec fallback." else "; no codec fallback."))
     }
 
-    fun resolve(settings: Settings): Settings = Settings.from(settings.request()).apply {
+    fun resolve(settings: Settings): Settings = Settings.from(settings.saved()).apply {
         videoEncoder = resolve(videoCodec, videoEncoder)
         if (audio && audioCodec != "raw") audioEncoder = resolve(audioCodec, audioEncoder)
     }

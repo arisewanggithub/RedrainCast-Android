@@ -1,0 +1,58 @@
+{
+  "version": 1,
+  "header": "Playback statistics",
+  "nullValue": "N/A",
+  "notApplicable": "—",
+  "kpis": [
+    {"id":"receivedFps","label":"Received FPS","unit":"frames/s"},
+    {"id":"decodedFps","label":"Decoded FPS","unit":"frames/s"},
+    {"id":"presentedFps","label":"Presented FPS","unit":"frames/s"},
+    {"id":"skippedRecent","label":"Skipped · recent","unit":"percent"}
+  ],
+  "totals": [
+    {"id":"decoded","label":"Decoded","unit":"frames"},
+    {"id":"presented","label":"Presented","unit":"frames"},
+    {"id":"skipped","label":"Skipped","unit":"frames"}
+  ],
+  "video": [
+    {"id":"videoCodec","label":"Codec","unit":"text"},
+    {"id":"encodedSize","label":"Encoded size","unit":"pixels"},
+    {"id":"captureLimit","label":"Capture limit","unit":"requested frames/s"},
+    {"id":"receiverCanvas","label":"Receiver canvas","unit":"physical pixels"},
+    {"id":"rotation","label":"Rotation","unit":"degrees and requested orientation"},
+    {"id":"videoBitrate","label":"Video bitrate","unit":"payload Mbps"},
+    {"id":"configuredBitrate","label":"Configured bitrate","unit":"configured video Mbps"},
+    {"id":"networkLoss","label":"Network loss","unit":"unmeasured"}
+  ],
+  "audio": [
+    {"id":"audioFormat","label":"Audio format","unit":"text"},
+    {"id":"audioBitrate","label":"Audio bitrate","unit":"payload Mbps"},
+    {"id":"pcmBufferTarget","label":"PCM buffer / target","unit":"ms"},
+    {"id":"devicePadding","label":"Device padding","unit":"ms"},
+    {"id":"insertedSilence","label":"Inserted silence","unit":"total ms and recent ms"},
+    {"id":"discardedPcm","label":"Discarded PCM","unit":"total ms and recent ms"},
+    {"id":"avSkew","label":"A/V skew","unit":"signed source ms"},
+    {"id":"peakObservedSkew","label":"Peak observed skew","unit":"absolute source ms sampled at 1 Hz"}
+  ],
+  "connectionHeaders": ["Channel","Queued","Span","Last activity","RTT"],
+  "channels": ["Video","Audio","Control"],
+  "footer": [
+    {"id":"state","label":"State","unit":"text"},
+    {"id":"generation","label":"Generation","unit":"generation"},
+    {"id":"playbackEpoch","label":"Playback epoch","unit":"epoch or unavailable"},
+    {"id":"occluded","label":"Occluded","unit":"boolean or unavailable"}
+  ],
+  "semantics": {
+    "queues": "Encoded queues: waiting packets; excludes dequeued codec work.",
+    "lastActivity": "Monotonic age since last fully received valid media packet; control uses last valid control message, not oldest queue age.",
+    "rtt": "Only Control has matching-own-nonce RTT; Video and Audio are not applicable.",
+    "skippedRecent": "recent skipped / (recent actual presented + recent skipped); unavailable or empty denominator is N/A.",
+    "peak": "Maximum absolute A/V skew observed by 1 Hz overlay sampler since current baseline; not a per-frame or interval maximum.",
+    "audioDeltaFormat": "total (+recent) ms; both values use the same sample-frame-derived millisecond unit.",
+    "androidPresented": "MediaCodec frame-rendered callback; scheduled releases are separate.",
+    "windowsPresented": "Successful platform presentation submission; not actual scanout.",
+    "androidPlaybackEpoch": "N/A; audio epoch is a separate Android detail.",
+    "androidOccluded": "N/A; no DXGI-equivalent cached visibility signal.",
+    "notes": ["Positive skew = video ahead","Source timestamps · not end-to-end latency"]
+  }
+}

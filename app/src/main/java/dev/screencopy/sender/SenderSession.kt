@@ -27,7 +27,11 @@ class SenderSession internal constructor(
             try { SenderFailureStore.recordDiagnostic(context, it) }
             catch (e: Exception) { android.util.Log.w("ScreenCopySender", "diagnostic_store=${e.javaClass.simpleName}") }
         })
-    private var settings = Settings.from(settings.request(), validate = false)
+    private var settings = Settings.from(settings.saved(), validate = false)
+    private val requestedStatistics = settings.showPlaybackStatistics
+    private var statisticsUnavailable = false
+    private fun streamingStatus(value: String) = status(if (statisticsUnavailable)
+        "$value - Playback statistics unavailable on this receiver" else value)
     private val session = (SecureRandom().nextLong() and Long.MAX_VALUE) or 1
     private val mux = MediaBudget(settings.audio)
     private val outcome = SessionOutcome()
@@ -163,14 +167,18 @@ class SenderSession internal constructor(
                 recovery = StreamRecoverySender(session, mux, diagnostic = { line ->
                     diagnostic(line)
                     if (line.startsWith("event=STREAM_RECOVERY_BEGIN")) status("Recovering stream")
-                    if (line.startsWith("event=STREAM_RECOVERY_COMPLETE")) status("Streaming")
+                    if (line.startsWith("event=STREAM_RECOVERY_COMPLETE")) streamingStatus("Streaming")
                 }, withAudio = settings.audio)
             diagnostic("event=STREAM_RECOVERY_NEGOTIATED enabled=${connected.streamRecovery}")
             val capture = ProjectionCapture(context, owner, ::captureFailed).also { backend = it }
             settings = capture.validate(settings)
             diagnostic("event=VIDEO_ROTATION_NEGOTIATED fixed_natural=${connected.videoRotation}")
             phase("Negotiating", SessionStopTrace.Phase.NEGOTIATING)
-            val request = settings.request()
+            val options = connected.receiverOptions.select(requestedStatistics)
+            statisticsUnavailable = requestedStatistics && !options.playbackStats
+            if (statisticsUnavailable)
+                diagnostic("event=RECEIVER_OPTION_UNAVAILABLE option=playbackStats nonfatal=true")
+            val request = org.screencopy.receiver.protocol.ReceiverOptionProtocol.apply(settings.request(), options)
             connected.send(Wire.control(Wire.SESSION_REQUEST, session, request))
             worker("receiver-control-write") { writeLoop(0) }
             requestSent = true
@@ -314,7 +322,7 @@ class SenderSession internal constructor(
                             phaseDeadline = 0
                             playing = true
                             trace.phase(SessionStopTrace.Phase.STREAMING)
-                            status(if (recovery == null) "Streaming" else "Resynchronizing stream")
+                            streamingStatus(if (recovery == null) "Streaming" else "Resynchronizing stream")
                         }
                     }
                     Wire.PING -> {

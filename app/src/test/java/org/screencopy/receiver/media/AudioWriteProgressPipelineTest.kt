@@ -24,7 +24,7 @@ class AudioWriteProgressPipelineTest {
             it.start()
             await { it.player.sourceSubmittedFrames == 960L || it.errors.isNotEmpty() }
             assertTrue(it.errors.toString(), it.errors.isEmpty())
-            assertEquals((0 until 1920).map(Int::toShort), it.track.accepted.take(1920))
+            assertEquals((0 until 1920).map(Int::toShort), it.track.accepted.toList().take(1920))
             assertTrue("Packet elapsed exceeds the unchanged no-progress budget", it.track.elapsedNs > 250_000_000)
             assertTrue(it.track.maximumQueued <= it.track.bufferFrames)
             assertEquals(960L, it.player.sourceSubmittedFrames)
@@ -45,7 +45,7 @@ class AudioWriteProgressPipelineTest {
             it.start()
             await { it.player.sourceSubmittedFrames == 960L || it.errors.isNotEmpty() }
             assertTrue(it.errors.toString(), it.errors.isEmpty())
-            assertEquals((0 until 1920).map(Int::toShort), it.track.accepted.take(1920))
+            assertEquals((0 until 1920).map(Int::toShort), it.track.accepted.toList().take(1920))
         }
     }
 

@@ -7,11 +7,13 @@ internal class TrackStoppedException : IllegalStateException("Track decoder is s
 
 abstract class TrackWorker(
     name: String,
-    maxBytes: Int,
+    private val maxBytes: Int,
     private val failure: (String, String) -> Unit,
     private val track: Int = 0
 ) : AutoCloseable {
     private val queue = ArrayDeque<AccessUnit>()
+    private val admittedAt = ArrayDeque<Long>()
+    @Volatile internal var statisticsEnabled = false
     private val monitor = Object()
     private val budget = PacketBudget(maxBytes, 250_000)
     protected val running = AtomicBoolean(true)
@@ -20,6 +22,11 @@ abstract class TrackWorker(
     fun start() = thread.start()
 
     internal fun queuedPackets(): Int = synchronized(monitor) { queue.size }
+    internal fun queueStatistics(): EncodedQueueStatistics = synchronized(monitor) {
+        EncodedQueueStatistics(queue.size, queue.sumOf { it.bytes.size },
+            if (queue.isEmpty()) 0 else queue.maxOf { it.ptsUs } - queue.minOf { it.ptsUs },
+            admittedAt.firstOrNull()?.let { (System.nanoTime() - it).coerceAtLeast(0) / 1_000_000 }, maxBytes)
+    }
 
     fun tryOffer(packet: AccessUnit): QueuePressure? = synchronized(monitor) {
         if (!running.get()) throw TrackStoppedException()
@@ -27,6 +34,7 @@ abstract class TrackWorker(
         if (pressure == null) {
             budget.add(packet)
             queue.addLast(packet)
+            if (statisticsEnabled) admittedAt.addLast(System.nanoTime())
             monitor.notifyAll()
         }
         pressure
@@ -42,6 +50,7 @@ abstract class TrackWorker(
                 if (pressure == null) {
                     budget.add(packet)
                     queue.addLast(packet)
+                    if (statisticsEnabled) admittedAt.addLast(System.nanoTime())
                     monitor.notifyAll()
                     return
                 }
@@ -56,6 +65,7 @@ abstract class TrackWorker(
     protected fun next(): AccessUnit? = synchronized(monitor) {
         if (queue.isEmpty() && running.get()) monitor.wait(2)
         if (queue.isEmpty()) null else queue.removeFirst().also {
+            if (admittedAt.isNotEmpty()) admittedAt.removeFirst()
             budget.remove()
             monitor.notifyAll()
         }
@@ -99,7 +109,7 @@ abstract class TrackWorker(
                 }
                 release()
             } finally {
-                synchronized(monitor) { queue.clear(); budget.clear(); monitor.notifyAll() }
+                synchronized(monitor) { queue.clear(); admittedAt.clear(); budget.clear(); monitor.notifyAll() }
             }
         }
     }

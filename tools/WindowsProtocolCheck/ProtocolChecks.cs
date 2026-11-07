@@ -13,6 +13,7 @@ internal static class ProtocolChecks
 
     public static async Task<int> RunAsync()
     {
+        await ReceiverOptionsAsync();
         Require(RecoveryAudio.Frames("raw", new byte[23040]) == 5760, "PCM 120 ms boundary differs.");
         foreach (var length in new[] { 0, 3, 23044, 48000 })
         {
@@ -184,6 +185,69 @@ internal static class ProtocolChecks
     private static ReceiverServer CreateServer(HeadlessFactory factory) =>
         new("Headless protocol checker", factory, _ => { }, 0, IPAddress.Loopback);
 
+    private static async Task ReceiverOptionsAsync()
+    {
+        using var resource = typeof(ProtocolChecks).Assembly.GetManifestResourceStream("ReceiverOptionsFixture") ??
+            throw new InvalidDataException("Missing receiver-options raw fixture.");
+        using var document = await JsonDocument.ParseAsync(resource);
+        foreach (var group in new[] { "capabilities", "selections", "invalidCapabilities", "invalidSelections" })
+        foreach (var item in document.RootElement.GetProperty(group).EnumerateArray())
+        {
+            var invalid = group.StartsWith("invalid", StringComparison.Ordinal);
+            using var raw = JsonDocument.Parse(invalid ? item.GetString()! : item.GetProperty("json").GetString()!);
+            var capabilities = group is "capabilities" or "invalidCapabilities";
+            var rejected = false;
+            bool enabled = false;
+            try
+            {
+                enabled = capabilities ? ReceiverOptionProtocol.Capabilities(raw.RootElement).PlaybackStats :
+                    ReceiverOptionProtocol.Parse(raw.RootElement, ReceiverOptionCapabilities.Implemented).PlaybackStats;
+                if (!capabilities)
+                    Require(!ReceiverOptionProtocol.Parse(raw.RootElement, ReceiverOptionCapabilities.None).PlaybackStats,
+                        "Unnegotiated option activated on Windows.");
+            }
+            catch (FormatException) { rejected = true; }
+            Require(invalid ? rejected : !rejected && enabled == item.GetProperty("enabled").GetBoolean(),
+                $"Windows receiver-options raw fixture differs: {group} {raw.RootElement.GetRawText()}");
+            Pass($"Windows receiver-options raw schema {group}");
+        }
+        foreach (var supported in new[] { false, true })
+        foreach (var offer in new[] { false, true })
+        foreach (var requested in new[] { false, true })
+        {
+            var factory = new HeadlessFactory(true, supported);
+            await using var server = CreateServer(factory);
+            server.Start(false);
+            using var control = new TcpClient { NoDelay = true };
+            await control.ConnectAsync(IPAddress.Loopback, server.Port);
+            var hello = new Dictionary<string, object>
+            {
+                ["role"] = "sender", ["versions"] = new[] { 3 }, ["name"] = "Android options fixture",
+                ["videoRotation"] = true
+            };
+            if (offer) hello["receiverOptions"] = ReceiverOptionCapabilities.Implemented.WireValue;
+            await SendAsync(control, Packet.Control(PacketType.Hello, 0, hello));
+            var response = await ReadAsync(control);
+            var negotiated = ReceiverOptionProtocol.Capabilities(response.Object());
+            Require(negotiated.PlaybackStats == (offer && supported), "Windows acknowledged an unsupported/unoffered option.");
+            var selection = JsonSerializer.SerializeToElement(new
+            {
+                video = new { codec = "h264", encoder = "", bitrate = 8000000, maxSize = 1920, maxFps = 60,
+                    displayId = 0, orientation = "0", crop = (object?)null, codecOptions = "" },
+                audio = new { enabled = false, codec = "raw", encoder = "", bitrate = 192000, source = "playback", codecOptions = "" },
+                receiverOrientation = "auto",
+                receiverOptions = new { version = 1, playbackStats = requested }
+            });
+            await SendAsync(control, Packet.Control(PacketType.SessionRequest, 73, selection));
+            Require((await ReadAsync(control)).Type == PacketType.SessionAccept, "Windows rejected options fixture.");
+            Require(factory.LastRequest?.EffectiveOptions.PlaybackStats == (offer && supported && requested),
+                "Windows changed the negotiated immutable selection.");
+            await SendAsync(control, Packet.Control(PacketType.Stop, 73, new { reason = "option fixture complete" }));
+            Require((await ReadAsync(control)).Type == PacketType.SessionEnd, "Options changed Stop semantics.");
+            Pass($"Windows options loopback offered={offer} supported={supported} selected={requested}");
+        }
+    }
+
     private static async Task NegotiationAsync(bool? offer, bool supported, uint rejectedFlag)
     {
         var factory = new HeadlessFactory(supported);
@@ -320,15 +384,18 @@ internal static class ProtocolChecks
     }
 
     // This observes packet delivery only. It never opens a decoder, GPU, display or audio device.
-    private sealed class HeadlessFactory(bool supported) : IPlaybackFactory
+    private sealed class HeadlessFactory(bool supported, bool options = false) : IPlaybackFactory
     {
         public string Description => "Explicitly fake/headless protocol observation";
         public bool SupportsVideoRotation => supported;
         public bool SupportsStreamRecovery => false;
+        public ReceiverOptionCapabilities ReceiverOptions => new(options);
+        public CastRequest? LastRequest { get; private set; }
         public HeadlessPlayback Playback { get; } = new();
         public int Opens { get; private set; }
         public ValueTask<IPlayback> OpenAsync(CastRequest request, CancellationToken cancellationToken)
         {
+            LastRequest = request;
             Opens++;
             return ValueTask.FromResult<IPlayback>(Playback);
         }

@@ -34,6 +34,8 @@ import org.screencopy.receiver.protocol.ReceiverOrientation
 import org.screencopy.receiver.ui.ReceiverScreenEvent
 import org.screencopy.receiver.ui.SessionOrientation
 import org.screencopy.receiver.ui.VideoPresentation
+import org.screencopy.receiver.ui.PlaybackStatisticsOverlay
+import org.screencopy.receiver.ui.PlaybackStatisticsDetails
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
@@ -55,6 +57,20 @@ class MainActivity : Activity(), TextureView.SurfaceTextureListener {
     private lateinit var home: HomeView
     private lateinit var videoBox: FrameLayout
     private lateinit var texture: TextureView
+    private lateinit var playbackStatistics: PlaybackStatisticsOverlay
+    private var statisticsDetails: PlaybackStatisticsDetails? = null
+    private var statisticsDialog: AlertDialog? = null
+    private val statisticsRefresh = object : Runnable {
+        override fun run() {
+            val visible = foreground && resumed && playing && listenerRun?.server?.playbackStatisticsRequested == true
+            listenerRun?.server?.showPlaybackStatistics(visible)
+            val snapshot = if (visible) listenerRun?.server?.playbackStatistics else null
+            playbackStatistics.show(snapshot, videoBox.width, videoBox.height)
+            statisticsDetails?.show(snapshot, videoBox.width, videoBox.height)
+            videoBox.isLongClickable = visible
+            if (visible) main.postDelayed(this, 1000)
+        }
+    }
     private lateinit var settings: Settings
     private var discovery: Discovery? = null
     private var discoveryAttempted = false
@@ -110,6 +126,13 @@ class MainActivity : Activity(), TextureView.SurfaceTextureListener {
         videoBox = FrameLayout(this).apply { setBackgroundColor(Color.BLACK) }
         texture = TextureView(this)
         videoBox.addView(texture, FrameLayout.LayoutParams(-1, -1, Gravity.CENTER))
+        videoBox.setOnLongClickListener {
+            if (playing && listenerRun?.server?.playbackStatisticsRequested == true) {
+                showPlaybackDiagnostics()
+                true
+            } else false
+        }
+        videoBox.isLongClickable = false
         texture.surfaceTextureListener = this
         videoBox.addOnLayoutChangeListener { _, _, _, _, _, _, _, _, _ -> fitVideo() }
         root.addView(videoBox, FrameLayout.LayoutParams(-1, -1))
@@ -120,6 +143,8 @@ class MainActivity : Activity(), TextureView.SurfaceTextureListener {
         }
         home.onLocalNetworkPermission = ::requestLocalNetworkPermission
         root.addView(home, FrameLayout.LayoutParams(-1, -1))
+        playbackStatistics = PlaybackStatisticsOverlay(this)
+        root.addView(playbackStatistics, FrameLayout.LayoutParams(-1, -2, Gravity.TOP or Gravity.START))
         setContentView(root)
         root.setOnApplyWindowInsetsListener { view, insets ->
             val bars = insets.getInsets(WindowInsets.Type.systemBars() or WindowInsets.Type.displayCutout())
@@ -259,7 +284,7 @@ class MainActivity : Activity(), TextureView.SurfaceTextureListener {
                             fitVideo()
                             showPlayer()
                         }
-                    } })
+                    } }, supportsPlaybackStatistics = true)
                 checkNotNull(run.server).start()
                 run.port = checkNotNull(run.server).listeningPort
                 self.remember(checkNotNull(run.server).addresses(), checkNotNull(run.server).listeningPort)
@@ -298,6 +323,7 @@ class MainActivity : Activity(), TextureView.SurfaceTextureListener {
                 detail = getString(R.string.flow_connecting)
                 dialog?.dismiss(); dialog = null
                 settingsDialog?.dismiss(); settingsDialog = null
+                closePlaybackDiagnostics()
             }
             ReceiverScreenEvent.CleanupFinished -> {
                 hidePlayer()
@@ -352,7 +378,7 @@ class MainActivity : Activity(), TextureView.SurfaceTextureListener {
             check(foreground && CastState.roles.role() == null) { getString(R.string.flow_busy) }
             check(!self.contains(target)) { getString(R.string.flow_self_target) }
             val resolved = ProjectionInventory.validate(this, settings, true)
-            val request = CastState.requests.reserve(resolved.request().toString(), target)
+            val request = CastState.requests.reserve(resolved.saved().toString(), target)
             pendingRequestId = request.id
             CastState.message = getString(R.string.flow_waiting_consent)
             CastState.failure = null
@@ -504,8 +530,36 @@ class MainActivity : Activity(), TextureView.SurfaceTextureListener {
     private fun showSettings() {
         if (CastState.roles.role() != null) return
         try {
-            settingsDialog = SharingSettings.show(this, settings, { saved -> settings = saved; render() }, ::showNotices)
+            settingsDialog = SharingSettings.show(this, settings, { saved -> settings = saved; render() }, ::showNotices,
+                ::showPlaybackDiagnostics)
         } catch (error: Exception) { showError(error) }
+    }
+
+    private fun showPlaybackDiagnostics() {
+        if (statisticsDialog?.isShowing == true) return
+        val content = PlaybackStatisticsDetails(this)
+        val prompt = AlertDialog.Builder(this).setTitle(R.string.rc_playback_diagnostics).setView(content)
+            .setPositiveButton(android.R.string.ok, null).create()
+        statisticsDialog = prompt
+        statisticsDetails = content
+        prompt.setOnDismissListener {
+            content.show(null, 0, 0)
+            if (statisticsDialog === prompt) { statisticsDialog = null; statisticsDetails = null }
+        }
+        if (window.attributes.flags and WindowManager.LayoutParams.FLAG_SECURE != 0)
+            prompt.window?.addFlags(WindowManager.LayoutParams.FLAG_SECURE)
+        prompt.show()
+        prompt.window?.setLayout(-1, -1)
+        content.post {
+            if (statisticsDialog === prompt && resumed)
+                content.show(if (playing) listenerRun?.server?.playbackStatistics else null, videoBox.width, videoBox.height)
+        }
+    }
+
+    private fun closePlaybackDiagnostics() {
+        statisticsDialog?.dismiss()
+        statisticsDialog = null
+        statisticsDetails = null
     }
 
     private fun showHelp() {
@@ -581,6 +635,8 @@ class MainActivity : Activity(), TextureView.SurfaceTextureListener {
     private fun showPlayer() {
         if (playing) return
         playing = true
+        main.removeCallbacks(statisticsRefresh)
+        main.post(statisticsRefresh)
         home.visibility = View.GONE
         window.insetsController?.hide(WindowInsets.Type.systemBars())
         window.insetsController?.systemBarsBehavior =
@@ -590,6 +646,11 @@ class MainActivity : Activity(), TextureView.SurfaceTextureListener {
     private fun hidePlayer() {
         playing = false
         hasPresentation = false
+        main.removeCallbacks(statisticsRefresh)
+        videoBox.isLongClickable = false
+        closePlaybackDiagnostics()
+        if (::playbackStatistics.isInitialized) playbackStatistics.show(null, 0, 0)
+        listenerRun?.server?.showPlaybackStatistics(false)
         if (::home.isInitialized) home.visibility = View.VISIBLE
         restoreOrientation()
         window.insetsController?.show(WindowInsets.Type.systemBars())
@@ -603,6 +664,8 @@ class MainActivity : Activity(), TextureView.SurfaceTextureListener {
     override fun onResume() {
         super.onResume()
         resumed = true
+        main.removeCallbacks(statisticsRefresh)
+        if (playing) main.post(statisticsRefresh)
         if (muteRecoveryPending) {
             muteRecoveryPending = false
             try { PlaybackMute.create(this).restore() } catch (error: Exception) { showError(error) }
@@ -618,6 +681,11 @@ class MainActivity : Activity(), TextureView.SurfaceTextureListener {
 
     override fun onPause() {
         resumed = false
+        main.removeCallbacks(statisticsRefresh)
+        listenerRun?.server?.showPlaybackStatistics(false)
+        playbackStatistics.show(null, 0, 0)
+        videoBox.isLongClickable = false
+        closePlaybackDiagnostics()
         updateDialog?.dismiss()
         updateDialog = null
         super.onPause()
@@ -632,7 +700,7 @@ class MainActivity : Activity(), TextureView.SurfaceTextureListener {
         }
         if (!resumed || !windowFocused || isFinishing || isDestroyed ||
             updateCheck.handled || updateDialog?.isShowing == true ||
-            dialog?.isShowing == true || settingsDialog?.isShowing == true) return
+            dialog?.isShowing == true || settingsDialog?.isShowing == true || statisticsDialog?.isShowing == true) return
         val update = updateCheck.available ?: return
         val prompt = AlertDialog.Builder(this).setTitle(R.string.rc_update_title)
             .setMessage(getString(R.string.rc_update_message, update.version))
@@ -675,6 +743,7 @@ class MainActivity : Activity(), TextureView.SurfaceTextureListener {
         main.removeCallbacks(refresh)
         dialog?.dismiss(); dialog = null
         settingsDialog?.dismiss(); settingsDialog = null
+        closePlaybackDiagnostics()
         closeDiscovery()
         retireListener()
         window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
@@ -690,6 +759,7 @@ class MainActivity : Activity(), TextureView.SurfaceTextureListener {
     }
 
     override fun onDestroy() {
+        closePlaybackDiagnostics()
         if (::updateCheck.isInitialized) {
             updateCheck.detach()
             if (!isChangingConfigurations) updateCheck.close()

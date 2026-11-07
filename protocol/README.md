@@ -4,6 +4,109 @@ Authority: current RedrainCast Windows `ScrcpySend.Core/SenderSession.cs`,
 `ScrcpyReceive.Core/ReceiverServer.cs`, `Protocol.cs`, and `Discovery.cs`.
 The sibling checkout is not modified by the Android build or protocol probe.
 
+## Optional receiver playback statistics
+
+This additive v3 extension matches Windows `ReceiverOptions.cs`; it does not
+change framing, flags, mandatory settings or the three TCP connections.
+Sender HELLO may offer
+`"receiverOptions":{"version":1,"supported":["playbackStats"]}`.
+An implementing receiver acknowledges only the intersection of offered and
+actually implemented names with the same shape. An empty intersection omits
+the entire member; old senders receive no acknowledgement.
+
+Only a checked sender preference and a mutual acknowledgement produce
+`"receiverOptions":{"version":1,"playbackStats":true}` in SESSION_REQUEST.
+Otherwise the whole member is omitted. A requested but unavailable option
+produces a bounded nonfatal sender notice retained with Streaming. The saved
+`ShowPlaybackStatistics` Boolean defaults false and is not implicitly serialized
+by Settings.request(). Selection is immutable per session, including native
+reconfiguration, and never enables a future session.
+
+Version is an exact positive signed-int32 JSON integer token (not `1.0`, `1e0`,
+a string, zero, negative or overflow). Supported is a required array in capability
+envelopes, with at most 16 distinct strings of 1..64 non-control characters.
+Envelopes are at most 2048 original UTF-8 bytes and 16 distinct members, whose
+names are also 1..64 non-control characters. Duplicate envelopes/members/names
+are protocol errors. Known selection fields require actual JSON Booleans even
+when unnegotiated or on a future revision. Unknown bounded names/members are
+ignored; unknown positive revisions negotiate none and preserve legacy casting.
+Raw strict parsing preserves duplicate, number-token and whitespace byte bounds.
+The portable raw fixture is `fixtures/receiver-options.json`.
+
+The Android display reads immutable typed caches at 1 Hz, not diagnostic strings
+or UI-thread native queries. Actual presented counts/PTS come from MediaCodec's
+frame-rendered callback; scheduled releases are labeled separately. Audio source
+PTS maps actual played source content through compensation/filter delay and
+silence, not the device frame count. Sync is signed last rendered video PTS minus
+played source-audio PTS, positive for video ahead, not end-to-end latency.
+Each PTS carries its original monotonic observation time: MediaCodec's rendered
+event timestamp for video, and the existing source-clock observation timestamp
+for audio (not its later statistics-publication time). Compare only pairs within
+10 ms, both no older than 250 ms; unknown, stale, future or noncomparable pairs
+yield N/A without entering the peak. No source-clock extrapolation or new native
+query is introduced. A valid comparison has up to 10 ms observation separation.
+First rates, unknown metrics and disabled audio are N/A; a later idle delta can
+legitimately be zero. Encoded queue bounds are not decoded PCM/native padding.
+Recent renderer skipped percentage is skipped / (actual presented + skipped);
+an empty or unavailable denominator is N/A, not receive-minus-decode loss.
+Encoded waiting queues exclude packets already dequeued into codec work.
+The connection table's Last activity is cached monotonic age since the last
+fully received valid video/audio packet, or the last valid control message.
+It is N/A before a packet arrives and does not reuse oldest queue admission age.
+Media RTT and control Queued/Span are not applicable (an em dash), not zero.
+RTT uses only a matching locally generated heartbeat nonce and monotonic send
+time; peer PING is not an RTT sample and no new probes are generated.
+Session, generation, epoch, counter regression, recovery and hidden/background
+transitions reset rolling baselines. Stop, failure and retirement clear the view.
+Default-off and hidden sessions do not run a recurring statistics UI timer.
+The top-left translucent overlay takes no focus/touch and uses 16sp normal or
+10sp dense diagnostic text, still honoring Android font scaling. This replaces
+the earlier 14sp minimum with the user's requested smaller-font presentation.
+No network, codec, quality, buffer or audio-rate limit changes.
+The full aligned layout uses four equal KPI cells, generation totals, actual
+label/value grids and a five-column connection table. A phone-sized viewport
+retains every metric with shorter labels, content-measured label widths and
+explicitly shared millisecond units in connection headers. Values and units
+are not removed; the full shared model remains available independently of these
+display abbreviations. Landscape phone mode is bounded to 65% viewport width.
+The complete layout remains available in a separate scrollable Full playback
+diagnostics view through Advanced settings or a long press on receiving video.
+The overlay itself still intercepts no input; the existing video owns the
+explicit long-press action. No wire option or remote command is added.
+Native tests require the full phone panel to cover less than half the actual
+reported Galaxy viewport at 115% font scale, in both orientations, with no
+clipped inner text, no ellipsis and no wrapping of short field labels.
+Full diagnostics can scroll instead of clipping lower metrics. It keeps
+receiver-canvas pixels distinct from its own dialog width, clears on
+background/Stop, and does not create a second sampling timer or native query.
+No string-space padding or automatic font shrinking is used.
+
+The display-only golden manifest `fixtures/playback-statistics-display.json`
+defines common field IDs, labels, order, units and null semantics. It is not a
+wire extension or a shared runtime dependency. Native readings are not expected
+to have equal numerical values across platforms.
+This manifest records the agreed comparison target; it does not assert that a
+Windows UI build containing that layout has been deployed. The protocol is
+unchanged and no new Windows build is required to validate these Android-only
+display changes.
+
+| Item | Aligned meaning | Honest platform difference |
+|---|---|---|
+| Presented FPS / Presented | Source-picture presentation progress, separate from decoded/scheduled | Android counts MediaCodec frame-rendered callbacks. Windows counts successful presentation API calls, not physical scanout. |
+| Queued / Span | Waiting encoded packets only, excluding dequeued/in-flight codec work | Platform admission byte/count/span bounds remain unchanged and need not be equal. Windows' existing diagnostic Snapshot may still include in-flight work; the aligned overlay needs its waiting-only view. |
+| Last activity | Age since last received media packet / valid control message | Not oldest queued-packet age, source freshness or a health verdict. |
+| A/V skew | Last presented source video PTS minus actually played source audio PTS | Android's played-source position is read from existing typed clock observations; no extra native output query. |
+| Peak observed skew | Absolute maximum of the overlay's 1 Hz samples since its baseline | Not a render-thread/per-frame maximum. Any higher-frequency Windows diagnostic peak remains a separate measurement. |
+| Playback epoch | Equivalent native playback-instance lifetime, if available | Android reports N/A; audio epoch is not renamed as a full playback epoch. |
+| Occluded | Cached platform occlusion status, if available | Android reports N/A, not false. |
+| Android details | Scheduled frames, Audio epoch, Device played | Device played includes silence and is not source content time. These supplemental fields do not fabricate Windows equivalents. |
+
+Common video codec labels are H.264, H.265 (HEVC), AV1; audio labels are PCM,
+Opus, AAC, Off. Network loss remains N/A until measured. Recent silence/discard
+values are sample-frame-derived milliseconds; renderer Skipped is not loss.
+There is one visible Peak observed skew, labeled "sampled 1 Hz"; the latest
+pair of samples is not presented as a true interval maximum.
+
 ## Connections and lifecycle
 
 UDP 27183 advertisements are JSON objects with `protocol:"screencopy"`,

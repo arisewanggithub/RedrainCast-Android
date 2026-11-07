@@ -10,6 +10,8 @@ import java.nio.ByteBuffer
 internal data class VideoOutput(val index: Int, val ptsUs: Long, val size: Int, val flags: Int)
 
 internal interface VideoDecoder : AutoCloseable {
+    val supportsRenderedStatistics: Boolean get() = false
+    fun renderedStatistics(listener: (Long, Long) -> Unit) {}
     val description: String
     fun dequeueInput(): Int
     fun input(index: Int): ByteBuffer?
@@ -23,6 +25,9 @@ internal class VideoCodecFailure(
 ) : IllegalStateException("Video codec operation failed", cause)
 
 internal class AndroidVideoDecoder(format: VideoFormat, surface: Surface, onPresented: () -> Unit) : VideoDecoder {
+    override val supportsRenderedStatistics = true
+    @Volatile private var statisticsListener: ((Long, Long) -> Unit)? = null
+    override fun renderedStatistics(listener: (Long, Long) -> Unit) { statisticsListener = listener }
     private val decoder: MediaCodec
     private val info = MediaCodec.BufferInfo()
     override val description: String
@@ -41,7 +46,10 @@ internal class AndroidVideoDecoder(format: VideoFormat, surface: Surface, onPres
             opened = created
             stage = VideoStage.CONFIGURE
             codecCall { created.configure(mediaFormat, surface, null, 0) }
-            codecCall { created.setOnFrameRenderedListener({ _, _, _ -> onPresented() }, Handler(Looper.getMainLooper())) }
+            codecCall { created.setOnFrameRenderedListener({ _, pts, renderedAtNs ->
+                statisticsListener?.invoke(pts, renderedAtNs)
+                onPresented()
+            }, Handler(Looper.getMainLooper())) }
             stage = VideoStage.START
             codecCall { created.start() }
             val software = codecCall { isSoftwareDecoder(created.codecInfo) }
