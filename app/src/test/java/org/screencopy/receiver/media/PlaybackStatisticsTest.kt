@@ -130,7 +130,8 @@ class PlaybackStatisticsTest {
         val model = PlaybackStatisticsText.display(PlaybackStatisticsSampler().sample(1000, input()), 1080, 1920)
         assertEquals(fixture.getString("header"), model.header)
         for ((group, fields) in listOf("kpis" to model.kpis, "totals" to model.totals,
-            "video" to model.video, "audio" to model.audio, "footer" to model.footer)) {
+            "video" to model.video, "audio" to model.audio, "footer" to model.footer,
+            "diagnostics" to model.diagnostics)) {
             val expected = fixture.getJSONArray(group)
             assertEquals(expected.length(), fields.size)
             fields.forEachIndexed { index, field ->
@@ -151,6 +152,29 @@ class PlaybackStatisticsTest {
             val display = PlaybackStatisticsText.display(PlaybackStatisticsSampler().sample(1000, input().copy(audioCodec = raw)), 1, 1)
             assertEquals(label, display.audio.first().value)
         }
+    }
+
+    @Test fun renderTargetAndDisplayOutputNeverBorrowEncodedOrAppViewDimensions() {
+        val snapshot = PlaybackStatisticsSampler().sample(1000, input().copy(encodedWidth = 2496, encodedHeight = 1664))
+        val unknown = PlaybackStatisticsText.display(snapshot, 1920, 1080)
+        assertTrue(unknown.video.none { it.id == "renderTarget" })
+        assertEquals("N/A", unknown.diagnostics.first { it.id == "renderTarget" }.value)
+        assertEquals("N/A", unknown.video.first { it.id == "displayOutput" }.value)
+        assertTrue(unknown.video.none { it.id == "receiverCanvas" })
+        assertEquals("1920 × 1080 px", unknown.diagnostics.first { it.id == "receiverCanvas" }.value)
+        val active4k = PlaybackStatisticsText.display(snapshot, 1920, 1080,
+            PlaybackDisplayMeasurements(displayOutput = PixelDimensions(3840, 2160)))
+        assertEquals("3840 × 2160 px", active4k.video.first { it.id == "displayOutput" }.value)
+        assertTrue(active4k.video.none { it.id == "renderTarget" })
+        assertEquals("N/A", active4k.diagnostics.first { it.id == "renderTarget" }.value)
+        assertEquals("2496 × 1664", active4k.video.first { it.id == "encodedSize" }.value)
+        val measured = PlaybackStatisticsText.display(snapshot, 1920, 1080,
+            PlaybackDisplayMeasurements(renderTarget = PixelDimensions(2560, 1440),
+                displayOutput = PixelDimensions(3840, 2160)))
+        assertTrue(measured.video.none { it.id == "renderTarget" })
+        assertEquals("2560 × 1440 px", measured.diagnostics.first { it.id == "renderTarget" }.value)
+        assertEquals("3840 × 2160 px", measured.video.first { it.id == "displayOutput" }.value)
+        assertTrue(active4k.diagnostics.last().value.contains("not scanout proof"))
     }
 
     @Test fun lastPacketActivityNeverReusesQueueAdmissionAgeAndOnlyControlHasRtt() {

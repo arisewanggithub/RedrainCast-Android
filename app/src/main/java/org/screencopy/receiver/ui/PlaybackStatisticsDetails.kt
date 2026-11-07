@@ -7,6 +7,7 @@ import android.widget.ScrollView
 import android.widget.TextView
 import dev.redrain.cast.R
 import org.screencopy.receiver.media.PlaybackStatisticsSnapshot
+import org.screencopy.receiver.media.PlaybackDisplayMeasurements
 
 class PlaybackStatisticsDetails(context: Context) : ScrollView(context) {
     internal val panel = PlaybackStatisticsOverlay(context, detailed = true)
@@ -27,10 +28,11 @@ class PlaybackStatisticsDetails(context: Context) : ScrollView(context) {
         })
     }
 
-    fun show(snapshot: PlaybackStatisticsSnapshot?, canvasWidth: Int, canvasHeight: Int) {
+    fun show(snapshot: PlaybackStatisticsSnapshot?, canvasWidth: Int, canvasHeight: Int,
+        measurements: PlaybackDisplayMeasurements = PlaybackDisplayMeasurements()) {
         unavailable.visibility = if (snapshot == null) View.VISIBLE else View.GONE
         panel.show(snapshot, canvasWidth, canvasHeight,
             availableWidth = (width - paddingLeft - paddingRight).takeIf { it > 0 } ?: canvasWidth,
-            availableHeight = height.takeIf { it > 0 } ?: canvasHeight)
+            availableHeight = height.takeIf { it > 0 } ?: canvasHeight, measurements = measurements)
     }
 }

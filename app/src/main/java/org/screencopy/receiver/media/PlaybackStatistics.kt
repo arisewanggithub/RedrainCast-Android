@@ -96,11 +96,19 @@ class PlaybackStatisticsSampler {
 data class StatisticsField(val id: String, val label: String, val value: String)
 data class StatisticsConnection(val id: String, val channel: String, val queued: String,
     val span: String, val lastActivity: String, val rtt: String)
+data class PixelDimensions(val width: Int, val height: Int) {
+    init { require(width > 0 && height > 0) }
+    fun format() = "$width × $height px"
+}
+data class PlaybackDisplayMeasurements(
+    val renderTarget: PixelDimensions? = null,
+    val displayOutput: PixelDimensions? = null
+)
 data class PlaybackStatisticsDisplay(
     val header: String, val kpis: List<StatisticsField>, val totals: List<StatisticsField>,
     val video: List<StatisticsField>, val audio: List<StatisticsField>,
     val connections: List<StatisticsConnection>, val footer: List<StatisticsField>,
-    val details: List<StatisticsField>
+    val details: List<StatisticsField>, val diagnostics: List<StatisticsField> = emptyList()
 ) {
     val connectionHeaders = listOf("Channel", "Queued", "Span", "Last activity", "RTT")
     val notes = listOf("Silence/discard: total (+recent)", "Positive skew = video ahead",
@@ -125,7 +133,8 @@ object PlaybackStatisticsText {
         else -> value
     }
 
-    fun display(snapshot: PlaybackStatisticsSnapshot, canvasWidth: Int, canvasHeight: Int): PlaybackStatisticsDisplay {
+    fun display(snapshot: PlaybackStatisticsSnapshot, canvasWidth: Int, canvasHeight: Int,
+        measurements: PlaybackDisplayMeasurements = PlaybackDisplayMeasurements()): PlaybackStatisticsDisplay {
         val s = snapshot.input
         val video = s.video
         val audio = s.audio
@@ -153,8 +162,7 @@ object PlaybackStatisticsText {
                 field("encodedSize", "Encoded size", if (s.encodedWidth != null && s.encodedHeight != null)
                     "${s.encodedWidth} × ${s.encodedHeight}" else "N/A"),
                 field("captureLimit", "Capture limit", "${s.requestedFps} FPS"),
-                field("receiverCanvas", "Receiver canvas", if (canvasWidth > 0 && canvasHeight > 0)
-                    "$canvasWidth × $canvasHeight px" else "N/A"),
+                field("displayOutput", "Display mode", measurements.displayOutput?.format() ?: "N/A"),
                 field("rotation", "Rotation", "${s.rotation}° · $orientation"),
                 field("videoBitrate", "Video bitrate", number(snapshot.videoMbps, " Mbps")),
                 field("configuredBitrate", "Configured bitrate",
@@ -178,17 +186,27 @@ object PlaybackStatisticsText {
                 field("occluded", "Occluded", s.occluded?.let { if (it) "Yes" else "No" } ?: "N/A")),
             listOf(field("scheduledFrames", "Scheduled frames", total(video?.scheduled)),
                 field("audioEpoch", "Audio epoch", s.audioEpoch.takeIf { it > 0 }?.toString() ?: "N/A"),
-                field("devicePlayed", "Device played", number(audio?.devicePlayedMs, " ms"))))
+                field("devicePlayed", "Device played", number(audio?.devicePlayedMs, " ms"))),
+            listOf(
+                field("receiverCanvas", "App view size", if (canvasWidth > 0 && canvasHeight > 0)
+                    "$canvasWidth × $canvasHeight px" else "N/A"),
+                field("renderTarget", "Render target", measurements.renderTarget?.format() ?: "N/A"),
+                field("renderTargetMeasurement", "Render target measurement",
+                    if (measurements.renderTarget == null) "Unavailable; view size is not a buffer measurement" else "Measured compositor target"),
+                field("displayOutputMeasurement", "Display mode source",
+                    if (measurements.displayOutput == null) "Unavailable" else "Android active display mode; not scanout proof")))
     }
 
-    fun format(snapshot: PlaybackStatisticsSnapshot, canvasWidth: Int, canvasHeight: Int): String {
-        val model = display(snapshot, canvasWidth, canvasHeight)
+    fun format(snapshot: PlaybackStatisticsSnapshot, canvasWidth: Int, canvasHeight: Int,
+        measurements: PlaybackDisplayMeasurements = PlaybackDisplayMeasurements()): String {
+        val model = display(snapshot, canvasWidth, canvasHeight, measurements)
         fun fields(values: List<StatisticsField>) = values.joinToString("\n") { "${it.label}: ${it.value}" }
         return listOf(model.header, fields(model.kpis), model.totalsCaption, fields(model.totals),
             "VIDEO STREAM", fields(model.video), "AUDIO & SYNC", fields(model.audio),
             model.peakCaption, model.notes.joinToString("\n"), "CONNECTIONS & QUEUES",
             model.connectionHeaders.joinToString(" | "), model.connections.joinToString("\n") {
                 "${it.channel} | ${it.queued} | ${it.span} | ${it.lastActivity} | ${it.rtt}"
-            }, model.queueCaption, fields(model.footer), "Android details", fields(model.details)).joinToString("\n")
+            }, model.queueCaption, fields(model.footer), "Android details", fields(model.details),
+            "Display diagnostics", fields(model.diagnostics)).joinToString("\n")
     }
 }

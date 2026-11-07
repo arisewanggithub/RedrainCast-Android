@@ -39,6 +39,41 @@ class MainActivityTest {
     @Before fun disableRealUpdateRequests() { MainActivity.updateFactory = ::noUpdateCheck }
     @After fun restoreUpdateFactory() { MainActivity.updateFactory = previousUpdateFactory }
 
+    @Test fun activeDisplayModeIsCachedSeparatelyAndObserverRetiresOnBackground() {
+        val controller = Robolectric.buildActivity(MainActivity::class.java).setup()
+        val activity = controller.get()
+        val manager = activity.getSystemService(android.hardware.display.DisplayManager::class.java)
+        val display = manager.getDisplay(android.view.Display.DEFAULT_DISPLAY)
+        val originalMode = display.mode
+        try {
+            val mode4k = org.robolectric.util.ReflectionHelpers.callConstructor(android.view.Display.Mode::class.java,
+                org.robolectric.util.ReflectionHelpers.ClassParameter.from(Int::class.javaPrimitiveType, originalMode.modeId),
+                org.robolectric.util.ReflectionHelpers.ClassParameter.from(Int::class.javaPrimitiveType, 3840),
+                org.robolectric.util.ReflectionHelpers.ClassParameter.from(Int::class.javaPrimitiveType, 2160),
+                org.robolectric.util.ReflectionHelpers.ClassParameter.from(Float::class.javaPrimitiveType, 60f))
+            org.robolectric.shadows.ShadowDisplayManager.setSupportedModes(display.displayId, mode4k)
+            shadowOf(Looper.getMainLooper()).idle()
+            activity.onWindowFocusChanged(true)
+            val observed = org.robolectric.util.ReflectionHelpers.getField<org.screencopy.receiver.media.PixelDimensions?>(
+                activity, "displayOutput")
+            assertEquals(org.screencopy.receiver.media.PixelDimensions(3840, 2160), observed)
+            assertTrue(org.robolectric.util.ReflectionHelpers.getField<Boolean>(activity, "observingDisplay"))
+            controller.pause().stop()
+            assertNull(org.robolectric.util.ReflectionHelpers.getField<org.screencopy.receiver.media.PixelDimensions?>(
+                activity, "displayOutput"))
+            assertFalse(org.robolectric.util.ReflectionHelpers.getField<Boolean>(activity, "observingDisplay"))
+            val listener = org.robolectric.util.ReflectionHelpers.getField<android.hardware.display.DisplayManager.DisplayListener>(
+                activity, "displayChanges")
+            listener.onDisplayChanged(display.displayId)
+            assertNull("A queued callback must not republish mode metadata after Stop",
+                org.robolectric.util.ReflectionHelpers.getField<org.screencopy.receiver.media.PixelDimensions?>(activity, "displayOutput"))
+        } finally {
+            org.robolectric.shadows.ShadowDisplayManager.setSupportedModes(display.displayId, originalMode)
+            controller.destroy()
+        }
+        await { activity.resourcesRetired }
+    }
+
     @Test fun connectingRetiresIdleDiagnosticsBeforeAnySessionSelectionOrPlayback() {
         val controller = Robolectric.buildActivity(MainActivity::class.java).setup()
         val activity = controller.get()

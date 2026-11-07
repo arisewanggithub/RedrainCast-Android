@@ -108,7 +108,7 @@ class PlaybackStatisticsOverlayTest {
                 assertTrue("Panel clipped at ${widthDp}x$heightDp: ${overlay.height}>$height", overlay.height <= height)
                 assertTrue("Panel should remain top-left and width-bounded", overlay.width <= minOf(width, (1100 * density).toInt()))
                 for (text in textViews) {
-                    val expectedSp = if (minOf(widthDp, heightDp) < 600) 12f else 16f
+                    val expectedSp = if (minOf(widthDp, heightDp) < 600) 10f else 16f
                     assertEquals(expectedSp * activity.resources.displayMetrics.scaledDensity, text.textSize, 0.1f)
                     assertFalse(text.isFocusable)
                     assertFalse(text.isClickable)
@@ -134,6 +134,7 @@ class PlaybackStatisticsOverlayTest {
                 val kpiViews = (0 until 4).map { kpiValues.getChildAt(it) }
                 assertTrue(kpiViews.maxOf { it.width } - kpiViews.minOf { it.width } <= 1)
                 assertTrue(kpiViews.maxOf { it.top } - kpiViews.minOf { it.top } <= 1)
+                assertFooterAligned(overlay)
             }
         } finally { controller.pause().stop().destroy() }
     }
@@ -154,7 +155,7 @@ class PlaybackStatisticsOverlayTest {
             for ((width, height) in listOf(2236 to 1080, 1080 to 2236)) {
                 overlay.show(snapshot().copy(input = snapshot().input.copy(encodedWidth = 2496, encodedHeight = 1664,
                     video = VideoStatistics(12345678, 12345670, 125, 12345553, 1_234_000))),
-                    width, height)
+                    width, height, measurements = PlaybackDisplayMeasurements(displayOutput = PixelDimensions(3840, 2160)))
                 shadowOf(Looper.getMainLooper()).idle()
                 parent.measure(View.MeasureSpec.makeMeasureSpec(width, View.MeasureSpec.EXACTLY),
                     View.MeasureSpec.makeMeasureSpec(height, View.MeasureSpec.EXACTLY))
@@ -175,6 +176,12 @@ class PlaybackStatisticsOverlayTest {
                 assertTrue(overlay.text.contains("Inserted silence"))
                 assertTrue(overlay.text.contains("Device played"))
                 assertTrue(overlay.text.contains("Occluded: N/A"))
+                assertFalse(overlay.text.contains("Render target"))
+                assertNull(overlay.findViewWithTag<View>("value:renderTarget"))
+                assertTrue(overlay.text.contains("Display mode: 3840 × 2160 px"))
+                assertEquals("Display px", overlay.findViewWithTag<TextView>("label:displayOutput").text.toString())
+                assertFalse(overlay.text.contains("App view size"))
+                assertFooterAligned(overlay)
                 assertTrue("Phone panel must leave part of the player uncovered: panel=${overlay.width}x${overlay.height}, canvas=${width}x$height",
                     overlay.width.toLong() * overlay.height < width.toLong() * height * 0.50)
                 assertTrue(overlay.width <= (width * if (width > height) 0.65f else 0.9f).toInt())
@@ -216,8 +223,10 @@ class PlaybackStatisticsOverlayTest {
                 parent.layout(0, 0, width, height)
                 assertTrue(details.panel.text.contains("Configured bitrate"))
                 assertTrue(details.panel.text.contains("Network loss"))
+                assertTrue(details.panel.text.contains("Render target: N/A"))
+                assertEquals("N/A", details.panel.findViewWithTag<TextView>("value:renderTarget").text.toString())
                 assertEquals("$width × $height px",
-                    details.panel.display!!.video.first { it.id == "receiverCanvas" }.value)
+                    details.panel.display!!.diagnostics.first { it.id == "receiverCanvas" }.value)
                 val totalsGrid = details.panel.findViewWithTag<ViewGroup>("statisticsTotals")
                 val labels = totalsGrid.getChildAt(0) as ViewGroup
                 val values = totalsGrid.getChildAt(1) as ViewGroup
@@ -266,5 +275,34 @@ class PlaybackStatisticsOverlayTest {
         assertEquals(View.GONE, overlay.visibility)
         assertEquals("", overlay.text)
         controller.pause().stop().destroy()
+    }
+
+    private fun assertFooterAligned(overlay: PlaybackStatisticsOverlay) {
+        for ((key, expected) in listOf(
+            "statisticsFooter" to listOf("State", "Generation", "Playback epoch", "Occluded"),
+            "statisticsPlatformDetails" to listOf("Scheduled frames", "Audio epoch", "Device played"))) {
+            val grid = overlay.findViewWithTag<ViewGroup>(key)
+            val labels = grid.getChildAt(0) as ViewGroup
+            val values = grid.getChildAt(1) as ViewGroup
+            assertEquals(expected.size, labels.childCount)
+            assertEquals(expected.size, values.childCount)
+            assertTrue(values.top >= labels.bottom)
+            val widths = (0 until values.childCount).map { values.getChildAt(it).width }
+            assertTrue(widths.maxOrNull()!! - widths.minOrNull()!! <= 1)
+            for (index in expected.indices) {
+                val label = labels.getChildAt(index) as TextView
+                val value = values.getChildAt(index) as TextView
+                val compact = label.textSize <= 12f * label.resources.displayMetrics.scaledDensity
+                val caption = if (compact && expected[index] == "Playback epoch") "Play epoch" else expected[index]
+                assertEquals(caption, label.text.toString())
+                assertEquals(expected[index], label.contentDescription.toString())
+                assertEquals("Values need the same column origin as their title", label.left, value.left)
+                assertEquals(label.width, value.width)
+                assertEquals(Gravity.START or Gravity.CENTER_VERTICAL, value.gravity)
+                assertEquals(label.compoundPaddingLeft + label.layout.getLineLeft(0),
+                    value.compoundPaddingLeft + value.layout.getLineLeft(0), 0.1f)
+            }
+        }
+        assertEquals("Playing", overlay.findViewWithTag<TextView>("value:state").text.toString())
     }
 }

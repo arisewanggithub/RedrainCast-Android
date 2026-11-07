@@ -8,6 +8,7 @@ import android.content.pm.PackageManager
 import android.content.res.Configuration
 import android.graphics.Color
 import android.graphics.SurfaceTexture
+import android.hardware.display.DisplayManager
 import android.media.projection.MediaProjectionManager
 import android.os.Bundle
 import android.os.Handler
@@ -29,6 +30,8 @@ import dev.screencopy.sender.ReceiverTarget
 import dev.screencopy.sender.Settings
 import org.screencopy.receiver.lifecycle.ResourceSlot
 import org.screencopy.receiver.media.VideoPlayer
+import org.screencopy.receiver.media.PixelDimensions
+import org.screencopy.receiver.media.PlaybackDisplayMeasurements
 import org.screencopy.receiver.net.ReceiverServer
 import org.screencopy.receiver.protocol.ReceiverOrientation
 import org.screencopy.receiver.ui.ReceiverScreenEvent
@@ -60,13 +63,21 @@ class MainActivity : Activity(), TextureView.SurfaceTextureListener {
     private lateinit var playbackStatistics: PlaybackStatisticsOverlay
     private var statisticsDetails: PlaybackStatisticsDetails? = null
     private var statisticsDialog: AlertDialog? = null
+    private var displayOutput: PixelDimensions? = null
+    private var observingDisplay = false
+    private val displayChanges = object : DisplayManager.DisplayListener {
+        override fun onDisplayAdded(displayId: Int) = updateDisplayOutput()
+        override fun onDisplayRemoved(displayId: Int) = updateDisplayOutput()
+        override fun onDisplayChanged(displayId: Int) = updateDisplayOutput()
+    }
     private val statisticsRefresh = object : Runnable {
         override fun run() {
             val visible = foreground && resumed && playing && listenerRun?.server?.playbackStatisticsRequested == true
             listenerRun?.server?.showPlaybackStatistics(visible)
             val snapshot = if (visible) listenerRun?.server?.playbackStatistics else null
-            playbackStatistics.show(snapshot, videoBox.width, videoBox.height)
-            statisticsDetails?.show(snapshot, videoBox.width, videoBox.height)
+            val measurements = PlaybackDisplayMeasurements(displayOutput = displayOutput)
+            playbackStatistics.show(snapshot, videoBox.width, videoBox.height, measurements = measurements)
+            statisticsDetails?.show(snapshot, videoBox.width, videoBox.height, measurements)
             videoBox.isLongClickable = visible
             if (visible) main.postDelayed(this, 1000)
         }
@@ -160,6 +171,15 @@ class MainActivity : Activity(), TextureView.SurfaceTextureListener {
     }
 
     private fun dp(value: Int) = (value * resources.displayMetrics.density + 0.5f).toInt()
+
+    private fun updateDisplayOutput() {
+        if (!observingDisplay) { displayOutput = null; return }
+        val attached = window.decorView.display
+        displayOutput = if (attached?.isValid == true) {
+            val mode = attached.mode
+            PixelDimensions(mode.physicalWidth, mode.physicalHeight)
+        } else null
+    }
 
     private fun showError(error: Exception) {
         android.util.Log.e("RedrainCast", "Operation failed", error)
@@ -552,7 +572,8 @@ class MainActivity : Activity(), TextureView.SurfaceTextureListener {
         prompt.window?.setLayout(-1, -1)
         content.post {
             if (statisticsDialog === prompt && resumed)
-                content.show(if (playing) listenerRun?.server?.playbackStatistics else null, videoBox.width, videoBox.height)
+                content.show(if (playing) listenerRun?.server?.playbackStatistics else null, videoBox.width, videoBox.height,
+                    PlaybackDisplayMeasurements(displayOutput = displayOutput))
         }
     }
 
@@ -658,11 +679,13 @@ class MainActivity : Activity(), TextureView.SurfaceTextureListener {
 
     override fun onConfigurationChanged(config: Configuration) {
         super.onConfigurationChanged(config)
+        updateDisplayOutput()
         fitVideo()
     }
 
     override fun onResume() {
         super.onResume()
+        updateDisplayOutput()
         resumed = true
         main.removeCallbacks(statisticsRefresh)
         if (playing) main.post(statisticsRefresh)
@@ -676,7 +699,7 @@ class MainActivity : Activity(), TextureView.SurfaceTextureListener {
     override fun onWindowFocusChanged(hasFocus: Boolean) {
         super.onWindowFocusChanged(hasFocus)
         windowFocused = hasFocus
-        if (hasFocus) showUpdateIfIdle()
+        if (hasFocus) { updateDisplayOutput(); showUpdateIfIdle() }
     }
 
     override fun onPause() {
@@ -727,6 +750,11 @@ class MainActivity : Activity(), TextureView.SurfaceTextureListener {
 
     override fun onStart() {
         super.onStart()
+        if (!observingDisplay) {
+            getSystemService(DisplayManager::class.java).registerDisplayListener(displayChanges, main)
+            observingDisplay = true
+        }
+        updateDisplayOutput()
         foreground = true
         if (CastState.roles.role() == RoleOwner.Role.SEND) window.clearFlags(WindowManager.LayoutParams.FLAG_SECURE)
         else window.addFlags(WindowManager.LayoutParams.FLAG_SECURE)
@@ -740,6 +768,11 @@ class MainActivity : Activity(), TextureView.SurfaceTextureListener {
 
     override fun onStop() {
         foreground = false
+        if (observingDisplay) {
+            getSystemService(DisplayManager::class.java).unregisterDisplayListener(displayChanges)
+            observingDisplay = false
+        }
+        displayOutput = null
         main.removeCallbacks(refresh)
         dialog?.dismiss(); dialog = null
         settingsDialog?.dismiss(); settingsDialog = null

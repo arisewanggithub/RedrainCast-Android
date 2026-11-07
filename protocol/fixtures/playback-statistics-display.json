@@ -18,7 +18,7 @@
     {"id":"videoCodec","label":"Codec","unit":"text"},
     {"id":"encodedSize","label":"Encoded size","unit":"pixels"},
     {"id":"captureLimit","label":"Capture limit","unit":"requested frames/s"},
-    {"id":"receiverCanvas","label":"Receiver canvas","unit":"physical pixels"},
+    {"id":"displayOutput","label":"Display mode","unit":"Android active mode physical pixel dimensions or unavailable"},
     {"id":"rotation","label":"Rotation","unit":"degrees and requested orientation"},
     {"id":"videoBitrate","label":"Video bitrate","unit":"payload Mbps"},
     {"id":"configuredBitrate","label":"Configured bitrate","unit":"configured video Mbps"},
@@ -42,6 +42,12 @@
     {"id":"playbackEpoch","label":"Playback epoch","unit":"epoch or unavailable"},
     {"id":"occluded","label":"Occluded","unit":"boolean or unavailable"}
   ],
+  "diagnostics": [
+    {"id":"receiverCanvas","label":"App view size","unit":"app view pixels or unavailable"},
+    {"id":"renderTarget","label":"Render target","unit":"measured compositor pixels or unavailable"},
+    {"id":"renderTargetMeasurement","label":"Render target measurement","unit":"measurement availability explanation"},
+    {"id":"displayOutputMeasurement","label":"Display mode source","unit":"reported mode source qualification"}
+  ],
   "semantics": {
     "queues": "Encoded queues: waiting packets; excludes dequeued codec work.",
     "lastActivity": "Monotonic age since last fully received valid media packet; control uses last valid control message, not oldest queue age.",
@@ -53,6 +59,9 @@
     "windowsPresented": "Successful platform presentation submission; not actual scanout.",
     "androidPlaybackEpoch": "N/A; audio epoch is a separate Android detail.",
     "androidOccluded": "N/A; no DXGI-equivalent cached visibility signal.",
+    "renderTarget": "Full diagnostics only: a verified compositor/render-target measurement, never inferred from encoded size, app view bounds or display mode. Current TextureView path reports N/A.",
+    "displayOutput": "Android's reported active Display.Mode dimensions in its mode orientation; not optical projection resolution or proof of native scanout.",
+    "receiverCanvas": "App view coordinates, available only in full display diagnostics. Not physical video-buffer resolution.",
     "notes": ["Positive skew = video ahead","Source timestamps · not end-to-end latency"]
   }
 }

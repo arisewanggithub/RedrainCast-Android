@@ -81,6 +81,23 @@ receiver-canvas pixels distinct from its own dialog width, clears on
 background/Stop, and does not create a second sampling timer or native query.
 No string-space padding or automatic font shrinking is used.
 
+Display dimensions are diagnostic-only, with no wire fields or render-mode
+requests. The main video section includes Encoded size and Display mode
+(Display px in the compact panel).
+Render target is retained only in full display diagnostics and accepts only
+verified compositor-target dimensions; the current TextureView implementation
+has no such measurement and reports N/A. Neither STREAM_CONFIG size,
+TextureView/view bounds nor display mode is a
+valid fallback for that field. Display mode uses the attached display's
+active `Display.Mode.physicalWidth/physicalHeight`, cached on display/lifecycle
+events rather than queried by the statistics refresh. These are Android-reported
+mode dimensions in their mode orientation, not a native-imager/optical-resolution
+or scanout guarantee. Full display diagnostics retain App view size separately.
+Footer headers and values occupy the same four grid columns; values are
+start-aligned directly beneath State, Generation, Playback epoch and Occluded.
+The supplemental Scheduled frames / Audio epoch / Device played row uses the
+same stacked-grid mechanism with three equal columns and start-aligned values.
+
 The display-only golden manifest `fixtures/playback-statistics-display.json`
 defines common field IDs, labels, order, units and null semantics. It is not a
 wire extension or a shared runtime dependency. Native readings are not expected
@@ -99,7 +116,8 @@ display changes.
 | Peak observed skew | Absolute maximum of the overlay's 1 Hz samples since its baseline | Not a render-thread/per-frame maximum. Any higher-frequency Windows diagnostic peak remains a separate measurement. |
 | Playback epoch | Equivalent native playback-instance lifetime, if available | Android reports N/A; audio epoch is not renamed as a full playback epoch. |
 | Occluded | Cached platform occlusion status, if available | Android reports N/A, not false. |
-| Android details | Scheduled frames, Audio epoch, Device played | Device played includes silence and is not source content time. These supplemental fields do not fabricate Windows equivalents. |
+| Display mode / diagnostic Render target | Reported active mode dimensions / verified compositor buffer in full diagnostics only | TextureView target is N/A unless measured, not inferred from view size. Android mode dimensions do not establish optical projection resolution. |
+| Android details | Scheduled frames, Audio epoch, Device played, full display diagnostics | Device played includes silence and is not source content time. App view size is diagnostic-only, not rendered pixel resolution. |
 
 Common video codec labels are H.264, H.265 (HEVC), AV1; audio labels are PCM,
 Opus, AAC, Off. Network loss remains N/A until measured. Recent silence/discard

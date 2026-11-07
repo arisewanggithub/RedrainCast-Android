@@ -15,6 +15,7 @@ import org.screencopy.receiver.media.PlaybackStatisticsDisplay
 import org.screencopy.receiver.media.PlaybackStatisticsSnapshot
 import org.screencopy.receiver.media.PlaybackStatisticsText
 import org.screencopy.receiver.media.StatisticsField
+import org.screencopy.receiver.media.PlaybackDisplayMeasurements
 
 /** Display-only grid; every pointer remains owned by the underlying player. */
 class PlaybackStatisticsOverlay @JvmOverloads constructor(
@@ -28,7 +29,8 @@ class PlaybackStatisticsOverlay @JvmOverloads constructor(
         (listOf(model.header) + (model.kpis + model.totals + model.video + model.audio +
             model.footer + model.details).map { "${it.label}: ${it.value}" } +
             model.connections.map { "${it.channel}: ${it.queued}, ${it.span}, ${it.lastActivity}, ${it.rtt}" } +
-            model.notes + listOf(model.queueCaption, model.peakCaption, model.totalsCaption)).joinToString("\n")
+            model.notes + listOf(model.queueCaption, model.peakCaption, model.totalsCaption) +
+            if (detailed) model.diagnostics.map { "${it.label}: ${it.value}" } else emptyList()).joinToString("\n")
     }.orEmpty()
     val textSize: Float get() = values.values.firstOrNull()?.textSize ?: 0f
 
@@ -86,6 +88,8 @@ class PlaybackStatisticsOverlay @JvmOverloads constructor(
             "encodedSize" -> "Encoded"
             "captureLimit" -> "FPS limit"
             "receiverCanvas" -> "Canvas px"
+            "renderTarget" -> "Render px"
+            "displayOutput" -> "Display px"
             "configuredBitrate" -> "Set bitrate"
             "videoBitrate" -> "Bitrate"
             "networkLoss" -> "Loss"
@@ -131,6 +135,33 @@ class PlaybackStatisticsOverlay @JvmOverloads constructor(
         column.addView(label(title, size, bold = true))
         parent.addView(column, LayoutParams(0, -2, 1f))
         return column
+    }
+
+    private fun stackedFields(parent: LinearLayout, fields: List<StatisticsField>, size: Float, key: String) {
+        val grid = TableLayout(context).apply {
+            tag = key
+            isStretchAllColumns = true
+            isShrinkAllColumns = true
+        }
+        val labels = TableRow(context)
+        val numbers = TableRow(context)
+        fields.forEach { field ->
+            val caption = if (size <= 12f && field.id == "playbackEpoch") "Play epoch" else field.label
+            labels.addView(label(caption, size).apply {
+                tag = "label:${field.id}"
+                contentDescription = field.label
+            },
+                TableRow.LayoutParams(0, -2, 1f))
+            val value = label(field.value, size, numeric = true).apply {
+                tag = "value:${field.id}"
+                gravity = Gravity.START or Gravity.CENTER_VERTICAL
+            }
+            values[field.id] = value
+            numbers.addView(value, TableRow.LayoutParams(0, -2, 1f))
+        }
+        grid.addView(labels)
+        grid.addView(numbers)
+        parent.addView(grid, LayoutParams(-1, -2))
     }
 
     private fun connections(parent: LinearLayout, model: PlaybackStatisticsDisplay, size: Float) {
@@ -180,6 +211,7 @@ class PlaybackStatisticsOverlay @JvmOverloads constructor(
         when (field.id) {
             "encodedSize" -> field.value.replace(" × ", "×")
             "receiverCanvas" -> field.value.replace(" × ", "×").removeSuffix(" px")
+            "renderTarget", "displayOutput" -> field.value.replace(" × ", "×").removeSuffix(" px")
             "rotation" -> field.value.replace(" · ", "/")
             "pcmBufferTarget" -> field.value.replace(" / ", "/")
             "insertedSilence", "discardedPcm" -> field.value.replace(" (+", "(+").removeSuffix(" ms")
@@ -191,7 +223,19 @@ class PlaybackStatisticsOverlay @JvmOverloads constructor(
         values.clear()
         val compact = layoutMode != 0
         val size = if (compact) 10f else 16f
-        addView(label(model.header, size, bold = true).apply { tag = "statisticsHeader"; setTextColor(foregroundColor) })
+        val heading = label(model.header, size, bold = true).apply {
+            tag = "statisticsHeader"
+            setTextColor(foregroundColor)
+        }
+        if (compact) {
+            addView(LinearLayout(context).apply {
+                orientation = HORIZONTAL
+                addView(heading, LayoutParams(-2, -2))
+                addView(label("Generation totals · skips ≠ network loss", size).apply {
+                    gravity = Gravity.END or Gravity.CENTER_VERTICAL
+                }, LayoutParams(0, -2, 1f))
+            }, LayoutParams(-1, -2))
+        } else addView(heading)
         rule(this)
         val kpis = TableLayout(context).apply {
             tag = "statisticsKpis"
@@ -228,7 +272,7 @@ class PlaybackStatisticsOverlay @JvmOverloads constructor(
         totals.addView(totalLabels)
         totals.addView(totalValues)
         addView(totals, LayoutParams(-1, -2))
-        addView(label(if (compact) "Generation totals · skips ≠ network loss" else model.totalsCaption, size))
+        if (!compact) addView(label(model.totalsCaption, size))
         rule(this)
         val body = LinearLayout(context).apply { orientation = if (layoutMode == 1) VERTICAL else HORIZONTAL }
         fun bodySection(title: String): LinearLayout {
@@ -255,40 +299,23 @@ class PlaybackStatisticsOverlay @JvmOverloads constructor(
         if (layoutMode != 2) {
             rule(this)
             connections(this, model, size)
-            if (layoutMode != 4) table(this, model.details, size)
         }
+        stackedFields(this, model.details, size, "statisticsPlatformDetails")
         if (layoutMode == 2 || layoutMode == 4) {
-            val details = LinearLayout(context).apply { orientation = HORIZONTAL }
-            model.details.forEach { field ->
-                val cell = LinearLayout(context).apply { orientation = HORIZONTAL }
-                cell.addView(label(when (field.id) {
-                    "scheduledFrames" -> "Scheduled"
-                    "devicePlayed" -> "Device ms"
-                    else -> field.label
-                }, size), LayoutParams(-2, -2))
-                val value = label(field.value, size, numeric = true).apply { tag = "value:${field.id}" }
-                values[field.id] = value
-                cell.addView(value, LayoutParams(0, -2, 1f))
-                details.addView(cell, LayoutParams(0, -2, 1f))
-            }
-            addView(details, LayoutParams(-1, -2))
             addView(label("Source skew: +video ahead, not latency · peak 1 Hz · PCM total(+recent) ms", size))
         }
-        rule(this)
-        val footer = LinearLayout(context).apply { orientation = HORIZONTAL; tag = "statisticsFooter" }
-        model.footer.forEach { field ->
-            val column = LinearLayout(context).apply { orientation = VERTICAL }
-            column.addView(label(field.label, size))
-            val value = label(field.value, size, numeric = true).apply { tag = "value:${field.id}" }
-            values[field.id] = value
-            column.addView(value)
-            footer.addView(column, LayoutParams(0, -2, 1f))
+        if (detailed) {
+            rule(this)
+            addView(label("DISPLAY DIAGNOSTICS", size, bold = true))
+            table(this, model.diagnostics, size)
         }
-        addView(footer, LayoutParams(-1, -2))
+        rule(this)
+        stackedFields(this, model.footer, size, "statisticsFooter")
     }
 
     fun show(snapshot: PlaybackStatisticsSnapshot?, canvasWidth: Int, canvasHeight: Int,
-        availableWidth: Int = canvasWidth, availableHeight: Int = canvasHeight) {
+        availableWidth: Int = canvasWidth, availableHeight: Int = canvasHeight,
+        measurements: PlaybackDisplayMeasurements = PlaybackDisplayMeasurements()) {
         if (snapshot == null) {
             display = null
             values.values.forEach { it.text = "" }
@@ -312,13 +339,14 @@ class PlaybackStatisticsOverlay @JvmOverloads constructor(
             panelWidth / density < 600 -> 1
             else -> 0
         }
-        val model = PlaybackStatisticsText.display(snapshot, canvasWidth, canvasHeight)
+        val model = PlaybackStatisticsText.display(snapshot, canvasWidth, canvasHeight, measurements)
         if (mode != layoutMode) {
             mode = layoutMode
             build(model, layoutMode)
         }
         display = model
-        (model.kpis + model.totals + model.video + model.audio + model.footer + model.details).forEach {
+        (model.kpis + model.totals + model.video + model.audio + model.footer + model.details +
+            if (detailed) model.diagnostics else emptyList()).forEach {
             values[it.id]?.text = fieldValue(it, if (mode == 0) 16f else 10f)
         }
         model.connections.forEach {

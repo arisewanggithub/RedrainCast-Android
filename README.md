@@ -37,6 +37,18 @@ It distinguishes requested FPS/bitrate from measured payload and actual rendered
 frames, encoded queues from decoded PCM/device padding, and played source audio
 from the device clock. A/V sync is video minus played source audio (not latency);
 renderer skips are not network packet loss. Unavailable metrics show N/A.
+The main video section separates **Encoded size** and **Display mode**
+(**Display px** in the compact panel).
+Render target is kept only in Full playback diagnostics: it is N/A on the
+current TextureView path because its final compositor buffer dimensions are
+not measured; encoded/view/mode sizes are never substituted for that
+measurement. Display mode is the attached
+display's reported active Android mode dimensions, in that mode's orientation,
+not proof of native optical projection or physical scanout. App view size is
+available separately in Full playback diagnostics and is not labeled as rendered
+resolution. Footer values share the same left-aligned columns as their titles
+(Playing directly below State). Scheduled frames, Audio epoch and Device played
+also use three equal label-over-value columns instead of a cramped inline row.
 Skew is compared only when both cached source observations are at most 250 ms
 old and within 10 ms of one another. Otherwise it is N/A and does not increase
 the observed peak; cached PTS is never extrapolated across source-clock changes.
