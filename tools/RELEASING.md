@@ -131,7 +131,7 @@ exception. Do not retag, rename its assets, rebuild it or rewrite its checksums.
    review the new revision and restart instead of approving stale artifacts.
    It tests/lints, builds/signs the optimized APK, pins the certificate,
    alignment-checks it and creates/smokes the relink kit.
-3. Review the private `signed-testing-candidate` artifact (7-day retention):
+3. Review the private `signed-testing-candidate` artifact (3-day retention):
    production APK, checksums, certificate, licenses and relink kit.
 4. With the scoped publisher configured, repeat at the same reviewed revision
    with `publish=true` to create a public-repository **draft** of the inferred kind.

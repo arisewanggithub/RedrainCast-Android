@@ -128,7 +128,7 @@ jobs:
         with:
           name: signed-testing-candidate
           path: ${{ runner.temp }}/public-assets/
-          retention-days: 7
+          retention-days: 3
           if-no-files-found: error
       - name: Upload public draft release
         if: inputs.publish
