@@ -124,13 +124,14 @@ settings are changed by statistics.
   listening automatically resumes while the app is foregrounded. A restarted
   listener can get a different port, so its displayed/advertised endpoints refresh.
 - **Sharing settings** are accessed through the header settings button and saved
-  only on Save. Codec, size, FPS, bitrate, orientation and audio are the primary
+  only on Save. Codec, size, Maximum capture FPS, bitrate, orientation and audio are the primary
   controls; crop and detailed audio options are under Advanced. Selection fields
   open standard Android single-choice dialogs with the current option checked.
   Text inputs select their full value when gaining focus for easy replacement;
   subsequent taps in the focused field retain normal cursor placement.
-  FPS offers the same presets as Windows: 15, 24, 25, 30, 48, 50, 60, 90 and
-  120 (default 60). A previously saved custom FPS remains selectable alongside
+  Maximum capture FPS defaults to **Uncapped**, followed by the common caps:
+  15, 24, 25, 30, 48, 50, 60, 90 and 120. This is a limit, not a promised
+  capture or playback rate. A previously saved custom FPS remains selectable alongside
   the sorted presets, but new arbitrary values cannot be entered.
   Selecting updates only the draft; cancelling a choice retains its prior value,
   and cancelling Sharing settings discards all edits. Child dialogs close with
@@ -149,10 +150,24 @@ settings are changed by statistics.
   replaced. Encoder names are selected automatically, including when loading
   older saved manual overrides. Raw PCM hides the encoded-audio bitrate control
   and uses fixed 48 kHz stereo s16le instead.
+  New video settings default to uncapped H.264 capture at 8 Mbps with a
+  1920-pixel maximum size; existing saved codec, bitrate and FPS selections
+  are preserved. Audio defaults and encoding behavior are unchanged: raw PCM,
+  with the existing 192 kbps encoded-audio setting. Uncapped capture requires a receiver advertising
+  `uncappedFps:true` in HELLO. Older Android/Windows receivers need an explicit
+  FPS cap until updated; unsupported uncapped selections fail clearly without
+  silently imposing a cap.
   Invalid settings and persistence failures stay visible without codec/quality/
   audio fallback. Errors appear at the top; each new home error is brought into
   view once, rather than repeatedly stealing scroll position during updates.
   Cancel does not change saved settings.
+- Video encoding follows scrcpy's defaults: a 60-FPS encoder hint, optional
+  capture cap, 10-second keyframe interval, limited color range, real-time
+  priority, one-frame requested latency and a 100-ms unchanged-frame repeat.
+  The hint is not a throttle. Hardware behavior and throughput remain
+  device-dependent. Explicit codec options still override supported defaults.
+  Zero B-frames remain an explicit receiver/protocol safeguard. Audio encoder
+  settings, including AAC-LC and the 3840-byte input hint, are unchanged.
 - Android's screen-sharing consent is required for every new sending session.
   Audio permission is requested only when sending with audio enabled. Playback
   capture is subject to Android's source-app capture policy; DRM/protected content
@@ -228,60 +243,63 @@ codec, transport and recovery-timeout errors remain terminal and visible.
 ## Bounded stream recovery
 
 Android peers offer and explicitly acknowledge Boolean `streamRecovery:true`
-**and integer `streamRecoveryVersion:1`** in HELLO. Both peers must be updated;
-the unfrozen 0.3.0 prototype's Boolean-only ACK is incompatible.
+**and integer `streamRecoveryVersion:2`** in HELLO. Both peers must be updated;
+revision 1's shared recovery is not implemented as a fallback.
 On receiver queue pressure the TCP readers continue consuming framed data rather
 than waiting on decoder admission. The receiver requests recovery and discards
 the obsolete epoch. Sender-side queue pressure can initiate the same recovery.
 
-The sender does not cancel partially written packets. It discards unsent
-obsolete media, sends cached video configuration at the next sequential video
-generation on the video socket, and waits for readiness. It then requests a
-hardware keyframe and suppresses dependent video until a verified random-access
-picture whose original capture PTS is at or after readiness. Audio remains held
-in the existing bounded queue until an explicit decoded-key proof. Codec, bitrate, raster,
-rotation metadata and timestamps are not substituted or rewritten.
+Each track owns its wire generation, queue retirement and completion proof.
+Initial media activation still requires all requested tracks to be READY.
+During slow initial capture/decoder setup, audio retains only a bounded, ordered
+preroll; it cannot issue a recovery configuration before that initial barrier.
+Once initialization completes, subsequent readiness and recovery remain per track.
+Sender byte capacity is independent too: 8 MiB for video and 512 KiB for audio,
+matching receiver track budgets (8.5 MiB maximum queued media in total). A full
+video queue cannot consume the capacity reserved for healthy audio.
+Video pressure discards only the obsolete video chain, configures a fresh video
+decoder, and requests a verified fresh keyframe. Healthy audio keeps playing
+without being held for video readiness or decode proof.
+Audio pressure reconstructs only audio with the same negotiated format and a
+source-timestamp cutoff. It preserves Opus's 80 ms/AAC's one-AU preroll, trims
+decoded samples on frame boundaries, and does not reapply initial Opus pre-skip.
+Healthy video continues decoding without another keyframe or decoder reset.
 
-The receiver rebuilds video and audio outputs on a dedicated playback worker,
-then acknowledges the new video generation. Audio wire generation is unchanged;
-local audio playback gets a fresh clock/output epoch, without reapplying initial
-Opus pre-skip. After decoded-key proof, packet-end-aware admission preserves
-Opus's 80 ms/AAC's one-AU preroll and overlapping packets; decoded PCM is trimmed
-on sample boundaries before key PTS. Old audio cannot leak into the new epoch.
-An explicit completion proof requires actual source-audio submission, not silence
-(or decoded video alone with audio disabled).
-Presentation ownership, the cast session and control heartbeats remain alive.
+Both tracks retain the same playback clock. While audio is detached, that clock
+continues monotonically; fresh audio resumes against it instead of rebasing the
+video timeline. Staleness is determined by source timestamps, not queue size.
+Only decoded video pictures and decoded PCM may be trimmed within a retained
+compressed chain. Initial audio does not wait for a video decode proof.
+Video completion proves usable decoded output; audio completion proves actual
+source-sample submission, not silence. Temporary A/V offsets do not terminate
+the session. Codec, bitrate, raster, rotation metadata and timestamps are not
+substituted or rewritten. Presentation ownership and control heartbeats survive.
+Audio proofs must fall inside source intervals from successfully written packets
+in their current generation. A proof racing its in-flight write is deferred
+until that write succeeds; queued data and impossible timestamps cannot clear
+the recovery deadline.
+Receiver decoder setup preserves the last picture rotation and waits for new
+presentation metadata before updating automatic orientation, avoiding a
+temporary portrait request during recovery of a landscape picture. Recovery
+does not eliminate the underlying load/transport problem, but a video stall no
+longer interrupts a healthy audio output.
 
-Native decoder resets are limited to one per second; sync requests are spaced
-at least 500 ms apart. The ten-second deadline starts at the **first unresolved
-recovery** and cannot be extended by more resets, readiness or keyframes.
-Source key admission remains at most 250 ms old. Decoded-key proofs match the
-live generation and exact sent key PTS; 350-800 ms of legitimate decode/control
-transit does not invalidate them. Audio waits for actual contiguous source
-coverage under that same deadline, not a 250 ms wall-clock timer. A provably lost
-RAW/AAC source window retries without increasing queue caps. An apparent Opus
-prefix gap waits because its source timestamps may move backward; packet/decode
-order is never rewritten to make the coverage appear contiguous.
-An actual local cap eviction of a packet in the selected key's required Opus
-preroll is separate loss evidence; eviction of only obsolete packets is not.
-The loss is of retained decode-chain data, even when later equal/reversed
-timestamps appear to cover the same interval; overlap cannot reconstruct it.
-That evidence is scoped to the current key/attempt and cleared on reset. A
-compressed-audio retry first collects fresh preroll under the unchanged
-first-unresolved deadline.
-The first source-audio sample must
-still lie within key PTS through key PTS + 250 ms. Older recovery-v1 peers may
-still apply the stricter receipt-age rule and need an implementation update.
-Regression coverage fills the actual 500 ms held-audio queue through an 1100 ms
-proof delay: evicting the required RAW prefix causes exactly one new attempt,
-then matching source audio completes it. Entirely absent PCM instead waits in
-one generation through deadline minus one nanosecond and fails at exactly the
-original ten-second deadline, without a reset storm.
+Native resets are limited to one per second **per track**; video sync requests
+are spaced at least 500 ms apart. Each track's ten-second deadline starts at
+its first unresolved recovery and cannot be extended by more resets or READY
+messages. Completing one track never clears the other track's deadline.
+Source keys remain at most 250 ms old when admitted, and proofs match their
+live track/generation and source window. Apparent Opus PTS gaps wait; actual
+selected-preroll eviction retries only audio under its original deadline.
+Packet/decode order and byte/count/PTS caps remain bounded.
+Recovery before the first audio submission uses the audio recovery deadline and
+fresh-source window, not the initial three-second startup checks or the original
+first-video timestamp. Ordinary startup still retains its existing checks.
 Stop retires pending work and cannot produce late readiness or
 start new audio output. Audio format changes require a new capture session.
 An unsupported or non-acknowledging peer retains the strict congestion policy;
 Windows rotation-only builds currently do not negotiate this recovery extension.
-See [the exact recovery v1 contract](protocol/README.md#optional-bounded-stream-recovery-v1)
+See [the exact recovery v2 contract](protocol/README.md#optional-independent-track-recovery-v2)
 for schemas, duplicate/stale rules, partial-write protection and A/V cutoff policy.
 
 ## Windows compatibility boundary
@@ -583,7 +601,8 @@ locked receiver. Compilation is not a valid native pixel-rendering baseline.
   its home after native tests (receiver surface readiness still requires an awake,
   foreground Activity); Galaxy was safely stopped with no app service/projection
   and was updated in the background without changing the user's foreground.
-  Both peers must acknowledge recovery v1 for this feature to negotiate.
+  That historical build negotiated shared recovery v1; current builds require
+  independent recovery v2 on both peers.
   No active cast was interrupted and no capture consent was automated. Live
   user-approved recovery/interoperability validation remains unverified.
 - Historically, on the real OnePlus AudioTrack, the silent-PCM single-step test failed on
@@ -647,7 +666,9 @@ Use `-p:WindowsRoot=...` to point MSBuild at a different Windows checkout.
 ### Reading congestion diagnostics
 
 The sender's media budget bounds queued per-track PTS span to 500 ms and local
-admission waiting to 500 ms, independently of its 8 MiB byte limit. A video
+admission waiting to 500 ms, independently of track-local byte limits: 8 MiB
+for video and 512 KiB for audio. Congestion diagnostics report bytes and the
+byte cap for the affected track, not the sum of both media queues. A video
 `PTS_SPAN` failure can therefore occur with only about 1 MiB queued; it is not an
 out-of-memory failure. A receiver `origin=PEER` report means the peer raised the
 error, not that the local decoder reported a fault.

@@ -163,6 +163,7 @@ class SenderSession internal constructor(
             lastIncoming = now()
             trace.phase(SessionStopTrace.Phase.CAPABILITIES)
             connected.requireVideoRotation()
+            connected.requireFpsSupport(settings.maxFps)
             if (connected.streamRecovery)
                 recovery = StreamRecoverySender(session, mux, diagnostic = { line ->
                     diagnostic(line)
@@ -341,15 +342,19 @@ class SenderSession internal constructor(
                             throw IOException("PROTOCOL: oversized STATUS fields")
                         if (state in setOf(StreamRecoveryProtocol.REQUEST, StreamRecoveryProtocol.KEY, StreamRecoveryProtocol.COMPLETE)) {
                             val current = recovery ?: throw IOException("PROTOCOL: stream recovery was not negotiated")
+                            val track = StreamRecoveryProtocol.track(json)
                             val generation = Json.integer(json, "generation")
-                            if (!settings.audio && json.has("audioPtsUs"))
-                                throw IOException("PROTOCOL: recovery audio proof was sent for disabled audio")
+                            if (track == 2 && !settings.audio || track == 1 && json.has("audioPtsUs") ||
+                                track == 2 && json.has("keyPtsUs"))
+                                throw IOException("PROTOCOL: recovery proof does not match its track")
                             when (state) {
-                                StreamRecoveryProtocol.REQUEST -> current.request(generation)
-                                StreamRecoveryProtocol.KEY -> current.keyProved(generation, StreamRecoveryProtocol.timestamp(json, "keyPtsUs"))
-                                StreamRecoveryProtocol.COMPLETE -> current.completed(generation,
-                                    StreamRecoveryProtocol.timestamp(json, "keyPtsUs"),
-                                    if (settings.audio) StreamRecoveryProtocol.timestamp(json, "audioPtsUs") else null)
+                                StreamRecoveryProtocol.REQUEST -> current.request(track, generation)
+                                StreamRecoveryProtocol.KEY -> {
+                                    if (track != 1) throw IOException("PROTOCOL: audio cannot acknowledge a video key")
+                                    current.keyProved(generation, StreamRecoveryProtocol.timestamp(json, "keyPtsUs"))
+                                }
+                                StreamRecoveryProtocol.COMPLETE -> current.completed(track, generation,
+                                    StreamRecoveryProtocol.timestamp(json, if (track == 1) "keyPtsUs" else "audioPtsUs"))
                             }
                         }
                     }
@@ -395,7 +400,10 @@ class SenderSession internal constructor(
                 if (message != null) {
                     if (lane == 0) writeStarted = now()
                     mux.beginWrite(message)
-                    try { connected.send(message) } finally {
+                    try {
+                        connected.send(message)
+                        recovery?.written(message)
+                    } finally {
                         mux.endWrite(message)
                         if (lane == 0) writeStarted = 0
                     }

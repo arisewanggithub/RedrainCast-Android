@@ -27,6 +27,8 @@ class ReceiverLink(private val target: ReceiverTarget) : Closeable {
         private set
     var streamRecovery: Boolean = false
         private set
+    var uncappedFps: Boolean = false
+        private set
     var receiverOptions = ReceiverOptionCapabilities()
         private set
 
@@ -60,7 +62,7 @@ class ReceiverLink(private val target: ReceiverTarget) : Closeable {
                 connectSocket(sockets[0])
                 send(Wire.control(Wire.HELLO, 0, Wire.obj(
                     "role" to "sender", "versions" to JSONArray().put(3),
-                    "name" to "RedrainCast", "videoRotation" to true, "streamRecovery" to true,
+                    "name" to "RedrainCast", "videoRotation" to true, "streamRecovery" to true, "uncappedFps" to true,
                     "streamRecoveryVersion" to StreamRecoveryProtocol.VERSION,
                     "receiverOptions" to ReceiverOptionProtocol.IMPLEMENTED.wireValue()
                 )))
@@ -86,6 +88,9 @@ class ReceiverLink(private val target: ReceiverTarget) : Closeable {
                 if (json.has("videoRotation") && json.opt("videoRotation") !is Boolean)
                     throw IOException("PROTOCOL: videoRotation must be boolean")
                 videoRotation = json.opt("videoRotation") == true
+                if (json.has("uncappedFps") && json.opt("uncappedFps") !is Boolean)
+                    throw IOException("PROTOCOL: uncappedFps must be boolean")
+                uncappedFps = json.opt("uncappedFps") == true
                 if (json.has("streamRecovery") && json.opt("streamRecovery") !is Boolean)
                     throw IOException("PROTOCOL: streamRecovery must be boolean")
                 streamRecovery = json.opt("streamRecovery") == true
@@ -102,6 +107,11 @@ class ReceiverLink(private val target: ReceiverTarget) : Closeable {
     fun requireVideoRotation() {
         if (!videoRotation)
             throw IOException("UNSUPPORTED_CONFIG: receiver does not support videoRotation metadata required by fixed-natural capture")
+    }
+
+    fun requireFpsSupport(maxFps: Int) {
+        if (maxFps == 0 && !uncappedFps)
+            throw IOException("UNSUPPORTED_CONFIG: receiver does not support uncapped capture FPS; update the receiver or select an explicit Maximum capture FPS")
     }
 
     fun attach(session: Long, acceptance: Wire.Message, withAudio: Boolean, timeoutMillis: Long = 10_000) {

@@ -93,6 +93,28 @@ class MediaBudgetTest {
         duration.offer(frame(1, 1, 0, 1)); duration.offer(frame(1, 1, 500_000, 1))
         assertThrows(IOException::class.java) { duration.offer(frame(1, 1, 500_001, 1)) }
     }
+    @Test fun exactTrackByteBudgetsCannotConsumeEachOthersCapacity() {
+        val mux = MediaBudget(true, System::nanoTime, 1)
+        for (track in 1..2) {
+            configure(mux, track, 1)
+            mux.pollLane(track, 1); mux.endWrite()
+            mux.ready(track, 1)
+        }
+        repeat(2) { index -> mux.offer(frame(1, 1, index.toLong(), 4 * 1024 * 1024)) }
+        repeat(2) { index -> mux.offer(frame(2, 1, index.toLong(), 256 * 1024)) }
+        assertEquals(8 * 1024 * 1024 + 512 * 1024, mux.queuedBytes())
+        for ((track, bytes) in listOf(1 to 8 * 1024 * 1024, 2 to 512 * 1024)) {
+            val pressure = checkNotNull(mux.tryOfferMedia(frame(track, 1, 2, 1)))
+            assertEquals(SenderLimit.MEDIA_BYTES, pressure.limit)
+            assertEquals(if (track == 1) SenderQueue.VIDEO else SenderQueue.AUDIO, pressure.queue)
+            assertEquals(bytes, pressure.bytes)
+            assertEquals(bytes, pressure.byteCap)
+        }
+        mux.discardMediaForRecovery(2)
+        assertEquals(8 * 1024 * 1024, mux.queuedBytes())
+        assertNull(mux.tryOfferMedia(frame(2, 1, 2, 4)))
+    }
+
     @Test fun restartWaitsForPreviousVideoReadinessAndWritesWithoutBlockingAudio() {
         val mux = MediaBudget(true, System::nanoTime, 1_000_000L)
         configure(mux, 1, 1); configure(mux, 2, 1)

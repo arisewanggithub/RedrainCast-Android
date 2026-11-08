@@ -33,7 +33,7 @@ data class Request(val videoCodec: String, val audioCodec: String?, val fps: Int
             protocolRequire(video.integer("bitrate") > 0, "Invalid video bitrate")
             protocolRequire(video.integer("maxSize") in 0..16384, "Invalid maxSize")
             val fps = video.integer("maxFps")
-            protocolRequire(fps in 1..240, "Invalid maxFps")
+            protocolRequire(fps in 0..240, "Invalid maxFps")
             protocolRequire(video.integer("displayId") >= 0, "Invalid displayId")
             protocolRequire(video.string("orientation") in listOf("0", "90", "180", "270", "@0", "@90", "@180", "@270"), "Invalid orientation")
             video.string("codecOptions", 8192)
@@ -52,7 +52,8 @@ data class Request(val videoCodec: String, val audioCodec: String?, val fps: Int
             audio.string("source", 80)
             audio.string("codecOptions", 8192)
             return Request(codec, if (enabled) audioCodec else null, fps,
-                "Requested $codec ${video.integer("bitrate")} bps, max ${video.integer("maxSize")} px, $fps fps; " +
+                "Requested $codec ${video.integer("bitrate")} bps, max ${video.integer("maxSize")} px, " +
+                    (if (fps == 0) "uncapped capture FPS; " else "$fps fps max; ") +
                     (if (enabled) "audio $audioCodec ${audio.integer("bitrate")} bps" else "audio disabled"),
                 receiverOrientation, options, video.integer("bitrate"),
                 if (enabled && audioCodec != "raw") audio.integer("bitrate") else null, color)

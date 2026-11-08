@@ -15,6 +15,8 @@ class BackendTest {
         val settings = Settings()
         assertTrue(settings.audio); assertEquals("raw", settings.audioCodec)
         assertEquals(192000, settings.audioBitrate); assertEquals("h264", settings.videoCodec)
+        assertEquals(0, settings.maxFps)
+        assertEquals(1920, settings.maxSize)
         settings.cropWidth = 400; settings.cropHeight = 600; settings.cropX = 10; settings.cropY = 20
         settings.orientation = "@90"; settings.displayId = 2
         settings.videoEncoder = "c2.android.avc.encoder"; settings.videoOptions = "profile=1,level:int=4"

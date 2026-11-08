@@ -713,7 +713,7 @@ class MainActivity : Activity(), SurfaceHolder.Callback, TextureView.SurfaceText
         check(selected?.isValid == true) { "Receiver presentation surface is unavailable" }
         presentationMode = mode
         aspect = format.width.toDouble() / format.height
-        rotation = 0
+        hasPresentation = false
         texture.isOpaque = mode == VideoPresentation.Mode.SDR_TEXTURE
         texture.alpha = if (mode == VideoPresentation.Mode.HDR_SURFACE) 0f else 1f
         sdrBox.setBackgroundColor(if (mode == VideoPresentation.Mode.HDR_SURFACE) Color.TRANSPARENT else Color.BLACK)

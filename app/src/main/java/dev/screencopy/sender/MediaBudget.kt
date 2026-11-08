@@ -29,7 +29,8 @@ class MediaBudget internal constructor(private val withAudio: Boolean, private v
     private var started = false
     private var ending = false
     private var recoveryAudioHeld = false
-    private var evictedRecoveryKeyPts: Long? = null
+    private var evictedRecoveryCutoffUs: Long? = null
+    private var initialAudioPrefixRetired = false
     private val pendingWrites = arrayOfNulls<Entry>(3)
     private val writing = BooleanArray(3)
     private val writerBytes = IntArray(3)
@@ -45,10 +46,14 @@ class MediaBudget internal constructor(private val withAudio: Boolean, private v
         catch (pressure: SenderCongestionException) { pressure.snapshot }
     }
 
-    internal fun discardMediaForRecovery() = synchronized(monitor) {
-        recoveryAudioHeld = true
-        evictedRecoveryKeyPts = null
-        for (queue in listOf(video, audio)) {
+    internal fun discardMediaForRecovery(track: Int) = synchronized(monitor) {
+        require(track in 1..2 && (track != 2 || withAudio))
+        if (track == 2) {
+            recoveryAudioHeld = true
+            evictedRecoveryCutoffUs = null
+            initialAudioPrefixRetired = false
+        }
+        for (queue in listOf(if (track == 1) video else audio)) {
             val entries = queue.iterator()
             while (entries.hasNext()) {
                 val entry = entries.next()
@@ -62,30 +67,38 @@ class MediaBudget internal constructor(private val withAudio: Boolean, private v
     }
 
     internal fun holdRecoveryAudio(message: Wire.Message, timing: AudioPacketTiming,
-                                   recoveryKeyPts: Long? = null): SenderQueueFailure? = synchronized(monitor) {
+                                   recoveryCutoffUs: Long? = null): SenderQueueFailure? = synchronized(monitor) {
         require(message.type == Wire.AUDIO_PACKET && message.track == 2)
         timing.endPts(message.pts, message.payload)
         var pressure = tryOfferMedia(message)
         while (pressure != null) {
             val oldest = audio.firstOrNull { it.message.type == Wire.AUDIO_PACKET } ?: break
-            if (timing.codec == "opus" && recoveryKeyPts != null &&
-                oldest.message.pts <= recoveryKeyPts &&
-                timing.endPts(oldest.message.pts, oldest.message.payload) > timing.windowStart(recoveryKeyPts))
-                evictedRecoveryKeyPts = recoveryKeyPts
+            if (timing.codec == "opus" && recoveryCutoffUs != null &&
+                oldest.message.pts <= recoveryCutoffUs &&
+                timing.endPts(oldest.message.pts, oldest.message.payload) > timing.windowStart(recoveryCutoffUs))
+                evictedRecoveryCutoffUs = recoveryCutoffUs
             audio.remove(oldest)
+            if (oldest.message.generation == 1) initialAudioPrefixRetired = true
             mediaBytes -= oldest.message.payload.size
             pressure = tryOfferMedia(message)
         }
         pressure
     }
 
+    internal fun firstQueuedAudioPts(): Long? = synchronized(monitor) {
+        audio.firstOrNull { it.message.type == Wire.AUDIO_PACKET }?.message?.pts
+    }
+
+    internal fun initialAudioPrefixRetired(): Boolean = synchronized(monitor) { initialAudioPrefixRetired }
+
     internal fun releaseRecoveryAudio(cutoff: Long, timing: AudioPacketTiming): RecoveryAudioCoverage = synchronized(monitor) {
-        if (evictedRecoveryKeyPts == cutoff) return@synchronized RecoveryAudioCoverage.LOST
+        if (evictedRecoveryCutoffUs == cutoff) return@synchronized RecoveryAudioCoverage.LOST
         val start = timing.windowStart(cutoff)
         while (true) {
             val oldest = audio.firstOrNull { it.message.type == Wire.AUDIO_PACKET } ?: break
             if (timing.endPts(oldest.message.pts, oldest.message.payload) > start) break
             audio.remove(oldest)
+            if (oldest.message.generation == 1) initialAudioPrefixRetired = true
             mediaBytes -= oldest.message.payload.size
         }
         val packets = audio.filter { it.message.type == Wire.AUDIO_PACKET }
@@ -131,7 +144,8 @@ class MediaBudget internal constructor(private val withAudio: Boolean, private v
             }
             val limit = violation(message) ?: break
             val remaining = waitNanos - (System.nanoTime() - begin)
-            if (remaining <= 0 || message.payload.size > 8 * 1024 * 1024 ||
+            if (remaining <= 0 || message.type in setOf(Wire.VIDEO_FRAME, Wire.AUDIO_PACKET) &&
+                message.payload.size > mediaByteLimit(track) ||
                 message.type !in setOf(Wire.VIDEO_FRAME, Wire.AUDIO_PACKET) && message.payload.size > 256 * 1024)
                 throw SenderCongestionException(snapshot(message, limit, (System.nanoTime() - begin) / 1_000_000))
             monitor.wait(remaining / 1_000_000, (remaining % 1_000_000).toInt())
@@ -178,7 +192,7 @@ class MediaBudget internal constructor(private val withAudio: Boolean, private v
             if (queue.size >= 1024) return SenderLimit.TRACK_COUNT
         }
         if (media) {
-            if (mediaBytes.toLong() + message.payload.size > 8 * 1024 * 1024) return SenderLimit.MEDIA_BYTES
+            if (queuedMediaBytes(queue).toLong() + message.payload.size > mediaByteLimit(message.track)) return SenderLimit.MEDIA_BYTES
             if (sourceSpan(queue, message.pts) > 500_000) return SenderLimit.PTS_SPAN
         }
         return null
@@ -190,8 +204,8 @@ class MediaBudget internal constructor(private val withAudio: Boolean, private v
         val lane = kind(message).ordinal
         val frames = queue.filter { it.message.type in setOf(Wire.VIDEO_FRAME, Wire.AUDIO_PACKET) }
         return SenderQueueFailure(kind(message), limit, if (control) controls.size + configCount else queue.size,
-            if (control) 64 else 1024, if (control) controlBytes else mediaBytes,
-            if (control) 256 * 1024 else 8 * 1024 * 1024, message.payload.size, queue.size,
+            if (control) 64 else 1024, if (control) controlBytes else queuedMediaBytes(queue),
+            if (control) 256 * 1024 else mediaByteLimit(message.track), message.payload.size, queue.size,
             frames.sumOf { it.message.payload.size }, sourceSpan(queue),
             if (media) sourceSpan(queue, message.pts) else 0,
             if (media && message.track in 1..2 && lastPts[message.track] >= 0) message.pts - lastPts[message.track] else 0,
@@ -204,6 +218,13 @@ class MediaBudget internal constructor(private val withAudio: Boolean, private v
     }
     private fun kind(message: Wire.Message) = when (message.track) {
         1 -> SenderQueue.VIDEO; 2 -> SenderQueue.AUDIO; else -> SenderQueue.CONTROL
+    }
+    private fun mediaByteLimit(track: Int) = if (track == 2) 512 * 1024 else 8 * 1024 * 1024
+    private fun queuedMediaBytes(queue: ArrayDeque<Entry>) =
+        queue.sumOf { if (it.message.type in setOf(Wire.VIDEO_FRAME, Wire.AUDIO_PACKET)) it.message.payload.size else 0 }
+
+    internal fun writingAudio(): Wire.Message? = synchronized(monitor) {
+        if (writing[2]) pendingWrites[2]?.message?.takeIf { it.type == Wire.AUDIO_PACKET } else null
     }
     private fun sourceSpan(queue: ArrayDeque<Entry>, incoming: Long? = null): Long {
         var minimum = incoming ?: Long.MAX_VALUE
@@ -310,6 +331,10 @@ class MediaBudget internal constructor(private val withAudio: Boolean, private v
     fun allReady(): Boolean = synchronized(monitor) {
         ready[1] == generation[1] && generation[1] > 0 &&
             (!withAudio || ready[2] == generation[2] && generation[2] > 0)
+    }
+    internal fun trackReady(track: Int): Boolean = synchronized(monitor) {
+        require(track in 1..2)
+        generation[track] > 0 && ready[track] == generation[track]
     }
     fun expiredTrack(): Int? = synchronized(monitor) {
         (1..2).firstOrNull { readinessDeadline[it] != 0L && clock() >= readinessDeadline[it] }

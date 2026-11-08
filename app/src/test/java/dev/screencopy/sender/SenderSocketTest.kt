@@ -29,9 +29,10 @@ class SenderSocketTest {
 
     private val session = 71L
     private val token = "aB".repeat(32)
-    private fun hello(rotation: Boolean? = true) = Wire.control(Wire.HELLO, 0,
+    private fun hello(rotation: Boolean? = true, uncapped: Boolean? = null) = Wire.control(Wire.HELLO, 0,
         Wire.obj("role" to "receiver", "versions" to JSONArray().put(3), "name" to "Fixture").apply {
             if (rotation != null) put("videoRotation", rotation)
+            if (uncapped != null) put("uncappedFps", uncapped)
         })
     private fun accepted(audio: Boolean, value: String = token) = Wire.control(Wire.SESSION_ACCEPT, session,
         Wire.obj("tracks" to JSONArray().put(1).apply { if (audio) put(2) }, "mediaToken" to value))
@@ -70,6 +71,47 @@ class SenderSocketTest {
         link.requireVideoRotation()
         link.send(Wire.control(Wire.SESSION_REQUEST, session, Settings().apply { this.audio = audio }.request()))
         link.attach(session, link.receive(), audio)
+    }
+
+    @Test fun uncappedFpsNeedsExplicitReceiverSupportButLegacyPeersStillPermitCaps() {
+        for (supported in listOf(null, false, true)) ServerSocket(0).use { server ->
+            val peer = CompletableFuture.runAsync {
+                server.accept().use { control ->
+                    control.soTimeout = 3000
+                    assertTrue(Wire.read(control.inputStream).json().getBoolean("uncappedFps"))
+                    Wire.write(control.outputStream, hello(uncapped = supported))
+                }
+            }
+            ReceiverLink(ReceiverTarget("127.0.0.1", server.localPort)).use { link ->
+                link.connect()
+                assertEquals(supported == true, link.uncappedFps)
+                link.requireFpsSupport(60)
+                if (supported == true) link.requireFpsSupport(0)
+                else {
+                    val error = assertThrows(IOException::class.java) { link.requireFpsSupport(0) }
+                    assertTrue(error.message!!.contains("UNSUPPORTED_CONFIG"))
+                    assertTrue(error.message!!.contains("select an explicit Maximum capture FPS"))
+                }
+            }
+            peer.get(3, TimeUnit.SECONDS)
+        }
+    }
+
+    @Test fun uncappedCapabilityRejectsNonBooleanAcknowledgements() {
+        for (invalid in listOf("true", 1, org.json.JSONObject.NULL)) ServerSocket(0).use { server ->
+            val peer = CompletableFuture.runAsync {
+                server.accept().use { control ->
+                    control.soTimeout = 3000
+                    Wire.read(control.inputStream)
+                    Wire.write(control.outputStream, Wire.control(Wire.HELLO, 0, hello().json().put("uncappedFps", invalid)))
+                }
+            }
+            ReceiverLink(ReceiverTarget("127.0.0.1", server.localPort)).use { link ->
+                val error = assertThrows(IOException::class.java) { link.connect() }
+                assertTrue(error.message!!.contains("uncappedFps must be boolean"))
+            }
+            peer.get(3, TimeUnit.SECONDS)
+        }
     }
 
     @Test fun attachesBothSocketsAndRoutesConfigsMediaReadinessAndStopToTheirOwnLanes() {

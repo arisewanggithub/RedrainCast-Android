@@ -191,7 +191,7 @@ object PlaybackStatisticsText {
                 field("presentationOutput", "Output", presentationOutput(s.presentation)),
                 field("encodedSize", "Encoded size", if (s.encodedWidth != null && s.encodedHeight != null)
                     "${s.encodedWidth} × ${s.encodedHeight}" else "N/A"),
-                field("captureLimit", "Capture limit", "${s.requestedFps} FPS"),
+                field("captureLimit", "Capture limit", if (s.requestedFps == 0) "Uncapped" else "${s.requestedFps} FPS"),
                 field("displayOutput", "Display mode", measurements.displayOutput?.format() ?: "N/A"),
                 field("rotation", "Rotation", "${s.rotation}° · $orientation"),
                 field("videoBitrate", "Video bitrate", number(snapshot.videoMbps, " Mbps")),

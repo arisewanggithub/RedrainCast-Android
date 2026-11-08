@@ -117,6 +117,24 @@ class ProtocolTest {
         assertThrows(ProtocolException::class.java) { Configuration.opusHead(bytes + 0, 2) }
     }
 
+    @Test fun maximumCaptureFpsAllowsUncappedZeroButRejectsInvalidOrCoercedValues() {
+        for (fps in listOf(0, 1, 15, 60, 120, 240)) {
+            val settings = dev.screencopy.sender.Settings().apply { maxFps = fps }
+            settings.validate()
+            val request = Request.parse(json(settings.request().toString()))
+            assertEquals(fps, request.fps)
+            assertEquals(fps == 0, request.summary.contains("uncapped capture FPS"))
+            val format = Configuration.video(JSONObject().put("codec", "h264").put("width", 640).put("height", 360)
+                .put("csd", org.json.JSONArray().put("AAAAAWdC")), request)
+            assertEquals(fps, format.frameRate)
+        }
+        for (invalid in listOf(-1, 241, 0.5, "0", false, JSONObject.NULL)) {
+            val request = dev.screencopy.sender.Settings().request()
+            request.getJSONObject("video").put("maxFps", invalid)
+            assertThrows(ProtocolException::class.java) { Request.parse(json(request.toString())) }
+        }
+    }
+
     @Test fun independentGenerationsAndStartupGate() {
         val state = TrackState(listOf(1, 2))
         state.configure(1, 1)

@@ -355,16 +355,23 @@ class ReceiverServer private constructor(
                 request?.receiverOptions?.playbackStats == true
         fun statisticsRequested(): Boolean = accepted && !stopping.get() && !terminalError &&
             firstFailure.get() == null && request?.receiverOptions?.playbackStats == true
-        @Volatile private var recovering = false
+        @Volatile private var videoRecovering = false
+        @Volatile private var audioRecovering = false
+        private val recovering: Boolean get() = videoRecoveryAt > 0 || audioRecoveryAt > 0
         private var awaitingRecoveryKey = false
-        @Volatile private var recoveryAt = 0L
-        private var lastRecoveryReset = 0L
+        @Volatile private var videoRecoveryAt = 0L
+        @Volatile private var audioRecoveryAt = 0L
+        private val lastRecoveryReset = LongArray(3)
         private var recoveryFormat: AudioFormat? = null
         private var activeVideoFormat: VideoFormat? = null
         private var recoveryKeyPts: Long? = null
-        private var audioRecoveryOpen = false
+        private var audioRecoveryAdmitted = false
+        private var audioRecoveryCutoff = 0L
         private var keyProvedGeneration = 0L
         private var completedGeneration = 0L
+        private var completedAudioEpoch = 0L
+        @Volatile private var audioGeneration = 0L
+        @Volatile private var retiredAudioGeneration = 0L
         private var audioPacketTiming: AudioPacketTiming? = null
         @Volatile private var retiredVideoThrough = 0L
         @Volatile private var audioEpoch = 0L
@@ -440,20 +447,24 @@ class ReceiverServer private constructor(
                     checkNotNull(audioPacketTiming).endPts(packet.ptsUs, packet.bytes) else null
                 if (message.type == Type.AUDIO_PACKET && request?.audioCodec == "raw")
                     protocolRequire(message.payload.size % 4 == 0, "Raw audio is not sample aligned")
-                if (streamRecovery && recovering) {
-                    if (!awaitingRecoveryKey || message.type != Type.VIDEO_FRAME || !packet.keyFrame)
-                        return@synchronized null
+                if (streamRecovery && message.type == Type.VIDEO_FRAME && videoRecovering) {
+                    if (!awaitingRecoveryKey || !packet.keyFrame) return@synchronized null
                     RandomAccessPoint.verify(checkNotNull(request).videoCodec, packet.bytes, checkNotNull(activeVideoFormat).configuration)
-                    recovering = false
+                    videoRecovering = false
                     awaitingRecoveryKey = false
                     recoveryKeyPts = packet.ptsUs
                     checkNotNull(video).discardOutputBeforePts = packet.ptsUs
-                    onDiscoveryDiagnostic("event=STREAM_RECOVERY_KEY generation=${message.generation} pts_us=${message.ptsUs}")
+                    onDiscoveryDiagnostic("event=STREAM_RECOVERY_KEY track=1 generation=${message.generation} pts_us=${message.ptsUs}")
                 }
-                if (streamRecovery && message.type == Type.AUDIO_PACKET) {
-                    val key = recoveryKeyPts
-                    if (!audioRecoveryOpen || key == null || checkNotNull(audioEnd) <= checkNotNull(audioPacketTiming).windowStart(key))
-                        return@synchronized null
+                if (streamRecovery && message.type == Type.AUDIO_PACKET && audioRecovering) {
+                    if (message.generation <= retiredAudioGeneration) return@synchronized null
+                    if (!audioRecoveryAdmitted) {
+                        val cutoff = maxOf(audioRecoveryCutoff, clock.currentUs() ?: audioRecoveryCutoff)
+                        if (checkNotNull(audioEnd) <= checkNotNull(audioPacketTiming).windowStart(cutoff))
+                            return@synchronized null
+                        checkNotNull(audio).recoveryCutoffUs = cutoff
+                        audioRecoveryAdmitted = true
+                    }
                 }
                 if (message.type == Type.VIDEO_FRAME) {
                     clock.anchorVideo(packet.ptsUs)
@@ -478,24 +489,33 @@ class ReceiverServer private constructor(
         }
 
         private fun requestRecovery(pressure: QueuePressure) {
+            val track = pressure.track
             val generation = synchronized(playbackLock) {
-                if (recovering || !accepted || stopping.get() || !tracksReady) return
-                recovering = true
-                retiredVideoThrough = maxOf(retiredVideoThrough, videoGeneration)
-                retiredAudioThrough = audioEpoch
-                awaitingRecoveryKey = false
-                if (recoveryAt == 0L) recoveryAt = now()
-                recoveryKeyPts = null
-                audioRecoveryOpen = false
+                if (!accepted || stopping.get() || !tracksReady) return
+                if (track == 1) {
+                    if (videoRecovering) return
+                    videoRecovering = true
+                    retiredVideoThrough = maxOf(retiredVideoThrough, videoGeneration)
+                    awaitingRecoveryKey = false
+                    if (videoRecoveryAt == 0L) videoRecoveryAt = now()
+                    recoveryKeyPts = null
+                } else {
+                    if (audioRecovering && audioGeneration <= retiredAudioGeneration) return
+                    clock.beginAudioRecovery()
+                    audioRecovering = true
+                    retiredAudioThrough = audioEpoch
+                    retiredAudioGeneration = audioGeneration
+                    audioRecoveryAdmitted = false
+                    if (audioRecoveryAt == 0L) audioRecoveryAt = now()
+                }
                 phase = "Recovering"
-                phaseAt = recoveryAt
                 playbackStatistics = null
-                videoGeneration
+                if (track == 1) videoGeneration else audioGeneration
             }
-            onDiscoveryDiagnostic("event=STREAM_RECOVERY_REQUEST generation=$generation ${pressure.logMessage()}")
+            onDiscoveryDiagnostic("event=STREAM_RECOVERY_REQUEST track=$track generation=$generation ${pressure.logMessage()}")
             send(Type.STATUS, JSONObject().put("state", "stream-recovery-request")
                 .put("message", "Receiver is discarding an obsolete dependency chain")
-                .put("generation", generation.toInt()))
+                .put("track", track).put("generation", generation.toInt()))
         }
 
         private fun closeMedia() {
@@ -570,6 +590,7 @@ class ReceiverServer private constructor(
                 protocolRequire(senderName.isNotEmpty() && senderName.none { it.isISOControl() }, "Invalid sender name")
                 protocolRequire(!h.has("videoRotation") || h.opt("videoRotation") is Boolean, "videoRotation must be boolean")
                 videoRotation = h.opt("videoRotation") == true
+                protocolRequire(!h.has("uncappedFps") || h.opt("uncappedFps") is Boolean, "uncappedFps must be boolean")
                 hdrVideoVersion = if (h.has("hdrVideoVersion")) h.integer("hdrVideoVersion") else null
                 protocolRequire(hdrVideoVersion == null || checkNotNull(hdrVideoVersion) > 0, "Invalid hdrVideoVersion")
                 protocolRequire(!h.has("streamRecovery") || h.opt("streamRecovery") is Boolean, "streamRecovery must be boolean")
@@ -580,6 +601,7 @@ class ReceiverServer private constructor(
                     ReceiverOptionCapabilities(supportsPlaybackStatistics))
                 controlStatistics.validControl(now())
                 val response = JSONObject().put("role", "receiver").put("versions", JSONArray().put(Wire.VERSION)).put("name", name)
+                    .put("uncappedFps", true)
                 if (videoRotation) response.put("videoRotation", true)
                 if (streamRecovery) response.put("streamRecovery", true).put("streamRecoveryVersion", StreamRecoveryProtocol.VERSION)
                 if (negotiatedOptions.playbackStats) response.put("receiverOptions", negotiatedOptions.wireValue())
@@ -762,12 +784,10 @@ class ReceiverServer private constructor(
         }
 
         private fun configure(message: Message) {
-            if (streamRecovery && message.track == 1 && message.generation > 1) {
+            if (streamRecovery && message.generation > 1) {
                 configureRecovery(message)
                 return
             }
-            if (streamRecovery && message.track == 2 && message.generation > 1)
-                throw ProtocolException("UNSUPPORTED_CONFIG", "Audio format changes require a new capture session")
             synchronized(playbackOperations) {
                 val retired: Pair<VideoPlayer?, AudioPlayer?> = synchronized(playbackLock) {
                     protocolRequire(accepted && !stopping.get(), "Session has ended")
@@ -812,6 +832,7 @@ class ReceiverServer private constructor(
                 val format = Configuration.audio(json, settings)
                 recoveryFormat = format
                 audioPacketTiming = AudioPacketTiming.from(format)
+                audioGeneration = message.generation
                 audio = createAudioPlayer(format, clock)
                 actualAudio = "Actual audio: ${format.codec} ${format.sampleRate} Hz ${format.channels}ch, pre-skip ${format.preSkip}, generation ${message.generation}\n${checkNotNull(audio).decoderDescription}"
             }
@@ -821,10 +842,10 @@ class ReceiverServer private constructor(
                 if (presentation == null) presentation = onPresentationStart(settings.receiverOrientation)
                 tracksReady = true
                 if (streamRecovery) {
-                    recovering = true
+                    videoRecovering = true
                     awaitingRecoveryKey = true
                     clock.recoveryStartup = true
-                    if (recoveryAt == 0L) recoveryAt = now()
+                    if (videoRecoveryAt == 0L) videoRecoveryAt = now()
                     phase = "Recovering"
                 } else phase = "Playing"
                 onStatus("Playing: $senderName", "$requestSummary\n$actualVideo\n$decoderDescription\n$actualAudio\nSurface ready; bounded synchronized playback active.")
@@ -832,93 +853,108 @@ class ReceiverServer private constructor(
         }
 
         private fun configureRecovery(message: Message) {
-            lastVideoPacketAt = null
-            lastAudioPacketAt = null
+            val track = message.track
+            if (track == 1) lastVideoPacketAt = null else lastAudioPacketAt = null
             val settings: Request
-            val format: VideoFormat
+            val videoFormat: VideoFormat?
+            val audioFormat: AudioFormat?
             synchronized(playbackLock) {
                 protocolRequire(accepted && !stopping.get() && tracksReady, "Recovery preceded initialized tracks")
-                protocolRequire(message.generation <= Int.MAX_VALUE, "Recovery video generation exhausted")
+                protocolRequire(message.generation <= Int.MAX_VALUE, "Recovery track generation exhausted")
                 settings = checkNotNull(request)
-                format = validateHdrOutput(Configuration.video(message.json(), settings))
-                checkNotNull(tracks).configure(1, message.generation, settings.videoCodec)
-                recovering = true
-                awaitingRecoveryKey = false
-                recoveryKeyPts = null
-                audioRecoveryOpen = false
-                if (recoveryAt == 0L) recoveryAt = now()
+                val json = message.json()
+                videoFormat = if (track == 1) validateHdrOutput(Configuration.video(json, settings)) else null
+                audioFormat = if (track == 2) Configuration.audio(json, settings) else null
+                if (track == 2) {
+                    val original = checkNotNull(recoveryFormat)
+                    val proposed = checkNotNull(audioFormat)
+                    protocolRequire(proposed.copy(configuration = original.configuration) == original &&
+                        proposed.configuration.contentEquals(original.configuration),
+                        "Audio format changes require a new capture session", "UNSUPPORTED_CONFIG")
+                    audioRecoveryCutoff = StreamRecoveryProtocol.timestamp(json, "recoveryPtsUs")
+                }
+                checkNotNull(tracks).configure(track, message.generation, if (track == 1) settings.videoCodec else settings.audioCodec)
+                if (track == 1) {
+                    videoRecovering = true
+                    awaitingRecoveryKey = false
+                    recoveryKeyPts = null
+                    if (videoRecoveryAt == 0L) videoRecoveryAt = now()
+                    retiredVideoThrough = maxOf(retiredVideoThrough, videoGeneration)
+                    videoGeneration = message.generation
+                } else {
+                    clock.beginAudioRecovery()
+                    audioRecovering = true
+                    audioRecoveryAdmitted = false
+                    if (audioRecoveryAt == 0L) audioRecoveryAt = now()
+                    retiredAudioThrough = audioEpoch
+                    retiredAudioGeneration = audioGeneration
+                    audioGeneration = message.generation
+                }
                 phase = "Recovering"
-                phaseAt = recoveryAt
-                tracksReady = false
-                retiredVideoThrough = maxOf(retiredVideoThrough, videoGeneration)
-                retiredAudioThrough = audioEpoch
-                videoGeneration = message.generation
             }
             recoveryExecutor.execute {
                 try {
-                    if (!accepted || stopping.get() || videoGeneration != message.generation || active.get() !== this) return@execute
-                    val cooldown = lastRecoveryReset + 1000 - now()
+                    fun current() = accepted && !stopping.get() && active.get() === this &&
+                        (if (track == 1) videoGeneration else audioGeneration) == message.generation
+                    if (!current()) return@execute
+                    val cooldown = lastRecoveryReset[track] + 1000 - now()
                     if (cooldown > 0) Thread.sleep(cooldown)
                     synchronized(playbackOperations) operations@ {
-                        if (!accepted || stopping.get() || videoGeneration != message.generation || active.get() !== this) return@operations
-                        lastRecoveryReset = now()
-                        retirePlayers(false)
-                        if (!accepted || stopping.get()) return@operations
-                        val nextClock = clockFactory().apply {
-                            audioExpected = settings.audioCodec != null
-                            recoveryStartup = true
+                        if (!current()) return@operations
+                        lastRecoveryReset[track] = now()
+                        val retired: Pair<VideoPlayer?, AudioPlayer?> = synchronized(playbackLock) {
+                            if (track == 1) (video to null).also { video = null }
+                            else (null to audio).also { audio = null }
                         }
-                        synchronized(playbackLock) { playbackClock = nextClock }
-                        val sameRaster = activeVideoFormat?.let { it.width == format.width && it.height == format.height } == true
-                        val createdVideo = createVideoPlayer(format, nextClock, message.generation)
-                        if (!accepted || stopping.get() || videoGeneration != message.generation || active.get() !== this) {
-                            videoOutput.release(createdVideo)
-                            return@operations
-                        }
+                        try { retired.first?.let { videoOutput.release(it) } } finally { retired.second?.close() }
+                        if (!current()) return@operations
+                        val sameRaster = videoFormat?.let { format ->
+                            activeVideoFormat?.let { it.width == format.width && it.height == format.height } == true
+                        } ?: true
+                        var createdVideo: VideoPlayer? = null
                         var createdAudio: AudioPlayer? = null
                         var installed = false
                         try {
-                            if (settings.audioCodec != null) {
-                                val audioFormat = checkNotNull(recoveryFormat).copy(preSkip = 0)
-                                createdAudio = createAudioPlayer(audioFormat, nextClock)
-                            }
+                            if (track == 1) createdVideo = createVideoPlayer(checkNotNull(videoFormat), clock, message.generation)
+                            else createdAudio = createAudioPlayer(checkNotNull(audioFormat).copy(preSkip = 0), clock, audioRecoveryCutoff)
                             synchronized(playbackLock) {
-                                if (!accepted || stopping.get()) {
-                                    return@synchronized
+                                if (!current()) return@synchronized
+                                if (track == 1) {
+                                    video = createdVideo
+                                    activeVideoFormat = videoFormat
+                                    actualVideo = "Actual video: ${checkNotNull(videoFormat).mime} ${videoFormat.width}x${videoFormat.height}, generation ${message.generation}"
+                                    framePresented.set(false)
+                                    awaitingRecoveryKey = true
+                                } else {
+                                    audio = createdAudio
+                                    actualAudio = "Audio playback resynchronized; ${checkNotNull(createdAudio).decoderDescription}"
                                 }
-                                video = createdVideo
-                                audio = createdAudio
-                                activeVideoFormat = format
-                                actualVideo = "Actual video: ${format.mime} ${format.width}x${format.height}, generation ${message.generation}"
-                                if (createdAudio != null)
-                                    actualAudio = "Audio playback resynchronized; ${createdAudio.decoderDescription}"
-                                framePresented.set(false)
-                                checkNotNull(tracks).ready(1)
-                                tracksReady = checkNotNull(tracks).allReady()
-                                awaitingRecoveryKey = true
+                                checkNotNull(tracks).ready(track)
                                 installed = true
                             }
                             if (!installed) {
-                                videoOutput.release(createdVideo)
+                                createdVideo?.let { videoOutput.release(it) }
                                 createdAudio?.close()
                                 return@operations
                             }
-                            if (!sameRaster) onVideoSize(format.width, format.height)
-                            if (accepted && !stopping.get() && videoGeneration == message.generation && active.get() === this) {
-                                send(Type.STREAM_READY, JSONObject().put("ok", true), 1, message.generation)
-                                onDiscoveryDiagnostic("event=STREAM_RECOVERY_READY generation=${message.generation}")
+                            if (!sameRaster) onVideoSize(checkNotNull(videoFormat).width, videoFormat.height)
+                            if (current()) {
+                                send(Type.STREAM_READY, JSONObject().put("ok", true), track, message.generation)
+                                onDiscoveryDiagnostic("event=STREAM_RECOVERY_READY track=$track generation=${message.generation}")
                             }
                         } catch (e: Exception) {
                             if (!installed) {
-                                try { videoOutput.release(createdVideo) } finally { createdAudio?.close() }
+                                try { createdVideo?.let { videoOutput.release(it) } } finally { createdAudio?.close() }
                             }
                             throw e
                         }
                     }
                 } catch (e: Exception) {
-                    if (accepted && !stopping.get() && videoGeneration == message.generation && active.get() === this)
-                        playbackFailed(if (e is PlaybackException) e.code else "DECODER_FAILED",
-                            "Stream recovery failed: ${e.message ?: e.javaClass.simpleName}", FailureOrigin.SESSION)
+                    if (accepted && !stopping.get() &&
+                        (if (track == 1) videoGeneration else audioGeneration) == message.generation && active.get() === this)
+                        playbackFailed(if (e is PlaybackException) e.code else if (track == 1) "DECODER_FAILED" else "AUDIO_FAILED",
+                            "Track $track recovery failed: ${e.message ?: e.javaClass.simpleName}",
+                            if (track == 1) FailureOrigin.VIDEO else FailureOrigin.AUDIO)
                     else if (e is InterruptedException || accepted && !stopping.get())
                         onDiscoveryDiagnostic("event=STREAM_RECOVERY_RETIRED exception=${e.javaClass.simpleName}")
                     else {
@@ -942,7 +978,7 @@ class ReceiverServer private constructor(
                         decoderDescription = diagnostic
                         onStatus("Initializing video", "$senderName\n$requestSummary\nActual: ${format.width}x${format.height}; $diagnostic")
                     }, failed, {
-                        if (running.get() && !stopping.get() && !recovering && tracksReady && active.get() === this && videoGeneration == generation &&
+                        if (running.get() && !stopping.get() && !videoRecovering && tracksReady && active.get() === this && videoGeneration == generation &&
                             framePresented.compareAndSet(false, true)) {
                             onScreenEvent(ReceiverScreenEvent.FramePresented)
                             onFramePresented { running.get() && active.get() === this && !stopping.get() && videoGeneration == generation }
@@ -951,7 +987,7 @@ class ReceiverServer private constructor(
                         val caps = receiveCapabilities()
                         caps.nativeHdrAvailable == true || format.toneMapToSdr && caps.hdrToSdr
                     }, onRotation = { rotation ->
-                        val current = { running.get() && !recovering && accepted && !stopping.get() && active.get() === this && videoGeneration == generation }
+                        val current = { running.get() && !videoRecovering && accepted && !stopping.get() && active.get() === this && videoGeneration == generation }
                         if (current()) {
                             VideoPresentation.requireSupportedRotation(format.videoColor != null, rotation)
                             actualRotation = if (videoRotation) rotation else 0
@@ -959,12 +995,13 @@ class ReceiverServer private constructor(
                         }
                     })).also {
                     it.statisticsEnabled = request?.receiverOptions?.playbackStats == true
+                    it.dropStaleOutput = streamRecovery
                     it.onDecoded = { pts -> proveVideoKey(generation, pts) }
                     it.start()
                 }
             }
 
-        private fun createAudioPlayer(format: AudioFormat, shared: PlaybackClock): AudioPlayer {
+        private fun createAudioPlayer(format: AudioFormat, shared: PlaybackClock, cutoff: Long? = null): AudioPlayer {
             val epoch = ++audioEpoch
             val failed: (String, String) -> Unit = { code, detail ->
                 if (accepted && !stopping.get() && epoch == audioEpoch && epoch > retiredAudioThrough)
@@ -977,6 +1014,7 @@ class ReceiverServer private constructor(
                 onUnderrunRecovery = { android.util.Log.w("ScreenCopyReceiver", it.logMessage()) },
                 onRegulation = { android.util.Log.i("ScreenCopyReceiver", it.logMessage()) })).also {
                 it.statisticsEnabled = request?.receiverOptions?.playbackStats == true
+                it.recoveryCutoffUs = cutoff
                 it.onFirstSubmitted = { pts -> completeAudio(epoch, pts) }
                 it.start()
             }
@@ -986,32 +1024,34 @@ class ReceiverServer private constructor(
             val key = recoveryKeyPts ?: return@synchronized
             if (!streamRecovery || !accepted || stopping.get() || generation != videoGeneration ||
                 generation <= retiredVideoThrough || decodedPts < key || keyProvedGeneration == generation) return@synchronized
-            send(Type.STATUS, StreamRecoveryProtocol.status(StreamRecoveryProtocol.KEY, generation, key))
+            if (clock.delayUs(decodedPts)?.let { it < -250_000 } == true) return@synchronized
+            send(Type.STATUS, StreamRecoveryProtocol.status(StreamRecoveryProtocol.KEY, 1, generation, key))
             keyProvedGeneration = generation
-            audio?.recoveryCutoffUs = key
-            audioRecoveryOpen = true
-            if (request?.audioCodec == null) completeRecovery(key, null)
+            completeRecovery(1, key)
         }
 
         private fun completeAudio(epoch: Long, pts: Long) = synchronized(playbackLock) {
-            val key = recoveryKeyPts ?: return@synchronized
-            if (!streamRecovery || !accepted || stopping.get() || epoch != audioEpoch || epoch <= retiredAudioThrough ||
-                keyProvedGeneration != videoGeneration || pts < key) return@synchronized
-            if (pts - key > 250_000) {
-                playbackFailed("AUDIO_FAILED", "Recovery audio starts more than 250 ms after the fresh video key", FailureOrigin.AUDIO)
-                return@synchronized
-            }
-            completeRecovery(key, pts)
+            if (!streamRecovery || !accepted || stopping.get() || !audioRecovering || epoch != audioEpoch ||
+                epoch <= retiredAudioThrough || pts < audioRecoveryCutoff) return@synchronized
+            completeRecovery(2, pts)
         }
 
-        private fun completeRecovery(key: Long, audioPts: Long?) {
-            if (completedGeneration == videoGeneration) return
-            send(Type.STATUS, StreamRecoveryProtocol.status(StreamRecoveryProtocol.COMPLETE, videoGeneration, key, audioPts))
-            completedGeneration = videoGeneration
-            recoveryAt = 0
-            clock.recoveryStartup = false
-            phase = "Playing"
-            onDiscoveryDiagnostic("event=STREAM_RECOVERY_COMPLETE generation=$videoGeneration")
+        private fun completeRecovery(track: Int, pts: Long) {
+            val generation = if (track == 1) videoGeneration else audioGeneration
+            if (track == 1 && completedGeneration == generation || track == 2 && completedAudioEpoch == audioEpoch) return
+            send(Type.STATUS, StreamRecoveryProtocol.status(StreamRecoveryProtocol.COMPLETE, track, generation, pts))
+            if (track == 1) {
+                completedGeneration = generation
+                videoRecoveryAt = 0
+                clock.recoveryStartup = false
+            } else {
+                completedAudioEpoch = audioEpoch
+                audioRecoveryAt = 0
+                audioRecovering = false
+                clock.endAudioRecovery()
+            }
+            phase = if (recovering) "Recovering" else "Playing"
+            onDiscoveryDiagnostic("event=STREAM_RECOVERY_COMPLETE track=$track generation=$generation")
         }
 
         private fun send(type: Type, json: JSONObject, track: Int = 0, generation: Long = 0) {
@@ -1089,17 +1129,17 @@ class ReceiverServer private constructor(
             }
         }
 
-        private fun stopPlayback() = synchronized(playbackOperations) { retirePlayers(true) }
+        private fun stopPlayback() = synchronized(playbackOperations) { retirePlayers() }
 
-        private fun retirePlayers(endSession: Boolean) {
+        private fun retirePlayers() {
             playbackStatistics = null
             resetStatistics()
             val retired = synchronized(playbackLock) {
                 tracksReady = false
-                val values = Triple(video, audio, if (endSession) presentation else null)
+                val values = Triple(video, audio, presentation)
                 video = null
                 audio = null
-                if (endSession) presentation = null
+                presentation = null
                 values
             }
             val (oldVideo, oldAudio, oldPresentation) = retired
@@ -1135,8 +1175,10 @@ class ReceiverServer private constructor(
                 return
             }
             when {
-                streamRecovery && recoveryAt > 0 && time - recoveryAt >= 10_000 -> {
-                    connectionError.compareAndSet(null, "TIMEOUT" to "Stream recovery did not produce a usable keyframe within 10 seconds")
+                streamRecovery && (videoRecoveryAt > 0 && time - videoRecoveryAt >= 10_000 ||
+                    audioRecoveryAt > 0 && time - audioRecoveryAt >= 10_000) -> {
+                    val track = if (videoRecoveryAt > 0 && time - videoRecoveryAt >= 10_000) 1 else 2
+                    connectionError.compareAndSet(null, "TIMEOUT" to "Track $track recovery produced no usable fresh media within 10 seconds")
                     socket.close()
                 }
                 stopping.get() && time - stopAt >= 2000 -> socket.close()
@@ -1184,7 +1226,7 @@ class ReceiverServer private constructor(
             val control = controlStatistics.snapshot(time)
             val videoPath = players.first?.videoPathStatistics()
             val snapshot = statisticsSampler.sample(time, PlaybackStatisticsInput(
-                session, epochs.first, epochs.second, if (recoveryAt > 0) "Recovering" else phase,
+                session, epochs.first, epochs.second, if (recovering) "Recovering" else phase,
                 settings.videoCodec, settings.audioCodec, format?.width, format?.height, settings.fps,
                 settings.videoBitrate, settings.audioBitrate, actualRotation, settings.receiverOrientation.wireValue,
                 receivedVideo.get(), receivedAudio.get(), videoPayload.get(), audioPayload.get(),

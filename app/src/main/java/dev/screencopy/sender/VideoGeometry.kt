@@ -7,7 +7,10 @@ internal data class VideoSize(val width: Int, val height: Int) {
     override fun toString() = "${width}x$height"
 }
 internal data class VideoGeometry(val requested: VideoSize, val output: VideoSize, val maxSize: Int, val normalizedMaxSize: Int, val fps: Int) {
-    fun description() = "Requested capture $requested, max size $maxSize (scrcpy $normalizedMaxSize); encoded output $output at up to $fps fps."
+    fun description(): String {
+        val rate = if (fps == 0) "with uncapped capture FPS" else "at up to $fps fps"
+        return "Requested capture $requested, max size $maxSize (scrcpy $normalizedMaxSize); encoded output $output $rate."
+    }
 }
 internal object ScrcpyVideoSizing {
     fun calculate(settings: Settings, inventory: DisplayInventory): VideoGeometry {
@@ -119,7 +122,9 @@ internal object VideoGeometryValidation {
         val limits = considered.mapNotNull { it.limits?.describe() }.distinct().take(4).joinToString(" | ")
         val suggestion = considered.firstNotNullOfOrNull { it.suggestion }
         val example = suggestion?.let {
-            " Verified encoded example: ${it.first} at ${it.second} fps; adjust crop/size/FPS explicitly within display bounds."
+            " Verified encoded example: ${it.first} " +
+                (if (it.second == 0) "with uncapped capture FPS" else "at ${it.second} fps") +
+                "; adjust crop/size/FPS explicitly within display bounds."
         }.orEmpty()
         val selection = if (automatic && supported > 0)
             "Automatic first-attempt ordering is uncertain and candidate metadata differs. Choose a compatible encoder explicitly; no candidate is substituted."

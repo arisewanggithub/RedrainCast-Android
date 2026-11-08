@@ -107,7 +107,7 @@ internal class ProjectionRenderer(
         val image = checkNotNull(surfaceTexture)
         image.updateTexImage()
         val time = image.timestamp
-        if (time <= 0 || lastFrame > 0 && time - lastFrame < 1_000_000_000L / settings.maxFps) return
+        if (!frameDue(time, lastFrame, settings.maxFps)) return
         lastFrame = time
         image.getTransformMatrix(matrix)
         val plan = ProjectionTransform.coordinates(settings, source)
@@ -130,6 +130,12 @@ internal class ProjectionRenderer(
         check(GLES20.glGetError() == GLES20.GL_NO_ERROR) { "GPU draw failed" }
         onFrame(time / 1000, VideoRotation.degrees(settings, source))
         check(EGLExt.eglPresentationTimeANDROID(display, window, time) && EGL14.eglSwapBuffers(display, window)) { "GPU frame delivery failed" }
+    }
+
+    companion object {
+        internal fun frameDue(timeNs: Long, lastFrameNs: Long, maxFps: Int): Boolean =
+            timeNs > 0 && (lastFrameNs <= 0 || timeNs > lastFrameNs &&
+                (maxFps == 0 || timeNs - lastFrameNs >= 1_000_000_000L / maxFps))
     }
 
     private fun shader(type: Int, code: String): Int {
