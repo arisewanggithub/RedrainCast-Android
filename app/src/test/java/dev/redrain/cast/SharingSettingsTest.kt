@@ -163,6 +163,68 @@ class SharingSettingsTest {
         }
     }
 
+    @Test fun textInputsSelectAllOnFocusAndAllowCursorEditsUntilFocusReturns() {
+        val controller = activity()
+        val current = Settings().apply {
+            cropWidth = 100
+            cropHeight = 200
+            cropX = 12
+            cropY = 16
+            audioCodec = "opus"
+        }
+        val dialog = show(controller.get(), current, { fail("Focus change saved settings") }, {})
+        latestDialog()
+        try {
+            field<Button>(dialog, "advancedToggle").performClick()
+            shadowOf(Looper.getMainLooper()).idle()
+            val keys = listOf("maxSize", "videoBitrate", "cropWidth", "cropHeight", "cropX", "cropY", "audioBitrate")
+            for (key in keys) {
+                val input = field<EditText>(dialog, key)
+                assertTrue(key, input.requestFocus())
+                shadowOf(Looper.getMainLooper()).idle()
+                assertEquals(key, 0, input.selectionStart)
+                assertEquals(key, input.text.length, input.selectionEnd)
+                input.setSelection(1)
+                assertTrue(input.requestFocus())
+                shadowOf(Looper.getMainLooper()).idle()
+                assertEquals(key, 1, input.selectionStart)
+                assertEquals(key, 1, input.selectionEnd)
+                assertTrue(field<EditText>(dialog, if (key == "maxSize") "videoBitrate" else "maxSize").requestFocus())
+                assertFalse(key, input.hasFocus())
+                assertTrue(input.requestFocus())
+                shadowOf(Looper.getMainLooper()).idle()
+                assertEquals(key, 0, input.selectionStart)
+                assertEquals(key, input.text.length, input.selectionEnd)
+            }
+        } finally {
+            dialog.dismiss()
+            controller.pause().stop().destroy()
+        }
+    }
+
+    @Test fun replacingSelectedInputNeedsNoDeletionAndCancelPreservesSettings() {
+        val controller = activity()
+        val activity = controller.get()
+        val current = Settings()
+        val original = current.saved().toString()
+        val preferences = activity.getSharedPreferences(SharingSettings.PREFERENCES, Context.MODE_PRIVATE)
+        preferences.edit().putString(SharingSettings.REQUEST, original).commit()
+        val dialog = show(activity, current, { fail("Cancel saved settings") }, {})
+        latestDialog()
+        try {
+            val input = field<EditText>(dialog, "maxSize")
+            assertTrue(input.requestFocus())
+            input.text.replace(input.selectionStart, input.selectionEnd, "1280")
+            assertEquals("1280", input.text.toString())
+            assertEquals(1920, current.maxSize)
+            click(dialog, AlertDialog.BUTTON_NEGATIVE)
+            assertEquals(original, preferences.getString(SharingSettings.REQUEST, null))
+        } finally {
+            dialog.dismiss()
+            controller.pause().stop().destroy()
+        }
+    }
+
     @Test fun nativeChoicesCheckCurrentDraftAndOnlyPersistAfterParentSave() {
         val controller = activity()
         val activity = controller.get()
@@ -183,6 +245,7 @@ class SharingSettingsTest {
             assertNoSpinners(dialog.window!!.decorView)
             for ((key, checked, selected) in listOf(
                 Triple("videoCodec", 1, 2),
+                Triple("maxFps", 6, 8),
                 Triple("receiverOrientation", 2, 1),
                 Triple("audioCodec", 2, 1),
                 Triple("audioSource", 1, 0)
@@ -210,6 +273,7 @@ class SharingSettingsTest {
             assertFalse(dialog.isShowing)
             val result = checkNotNull(saved)
             assertEquals("av1", result.videoCodec)
+            assertEquals(120, result.maxFps)
             assertEquals("landscape", result.receiverOrientation)
             assertEquals("opus", result.audioCodec)
             assertEquals("playback", result.audioSource)
@@ -304,7 +368,7 @@ class SharingSettingsTest {
         assertSame(shownDialog, dialog)
         try {
             field<EditText>(dialog, "maxSize").setText("0")
-            field<EditText>(dialog, "maxFps").setText("90")
+            choose(dialog, "maxFps", 7)
             field<EditText>(dialog, "videoBitrate").setText("12.5")
             choose(dialog, "videoCodec", 1)
             choose(dialog, "receiverOrientation", 2)
@@ -337,6 +401,68 @@ class SharingSettingsTest {
         }
     }
 
+    @Test fun fpsPickerMatchesWindowsPresetsAndPersistsEveryOption() {
+        val controller = activity()
+        val activity = controller.get()
+        val presets = listOf(15, 24, 25, 30, 48, 50, 60, 90, 120)
+        try {
+            for ((position, expected) in presets.withIndex()) {
+                val current = Settings()
+                var saved: Settings? = null
+                val dialog = show(activity, current, { saved = it }, {})
+                latestDialog()
+                assertEquals(Button::class.java, field<Button>(dialog, "maxFps").javaClass)
+                assertEquals("60", field<Button>(dialog, "maxFps").text.toString())
+                val picker = openChoice(dialog, "maxFps")
+                assertEquals(presets.map(Int::toString),
+                    (0 until picker.listView.count).map { picker.listView.getItemAtPosition(it).toString() })
+                assertEquals(6, picker.listView.checkedItemPosition)
+                click(picker, AlertDialog.BUTTON_NEGATIVE)
+                choose(dialog, "maxFps", position)
+                assertEquals(expected.toString(), field<Button>(dialog, "maxFps").text.toString())
+                assertEquals(60, current.maxFps)
+                click(dialog, AlertDialog.BUTTON_POSITIVE)
+                assertFalse(dialog.isShowing)
+                assertEquals(expected, checkNotNull(saved).maxFps)
+                assertEquals(expected, SharingSettings.load(activity) { throw it }.maxFps)
+            }
+        } finally {
+            controller.pause().stop().destroy()
+        }
+    }
+
+    @Test fun fpsPickerPreservesSavedCustomValueAndCancelDiscardsDraft() {
+        val controller = activity()
+        val activity = controller.get()
+        val current = Settings().apply { maxFps = 47 }
+        val original = current.saved().toString()
+        val preferences = activity.getSharedPreferences(SharingSettings.PREFERENCES, Context.MODE_PRIVATE)
+        preferences.edit().putString(SharingSettings.REQUEST, original).commit()
+        try {
+            val dialog = show(activity, SharingSettings.load(activity) { throw it }, { fail("Cancel saved settings") }, {})
+            latestDialog()
+            assertEquals("47", field<Button>(dialog, "maxFps").text.toString())
+            val picker = openChoice(dialog, "maxFps")
+            assertEquals(listOf("15", "24", "25", "30", "47", "48", "50", "60", "90", "120"),
+                (0 until picker.listView.count).map { picker.listView.getItemAtPosition(it).toString() })
+            assertEquals(4, picker.listView.checkedItemPosition)
+            click(picker, AlertDialog.BUTTON_NEGATIVE)
+            assertEquals("47", field<Button>(dialog, "maxFps").text.toString())
+            choose(dialog, "maxFps", 9)
+            click(dialog, AlertDialog.BUTTON_NEGATIVE)
+            assertEquals(original, preferences.getString(SharingSettings.REQUEST, null))
+            assertEquals(47, current.maxFps)
+            var saved: Settings? = null
+            val reopened = show(activity, SharingSettings.load(activity) { throw it }, { saved = it }, {})
+            latestDialog()
+            click(reopened, AlertDialog.BUTTON_POSITIVE)
+            assertEquals(47, checkNotNull(saved).maxFps)
+            assertEquals(47, SharingSettings.load(activity) { throw it }.maxFps)
+        } finally {
+            controller.pause().stop().destroy()
+        }
+    }
+
     @Test fun invalidSettingsStayOpenWithoutWritingOrCallingSaveAndCanBeCorrected() {
         val controller = activity()
         val activity = controller.get()
@@ -344,13 +470,13 @@ class SharingSettingsTest {
         show(activity, Settings(), { saves++ }, {})
         val dialog = latestDialog()
         try {
-            field<EditText>(dialog, "maxFps").setText("0")
+            field<EditText>(dialog, "maxSize").setText("-1")
             click(dialog, AlertDialog.BUTTON_POSITIVE)
             assertTrue(dialog.isShowing)
             assertEquals(0, saves)
             assertEquals(View.VISIBLE, field<TextView>(dialog, "settingsError").visibility)
             assertFalse(activity.getSharedPreferences(SharingSettings.PREFERENCES, Context.MODE_PRIVATE).contains(SharingSettings.REQUEST))
-            field<EditText>(dialog, "maxFps").setText("60")
+            field<EditText>(dialog, "maxSize").setText("1920")
             field<EditText>(dialog, "videoBitrate").setText("not a number")
             click(dialog, AlertDialog.BUTTON_POSITIVE)
             assertTrue(dialog.isShowing)
@@ -616,7 +742,7 @@ class SharingSettingsTest {
             scroll.layout(0, 0, 400, 500)
             scroll.scrollTo(0, 200)
             assertTrue(scroll.scrollY > 0)
-            field<EditText>(dialog, "maxFps").setText("0")
+            field<EditText>(dialog, "maxSize").setText("-1")
             click(dialog, AlertDialog.BUTTON_POSITIVE)
             assertEquals(View.VISIBLE, error.visibility)
             assertEquals(0, scroll.scrollY)

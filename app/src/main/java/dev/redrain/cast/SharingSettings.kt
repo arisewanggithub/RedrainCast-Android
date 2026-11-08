@@ -111,6 +111,7 @@ object SharingSettings {
                 inputType = if (numeric) InputType.TYPE_CLASS_NUMBER or InputType.TYPE_NUMBER_FLAG_DECIMAL
                     else InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS
                 setText(value)
+                setSelectAllOnFocus(true)
                 if (hint != null) setHint(hint)
                 caption.labelFor = id
                 parent.addView(this, spacing())
@@ -189,7 +190,9 @@ object SharingSettings {
         }
         val size = edit(body, R.string.rc_max_size, current.maxSize.toString(), "maxSize", hint = R.string.rc_max_size_hint)
         label(body, R.string.rc_max_size_hint)
-        val fps = edit(body, R.string.rc_fps, current.maxFps.toString(), "maxFps")
+        val fpsValues = (listOf(15, 24, 25, 30, 48, 50, 60, 90, 120) + current.maxFps)
+            .distinct().sorted().map(Int::toString)
+        val fps = choice(body, R.string.rc_fps, fpsValues, fpsValues, current.maxFps.toString(), "maxFps")
         val bitrate = edit(body, R.string.rc_bitrate, decimal(current.videoBitrate, 1_000_000), "videoBitrate")
         val orientations = listOf("auto", "landscape", "portrait")
         val orientation = choice(
@@ -305,7 +308,7 @@ object SharingSettings {
                         this.videoCodec = requireNotNull(videoCodec.value) { activity.getString(R.string.rc_select_hardware_codec) }
                         encoders.resolve(this.videoCodec, "")
                         maxSize = number(size, R.string.rc_max_size)
-                        maxFps = number(fps, R.string.rc_fps)
+                        maxFps = checkNotNull(fps.value).toInt()
                         videoBitrate = number(bitrate, R.string.rc_bitrate, 1_000_000)
                         receiverOrientation = checkNotNull(orientation.value)
                         this.audio = audio.isChecked
