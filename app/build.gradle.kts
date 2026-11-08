@@ -98,6 +98,9 @@ tasks.named("preBuild") { dependsOn(verifyFfmpegPackage) }
 tasks.configureEach {
     if (name.startsWith("configureCMake")) dependsOn(verifyFfmpegPackage)
 }
+tasks.withType<Test>().configureEach {
+    testLogging.exceptionFormat = org.gradle.api.tasks.testing.logging.TestExceptionFormat.FULL
+}
 
 dependencies {
     implementation(ffmpegPackage)
