@@ -127,6 +127,11 @@ settings are changed by statistics.
   only on Save. Codec, size, FPS, bitrate, orientation and audio are the primary
   controls; crop and detailed audio options are under Advanced. Selection fields
   open standard Android single-choice dialogs with the current option checked.
+  Text inputs select their full value when gaining focus for easy replacement;
+  subsequent taps in the focused field retain normal cursor placement.
+  FPS offers the same presets as Windows: 15, 24, 25, 30, 48, 50, 60, 90 and
+  120 (default 60). A previously saved custom FPS remains selectable alongside
+  the sorted presets, but new arbitrary values cannot be entered.
   Selecting updates only the draft; cancelling a choice retains its prior value,
   and cancelling Sharing settings discards all edits. Child dialogs close with
   their parent, and the settings scroll position is retained.
@@ -345,8 +350,8 @@ Ordinary release builds are optimized and **unsigned**. The manually triggered
 production signing, cross-repository access and reviewed LGPL relink materials
 are configured. No production key material or in-app APK installer is included.
 Debug builds use application ID `dev.redrain.cast.debug`, launcher name
-**RedrainCast Debug**, and version name `0.4.13-debug` (the release version plus
-`-debug`). Release remains `dev.redrain.cast`, **RedrainCast**, version `0.4.13`,
+**RedrainCast Debug**, and version name `0.4.14-debug` (the release version plus
+`-debug`). Release remains `dev.redrain.cast`, **RedrainCast**, version `0.4.14`,
 code `26`; both variants retain source namespace `dev.redrain.cast`.
 The distinct IDs allow debug and release to be installed side by side, with
 separate app data, saved settings and permissions; installing debug does not
