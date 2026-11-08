@@ -24,6 +24,85 @@ import dev.screencopy.sender.StreamRecoverySender
 import dev.screencopy.sender.Wire as SenderWire
 
 class StreamRecoveryPipelineTest {
+    @Test(timeout = 15_000) fun recoveryAfterLongPlaybackUsesItsTrackDeadlineNotTheSetupTimestamp() {
+        for (track in 1..2) recoveryDeadline(track, expireControl = false)
+    }
+
+    @Test(timeout = 10_000) fun freshRecoveryDoesNotDisableControlReadLiveness() =
+        recoveryDeadline(1, expireControl = true)
+
+    private fun recoveryDeadline(track: Int, expireControl: Boolean) {
+        val entered = CountDownLatch(1)
+        val release = CountDownLatch(1)
+        val audioCreations = AtomicInteger()
+        ReceiverServer.forProtocolTests("Receiver",
+            videoFactory = { format, clock, failed, generation ->
+                if (track == 1 && generation == 2L) {
+                    entered.countDown()
+                    assertTrue(release.await(3, TimeUnit.SECONDS))
+                }
+                VideoPlayer(format, clock, failed, Decoder(false), generation)
+            },
+            audioFactory = { format, clock, failed ->
+                if (track == 2 && audioCreations.incrementAndGet() == 2) {
+                    entered.countDown()
+                    assertTrue(release.await(3, TimeUnit.SECONDS))
+                }
+                testAudioPlayer(format, clock, failed, { Output() }, opusFactory = {
+                    object : OpusPacketDecoder {
+                        override fun decode(packet: ByteArray) = ShortArray(1920)
+                        override fun close() {}
+                    }
+                })
+            }).use { server ->
+            try {
+                session(server) { peer, media ->
+                    Wire.write(media.video.outputStream, frame(1_000_000, key = true))
+                    assertEquals(StreamRecoveryProtocol.KEY, expect(peer, Type.STATUS).json().getString("state"))
+                    assertEquals(StreamRecoveryProtocol.COMPLETE, expect(peer, Type.STATUS).json().getString("state"))
+                    val active = ReceiverServer::class.java.getDeclaredField("active").apply { isAccessible = true }
+                        .get(server) as java.util.concurrent.atomic.AtomicReference<*>
+                    val connection = checkNotNull(active.get())
+                    fun field(name: String) = connection.javaClass.getDeclaredField(name).apply { isAccessible = true }
+                    assertEquals("Playing", field("phase").get(connection))
+                    val timer = ReceiverServer::class.java.getDeclaredField("timer").apply { isAccessible = true }
+                        .get(server) as java.util.concurrent.ScheduledExecutorService
+                    timer.shutdown()
+                    assertTrue(timer.awaitTermination(3, TimeUnit.SECONDS))
+                    val oldSetup = System.nanoTime() / 1_000_000 - 30_000
+                    field("phaseAt").setLong(connection, oldSetup)
+                    val socket = field("socket").get(connection) as Socket
+                    val config = if (track == 1) videoConfig(2) else audioConfig(2, 1_080_000)
+                    Wire.write((if (track == 1) media.video else media.audio).outputStream, config)
+                    assertTrue(entered.await(2, TimeUnit.SECONDS))
+                    assertEquals("Recovering", field("phase").get(connection))
+                    sendControl(peer, Type.PING, JSONObject().put("nonce", 741))
+                    assertEquals(741, expect(peer, Type.PONG).json().getInt("nonce"))
+                    val recoveryAt = field(if (track == 1) "videoRecoveryAt" else "audioRecoveryAt")
+                    val originalRecovery = recoveryAt.getLong(connection)
+                    assertTrue(originalRecovery > 0)
+                    val tick = connection.javaClass.getDeclaredMethod("tick").apply { isAccessible = true }
+                    if (expireControl) field("lastRead").setLong(connection, System.nanoTime() / 1_000_000 - 10_000)
+                    tick.invoke(connection)
+                    if (expireControl) {
+                        assertTrue("Control read liveness must still close the socket", socket.isClosed)
+                    } else {
+                        assertFalse("A stale setup deadline must not close fresh recovery", socket.isClosed)
+                        assertEquals(oldSetup, field("phaseAt").getLong(connection))
+                        assertEquals(originalRecovery, recoveryAt.getLong(connection))
+                        recoveryAt.setLong(connection, System.nanoTime() / 1_000_000 - 9_000)
+                        tick.invoke(connection)
+                        assertFalse("Track recovery must retain its full ten-second budget", socket.isClosed)
+                        recoveryAt.setLong(connection, System.nanoTime() / 1_000_000 - 10_000)
+                        tick.invoke(connection)
+                        assertTrue("The original track deadline must still expire", socket.isClosed)
+                    }
+                    release.countDown()
+                }
+            } finally { release.countDown() }
+        }
+    }
+
     @Test(timeout = 10_000) fun fatalErrorIsDeliveredWhileControlWaitsForPlaybackRetirement() {
         val retiring = CountDownLatch(1)
         val release = CountDownLatch(1)

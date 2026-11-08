@@ -1160,7 +1160,7 @@ class ReceiverServer private constructor(
                 org.screencopy.receiver.protocol.HdrPreparationDeadline.milliseconds(hdrVideoVersion) else 10_000
             val progressExpired = org.screencopy.receiver.protocol.HdrPreparationDeadline.expired(
                 if (phase == "Negotiating") hdrVideoVersion else null, time - lastRead,
-                if (phase == "Playing" || stopping.get()) 0 else time - phaseAt)
+                if (phase == "Playing" || phase == "Recovering" || stopping.get()) 0 else time - phaseAt)
             sampleStatistics(time)
             if (mediaOwner != null) {
                 if (writer?.stalled(time) == true) {

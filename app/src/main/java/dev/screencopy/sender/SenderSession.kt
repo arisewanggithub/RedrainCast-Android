@@ -82,7 +82,7 @@ class SenderSession internal constructor(
         requestStop()
         return true
     }
-    private fun requestStop() {
+    @Synchronized private fun requestStop() {
         if (!outcome.requestStop()) return
         trace.mark(SessionStopTrace.Stage.REQUESTED)
         status("Stopping")
@@ -232,7 +232,7 @@ class SenderSession internal constructor(
     }
 
     internal fun retireTransport() {
-        closing = true
+        synchronized(this) { closing = true }
         trace.phase(SessionStopTrace.Phase.CLEANUP)
         phaseDeadline = now() + 2_000_000_000L
         status("Stopping")
@@ -387,6 +387,10 @@ class SenderSession internal constructor(
             } else fail(e, SessionOutcome.Origin.RECEIVER_READ)
         } finally { receiverReleased.countDown() }
     }
+    @Synchronized private fun writeCompleted(message: Wire.Message) {
+        if (!stopping && !closing) recovery?.written(message)
+    }
+
     private fun writeLoop(lane: Int) {
         var ping = 0L
         try {
@@ -402,7 +406,7 @@ class SenderSession internal constructor(
                     mux.beginWrite(message)
                     try {
                         connected.send(message)
-                        recovery?.written(message)
+                        writeCompleted(message)
                     } finally {
                         mux.endWrite(message)
                         if (lane == 0) writeStarted = 0

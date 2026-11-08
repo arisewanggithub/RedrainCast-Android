@@ -652,6 +652,8 @@ Each track has a **10-second deadline anchored to its first unresolved recovery*
 covering reset/cooldown, READY and usable source output. Initial
 negotiated startup is also bounded. Repeated reset/config/READY/key/request
 events cannot extend it. One track's completion never resets the other's deadline.
+Recovery is excluded from the generic absolute setup-phase deadline; its
+track-local deadlines and control-read/write liveness checks still apply.
 Audio recovery before first playback explicitly uses its own recovery startup
 state: video completion cannot restore the initial three-second timeout, and
 fresh audio is not compared to an obsolete first-video timestamp. The common
@@ -672,6 +674,9 @@ failure/proof callback and READY must still own its accepted session and current
 track generation/audio epoch; retired completions cannot revive or poison a
 new epoch. Current codec/output failures remain fatal, not success-shaped READY.
 Pending Stop cannot start new audio, and SESSION_END follows retirement.
+Successful in-flight writes finishing after Stop or capture retirement do not
+feed recovery proofs or recheck recovery deadlines. Actual transport-write
+failures retain their existing error/teardown handling.
 Audio-format changes require a new capture session. A successful recovery keeps
 the session/presentation lease; no shared, software, codec, quality or audio fallback.
 Fatal errors mean a required stream cannot recover, a current decoder/output
