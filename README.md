@@ -40,7 +40,7 @@ renderer skips are not network packet loss. Unavailable metrics show N/A.
 The main video section separates **Encoded size** and **Display mode**
 (**Display px** in the compact panel).
 Render target is kept only in Full playback diagnostics: it is N/A on the
-current TextureView path because its final compositor buffer dimensions are
+current video paths because their final compositor buffer dimensions are
 not measured; encoded/view/mode sizes are never substituted for that
 measurement. Display mode is the attached
 display's reported active Android mode dimensions, in that mode's orientation,
@@ -64,6 +64,31 @@ claims screen scanout. Playback epoch and Occluded are N/A on Android because
 there is no equivalent lifetime/occlusion signal; Audio epoch and Scheduled
 frames remain separate Android details. Common labels/order/units are tested
 against `protocol/fixtures/playback-statistics-display.json`.
+Local display contract v2 adds **Stream range**, **Profile / depth**, and
+**Output** immediately after Codec; the network contract is unchanged.
+Stream range separates validated incoming HDR10 from the decoder's reported
+transfer (PQ/BT.709). Missing SDR color evidence is N/A, not assumed SDR.
+Profile comes from the decoder output format; depth is shown only for explicit
+decoded YUV component formats (8-bit or P010 10-bit). An opaque Surface does
+not establish depth, even with a Main 10 profile.
+Output is cached only after a matching MediaCodec frame-rendered callback for
+the submitted picture's validated output format. **HDR output** means the
+BT2020/PQ/limited direct Surface path, not physical HDR emission, display-wire
+protocol or an OEM HDR switch. Capabilities and negotiated HDR alone cannot
+establish it. The optional tone-map request has no independent runtime mapping
+proof, so it does not report **SDR (tone-mapped)**. Missing evidence stays N/A.
+Metadata is cached on decoder/output events, never queried on the 1-Hz refresh;
+retired players and unmatched callbacks cannot publish old presentation paths.
+The copied Windows comparison manifest is
+`protocol/fixtures/playback-statistics-display-contract.json`; Android retains
+its existing display-mode/app-view diagnostic fields and typography.
+Compact landscape panels reserve 40% of the player width for unobscured video;
+the native-rendered area checks retain their strict less-than-half limit.
+The video metadata column receives more width than the short queue column to
+avoid turning the added rows and existing raster values into a taller panel.
+Landscape KPI and generation-total grids share a horizontal summary row,
+retaining their title-over-value cells. The source-skew explanation sits below
+the shorter audio column instead of adding another full-width panel row.
 Native-rendering tests inspect inner text bounds and the real reported Galaxy
 canvas dimensions at 450 dpi and 115% font scaling, including summary area and
 short-label wrapping. Full diagnostics tests scroll to the footer and retain the
@@ -128,11 +153,54 @@ settings are changed by statistics.
   capture is subject to Android's source-app capture policy; DRM/protected content
   cannot be captured. Microphone capture uses the microphone foreground-service
   type. Notification Stop remains available when the activity is backgrounded.
-- The receiver uses GPU-composited TextureView presentation with secure-window
+- Accepted SDR uses the proven MediaCodec-to-TextureView presentation path;
+  accepted HDR uses direct MediaCodec-to-SurfaceView, with secure-surface/window
   protection. Decoded video alone triggers fullscreen playback, with no initial
   banner, local stop button, or touch/D-pad overlay. The sender controls normal
   session start/stop. A sender stop returns the receiver to readiness without
   closing its healthy listener.
+  Native HDR10 reception requires explicit v1 HDR negotiation, a hardware HEVC
+  Main10 HDR10 decoder and HDR10 support on the attached display's current mode.
+  SDR senders keep their existing protocol and playback path. Android does not
+  advertise HDR-to-SDR conversion without verified decoder support; losing HDR
+  output ends the HDR session explicitly and requires an SDR restart.
+  Capability reporting and JVM tests are not proof of real-device HDR scanout.
+  HDR bitstream admission failures retain their specific validation reason in
+  the playback error, alongside structured stage/generation diagnostics, without
+  exposing encoded pictures or vendor exception text.
+  Unsupported decoder selection preserves the requested MIME, raster, frame
+  rate and profile in the SELECT error. Per-hardware-candidate logs include
+  profile/level support, raster bounds/alignment, size support, frame-rate range
+  at that exact raster, and format/size-rate support. Generic maximum resolution
+  or frame rate is not a guarantee that their combination is supported.
+  Long candidate details are explicitly truncated to the bounded 1100-character
+  selection reason within the existing 2048-character error envelope; full
+  per-candidate diagnostics remain in the ScreenCopyReceiver log.
+  Rejection does not change HDR gates, settings or the protocol. A manual
+  1920x1080@60 retry is an option, not a compatibility guarantee; SDR is required
+  when native HDR display support is unavailable.
+  Routing uses the accepted `videoColor`, not the codec name: unmarked HEVC is
+  SDR, and HDR never enters TextureView even for a tone-mapping request.
+  SDR rotates its TextureView by each picture's 0/90/180/270-degree metadata
+  with aspect-preserving fitting. HDR keeps the framework-owned SurfaceView
+  unrotated and supports only zero picture rotation; nonzero HDR rotation
+  explicitly logs/fails `UNSUPPORTED_CONFIG` before decoder input dequeue/queue
+  and before output release. Nonzero HDR initial format rotation is rejected
+  before decoder creation.
+  KEY_ROTATION remains zero, so there is only one SDR rotation owner.
+  Both views stay attached; the SDR panel is opaque black during SDR and
+  transparent/non-opaque during HDR, avoiding decoder-surface teardown or
+  leaking old native video into SDR letterboxes. Codec slots, including detached
+  pending retirements, close before the owned TextureView Surface is released.
+  Retired TextureView/holder callbacks are identity-checked and cannot close or
+  replace a newer surface epoch.
+  The experimental child-SurfaceControl geometry bridge was removed after it
+  placed landscape video entirely outside the parent; its earlier matrix unit
+  oracle had transposed compositor coefficients and was not pixel-render proof.
+  Physical projector and HDR retests still require an authorized idle target.
+  Encoded mastering chromaticities tolerate at most one normalized 1/50000 unit
+  of hardware requantization; luminance/light levels and negotiated wire metadata
+  remain exact.
   Leaving the activity retires the listener and playback resources; it does not
   create a background receiver service. An outgoing cast can continue in its
   foreground service, and readiness resumes when the app returns after it ends.
@@ -276,7 +344,31 @@ Ordinary release builds are optimized and **unsigned**. The manually triggered
 [public prerelease workflow](tools/RELEASING.md) signs and publishes only after
 production signing, cross-repository access and reviewed LGPL relink materials
 are configured. No production key material or in-app APK installer is included.
-Debug installation is side-by-side with existing applications.
+Debug builds use application ID `dev.redrain.cast.debug`, launcher name
+**RedrainCast Debug**, and version name `0.4.13-debug` (the release version plus
+`-debug`). Release remains `dev.redrain.cast`, **RedrainCast**, version `0.4.13`,
+code `26`; both variants retain source namespace `dev.redrain.cast`.
+The distinct IDs allow debug and release to be installed side by side, with
+separate app data, saved settings and permissions; installing debug does not
+replace release. Older debug APKs using the release ID do not migrate to the
+new debug ID. Debug keeps normal development signing; release signing is unchanged.
+
+Build only (these commands do not install or launch either app):
+
+```powershell
+.\gradlew.bat :app:assembleDebug :app:assembleRelease :app:assembleDebugAndroidTest --console=plain
+```
+
+Outputs are `app\build\outputs\apk\debug\app-debug.apk`,
+`app\build\outputs\apk\release\app-release-unsigned.apk`, and
+`app\build\outputs\apk\androidTest\debug\app-debug-androidTest.apk`.
+Debug instrumentation uses package `dev.redrain.cast.debug.test` and targets
+`dev.redrain.cast.debug`; component class names retain their source packages.
+The launch update check compares the base version without the debug-only suffix,
+preserving alpha/beta/rc ordering and strict public release validation. It still
+offers public **release** pages, not debug updates: a downloaded release APK updates
+the separately installed release app (subject to its signing certificate), never
+the debug app. The displayed debug version retains `-debug`.
 Ordinary push/PR CI runs validation only; public publication is manual and gated.
 The separate public
 [RedrainCast-Native repository](https://github.com/arisewanggithub/RedrainCast-Native)
@@ -336,7 +428,7 @@ device identifiers are sent by the update checker.
 
 Debug builds include a non-exported `SyntheticVideoProbeActivity`; release builds
 do not. Its instrumented tests use synthetic colors, a hardware H.265 encoder,
-the production decoder and GPU presentation, including first-rotation/Auto
+the production SDR decoder/TextureView presentation, including first-rotation/Auto
 window-resize races and a separate sender normalization probe.
 
 These are opt-in diagnostics, not automatic casting tests. Never install or run
@@ -347,12 +439,13 @@ the diagnostic debug and androidTest APKs only after that gate. The explicit
 instrumentation runs unless the manual safety gate has been satisfied.
 
 ```text
-adb -s <verified-device> shell am instrument -w -e syntheticVideoProbe true -e class org.screencopy.receiver.SyntheticVideoRenderingDiagnosticTest#firstHevcQuarterTurnRacesAutoWindowResizeAcrossFreshStarts dev.redrain.cast.test/androidx.test.runner.AndroidJUnitRunner
-adb -s <verified-device> shell am instrument -w -e syntheticVideoProbe true -e class org.screencopy.receiver.SyntheticVideoRenderingDiagnosticTest#firstProjectionResizeRacesAutoWindowWithIndependentCropAcrossFreshStarts dev.redrain.cast.test/androidx.test.runner.AndroidJUnitRunner
+adb -s <verified-device> shell am instrument -w -e syntheticVideoProbe true -e class org.screencopy.receiver.SyntheticVideoRenderingDiagnosticTest#firstHevcQuarterTurnRacesAutoWindowResizeAcrossFreshStarts dev.redrain.cast.debug.test/androidx.test.runner.AndroidJUnitRunner
+adb -s <verified-device> shell am instrument -w -e syntheticVideoProbe true -e class org.screencopy.receiver.SyntheticVideoRenderingDiagnosticTest#firstProjectionResizeRacesAutoWindowWithIndependentCropAcrossFreshStarts dev.redrain.cast.debug.test/androidx.test.runner.AndroidJUnitRunner
 ```
 
 PixelCopy reads only the isolated synthetic window, never protected production
-content. Restore the previous app APK and remove the test helper afterward.
+content. Remove the debug/test helpers afterward if no longer needed; the separate
+release installation and its data are untouched.
 The intermittent tiny-strip rendering issue is still unresolved: the initial
 diagnostic Activity setup crash was corrected, but the retry was blocked by a
 locked receiver. Compilation is not a valid native pixel-rendering baseline.

@@ -302,7 +302,9 @@ class SyntheticVideoRenderingDiagnosticTest {
                 var output: Surface? = null
                 scenario.onActivity { output = it.output }
                 val decoder = SyntheticDecoderMetadata(
-                    AndroidVideoDecoder(format, checkNotNull(output)) { presented.incrementAndGet() },
+                    AndroidVideoDecoder(format, checkNotNull(output)) {
+                        presented.incrementAndGet()
+                    },
                     { decoderMetadata.set(it) })
                 Log.i(TAG, "codec=${decoder.description}")
                 player = VideoPlayer(format, PlaybackClock(),
@@ -361,7 +363,7 @@ class SyntheticVideoRenderingDiagnosticTest {
     }
 
     private fun awaitSurface(scenario: ActivityScenario<SyntheticVideoProbeActivity>): SurfaceTexture {
-        await("synthetic TextureView surface") {
+        await("synthetic SDR TextureView surface") {
             activityValue(scenario) { it.output != null && it.box.width > 0 && it.box.height > 0 }
         }
         var texture: SurfaceTexture? = null
@@ -409,7 +411,7 @@ class SyntheticVideoRenderingDiagnosticTest {
             pipeline.checkHealthy()
             pipeline.encoder.drain()
             pipeline.presented.get() >= before + 3 && activityValue(scenario) {
-                assertSame("Resize replaced the decoder SurfaceTexture", original, it.texture.surfaceTexture)
+                assertSame("Resize replaced the SDR SurfaceTexture", original, it.texture.surfaceTexture)
                 it.pictureRotation == degrees && it.updates.get() >= updates + 3 &&
                     it.texture.width == it.texture.layoutParams.width &&
                     it.texture.height == it.texture.layoutParams.height

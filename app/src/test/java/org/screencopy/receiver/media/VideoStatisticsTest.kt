@@ -19,14 +19,17 @@ class VideoStatisticsTest {
             assertEquals(1L, scheduled.scheduled)
             assertEquals(0L, scheduled.rendered)
             assertNull(scheduled.renderedPtsUs)
+            assertNull(player.videoPathStatistics().presentation)
             decoder.rendered(1_000_000, 2_000_000_000)
             assertEquals(1L, player.videoStatistics().rendered)
             assertEquals(1_000_000L, player.videoStatistics().renderedPtsUs)
             assertEquals(2_000_000_000L, player.videoStatistics().renderedAtNs)
+            assertEquals(VideoPresentationOutput.Sdr, player.videoPathStatistics().presentation!!.output)
         } finally { player.close() }
         decoder.rendered(1_020_000, 2_020_000_000)
         assertEquals(1L, player.videoStatistics().rendered)
         assertEquals(2_000_000_000L, player.videoStatistics().renderedAtNs)
+        assertEquals(VideoPathStatistics(null, null), player.videoPathStatistics())
     }
 
     private class Decoder : VideoDecoder {
@@ -38,7 +41,9 @@ class VideoStatisticsTest {
         override fun dequeueInput() = 0
         override fun input(index: Int) = ByteBuffer.allocate(16)
         override fun queueInput(index: Int, size: Int, ptsUs: Long, keyFrame: Boolean) {
-            output = VideoOutput(0, ptsUs, size, 0)
+            output = VideoOutput(0, ptsUs, size, 0, VideoPathStatistics(
+                DecodedVideoStatistics(VideoStreamFormat.Sdr, VideoTransfer.Bt709, "Main", 8),
+                VideoPresentationStatistics(VideoPresentationOutput.Sdr)))
         }
         override fun dequeueOutput(): VideoOutput? = output.also { output = null }
         override fun releaseOutput(index: Int, renderAtNs: Long?) {}

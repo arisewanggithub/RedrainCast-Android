@@ -73,7 +73,7 @@ class SyntheticVideoProbeActivity : Activity(), TextureView.SurfaceTextureListen
         texture.getTransform(Matrix()).getValues(transform)
         val image = texture.surfaceTexture
         val imageTransform = if (image != null && updates.get() > 0) {
-            // TextureView owns latching; read only metadata, never updateTexImage or pixels.
+            // TextureView owns latching; inspect metadata only, never updateTexImage or user pixels.
             FloatArray(16).also { image.getTransformMatrix(it) }.contentToString()
         } else "not-yet-latched"
         fun size(view: android.view.View) =
@@ -105,8 +105,7 @@ class SyntheticVideoProbeActivity : Activity(), TextureView.SurfaceTextureListen
     }
 
     private fun fit() {
-        if (pictureRotation >= 0)
-            VideoPresentation.fit(texture, box, 1080.0 / 1920, pictureRotation)
+        if (pictureRotation >= 0) VideoPresentation.fit(texture, box, 1080.0 / 1920, pictureRotation)
     }
 
     override fun onConfigurationChanged(newConfig: Configuration) {

@@ -6,7 +6,9 @@ data class VideoFormat(
     val height: Int,
     val configuration: List<ByteArray>,
     val frameRate: Int,
-    val rotation: Int = 0
+    val rotation: Int = 0,
+    val videoColor: org.screencopy.receiver.protocol.HdrVideoColor? = null,
+    val toneMapToSdr: Boolean = false
 )
 
 data class AudioFormat(

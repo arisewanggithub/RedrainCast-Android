@@ -29,6 +29,7 @@ import org.screencopy.receiver.ui.ReceiverScreenEvent
 import org.screencopy.receiver.ui.FailureDiagnostic
 import org.screencopy.receiver.ui.FailureOrigin
 import org.screencopy.receiver.ui.ReceiverOrientationException
+import org.screencopy.receiver.ui.VideoPresentation
 import java.io.EOFException
 import java.io.IOException
 import java.net.DatagramPacket
@@ -77,7 +78,11 @@ class ReceiverServer private constructor(
     private val acquireSession: (() -> AutoCloseable?)? = null,
     private val instanceId: String = UUID.randomUUID().toString().replace("-", ""),
     private val onFramePresented: (() -> Boolean) -> Unit = {},
-    private val supportsPlaybackStatistics: Boolean = false
+    private val supportsPlaybackStatistics: Boolean = false,
+    private val receiveCapabilities: () -> org.screencopy.receiver.protocol.ReceiveCapabilities = {
+        org.screencopy.receiver.protocol.ReceiveCapabilities()
+    },
+    private val videoSurface: ((VideoFormat) -> Surface)? = null
 ) : AutoCloseable {
     constructor(
         name: String, surface: Surface,
@@ -93,12 +98,17 @@ class ReceiverServer private constructor(
         acquireSession: (() -> AutoCloseable?)? = null,
         instanceId: String = UUID.randomUUID().toString().replace("-", ""),
         onFramePresented: (() -> Boolean) -> Unit = {},
-        supportsPlaybackStatistics: Boolean = false
+        supportsPlaybackStatistics: Boolean = false,
+        receiveCapabilities: () -> org.screencopy.receiver.protocol.ReceiveCapabilities = {
+            org.screencopy.receiver.protocol.ReceiveCapabilities()
+        },
+        videoSurface: ((VideoFormat) -> Surface)? = null
     ) : this(name, surface, onStatus, onVideoSize, onListener, port, videoOutput, ::validateCapabilities, onScreenEvent,
         { android.util.Log.e("ScreenCopyReceiver", it.logMessage()) }, onPresentationStart, null,
         onDiscoveryDiagnostic = { android.util.Log.i("ScreenCopyReceiver", it) }, onVideoRotation = onVideoRotation,
         acquireSession = acquireSession, instanceId = instanceId, onFramePresented = onFramePresented,
-        supportsPlaybackStatistics = supportsPlaybackStatistics)
+        supportsPlaybackStatistics = supportsPlaybackStatistics, receiveCapabilities = receiveCapabilities,
+        videoSurface = videoSurface)
 
     private val name = name.take(80)
     private val running = AtomicBoolean(false)
@@ -160,6 +170,8 @@ class ReceiverServer private constructor(
     }.sorted()
 
     fun disconnect(reason: String) { active.get()?.requestStop(reason) }
+
+    fun displayCapabilitiesChanged() { active.get()?.checkHdrOutput() }
 
     private fun acceptConnections() {
         try {
@@ -224,6 +236,7 @@ class ReceiverServer private constructor(
         val bytes = JSONObject().put("protocol", "screencopy").put("version", Wire.VERSION)
             .put("name", name).put("port", listeningPort)
             .put("instanceId", instanceId)
+            .put("receiveCapabilities", receiveCapabilities().json())
             .put("state", if (active.get() == null) "available" else "busy").toString().toByteArray(Charsets.UTF_8)
         check(bytes.size <= 1024) { "Discovery advertisement exceeds 1024 bytes" }
         return bytes
@@ -305,8 +318,24 @@ class ReceiverServer private constructor(
         @Volatile private var tracksReady = false
         @Volatile private var videoGeneration = 0L
         private var videoRotation = false
+        private var hdrVideoVersion: Int? = null
         private var streamRecovery = false
         private var negotiatedOptions = ReceiverOptionCapabilities()
+        fun checkHdrOutput() {
+            val caps = receiveCapabilities()
+            val toneMapped = synchronized(playbackLock) { activeVideoFormat?.toneMapToSdr == true }
+            if (request?.videoColor != null && (!caps.acceptsHdr ||
+                caps.nativeHdrAvailable != true && !toneMapped))
+                mediaFailed(ProtocolException("UNSUPPORTED_CONFIG",
+                    "HDR display output became unavailable; restart casting with SDR"))
+        }
+
+        private fun validateHdrOutput(format: VideoFormat): VideoFormat {
+            if (format.videoColor == null) return format
+            val caps = receiveCapabilities()
+            protocolRequire(caps.acceptsHdr, "HDR output is unavailable; restart casting with SDR", "UNSUPPORTED_CONFIG")
+            return format.copy(toneMapToSdr = caps.nativeHdrAvailable != true)
+        }
         private val statisticsSampler = PlaybackStatisticsSampler()
         private val receivedVideo = AtomicLong()
         private val receivedAudio = AtomicLong()
@@ -541,6 +570,8 @@ class ReceiverServer private constructor(
                 protocolRequire(senderName.isNotEmpty() && senderName.none { it.isISOControl() }, "Invalid sender name")
                 protocolRequire(!h.has("videoRotation") || h.opt("videoRotation") is Boolean, "videoRotation must be boolean")
                 videoRotation = h.opt("videoRotation") == true
+                hdrVideoVersion = if (h.has("hdrVideoVersion")) h.integer("hdrVideoVersion") else null
+                protocolRequire(hdrVideoVersion == null || checkNotNull(hdrVideoVersion) > 0, "Invalid hdrVideoVersion")
                 protocolRequire(!h.has("streamRecovery") || h.opt("streamRecovery") is Boolean, "streamRecovery must be boolean")
                 val version = if (h.has("streamRecoveryVersion")) h.integer("streamRecoveryVersion") else null
                 protocolRequire(version == null || version > 0, "Invalid stream recovery version")
@@ -552,10 +583,13 @@ class ReceiverServer private constructor(
                 if (videoRotation) response.put("videoRotation", true)
                 if (streamRecovery) response.put("streamRecovery", true).put("streamRecoveryVersion", StreamRecoveryProtocol.VERSION)
                 if (negotiatedOptions.playbackStats) response.put("receiverOptions", negotiatedOptions.wireValue())
+                if (hdrVideoVersion == 1) response.put("receiveCapabilities", receiveCapabilities().json())
                 send(Type.HELLO, response)
                 phase = "Negotiating"
                 phaseAt = now()
+                socket.soTimeout = org.screencopy.receiver.protocol.HdrPreparationDeadline.milliseconds(hdrVideoVersion)
                 val negotiation = readControlUntilRequest()
+                socket.soTimeout = 10_000
                 session = negotiation.session
                 protocolRequire(session > 0, "Session ID must be positive")
                 if (!active.compareAndSet(null, this)) {
@@ -570,7 +604,7 @@ class ReceiverServer private constructor(
                     }
                 }
                 onScreenEvent(ReceiverScreenEvent.Connecting)
-                request = Request.parse(negotiation.json(), negotiatedOptions)
+                request = Request.parse(negotiation.json(), negotiatedOptions, hdrVideoVersion == 1, receiveCapabilities())
                 controlStatistics.validControl(now())
                 val settings = checkNotNull(request)
                 validateRequest(settings)
@@ -581,7 +615,9 @@ class ReceiverServer private constructor(
                 phaseAt = now()
                 onStatus(phase, "$senderName\n$requestSummary")
                 synchronized(mediaLock) { accepted = true }
-                send(Type.SESSION_ACCEPT, JSONObject().put("tracks", JSONArray(settings.tracks)).put("mediaToken", mediaToken))
+                send(Type.SESSION_ACCEPT, JSONObject().put("tracks", JSONArray(settings.tracks)).put("mediaToken", mediaToken).apply {
+                    settings.videoColor?.let { put("videoColor", it.json()) }
+                })
                 while (running.get() && !socket.isClosed) {
                     val message = read()
                     protocolRequire(message.session == session, "Session ID changed")
@@ -711,6 +747,9 @@ class ReceiverServer private constructor(
         private fun readControlUntilRequest(): Message {
             while (true) {
                 val message = read()
+                protocolRequire(!org.screencopy.receiver.protocol.HdrPreparationDeadline.expired(
+                    hdrVideoVersion, 0, now() - phaseAt),
+                    "Session preparation exceeded its absolute deadline", "TIMEOUT")
                 if (message.type == Type.SESSION_REQUEST) return message
                 protocolRequire(message.session == 0L, "Unexpected session before negotiation")
                 when (message.type) {
@@ -763,7 +802,7 @@ class ReceiverServer private constructor(
             trackState.configure(message.track, message.generation, codec?.takeIf { json.opt("codec") == it })
             if (message.track == 1) {
                 if (message.generation > 1) clock.endVideoPreroll()
-                val format = Configuration.video(json, settings)
+                val format = validateHdrOutput(Configuration.video(json, settings))
                 activeVideoFormat = format
                 actualVideo = "Actual video: ${format.mime} ${format.width}x${format.height}, generation ${message.generation}"
                 videoGeneration = message.generation
@@ -801,7 +840,7 @@ class ReceiverServer private constructor(
                 protocolRequire(accepted && !stopping.get() && tracksReady, "Recovery preceded initialized tracks")
                 protocolRequire(message.generation <= Int.MAX_VALUE, "Recovery video generation exhausted")
                 settings = checkNotNull(request)
-                format = Configuration.video(message.json(), settings)
+                format = validateHdrOutput(Configuration.video(message.json(), settings))
                 checkNotNull(tracks).configure(1, message.generation, settings.videoCodec)
                 recovering = true
                 awaitingRecoveryKey = false
@@ -897,7 +936,8 @@ class ReceiverServer private constructor(
                         playbackFailed(code, detail, FailureOrigin.VIDEO)
                     else onDiscoveryDiagnostic("event=RETIRED_VIDEO_FAILURE generation=$generation code=$code")
                 }
-                (videoFactory?.invoke(format, shared, failed, generation) ?: VideoPlayer(format, checkNotNull(surface), shared,
+                (videoFactory?.invoke(format, shared, failed, generation) ?: VideoPlayer(format,
+                    videoSurface?.invoke(format) ?: checkNotNull(surface), shared,
                     { diagnostic ->
                         decoderDescription = diagnostic
                         onStatus("Initializing video", "$senderName\n$requestSummary\nActual: ${format.width}x${format.height}; $diagnostic")
@@ -907,9 +947,13 @@ class ReceiverServer private constructor(
                             onScreenEvent(ReceiverScreenEvent.FramePresented)
                             onFramePresented { running.get() && active.get() === this && !stopping.get() && videoGeneration == generation }
                         }
-                    }, generation, onRotation = { rotation ->
+                    }, generation, outputAvailable = {
+                        val caps = receiveCapabilities()
+                        caps.nativeHdrAvailable == true || format.toneMapToSdr && caps.hdrToSdr
+                    }, onRotation = { rotation ->
                         val current = { running.get() && !recovering && accepted && !stopping.get() && active.get() === this && videoGeneration == generation }
                         if (current()) {
+                            VideoPresentation.requireSupportedRotation(format.videoColor != null, rotation)
                             actualRotation = if (videoRotation) rotation else 0
                             if (videoRotation) onVideoRotation(rotation, current)
                         }
@@ -1072,6 +1116,11 @@ class ReceiverServer private constructor(
 
         fun tick() {
             val time = now()
+            val progressTimeout = if (phase == "Negotiating")
+                org.screencopy.receiver.protocol.HdrPreparationDeadline.milliseconds(hdrVideoVersion) else 10_000
+            val progressExpired = org.screencopy.receiver.protocol.HdrPreparationDeadline.expired(
+                if (phase == "Negotiating") hdrVideoVersion else null, time - lastRead,
+                if (phase == "Playing" || stopping.get()) 0 else time - phaseAt)
             sampleStatistics(time)
             if (mediaOwner != null) {
                 if (writer?.stalled(time) == true) {
@@ -1091,9 +1140,9 @@ class ReceiverServer private constructor(
                     socket.close()
                 }
                 stopping.get() && time - stopAt >= 2000 -> socket.close()
-                time - lastRead >= 10_000 || phase != "Playing" && !stopping.get() && time - phaseAt >= 10_000 -> {
-                    connectionError.compareAndSet(null, "TIMEOUT" to "No progress from sender within 10 seconds")
-                    if (active.get() === this) onStatus("Session timed out", "No progress from sender within 10 seconds. Check its network and retry.")
+                progressExpired -> {
+                    connectionError.compareAndSet(null, "TIMEOUT" to "No progress from sender within ${progressTimeout / 1000} seconds")
+                    if (active.get() === this) onStatus("Session timed out", "No progress from sender within ${progressTimeout / 1000} seconds. Check its network and retry.")
                     socket.close()
                 }
                 writer?.stalled(time) == true -> {
@@ -1133,6 +1182,7 @@ class ReceiverServer private constructor(
                 Triple(video to audio, activeVideoFormat, videoGeneration to audioEpoch)
             }
             val control = controlStatistics.snapshot(time)
+            val videoPath = players.first?.videoPathStatistics()
             val snapshot = statisticsSampler.sample(time, PlaybackStatisticsInput(
                 session, epochs.first, epochs.second, if (recoveryAt > 0) "Recovering" else phase,
                 settings.videoCodec, settings.audioCodec, format?.width, format?.height, settings.fps,
@@ -1142,7 +1192,8 @@ class ReceiverServer private constructor(
                 players.first?.queueStatistics(), players.second?.queueStatistics(), control.rttMs,
                 control.lastValidControlAgeMs,
                 lastVideoPacketAt?.let { (time - it).coerceAtLeast(0) },
-                lastAudioPacketAt?.let { (time - it).coerceAtLeast(0) }))
+                lastAudioPacketAt?.let { (time - it).coerceAtLeast(0) },
+                decodedVideo = videoPath?.video, presentation = videoPath?.presentation))
             if (active.get() === this && statisticsCurrent(session, epochs.first, epochs.second) && statisticsVisible.get())
                 playbackStatistics = snapshot
         }
@@ -1167,10 +1218,14 @@ class ReceiverServer private constructor(
             onVideoRotation: (Int, () -> Boolean) -> Unit = { _, _ -> },
             acquireSession: (() -> AutoCloseable?)? = null,
             instanceId: String = UUID.randomUUID().toString().replace("-", ""),
-            supportsPlaybackStatistics: Boolean = false) =
+            supportsPlaybackStatistics: Boolean = false,
+            receiveCapabilities: () -> org.screencopy.receiver.protocol.ReceiveCapabilities = {
+                org.screencopy.receiver.protocol.ReceiveCapabilities()
+            }) =
             ReceiverServer(name, null, onStatus, onVideoSize, onListener, port, ResourceSlot(), validateRequest, onScreenEvent,
                 onFailure, onPresentationStart, videoFactory, audioFactory, clockFactory, onVideoRotation = onVideoRotation,
-                acquireSession = acquireSession, instanceId = instanceId, supportsPlaybackStatistics = supportsPlaybackStatistics)
+                acquireSession = acquireSession, instanceId = instanceId, supportsPlaybackStatistics = supportsPlaybackStatistics,
+                receiveCapabilities = receiveCapabilities)
 
         private fun validateCapabilities(settings: Request) {
             val types = MediaCodecList(MediaCodecList.REGULAR_CODECS).codecInfos.filter { !it.isEncoder }.flatMap { it.supportedTypes.toList() }

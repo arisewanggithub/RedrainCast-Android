@@ -15,6 +15,8 @@ import android.os.Handler
 import android.os.Looper
 import android.view.Gravity
 import android.view.Surface
+import android.view.SurfaceView
+import android.view.SurfaceHolder
 import android.view.TextureView
 import android.view.View
 import android.view.WindowInsets
@@ -45,8 +47,8 @@ import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicReference
 
-class MainActivity : Activity(), TextureView.SurfaceTextureListener {
-    private class ListenerRun(val surface: Surface) {
+class MainActivity : Activity(), SurfaceHolder.Callback, TextureView.SurfaceTextureListener {
+    private class ListenerRun(val surface: Surface, val hdrSurface: Surface) {
         val output = ResourceSlot<VideoPlayer>()
         @Volatile var server: ReceiverServer? = null
         @Volatile var port: Int? = null
@@ -60,6 +62,11 @@ class MainActivity : Activity(), TextureView.SurfaceTextureListener {
     private lateinit var home: HomeView
     private lateinit var videoBox: FrameLayout
     private lateinit var texture: TextureView
+    private lateinit var sdrBox: FrameLayout
+    private lateinit var hdrView: SurfaceView
+    private var presentationMode = VideoPresentation.Mode.SDR_TEXTURE
+    private val nativeHdrDisplay = AtomicReference<Boolean?>(null)
+    private val receiveCapabilities = AtomicReference(org.screencopy.receiver.protocol.ReceiveCapabilities())
     private lateinit var playbackStatistics: PlaybackStatisticsOverlay
     private var statisticsDetails: PlaybackStatisticsDetails? = null
     private var statisticsDialog: AlertDialog? = null
@@ -88,8 +95,14 @@ class MainActivity : Activity(), TextureView.SurfaceTextureListener {
     private var receivers = emptyList<Discovery.Receiver>()
     private val self = SelfReceivers(CastState.instanceId)
     @Volatile private var listenerRun: ListenerRun? = null
+    private val retiringRuns = mutableSetOf<ListenerRun>()
     @Volatile private var foreground = false
     private var decoderSurface: Surface? = null
+    private var hdrDecoderSurface: Surface? = null
+    private var decoderTexture: SurfaceTexture? = null
+    private var hdrHolder: SurfaceHolder? = null
+    private val retiredTextures = mutableSetOf<SurfaceTexture>()
+    private val retiredHolders = mutableSetOf<SurfaceHolder>()
     private var listenerFault = false
     private var readiness = "STARTING"
     private var detail = ""
@@ -135,8 +148,12 @@ class MainActivity : Activity(), TextureView.SurfaceTextureListener {
         }
         root = FrameLayout(this)
         videoBox = FrameLayout(this).apply { setBackgroundColor(Color.BLACK) }
-        texture = TextureView(this)
-        videoBox.addView(texture, FrameLayout.LayoutParams(-1, -1, Gravity.CENTER))
+        hdrView = SurfaceView(this).apply { setSecure(true); holder.addCallback(this@MainActivity) }
+        videoBox.addView(hdrView, FrameLayout.LayoutParams(-1, -1, Gravity.CENTER))
+        sdrBox = FrameLayout(this).apply { setBackgroundColor(Color.BLACK) }
+        texture = TextureView(this).apply { surfaceTextureListener = this@MainActivity }
+        sdrBox.addView(texture, FrameLayout.LayoutParams(-1, -1, Gravity.CENTER))
+        videoBox.addView(sdrBox, FrameLayout.LayoutParams(-1, -1))
         videoBox.setOnLongClickListener {
             if (playing && listenerRun?.server?.playbackStatisticsRequested == true) {
                 showPlaybackDiagnostics()
@@ -144,7 +161,6 @@ class MainActivity : Activity(), TextureView.SurfaceTextureListener {
             } else false
         }
         videoBox.isLongClickable = false
-        texture.surfaceTextureListener = this
         videoBox.addOnLayoutChangeListener { _, _, _, _, _, _, _, _, _ -> fitVideo() }
         root.addView(videoBox, FrameLayout.LayoutParams(-1, -1))
         home = HomeView(this, ::showSettings, ::manualConnect, ::prepareSend, ::stopSending, ::showHelp) {
@@ -165,7 +181,9 @@ class MainActivity : Activity(), TextureView.SurfaceTextureListener {
         render()
         @Suppress("DEPRECATION")
         val retained = lastNonConfigurationInstance as? LaunchUpdateCheck
-        updateCheck = retained ?: updateFactory(BuildConfig.VERSION_NAME)
+        val installedVersion = if (BuildConfig.DEBUG) BuildConfig.VERSION_NAME.removeSuffix("-debug")
+            else BuildConfig.VERSION_NAME
+        updateCheck = retained ?: updateFactory(installedVersion)
         updateCheck.attach(::showUpdateIfIdle)
         updateCheck.start()
     }
@@ -179,6 +197,18 @@ class MainActivity : Activity(), TextureView.SurfaceTextureListener {
             val mode = attached.mode
             PixelDimensions(mode.physicalWidth, mode.physicalHeight)
         } else null
+        val nativeHdr = if (attached?.isValid == true) {
+            @Suppress("DEPRECATION")
+            val effective = attached.hdrCapabilities?.supportedHdrTypes
+            val modeTypes = if (android.os.Build.VERSION.SDK_INT >= 34) attached.mode.supportedHdrTypes else effective
+            if (effective == null || modeTypes == null) null
+            else android.view.Display.HdrCapabilities.HDR_TYPE_HDR10 in effective &&
+                android.view.Display.HdrCapabilities.HDR_TYPE_HDR10 in modeTypes
+        } else null
+        nativeHdrDisplay.set(nativeHdr)
+        receiveCapabilities.updateAndGet { it.copy(nativeHdrAvailable = nativeHdr) }
+        val run = listenerRun
+        if (run != null) worker.execute { if (current(run)) run.server?.displayCapabilitiesChanged() }
     }
 
     private fun showError(error: Exception) {
@@ -218,6 +248,7 @@ class MainActivity : Activity(), TextureView.SurfaceTextureListener {
             return
         }
         if (CastState.roles.role() != RoleOwner.Role.SEND && decoderSurface?.isValid == true &&
+            hdrDecoderSurface?.isValid == true &&
             listenerRun == null && !listenerFault) startListener()
         if (discovery == null && !discoveryAttempted) startDiscovery()
         render()
@@ -257,7 +288,8 @@ class MainActivity : Activity(), TextureView.SurfaceTextureListener {
     private fun startListener() {
         window.addFlags(WindowManager.LayoutParams.FLAG_SECURE)
         val surface = decoderSurface ?: return
-        val run = ListenerRun(surface)
+        val hdrSurface = hdrDecoderSurface ?: return
+        val run = ListenerRun(surface, hdrSurface)
         listenerRun = run
         readiness = "STARTING"
         detail = getString(R.string.flow_starting)
@@ -265,6 +297,8 @@ class MainActivity : Activity(), TextureView.SurfaceTextureListener {
         worker.execute {
             if (!current(run)) return@execute
             try {
+                val decoderCapabilities = org.screencopy.receiver.media.HdrDecoderCapabilities.capabilities(null)
+                receiveCapabilities.updateAndGet { decoderCapabilities.copy(nativeHdrAvailable = nativeHdrDisplay.get()) }
                 run.server = ReceiverServer("RedrainCast ${android.os.Build.MODEL}".take(80), run.surface,
                     onStatus = { state, message -> main.post {
                         if (current(run)) {
@@ -304,7 +338,8 @@ class MainActivity : Activity(), TextureView.SurfaceTextureListener {
                             fitVideo()
                             showPlayer()
                         }
-                    } }, supportsPlaybackStatistics = true)
+                    } }, supportsPlaybackStatistics = true, receiveCapabilities = { receiveCapabilities.get() },
+                    videoSurface = { format -> presentationSurface(format, run) })
                 checkNotNull(run.server).start()
                 run.port = checkNotNull(run.server).listeningPort
                 self.remember(checkNotNull(run.server).addresses(), checkNotNull(run.server).listeningPort)
@@ -368,6 +403,7 @@ class MainActivity : Activity(), TextureView.SurfaceTextureListener {
     private fun retireListener(after: (Boolean) -> Unit = {}) {
         val run = listenerRun
         listenerRun = null
+        if (run != null) retiringRuns.add(run)
         endpoints = emptyList()
         hidePlayer()
         worker.execute {
@@ -380,6 +416,7 @@ class MainActivity : Activity(), TextureView.SurfaceTextureListener {
             cleanup { run?.server?.close() }
             cleanup { run?.output?.close() }
             main.post {
+                if (run != null) retiringRuns.remove(run)
                 if (!isDestroyed) {
                     failure?.let { listenerFault = true; showError(it) }
                     after(failure == null)
@@ -602,20 +639,108 @@ class MainActivity : Activity(), TextureView.SurfaceTextureListener {
         } catch (error: Exception) { showError(error) }
     }
 
+    override fun surfaceCreated(holder: SurfaceHolder) {
+        if (holder in retiredHolders || !holder.surface.isValid) {
+            android.util.Log.i("ScreenCopyReceiver", "event=RETIRED_SURFACE_CALLBACK kind=HDR_CREATED")
+            return
+        }
+        if (hdrHolder === holder && hdrDecoderSurface === holder.surface) return
+        if (hdrDecoderSurface != null) {
+            hdrHolder?.takeIf { it !== holder }?.let(retiredHolders::add)
+            closeDecoderOutputs()
+            retireListener()
+        }
+        hdrHolder = holder
+        hdrDecoderSurface = holder.surface
+        fitVideo()
+        reconcile()
+    }
+
+    override fun surfaceDestroyed(holder: SurfaceHolder) {
+        if (hdrHolder !== holder) {
+            android.util.Log.i("ScreenCopyReceiver", "event=RETIRED_SURFACE_CALLBACK kind=HDR_DESTROYED")
+            return
+        }
+        hdrHolder = null
+        hdrDecoderSurface = null
+        closeDecoderOutputs()
+        retireListener()
+    }
+    override fun surfaceChanged(holder: SurfaceHolder, format: Int, width: Int, height: Int) {
+        if (hdrHolder !== holder) return
+        fitVideo()
+    }
+
     override fun onSurfaceTextureAvailable(surface: SurfaceTexture, width: Int, height: Int) {
+        if (surface in retiredTextures || surface.isReleased) {
+            android.util.Log.i("ScreenCopyReceiver", "event=RETIRED_SURFACE_CALLBACK kind=SDR_AVAILABLE")
+            return
+        }
+        if (decoderTexture === surface) return
+        if (decoderSurface != null) {
+            decoderTexture?.let(retiredTextures::add)
+            closeDecoderOutputs()
+            retireListener()
+            decoderSurface?.release()
+        }
+        decoderTexture = surface
         decoderSurface = Surface(surface)
         reconcile()
     }
 
     override fun onSurfaceTextureDestroyed(surface: SurfaceTexture): Boolean {
-        val retired = decoderSurface
+        if (decoderTexture !== surface) {
+            android.util.Log.i("ScreenCopyReceiver", "event=RETIRED_SURFACE_CALLBACK kind=SDR_DESTROYED")
+            return true
+        }
+        val output = decoderSurface
+        decoderTexture = null
         decoderSurface = null
+        closeDecoderOutputs()
         retireListener()
-        worker.execute { try { retired?.release() } finally { surface.release() } }
-        return false
+        output?.release()
+        return true
     }
-    override fun onSurfaceTextureSizeChanged(surface: SurfaceTexture, width: Int, height: Int) = Unit
+
+    override fun onSurfaceTextureSizeChanged(surface: SurfaceTexture, width: Int, height: Int) {
+        if (decoderTexture === surface) fitVideo()
+    }
     override fun onSurfaceTextureUpdated(surface: SurfaceTexture) = Unit
+
+    internal fun selectVideoSurface(format: org.screencopy.receiver.media.VideoFormat): Surface {
+        val mode = VideoPresentation.mode(format)
+        val selected = if (mode == VideoPresentation.Mode.HDR_SURFACE) hdrDecoderSurface else decoderSurface
+        check(selected?.isValid == true) { "Receiver presentation surface is unavailable" }
+        presentationMode = mode
+        aspect = format.width.toDouble() / format.height
+        rotation = 0
+        texture.isOpaque = mode == VideoPresentation.Mode.SDR_TEXTURE
+        texture.alpha = if (mode == VideoPresentation.Mode.HDR_SURFACE) 0f else 1f
+        sdrBox.setBackgroundColor(if (mode == VideoPresentation.Mode.HDR_SURFACE) Color.TRANSPARENT else Color.BLACK)
+        android.util.Log.i("ScreenCopyReceiver", "event=VIDEO_PRESENTATION_PATH mode=$mode")
+        fitVideo()
+        return checkNotNull(selected)
+    }
+
+    private fun presentationSurface(format: org.screencopy.receiver.media.VideoFormat, run: ListenerRun): Surface {
+        val mode = VideoPresentation.mode(format)
+        val selected = if (mode == VideoPresentation.Mode.HDR_SURFACE) run.hdrSurface else run.surface
+        check(current(run) && selected.isValid) { "Receiver presentation surface is unavailable" }
+        main.post {
+            if (current(run) && !isDestroyed) {
+                try { check(selectVideoSurface(format) === selected) }
+                catch (error: Exception) { listenerFault = true; showError(error); retireListener() }
+            }
+        }
+        return selected
+    }
+
+    private fun closeDecoderOutputs() {
+        for (run in listOfNotNull(listenerRun) + retiringRuns) {
+            try { run.output.close() }
+            catch (error: Exception) { showError(error) }
+        }
+    }
 
     private fun beginPresentation(mode: ReceiverOrientation, run: ListenerRun): AutoCloseable {
         val token = Any()
@@ -649,7 +774,15 @@ class MainActivity : Activity(), TextureView.SurfaceTextureListener {
 
     private fun fitVideo() {
         if (!::texture.isInitialized) return
-        VideoPresentation.fit(texture, videoBox, aspect, rotation)
+        try {
+            if (presentationMode == VideoPresentation.Mode.HDR_SURFACE)
+                VideoPresentation.fitHdr(hdrView, videoBox, aspect)
+            else VideoPresentation.fit(texture, sdrBox, aspect, rotation)
+        } catch (error: Exception) {
+            listenerFault = true
+            showError(error)
+            retireListener()
+        }
         if (hasPresentation) sessionOrientation.followVideo(aspect, rotation)
     }
 
@@ -801,11 +934,18 @@ class MainActivity : Activity(), TextureView.SurfaceTextureListener {
         updateDialog = null
         if (isFinishing || pendingRequest()?.consentStarted != true)
             cancelPending(getString(R.string.flow_send_cancelled))
+        hdrView.holder.removeCallback(this)
         texture.surfaceTextureListener = null
         val surface = decoderSurface
+        decoderTexture = null
+        hdrHolder = null
+        retiredTextures.clear()
+        retiredHolders.clear()
         decoderSurface = null
-        val surfaceTexture = texture.surfaceTexture
-        worker.execute { try { surface?.release() } finally { surfaceTexture?.release() } }
+        hdrDecoderSurface = null
+        closeDecoderOutputs()
+        try { surface?.release() }
+        catch (error: Exception) { showError(error) }
         worker.shutdown()
         main.removeCallbacksAndMessages(null)
         super.onDestroy()

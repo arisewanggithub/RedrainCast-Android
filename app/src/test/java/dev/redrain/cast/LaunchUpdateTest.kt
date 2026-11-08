@@ -45,6 +45,7 @@ class LaunchUpdateTest {
     private val previousFactory = MainActivity.updateFactory
     private lateinit var controller: ActivityController<MainActivity>
     private var checks = 0
+    private var checkedVersion: String? = null
     private var cancelled = 0
     private var failRequest = false
     private var result: ReleaseUpdate? = ReleaseUpdate("0.5.0",
@@ -55,6 +56,7 @@ class LaunchUpdateTest {
             LaunchUpdateCheck(object : UpdateSource {
                 override fun check(installedVersion: String): ReleaseUpdate? {
                     checks++
+                    checkedVersion = installedVersion
                     if (failRequest) error("Fixture update request failed")
                     return result
                 }
@@ -81,6 +83,15 @@ class LaunchUpdateTest {
     }
 
     private fun prompt() = checkNotNull(ShadowAlertDialog.getLatestAlertDialog())
+
+    @Test fun debugBuildComparesItsBaseVersionWithoutTreatingDebugAsAPrerelease() {
+        result = null
+        open()
+        assertEquals("0.4.13", checkedVersion)
+        assertEquals(if (BuildConfig.DEBUG) "0.4.13-debug" else "0.4.13", BuildConfig.VERSION_NAME)
+        assertEquals(1, checks)
+        assertNull(ShadowAlertDialog.getLatestAlertDialog())
+    }
 
     @Test fun newerReleasePromptsOnlyOnceAndLaterDoesNotRetryOnOrdinaryResume() {
         open()

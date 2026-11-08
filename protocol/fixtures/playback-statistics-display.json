@@ -1,5 +1,7 @@
 {
   "version": 1,
+  "displayContractVersion": 2,
+  "wireContractChanged": false,
   "header": "Playback statistics",
   "nullValue": "N/A",
   "notApplicable": "—",
@@ -16,6 +18,9 @@
   ],
   "video": [
     {"id":"videoCodec","label":"Codec","unit":"text"},
+    {"id":"videoDynamicRange","label":"Stream range","meaning":"Validated incoming format and actual decoded transfer; never a physical HDR wire claim."},
+    {"id":"videoDecodeFormat","label":"Profile / depth","meaning":"Decoder output profile and explicitly reported component depth; missing components independently N/A."},
+    {"id":"presentationOutput","label":"Output","meaning":"Last matched successful frame-rendered path; unknown remains N/A, never inferred from capabilities."},
     {"id":"encodedSize","label":"Encoded size","unit":"pixels"},
     {"id":"captureLimit","label":"Capture limit","unit":"requested frames/s"},
     {"id":"displayOutput","label":"Display mode","unit":"Android active mode physical pixel dimensions or unavailable"},
@@ -59,7 +64,8 @@
     "windowsPresented": "Successful platform presentation submission; not actual scanout.",
     "androidPlaybackEpoch": "N/A; audio epoch is a separate Android detail.",
     "androidOccluded": "N/A; no DXGI-equivalent cached visibility signal.",
-    "renderTarget": "Full diagnostics only: a verified compositor/render-target measurement, never inferred from encoded size, app view bounds or display mode. Current TextureView path reports N/A.",
+    "renderTarget": "Full diagnostics only: a verified compositor/render-target measurement, never inferred from encoded size, app view bounds or display mode.",
+    "presentationOutput": "HDR output describes validated BT2020/PQ/limited decoder output rendered to the direct Surface, not physical HDR emission/OEM state. Optional tone-map requests alone do not prove mapping and remain N/A.",
     "displayOutput": "Android's reported active Display.Mode dimensions in its mode orientation; not optical projection resolution or proof of native scanout.",
     "receiverCanvas": "App view coordinates, available only in full display diagnostics. Not physical video-buffer resolution.",
     "notes": ["Positive skew = video ahead","Source timestamps · not end-to-end latency"]

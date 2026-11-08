@@ -10,12 +10,16 @@ import android.view.View
 import android.view.ViewGroup
 import android.view.KeyEvent
 import android.view.MotionEvent
+import android.view.SurfaceView
 import android.view.TextureView
+import android.view.Surface
+import android.view.SurfaceHolder
 import android.view.WindowManager
 import android.widget.Button
 import android.widget.FrameLayout
 import dev.screencopy.sender.ReceiverTarget
 import dev.screencopy.sender.Settings
+import org.screencopy.receiver.ui.VideoPresentation
 import org.junit.Assert.*
 import org.junit.Test
 import org.junit.Before
@@ -35,9 +39,31 @@ import java.net.Socket
 @GraphicsMode(GraphicsMode.Mode.LEGACY)
 @ConscryptMode(ConscryptMode.Mode.OFF)
 class MainActivityTest {
+    private val holderSurfaces = mutableListOf<Pair<Surface, SurfaceTexture>>()
+    private fun surfaceReady(activity: MainActivity): SurfaceHolder {
+        // Legacy Robolectric's default holder does not create a valid native surface.
+        if (org.robolectric.util.ReflectionHelpers.getField<Surface?>(activity, "decoderSurface") == null) {
+            val texture = SurfaceTexture(0)
+            holderSurfaces.add(Surface(texture) to texture)
+            activity.onSurfaceTextureAvailable(texture, 1080, 1920)
+        }
+        val image = SurfaceTexture(0)
+        val surface = Surface(image)
+        holderSurfaces.add(surface to image)
+        val holder = org.mockito.Mockito.mock(SurfaceHolder::class.java)
+        org.mockito.Mockito.`when`(holder.surface).thenReturn(surface)
+        activity.surfaceCreated(holder)
+        return holder
+    }
+
     private val previousUpdateFactory = MainActivity.updateFactory
-    @Before fun disableRealUpdateRequests() { MainActivity.updateFactory = ::noUpdateCheck }
-    @After fun restoreUpdateFactory() { MainActivity.updateFactory = previousUpdateFactory }
+    @Before fun disableRealUpdateRequests() {
+        MainActivity.updateFactory = ::noUpdateCheck
+    }
+    @After fun restoreUpdateFactory() {
+        MainActivity.updateFactory = previousUpdateFactory
+        holderSurfaces.forEach { (surface, image) -> surface.release(); image.release() }
+    }
 
     @Test fun activeDisplayModeIsCachedSeparatelyAndObserverRetiresOnBackground() {
         val controller = Robolectric.buildActivity(MainActivity::class.java).setup()
@@ -71,6 +97,91 @@ class MainActivityTest {
             org.robolectric.shadows.ShadowDisplayManager.setSupportedModes(display.displayId, originalMode)
             controller.destroy()
         }
+        await { activity.resourcesRetired }
+    }
+
+    @Test fun acceptedSdrAndHdrUseSeparateStableSurfacesWithoutNativeChildOrHdrTextureFallback() {
+        val controller = Robolectric.buildActivity(MainActivity::class.java).setup()
+        val activity = controller.get()
+        try {
+            val holder = surfaceReady(activity)
+            await { activity.currentListeningPort != null }
+            val port = activity.currentListeningPort
+            val texture = org.robolectric.util.ReflectionHelpers.getField<TextureView>(activity, "texture")
+            val sdrBox = org.robolectric.util.ReflectionHelpers.getField<FrameLayout>(activity, "sdrBox")
+            val backgroundColor = {
+                val background = sdrBox.background
+                check(background is android.graphics.drawable.ColorDrawable)
+                background.color
+            }
+            val hdrView = org.robolectric.util.ReflectionHelpers.getField<SurfaceView>(activity, "hdrView")
+            val sdr = org.robolectric.util.ReflectionHelpers.getField<Surface>(activity, "decoderSurface")
+            val format = org.screencopy.receiver.media.VideoFormat("video/hevc", 1080, 1920, emptyList(), 60)
+            assertSame(sdr, activity.selectVideoSurface(format))
+            assertEquals(1f, texture.alpha, 0f)
+            assertTrue(texture.isOpaque)
+            assertEquals(android.graphics.Color.BLACK, backgroundColor())
+            val hdr = format.copy(videoColor = org.screencopy.receiver.protocol.HdrVideoColor())
+            assertSame(holder.surface, activity.selectVideoSurface(hdr))
+            assertEquals(0f, texture.alpha, 0f)
+            assertFalse(texture.isOpaque)
+            assertEquals(android.graphics.Color.TRANSPARENT, backgroundColor())
+            assertEquals(View.VISIBLE, hdrView.visibility)
+            assertEquals(0f, hdrView.rotation, 0f)
+            assertSame(sdr, activity.selectVideoSurface(format))
+            assertEquals(1f, texture.alpha, 0f)
+            assertTrue(texture.isOpaque)
+            assertEquals(port, activity.currentListeningPort)
+            assertSame(sdrBox, org.robolectric.util.ReflectionHelpers
+                .getField<FrameLayout>(activity, "videoBox").getChildAt(1))
+            assertThrows(org.screencopy.receiver.media.PlaybackException::class.java) {
+                activity.selectVideoSurface(hdr.copy(rotation = 270))
+            }
+            assertEquals(1f, texture.alpha, 0f)
+        } finally { controller.pause().stop().destroy() }
+        await { activity.resourcesRetired }
+    }
+
+    @Test fun retiredTextureCallbacksCannotRetireOrReplaceCurrentSurfaceEpoch() {
+        val controller = Robolectric.buildActivity(MainActivity::class.java).setup()
+        val activity = controller.get()
+        try {
+            surfaceReady(activity)
+            await { activity.currentListeningPort != null }
+            val old = org.robolectric.util.ReflectionHelpers.getField<SurfaceTexture>(activity, "decoderTexture")
+            val replacement = SurfaceTexture(0)
+            holderSurfaces.add(Surface(replacement) to replacement)
+            activity.onSurfaceTextureAvailable(replacement, 1080, 1920)
+            await { activity.currentListeningPort != null }
+            val current = org.robolectric.util.ReflectionHelpers.getField<Any>(activity, "listenerRun")
+            val surface = org.robolectric.util.ReflectionHelpers.getField<Surface>(activity, "decoderSurface")
+            activity.onSurfaceTextureDestroyed(old)
+            activity.onSurfaceTextureSizeChanged(old, 1920, 1080)
+            activity.onSurfaceTextureAvailable(old, 1920, 1080)
+            assertSame(current, org.robolectric.util.ReflectionHelpers.getField<Any>(activity, "listenerRun"))
+            assertSame(surface, org.robolectric.util.ReflectionHelpers.getField<Surface>(activity, "decoderSurface"))
+            assertTrue(surface.isValid)
+            assertSame(replacement, org.robolectric.util.ReflectionHelpers.getField<SurfaceTexture>(activity, "decoderTexture"))
+        } finally { controller.pause().stop().destroy() }
+        await { activity.resourcesRetired }
+    }
+
+    @Test fun retiredHolderCallbacksCannotRetireCurrentSurfaceEpoch() {
+        val controller = Robolectric.buildActivity(MainActivity::class.java).setup()
+        val activity = controller.get()
+        try {
+            val old = surfaceReady(activity)
+            await { activity.currentListeningPort != null }
+            val replacement = surfaceReady(activity)
+            await { activity.currentListeningPort != null }
+            val current = org.robolectric.util.ReflectionHelpers.getField<Any>(activity, "listenerRun")
+            activity.surfaceDestroyed(old)
+            activity.surfaceChanged(old, 0, 1, 1)
+            activity.surfaceCreated(old)
+            assertSame(current, org.robolectric.util.ReflectionHelpers.getField<Any>(activity, "listenerRun"))
+            assertSame(replacement.surface, org.robolectric.util.ReflectionHelpers.getField<Surface>(activity, "hdrDecoderSurface"))
+            assertTrue(replacement.surface.isValid)
+        } finally { controller.pause().stop().destroy() }
         await { activity.resourcesRetired }
     }
 
@@ -149,7 +260,7 @@ class MainActivityTest {
             assertNull(shadowOf(replacement).nextStartedActivityForResult)
             assertNull(shadowOf(replacement).lastRequestedPermission)
             assertNull(shadowOf(replacement).nextStartedService)
-            replacement.onSurfaceTextureAvailable(SurfaceTexture(0), 720, 1280)
+            surfaceReady(replacement)
             await { replacement.currentListeningPort != null }
             assertTrue(replacement.window.attributes.flags and WindowManager.LayoutParams.FLAG_SECURE != 0)
         } finally {
@@ -339,7 +450,7 @@ class MainActivityTest {
         val controller = Robolectric.buildActivity(MainActivity::class.java).setup()
         val activity = controller.get()
         try {
-            activity.onSurfaceTextureAvailable(SurfaceTexture(0), 720, 1280)
+            surfaceReady(activity)
             shadowOf(Looper.getMainLooper()).idle()
             assertNull(activity.currentListeningPort)
             assertNull(CastState.roles.role())
@@ -365,7 +476,7 @@ class MainActivityTest {
         val controller = Robolectric.buildActivity(MainActivity::class.java).setup()
         val activity = controller.get()
         try {
-            activity.onSurfaceTextureAvailable(SurfaceTexture(0), 720, 1280)
+            surfaceReady(activity)
             shadowOf(Looper.getMainLooper()).idle()
             assertNull(activity.currentListeningPort)
             assertOnlyLocalNetworkPrompt(activity)
@@ -401,7 +512,9 @@ class MainActivityTest {
             shadowOf(Looper.getMainLooper()).idle()
             Thread.sleep(5)
         }
-        assertTrue("Activity lifecycle did not reach expected state", condition())
+        assertTrue("Activity lifecycle did not reach expected state: " +
+            org.robolectric.shadows.ShadowLog.getLogs().takeLast(8).joinToString { "${it.tag}: ${it.msg} ${it.throwable}" },
+            condition())
     }
 
     @Test fun automaticListenerNeedsNoCaptureConsentAndDoesNotReserveAnIncomingSession() {
@@ -415,21 +528,79 @@ class MainActivityTest {
                 activity.checkSelfPermission(Manifest.permission.RECORD_AUDIO))
             assertFalse(buttons(activity.window.decorView).any { it.text == "Receive" })
             assertFalse(buttons(activity.window.decorView).any { it.text.contains("Find receivers") })
-            activity.onSurfaceTextureAvailable(SurfaceTexture(0), 720, 1280)
+            surfaceReady(activity)
             await { activity.currentListeningPort != null }
             Socket(InetAddress.getLoopbackAddress(), checkNotNull(activity.currentListeningPort)).use {
                 assertTrue(it.isConnected)
             }
+
             assertNull(CastState.roles.role())
         } finally { controller.pause().stop().destroy() }
         await { CastState.roles.role() == null && activity.resourcesRetired }
+    }
+
+    @Test fun holderSurfaceRemainsFrameworkOwnedAcrossListenerRetirementAndRecreation() {
+        val controller = Robolectric.buildActivity(MainActivity::class.java).setup()
+        val activity = controller.get()
+        try {
+            val first = surfaceReady(activity)
+            val sdr = org.robolectric.util.ReflectionHelpers.getField<Surface>(activity, "decoderSurface")
+            val run = org.robolectric.util.ReflectionHelpers.getField<Any>(activity, "listenerRun")
+            val slot = org.robolectric.util.ReflectionHelpers
+                .getField<org.screencopy.receiver.lifecycle.ResourceSlot<org.screencopy.receiver.media.VideoPlayer>>(run, "output")
+            await { activity.currentListeningPort != null }
+            activity.surfaceDestroyed(first)
+            await { activity.currentListeningPort == null }
+            assertTrue("The Activity must not release the holder's Surface", first.surface.isValid)
+            assertTrue(slot.isClosed)
+            assertTrue("SDR TextureView surface survives an HDR holder recreation", sdr.isValid)
+            val second = surfaceReady(activity)
+            await { activity.currentListeningPort != null }
+            assertNotSame(first.surface, second.surface)
+            assertSame(sdr, org.robolectric.util.ReflectionHelpers.getField<Surface>(activity, "decoderSurface"))
+            assertNull(CastState.roles.role())
+        } finally { controller.pause().stop().destroy() }
+        await { activity.resourcesRetired }
+    }
+
+    @Test fun destructionClosesDetachedDecoderSlotBeforeReleasingTextureEvenWhenRetirementIsQueued() {
+        val controller = Robolectric.buildActivity(MainActivity::class.java).setup()
+        val activity = controller.get()
+        val releaseWorker = java.util.concurrent.CountDownLatch(1)
+        try {
+            surfaceReady(activity)
+            await { activity.currentListeningPort != null }
+            val run = org.robolectric.util.ReflectionHelpers.getField<Any>(activity, "listenerRun")
+            val slot = org.robolectric.util.ReflectionHelpers
+                .getField<org.screencopy.receiver.lifecycle.ResourceSlot<org.screencopy.receiver.media.VideoPlayer>>(run, "output")
+            val worker = org.robolectric.util.ReflectionHelpers
+                .getField<java.util.concurrent.ExecutorService>(activity, "worker")
+            val workerBlocked = java.util.concurrent.CountDownLatch(1)
+            worker.execute { workerBlocked.countDown(); releaseWorker.await(5, java.util.concurrent.TimeUnit.SECONDS) }
+            assertTrue(workerBlocked.await(5, java.util.concurrent.TimeUnit.SECONDS))
+            val surface = org.robolectric.util.ReflectionHelpers.getField<Surface>(activity, "decoderSurface")
+            val player = org.mockito.Mockito.mock(org.screencopy.receiver.media.VideoPlayer::class.java)
+            org.mockito.Mockito.doAnswer {
+                assertTrue("Codec must close before its TextureView surface", surface.isValid)
+                null
+            }.`when`(player).close()
+            slot.replace { player }
+            controller.pause().stop().destroy()
+            org.mockito.Mockito.verify(player).close()
+            assertTrue(slot.isClosed)
+            assertFalse(surface.isValid)
+        } finally {
+            releaseWorker.countDown()
+            if (!activity.isDestroyed) controller.pause().stop().destroy()
+        }
+        await { activity.resourcesRetired }
     }
 
     @Test fun foregroundListeningStopsWhenBackgroundedAndRestartsWithoutManualControls() {
         val controller = Robolectric.buildActivity(MainActivity::class.java).setup()
         val activity = controller.get()
         try {
-            activity.onSurfaceTextureAvailable(SurfaceTexture(0), 720, 1280)
+            surfaceReady(activity)
             await { activity.currentListeningPort != null }
             val port = checkNotNull(activity.currentListeningPort)
             controller.pause().stop()
@@ -451,7 +622,7 @@ class MainActivityTest {
         val controller = Robolectric.buildActivity(MainActivity::class.java).create(state).start().resume().visible()
         val activity = controller.get()
         try {
-            activity.onSurfaceTextureAvailable(SurfaceTexture(0), 720, 1280)
+            surfaceReady(activity)
             assertNull(activity.currentListeningPort)
             org.robolectric.util.ReflectionHelpers.callInstanceMethod<Unit>(activity, "onActivityResult",
                 org.robolectric.util.ReflectionHelpers.ClassParameter.from(Int::class.javaPrimitiveType, 11),
@@ -474,7 +645,7 @@ class MainActivityTest {
         val controller = Robolectric.buildActivity(MainActivity::class.java).setup()
         val activity = controller.get()
         try {
-            activity.onSurfaceTextureAvailable(SurfaceTexture(0), 720, 1280)
+            surfaceReady(activity)
             assertNull(activity.currentListeningPort)
             assertEquals(RoleOwner.Role.SEND, CastState.roles.role())
             assertEquals("Outgoing app UI must be capturable, not a secure black window", 0,
@@ -515,12 +686,16 @@ class MainActivityTest {
         val video = org.robolectric.util.ReflectionHelpers.getField<FrameLayout>(activity, "videoBox")
         val home = org.robolectric.util.ReflectionHelpers.getField<HomeView>(activity, "home")
         try {
-            assertEquals(1, video.childCount)
-            val texture = video.getChildAt(0)
+            assertEquals(2, video.childCount)
+            val surface = video.getChildAt(0)
+            assertTrue(surface is SurfaceView)
+            val sdr = org.robolectric.util.ReflectionHelpers.getField<FrameLayout>(activity, "sdrBox")
+            assertSame(sdr, video.getChildAt(1))
+            val texture = sdr.getChildAt(0)
             assertTrue(texture is TextureView)
             org.robolectric.util.ReflectionHelpers.callInstanceMethod<Unit>(activity, "showPlayer")
             assertEquals(View.GONE, home.visibility)
-            assertEquals(1, video.childCount)
+            assertEquals(2, video.childCount)
             assertFalse(video.hasOnClickListeners())
             val down = MotionEvent.obtain(0, 0, MotionEvent.ACTION_DOWN, 10f, 10f, 0)
             val up = MotionEvent.obtain(0, 1, MotionEvent.ACTION_UP, 10f, 10f, 0)
@@ -528,8 +703,9 @@ class MainActivityTest {
             finally { down.recycle(); up.recycle() }
             activity.dispatchKeyEvent(KeyEvent(KeyEvent.ACTION_DOWN, KeyEvent.KEYCODE_DPAD_CENTER))
             shadowOf(Looper.getMainLooper()).idle()
-            assertEquals(1, video.childCount)
-            assertSame(texture, video.getChildAt(0))
+            assertEquals(2, video.childCount)
+            assertSame(surface, video.getChildAt(0))
+            assertSame(sdr, video.getChildAt(1))
             assertTrue(buttons(video).isEmpty())
             assertTrue(activity.window.attributes.flags and WindowManager.LayoutParams.FLAG_SECURE != 0)
             org.robolectric.util.ReflectionHelpers.callInstanceMethod<Unit>(activity, "hidePlayer")
@@ -538,10 +714,22 @@ class MainActivityTest {
         await { activity.resourcesRetired }
     }
 
-    @Test fun appIdentityIsUnifiedAndNew() {
+    @Test fun appIdentityMatchesVariantWithoutChangingComponentNamespace() {
         val context = org.robolectric.RuntimeEnvironment.getApplication()
-        assertEquals("dev.redrain.cast", context.packageName)
-        assertEquals("RedrainCast", context.applicationInfo.loadLabel(context.packageManager).toString())
+        val packageName = if (BuildConfig.DEBUG) "dev.redrain.cast.debug" else "dev.redrain.cast"
+        assertEquals(packageName, BuildConfig.APPLICATION_ID)
+        assertEquals(packageName, context.packageName)
+        assertEquals(if (BuildConfig.DEBUG) "RedrainCast Debug" else "RedrainCast",
+            context.applicationInfo.loadLabel(context.packageManager).toString())
+        val info = context.packageManager.getPackageInfo(packageName, 0)
+        assertEquals(if (BuildConfig.DEBUG) "0.4.13-debug" else "0.4.13", info.versionName)
+        assertEquals(26L, info.longVersionCode)
+        val activity = context.packageManager.getActivityInfo(
+            android.content.ComponentName(context, MainActivity::class.java), 0)
+        assertEquals("dev.redrain.cast.MainActivity", activity.name)
+        val service = context.packageManager.getServiceInfo(
+            android.content.ComponentName(context, CastService::class.java), 0)
+        assertEquals("dev.redrain.cast.CastService", service.name)
         assertEquals(30, context.applicationInfo.minSdkVersion)
     }
 }

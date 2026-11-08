@@ -26,6 +26,7 @@ class ReleaseUpdateTest {
     @Test fun rcTagsNeverBecomeStableUpdatesEvenWhenApiFlagIsWrong() {
         assertNull(parse("0.4.10", metadata("0.5.0-rc.2", true)))
         assertThrows(IllegalArgumentException::class.java) { parse("0.4.10", metadata("0.5.0-rc.2")) }
+        assertThrows(IllegalArgumentException::class.java) { parse("0.4.10", metadata("0.5.0-debug")) }
     }
 
     @Test fun installedPrereleaseVersionsRequireCanonicalChannelAndPositiveCounter() {

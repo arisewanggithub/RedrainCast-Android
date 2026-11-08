@@ -23,7 +23,9 @@ data class PlaybackStatisticsInput(
     val videoQueue: EncodedQueueStatistics?, val audioQueue: EncodedQueueStatistics?,
     val rttMs: Long?, val controlAgeMs: Long,
     val videoLastPacketAgeMs: Long? = null, val audioLastPacketAgeMs: Long? = null,
-    val playbackEpoch: Long? = null, val occluded: Boolean? = null
+    val playbackEpoch: Long? = null, val occluded: Boolean? = null,
+    val decodedVideo: DecodedVideoStatistics? = null,
+    val presentation: VideoPresentationStatistics? = null
 )
 
 data class PlaybackStatisticsSnapshot(val input: PlaybackStatisticsInput, val rxFps: Double?,
@@ -119,6 +121,31 @@ data class PlaybackStatisticsDisplay(
 }
 
 object PlaybackStatisticsText {
+    fun streamRange(video: DecodedVideoStatistics?): String {
+        val range = when (video?.streamFormat) {
+            VideoStreamFormat.Hdr10 -> "HDR10"
+            VideoStreamFormat.Sdr -> "SDR"
+            null -> return "N/A"
+        }
+        val transfer = when (video.transfer) {
+            VideoTransfer.Pq -> "PQ"
+            VideoTransfer.Bt709 -> "BT.709"
+            null -> return range
+        }
+        return "$range · $transfer"
+    }
+
+    fun decodeFormat(video: DecodedVideoStatistics?, bitText: (Int) -> String = { "$it-bit" }): String =
+        if (video?.codecProfile == null && video?.bitDepth == null) "N/A"
+        else "${video?.codecProfile ?: "N/A"} · ${video?.bitDepth?.let(bitText) ?: "N/A"}"
+
+    fun presentationOutput(presentation: VideoPresentationStatistics?): String = when (presentation?.output) {
+        VideoPresentationOutput.Hdr -> "HDR output"
+        VideoPresentationOutput.Sdr -> "SDR output"
+        VideoPresentationOutput.SdrToneMapped -> "SDR (tone-mapped)"
+        null -> "N/A"
+    }
+
     private fun number(value: Double?, suffix: String = "") =
         value?.let { String.format(Locale.ROOT, "%.1f%s", it, suffix) } ?: "N/A"
     private fun age(value: Long?) = value?.let { "$it ms" } ?: "N/A"
@@ -159,6 +186,9 @@ object PlaybackStatisticsText {
                 field("skipped", "Skipped", total(video?.skipped))),
             listOf(
                 field("videoCodec", "Codec", codec(s.videoCodec)),
+                field("videoDynamicRange", "Stream range", streamRange(s.decodedVideo)),
+                field("videoDecodeFormat", "Profile / depth", decodeFormat(s.decodedVideo)),
+                field("presentationOutput", "Output", presentationOutput(s.presentation)),
                 field("encodedSize", "Encoded size", if (s.encodedWidth != null && s.encodedHeight != null)
                     "${s.encodedWidth} × ${s.encodedHeight}" else "N/A"),
                 field("captureLimit", "Capture limit", "${s.requestedFps} FPS"),

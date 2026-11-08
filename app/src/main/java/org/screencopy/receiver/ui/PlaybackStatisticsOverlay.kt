@@ -11,11 +11,13 @@ import android.widget.LinearLayout
 import android.widget.TableLayout
 import android.widget.TableRow
 import android.widget.TextView
+import dev.redrain.cast.R
 import org.screencopy.receiver.media.PlaybackStatisticsDisplay
 import org.screencopy.receiver.media.PlaybackStatisticsSnapshot
 import org.screencopy.receiver.media.PlaybackStatisticsText
 import org.screencopy.receiver.media.StatisticsField
 import org.screencopy.receiver.media.PlaybackDisplayMeasurements
+import org.screencopy.receiver.media.VideoPresentationOutput
 
 /** Display-only grid; every pointer remains owned by the underlying player. */
 class PlaybackStatisticsOverlay @JvmOverloads constructor(
@@ -85,6 +87,8 @@ class PlaybackStatisticsOverlay @JvmOverloads constructor(
     private fun table(parent: LinearLayout, fields: List<StatisticsField>, size: Float,
         labelWeight: Float = 1f, valueWeight: Float = 1f) {
         fun caption(field: StatisticsField): String = if (size <= 12f) when (field.id) {
+            "videoDynamicRange" -> context.getString(R.string.rc_stats_stream_range_compact)
+            "videoDecodeFormat" -> context.getString(R.string.rc_stats_profile_depth_compact)
             "encodedSize" -> "Encoded"
             "captureLimit" -> "FPS limit"
             "receiverCanvas" -> "Canvas px"
@@ -209,6 +213,7 @@ class PlaybackStatisticsOverlay @JvmOverloads constructor(
 
     private fun fieldValue(field: StatisticsField, size: Float): String = if (size > 12f) field.value else
         when (field.id) {
+            "videoDynamicRange", "videoDecodeFormat" -> field.value.replace(" · ", "·")
             "encodedSize" -> field.value.replace(" × ", "×")
             "receiverCanvas" -> field.value.replace(" × ", "×").removeSuffix(" px")
             "renderTarget", "displayOutput" -> field.value.replace(" × ", "×").removeSuffix(" px")
@@ -222,6 +227,8 @@ class PlaybackStatisticsOverlay @JvmOverloads constructor(
         removeAllViews()
         values.clear()
         val compact = layoutMode != 0
+        val verticalInset = dp(if (compact) 2 else 4)
+        setPadding(dp(6), verticalInset, dp(6), verticalInset)
         val size = if (compact) 10f else 16f
         val heading = label(model.header, size, bold = true).apply {
             tag = "statisticsHeader"
@@ -252,7 +259,6 @@ class PlaybackStatisticsOverlay @JvmOverloads constructor(
         }
         kpis.addView(kpiLabels)
         kpis.addView(kpiValues)
-        addView(kpis, LayoutParams(-1, -2))
         val totals = TableLayout(context).apply {
             tag = "statisticsTotals"
             isStretchAllColumns = true
@@ -271,7 +277,17 @@ class PlaybackStatisticsOverlay @JvmOverloads constructor(
         }
         totals.addView(totalLabels)
         totals.addView(totalValues)
-        addView(totals, LayoutParams(-1, -2))
+        if (layoutMode == 2) {
+            addView(LinearLayout(context).apply {
+                orientation = HORIZONTAL
+                isBaselineAligned = false
+                addView(kpis, LayoutParams(0, -2, 1.5f))
+                addView(totals, LayoutParams(0, -2, 1f))
+            }, LayoutParams(-1, -2))
+        } else {
+            addView(kpis, LayoutParams(-1, -2))
+            addView(totals, LayoutParams(-1, -2))
+        }
         if (!compact) addView(label(model.totalsCaption, size))
         rule(this)
         val body = LinearLayout(context).apply { orientation = if (layoutMode == 1) VERTICAL else HORIZONTAL }
@@ -281,18 +297,20 @@ class PlaybackStatisticsOverlay @JvmOverloads constructor(
             return column
         }
         val video = bodySection("VIDEO STREAM")
-        if (layoutMode == 2) video.layoutParams = LayoutParams(0, -2, 1f)
+        if (layoutMode == 2) video.layoutParams = LayoutParams(0, -2, 1.35f)
         table(video, model.video, size)
         val audio = bodySection("AUDIO & SYNC")
         if (layoutMode == 2) audio.layoutParams = LayoutParams(0, -2, 1.25f)
         table(audio, model.audio, size)
+        val compactNote = "Source skew: +video ahead, not latency · peak 1 Hz · PCM total(+recent) ms"
         if (layoutMode == 0 || layoutMode == 1) {
             audio.addView(label(model.peakCaption, size))
             model.notes.forEach { audio.addView(label(it, size)) }
         } else if (layoutMode == 2) {
+            audio.addView(label(compactNote, size))
             val queues = bodySection("CONNECTIONS")
             queues.removeAllViews()
-            queues.layoutParams = LayoutParams(0, -2, 1.35f)
+            queues.layoutParams = LayoutParams(0, -2, 1f)
             connections(queues, model, size)
         }
         addView(body, LayoutParams(-1, -2))
@@ -301,8 +319,8 @@ class PlaybackStatisticsOverlay @JvmOverloads constructor(
             connections(this, model, size)
         }
         stackedFields(this, model.details, size, "statisticsPlatformDetails")
-        if (layoutMode == 2 || layoutMode == 4) {
-            addView(label("Source skew: +video ahead, not latency · peak 1 Hz · PCM total(+recent) ms", size))
+        if (layoutMode == 4) {
+            addView(label(compactNote, size))
         }
         if (detailed) {
             rule(this)
@@ -311,6 +329,30 @@ class PlaybackStatisticsOverlay @JvmOverloads constructor(
         }
         rule(this)
         stackedFields(this, model.footer, size, "statisticsFooter")
+    }
+
+    private fun localizedModel(snapshot: PlaybackStatisticsSnapshot, canvasWidth: Int, canvasHeight: Int,
+        measurements: PlaybackDisplayMeasurements): PlaybackStatisticsDisplay {
+        val model = PlaybackStatisticsText.display(snapshot, canvasWidth, canvasHeight, measurements)
+        val unknown = context.getString(R.string.rc_stats_unknown)
+        return model.copy(video = model.video.map { field ->
+            when (field.id) {
+                "videoDynamicRange" -> field.copy(label = context.getString(R.string.rc_stats_stream_range),
+                    value = field.value.replace("N/A", unknown))
+                "videoDecodeFormat" -> field.copy(label = context.getString(R.string.rc_stats_profile_depth),
+                    value = PlaybackStatisticsText.decodeFormat(snapshot.input.decodedVideo) {
+                        context.getString(R.string.rc_stats_bit_depth, it)
+                    }.replace("N/A", unknown))
+                "presentationOutput" -> field.copy(label = context.getString(R.string.rc_stats_output),
+                    value = when (snapshot.input.presentation?.output) {
+                        VideoPresentationOutput.Hdr -> context.getString(R.string.rc_stats_hdr_output)
+                        VideoPresentationOutput.Sdr -> context.getString(R.string.rc_stats_sdr_output)
+                        VideoPresentationOutput.SdrToneMapped -> context.getString(R.string.rc_stats_sdr_tone_mapped)
+                        null -> unknown
+                    })
+                else -> field
+            }
+        })
     }
 
     fun show(snapshot: PlaybackStatisticsSnapshot?, canvasWidth: Int, canvasHeight: Int,
@@ -325,7 +367,7 @@ class PlaybackStatisticsOverlay @JvmOverloads constructor(
         val density = resources.displayMetrics.density
         val compact = minOf(availableWidth, availableHeight) / density < 600
         val panelWidth = if (!detailed && compact)
-            minOf((availableWidth * if (availableWidth > availableHeight) 0.65f else 0.90f).toInt(), dp(760))
+            minOf((availableWidth * if (availableWidth > availableHeight) 0.60f else 0.90f).toInt(), dp(760))
             else minOf(availableWidth, dp(1100))
         layoutParams?.let {
             if (panelWidth > 0 && it.width != panelWidth) {
@@ -339,7 +381,7 @@ class PlaybackStatisticsOverlay @JvmOverloads constructor(
             panelWidth / density < 600 -> 1
             else -> 0
         }
-        val model = PlaybackStatisticsText.display(snapshot, canvasWidth, canvasHeight, measurements)
+        val model = localizedModel(snapshot, canvasWidth, canvasHeight, measurements)
         if (mode != layoutMode) {
             mode = layoutMode
             build(model, layoutMode)

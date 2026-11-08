@@ -1,0 +1,118 @@
+{
+  "displayContractVersion": 2,
+  "wireContractChanged": false,
+  "title": "Playback statistics",
+  "kpis": [
+    { "id": "receivedFps", "label": "Received FPS", "unit": "FPS" },
+    { "id": "decodedFps", "label": "Decoded FPS", "unit": "FPS" },
+    { "id": "presentedFps", "label": "Presented FPS", "unit": "FPS" },
+    { "id": "recentSkippedPercent", "label": "Skipped · recent", "unit": "%" }
+  ],
+  "videoTotals": ["Decoded", "Presented", "Skipped"],
+  "groups": [
+    {
+      "id": "video",
+      "title": "VIDEO STREAM",
+      "fields": [
+        { "id": "videoCodec", "label": "Codec" },
+        { "id": "videoDynamicRange", "label": "Stream range", "meaning": "Validated incoming format, HDR10 or SDR, plus actual decoded transfer when known (PQ is a transfer, not a display wire protocol)." },
+        { "id": "videoDecodeFormat", "label": "Profile / depth", "meaning": "Actual decoder codec profile and decoded surface component bit depth; unknown components remain N/A, never inferred from negotiation or output buffer precision." },
+        { "id": "presentationOutput", "label": "Output", "meaning": "Cached actual presentation path: HDR output, SDR (tone-mapped), SDR output, or N/A before successful presentation. Incoming HDR does not imply HDR output." },
+        { "id": "encodedSize", "label": "Encoded size", "unit": "px" },
+        { "id": "captureLimit", "label": "Capture limit", "unit": "FPS", "meaning": "Requested maximum, not observed rate." },
+        { "id": "canvasSize", "label": "Receiver canvas", "unit": "px", "meaning": "Physical pixel viewport, not DIP or source raster." },
+        { "id": "rotation", "label": "Rotation", "meaning": "Applied degrees and requested orientation." },
+        { "id": "videoBitrate", "label": "Video bitrate", "unit": "Mbps", "meaning": "Received video payload over the sample interval." },
+        { "id": "configuredVideoBitrate", "label": "Configured bitrate", "unit": "Mbps", "meaning": "Configured video target, not measured throughput." },
+        { "id": "networkLoss", "label": "Network loss", "meaning": "N/A unless actually measured; TCP/render skips do not measure it." }
+      ]
+    },
+    {
+      "id": "audioSync",
+      "title": "AUDIO & SYNC",
+      "fields": [
+        { "id": "audioCodec", "label": "Audio format" },
+        { "id": "audioBitrate", "label": "Audio bitrate", "unit": "Mbps", "meaning": "Received audio payload over the sample interval." },
+        { "id": "pcmBufferTarget", "label": "PCM buffer / target", "unit": "ms" },
+        { "id": "devicePadding", "label": "Device padding", "unit": "ms", "meaning": "Cached native device padding; no added UI-thread query." },
+        { "id": "insertedSilence", "label": "Inserted silence", "unit": "ms", "meaning": "Total plus recent sample delta, not acoustic-silence measurement." },
+        { "id": "discardedPcm", "label": "Discarded PCM", "unit": "ms", "meaning": "Total plus recent sample delta, not compressed packet drops." },
+        { "id": "avSkew", "label": "A/V skew", "unit": "ms", "meaning": "Video source PTS minus played-source audio PTS. Positive means video ahead." },
+        { "id": "peakObservedSkew", "label": "Peak observed skew", "unit": "ms", "meaning": "Maximum absolute valid 1-Hz overlay sample in the current session/generation/playback epoch. Native diagnostic maxima remain separate." }
+      ]
+    }
+  ],
+  "connections": {
+    "title": "CONNECTIONS & QUEUES",
+    "columns": ["Channel", "Queued", "Span", "Last activity", "RTT"],
+    "rows": ["Video", "Audio", "Control"],
+    "mediaQueueScope": "Encoded waiting packets only, excluding dequeued/in-flight codec work. Does not alter media admission limits or inclusive diagnostic counters.",
+    "mediaQueued": "Packet count and payload bytes.",
+    "mediaSpan": "PTS range of the encoded waiting packets, in ms.",
+    "mediaLastActivity": "Monotonic age since the last valid media packet received; not queue oldest-admission age.",
+    "controlLastActivity": "Monotonic age since last valid control message.",
+    "controlRtt": "Only a matching reply to a locally generated nonce with a locally recorded send timestamp.",
+    "notApplicable": "Control Queued/Span and media RTT display an em dash.",
+    "footnote": "Encoded queues: waiting packets"
+  },
+  "footer": ["State", "Generation", "Playback epoch", "Occluded"],
+  "notes": [
+    "Positive skew = video ahead",
+    "Source timestamps · not end-to-end latency",
+    "Peak observed skew uses 1-Hz samples."
+  ],
+  "formatting": {
+    "videoCodecs": { "h264": "H.264", "h265": "H.265 (HEVC)", "av1": "AV1" },
+    "audioCodecs": { "raw": "PCM", "pcm": "PCM", "opus": "Opus", "aac": "AAC" },
+    "audioOff": "Off",
+    "unknown": "N/A",
+    "hdrStreamExample": "HDR10 · PQ",
+    "hdrDecodeExample": "Main 10 · 10-bit",
+    "presentationOutputs": ["HDR output", "SDR (tone-mapped)", "SDR output"],
+    "notApplicable": "—",
+    "numericCulture": "Invariant decimal formatting",
+    "sizes": "width × height",
+    "labelsLeftValuesRight": true,
+    "normalFontSize": 16,
+    "compactMinimumFontSize": 14,
+    "inputIntercepted": false,
+    "sampleIntervalMilliseconds": 1000
+  },
+  "platformDifferences": [
+    {
+      "id": "presentationOutput",
+      "windows": "Last successful swap-chain submission or redraw with applied monitor policy. HDR output uses FP16 scRGB; this does not identify the physical display wire protocol.",
+      "android": "Actual configured presentation path and output policy, never inferred solely from HDR stream metadata or display HDR capabilities.",
+      "commonLimit": "SDR content remains an SDR stream on HDR displays. Output is N/A without a known successfully applied presentation path."
+    },
+    {
+      "id": "presentedFps",
+      "windows": "Successful swap-chain submissions, excluding redraws.",
+      "android": "Actual MediaCodec frame-rendered callbacks; never substitute scheduled output releases.",
+      "commonLimit": "Neither is independent proof of physical display scanout or refresh rate."
+    },
+    {
+      "id": "playbackEpoch",
+      "windows": "Native playback instance/rebuild epoch.",
+      "android": "N/A if there is no equivalent native playback-instance counter; do not relabel audio epoch."
+    },
+    {
+      "id": "occluded",
+      "windows": "Cached presentation occlusion status.",
+      "android": "N/A when not measured."
+    }
+  ],
+  "optionalPlatformDetails": [
+    { "id": "scheduledFrames", "label": "Scheduled frames", "meaning": "Distinct from actual Presented." },
+    { "id": "audioEpoch", "label": "Audio epoch", "meaning": "Distinct from native Playback epoch." },
+    { "id": "devicePlayed", "label": "Device played", "unit": "ms", "meaning": "Includes device silence; distinct from played-source PTS." },
+    { "id": "configuredAudioBitrate", "label": "Configured audio bitrate", "unit": "Mbps" }
+  ],
+  "lifecycle": {
+    "enabled": "Only the existing negotiated playbackStats option; no wire change.",
+    "firstRates": "N/A until two comparable samples.",
+    "idleRates": "A genuine zero delta is 0; static content is not automatically unhealthy.",
+    "reset": "Session, generation, playback epoch, counter regression, missing snapshot, retirement, hide or Stop resets rate/peak baselines.",
+    "nativeAccess": "Typed cached snapshots only; no extra per-frame UI/JSON/logging or UI-thread native media queries."
+  }
+}

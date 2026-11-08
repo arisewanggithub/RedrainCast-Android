@@ -3,8 +3,6 @@ package org.screencopy.receiver.ui
 import android.app.Activity
 import android.content.pm.ActivityInfo
 import android.content.pm.PackageManager
-import android.view.TextureView
-import android.widget.FrameLayout
 import org.junit.Assert.*
 import org.junit.Test
 import org.junit.runner.RunWith
@@ -88,16 +86,14 @@ class ReceiverDisplayOrientationTest {
     private fun verifyFittedPictures(activity: Activity, boxWidth: Int, boxHeight: Int, aspect: Double, axis: Int) {
         val policy = SessionOrientation.forActivity(activity)
         policy.begin(Any(), ReceiverOrientation.AUTO)
-        val box = FrameLayout(activity).apply { layout(0, 0, boxWidth, boxHeight) }
-        val texture = TextureView(activity)
-        box.addView(texture)
         for (rotation in listOf(0, 90, 180, 270)) {
             policy.followVideo(aspect, rotation)
-            VideoPresentation.fit(texture, box, aspect, rotation)
+            val sourceWidth = if (aspect < 1) 1080 else 1920
+            val sourceHeight = if (aspect < 1) 1920 else 1080
+            val geometry = checkNotNull(VideoPresentation.geometry(boxWidth, boxHeight, sourceWidth, sourceHeight, rotation))
             assertEquals(axis, activity.requestedOrientation)
-            assertEquals(rotation.toFloat(), texture.rotation, 0f)
-            val width = if (rotation % 180 == 0) texture.layoutParams.width else texture.layoutParams.height
-            val height = if (rotation % 180 == 0) texture.layoutParams.height else texture.layoutParams.width
+            val width = geometry.destination.width()
+            val height = geometry.destination.height()
             assertTrue(width in 1..boxWidth)
             assertTrue(height in 1..boxHeight)
             assertEquals(if (rotation % 180 == 0) aspect else 1.0 / aspect, width.toDouble() / height, 0.002)

@@ -128,6 +128,8 @@ class PlaybackStatisticsTest {
             org.screencopy.receiver.protocol.StrictJson.decode(it.readBytes())
         }
         val model = PlaybackStatisticsText.display(PlaybackStatisticsSampler().sample(1000, input()), 1080, 1920)
+        assertEquals(2, fixture.getInt("displayContractVersion"))
+        assertFalse(fixture.getBoolean("wireContractChanged"))
         assertEquals(fixture.getString("header"), model.header)
         for ((group, fields) in listOf("kpis" to model.kpis, "totals" to model.totals,
             "video" to model.video, "audio" to model.audio, "footer" to model.footer,
@@ -137,7 +139,8 @@ class PlaybackStatisticsTest {
             fields.forEachIndexed { index, field ->
                 assertEquals(expected.getJSONObject(index).getString("id"), field.id)
                 assertEquals(expected.getJSONObject(index).getString("label"), field.label)
-                assertTrue(expected.getJSONObject(index).getString("unit").isNotEmpty())
+                val entry = expected.getJSONObject(index)
+                assertTrue(entry.optString("unit").isNotEmpty() || entry.optString("meaning").isNotEmpty())
             }
         }
         assertEquals(listOf("Channel", "Queued", "Span", "Last activity", "RTT"), model.connectionHeaders)
