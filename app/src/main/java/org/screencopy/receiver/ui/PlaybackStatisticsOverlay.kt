@@ -259,7 +259,6 @@ class PlaybackStatisticsOverlay @JvmOverloads constructor(
         }
         kpis.addView(kpiLabels)
         kpis.addView(kpiValues)
-        addView(kpis, LayoutParams(-1, -2))
         val totals = TableLayout(context).apply {
             tag = "statisticsTotals"
             isStretchAllColumns = true
@@ -278,7 +277,17 @@ class PlaybackStatisticsOverlay @JvmOverloads constructor(
         }
         totals.addView(totalLabels)
         totals.addView(totalValues)
-        addView(totals, LayoutParams(-1, -2))
+        if (layoutMode == 2) {
+            addView(LinearLayout(context).apply {
+                orientation = HORIZONTAL
+                isBaselineAligned = false
+                addView(kpis, LayoutParams(0, -2, 1.5f))
+                addView(totals, LayoutParams(0, -2, 1f))
+            }, LayoutParams(-1, -2))
+        } else {
+            addView(kpis, LayoutParams(-1, -2))
+            addView(totals, LayoutParams(-1, -2))
+        }
         if (!compact) addView(label(model.totalsCaption, size))
         rule(this)
         val body = LinearLayout(context).apply { orientation = if (layoutMode == 1) VERTICAL else HORIZONTAL }
@@ -293,10 +302,12 @@ class PlaybackStatisticsOverlay @JvmOverloads constructor(
         val audio = bodySection("AUDIO & SYNC")
         if (layoutMode == 2) audio.layoutParams = LayoutParams(0, -2, 1.25f)
         table(audio, model.audio, size)
+        val compactNote = "Source skew: +video ahead, not latency · peak 1 Hz · PCM total(+recent) ms"
         if (layoutMode == 0 || layoutMode == 1) {
             audio.addView(label(model.peakCaption, size))
             model.notes.forEach { audio.addView(label(it, size)) }
         } else if (layoutMode == 2) {
+            audio.addView(label(compactNote, size))
             val queues = bodySection("CONNECTIONS")
             queues.removeAllViews()
             queues.layoutParams = LayoutParams(0, -2, 1f)
@@ -308,8 +319,8 @@ class PlaybackStatisticsOverlay @JvmOverloads constructor(
             connections(this, model, size)
         }
         stackedFields(this, model.details, size, "statisticsPlatformDetails")
-        if (layoutMode == 2 || layoutMode == 4) {
-            addView(label("Source skew: +video ahead, not latency · peak 1 Hz · PCM total(+recent) ms", size))
+        if (layoutMode == 4) {
+            addView(label(compactNote, size))
         }
         if (detailed) {
             rule(this)

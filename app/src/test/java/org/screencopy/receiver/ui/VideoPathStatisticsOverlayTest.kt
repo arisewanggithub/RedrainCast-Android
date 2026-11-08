@@ -114,6 +114,12 @@ class VideoPathStatisticsOverlayTest {
                 parent.layout(0, 0, width, height)
                 assertTrue("Panel exceeds viewport at ${width}x$height", overlay.height <= height)
                 assertTrue(overlay.width <= (width * if (width > height) 0.60f else 0.90f).toInt())
+                if (width > height) {
+                    val kpis = overlay.findViewWithTag<View>("statisticsKpis")
+                    val totals = overlay.findViewWithTag<View>("statisticsTotals")
+                    assertSame(kpis.parent, totals.parent)
+                    assertTrue(totals.left >= kpis.right)
+                }
                 assertTrue("Panel obscures half the player at ${width}x$height: ${overlay.width}x${overlay.height}",
                     overlay.width.toLong() * overlay.height < width.toLong() * height * 0.50)
                 for (id in listOf("videoDynamicRange", "videoDecodeFormat", "presentationOutput")) {

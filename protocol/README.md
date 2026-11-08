@@ -185,6 +185,9 @@ Compact landscape panel width is capped at 60% of the viewport so the taller
 video metadata group still leaves more than half the player area uncovered.
 Within that panel, video receives a 1.35 column share, audio 1.25 and queues 1.0
 to fit decoded metadata and raster values without unnecessary wrapping.
+Compact landscape preserves both two-row summary grids side by side, and puts
+the unchanged source-skew explanation under audio to use the shorter column's
+space rather than growing the full panel.
 
 Incoming HDR10 is validated independently of presentation; PQ/BT.709 comes
 from actual decoder output color metadata. Missing SDR metadata remains N/A.

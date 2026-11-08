@@ -86,6 +86,9 @@ Compact landscape panels reserve 40% of the player width for unobscured video;
 the native-rendered area checks retain their strict less-than-half limit.
 The video metadata column receives more width than the short queue column to
 avoid turning the added rows and existing raster values into a taller panel.
+Landscape KPI and generation-total grids share a horizontal summary row,
+retaining their title-over-value cells. The source-skew explanation sits below
+the shorter audio column instead of adding another full-width panel row.
 Native-rendering tests inspect inner text bounds and the real reported Galaxy
 canvas dimensions at 450 dpi and 115% font scaling, including summary area and
 short-label wrapping. Full diagnostics tests scroll to the footer and retain the
