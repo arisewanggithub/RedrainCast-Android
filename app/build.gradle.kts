@@ -13,8 +13,8 @@ android {
         applicationId = "dev.redrain.cast"
         minSdk = 30
         targetSdk = 37
-        versionCode = 25
-        versionName = "0.4.12"
+        versionCode = 26
+        versionName = "0.4.13"
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         externalNativeBuild {
             cmake { arguments += "-DANDROID_STL=c++_static" }
@@ -42,6 +42,10 @@ android {
     sourceSets["test"].resources.directories.add(rootProject.file("protocol/fixtures").path)
     lint { abortOnError = true }
     buildTypes {
+        getByName("debug") {
+            applicationIdSuffix = ".debug"
+            versionNameSuffix = "-debug"
+        }
         getByName("release") {
             isDebuggable = false
             isMinifyEnabled = true

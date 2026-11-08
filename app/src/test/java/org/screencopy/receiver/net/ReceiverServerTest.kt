@@ -22,6 +22,224 @@ import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
 
 class ReceiverServerTest {
+    @Test fun frameAverageAboveKnownContentLightIsRejectedBeforeAccept() {
+        ReceiverServer.forProtocolTests("Receiver",
+            receiveCapabilities = { ReceiveCapabilities(true, true) }).use { server ->
+            server.start()
+            connect(server).use { peer ->
+                send(peer, Type.HELLO, helloPayload().put("hdrVideoVersion", 1))
+                assertEquals(Type.HELLO, read(peer).type)
+                val color = HdrVideoColor(HdrStaticMetadata(
+                    listOf(35400, 14600, 8500, 39850, 6550, 2300, 15635, 16450),
+                    1000, 50, 400, 1000)).json()
+                send(peer, Type.SESSION_REQUEST, hdrSettings().put("videoColor", color), 77)
+                val response = read(peer)
+                assertEquals(Type.REJECT, response.type)
+                assertEquals("PROTOCOL", response.json().string("code"))
+                assertEquals("Invalid HDR luminance metadata", response.json().string("message"))
+            }
+            await { !server.busyForUpdate }
+        }
+    }
+
+    @Test fun canonicalMetadataMinimum65535IsAcceptedBut65536IsRejectedBeforeAccept() {
+        val fixture = checkNotNull(javaClass.getResourceAsStream("/hdr-video.json"))
+            .use { StrictJson.decode(it.readBytes()) }
+        ReceiverServer.forProtocolTests("Receiver",
+            receiveCapabilities = { ReceiveCapabilities(true, true) }).use { server ->
+            server.start()
+            for (minimum in listOf(65535, 65536)) {
+                connect(server).use { peer ->
+                    send(peer, Type.HELLO, helloPayload().put("hdrVideoVersion", 1))
+                    assertEquals(Type.HELLO, read(peer).type)
+                    val color = fixture.obj("videoColor")
+                    color.obj("staticMetadata").put("minMasteringTenThousandths", minimum)
+                    send(peer, Type.SESSION_REQUEST, hdrSettings().put("videoColor", color), 77)
+                    val response = read(peer)
+                    if (minimum == 65535) {
+                        assertEquals(Type.SESSION_ACCEPT, response.type)
+                        assertEquals(65535, HdrVideoColor.parse(response.json().obj("videoColor"))
+                            .staticMetadata?.minMasteringTenThousandths)
+                        send(peer, Type.STOP, JSONObject().put("reason", "done"), 77)
+                        assertEquals(Type.SESSION_END, read(peer).type)
+                    } else {
+                        assertEquals(Type.REJECT, response.type)
+                        assertEquals("UNSUPPORTED_CONFIG", response.json().string("code"))
+                        assertTrue(response.json().string("message").contains("cannot be represented"))
+                    }
+                }
+                await { !server.busyForUpdate }
+            }
+        }
+    }
+
+    @Test fun preparationDeadlineIsCheckedOnReceiptEvenBetweenMaintenanceTicks() {
+        fun field(owner: Any, name: String) = owner.javaClass.getDeclaredField(name).apply { isAccessible = true }
+        listOf<Int?>(1, 2, null).forEach { version ->
+            ReceiverServer.forProtocolTests("Receiver").use { server ->
+                server.start()
+                connect(server).use { peer ->
+                    val payload = helloPayload().apply { version?.let { put("hdrVideoVersion", it) } }
+                    send(peer, Type.HELLO, payload)
+                    assertEquals(Type.HELLO, read(peer).type)
+                    val pool = field(server, "clients").get(server) as ConnectionPool<*>
+                    val connection = checkNotNull(pool.snapshot().single())
+                    await { field(connection, "phase").get(connection) == "Negotiating" }
+                    val timer = field(server, "timer").get(server) as java.util.concurrent.ScheduledExecutorService
+                    timer.shutdown()
+                    assertTrue(timer.awaitTermination(3, TimeUnit.SECONDS))
+                    if (version == 1) {
+                        field(connection, "phaseAt").setLong(connection, System.nanoTime() / 1_000_000 - 11000)
+                        send(peer, Type.PING, JSONObject().put("nonce", 17))
+                        assertEquals(Type.PONG, read(peer).type)
+                    }
+                    field(connection, "phaseAt").setLong(connection,
+                        System.nanoTime() / 1_000_000 - HdrPreparationDeadline.milliseconds(version))
+                    // A newly received request must not win the race against the next maintenance tick.
+                    send(peer, Type.SESSION_REQUEST, settings(), 77)
+                    val error = read(peer)
+                    assertEquals(Type.ERROR, error.type)
+                    assertEquals("TIMEOUT", error.json().string("code"))
+                    assertFalse(server.busyForUpdate)
+                }
+            }
+        }
+    }
+
+    @Test fun hdrDiscoveryAndHelloAreAdditiveButSelectionRequiresExplicitSupport() {
+        val caps = ReceiveCapabilities(true, true)
+        ReceiverServer.forProtocolTests("Receiver", receiveCapabilities = { caps }).use { server ->
+            server.start()
+            val advertisement = StrictJson.decode(server.advertisement())
+            assertEquals(caps, ReceiveCapabilities.parse(advertisement.obj("receiveCapabilities")))
+            assertTrue(server.advertisement().size <= 1024)
+            connect(server).use { peer ->
+                hello(peer)
+                send(peer, Type.SESSION_REQUEST, hdrSettings(), 77)
+                assertEquals(Type.REJECT, read(peer).type)
+            }
+            await { !server.busyForUpdate }
+            connect(server).use { peer ->
+                send(peer, Type.HELLO, helloPayload().put("hdrVideoVersion", 1))
+                assertEquals(caps, ReceiveCapabilities.parse(read(peer).json().obj("receiveCapabilities")))
+                send(peer, Type.SESSION_REQUEST, hdrSettings(), 78)
+                val accepted = read(peer)
+                assertEquals(Type.SESSION_ACCEPT, accepted.type)
+                assertEquals(HdrVideoColor(), HdrVideoColor.parse(accepted.json().obj("videoColor")))
+                send(peer, Type.STOP, JSONObject().put("reason", "done"), 78)
+                assertEquals(Type.SESSION_END, read(peer).type)
+            }
+        }
+    }
+
+    @Test fun hdrConfigCannotDropColorAndNativeDisplayLossFailsExplicitly() {
+        val caps = java.util.concurrent.atomic.AtomicReference(ReceiveCapabilities(true, true))
+        ReceiverServer.forProtocolTests("Receiver", receiveCapabilities = { caps.get() }).use { server ->
+            server.start()
+            connect(server).use { peer ->
+                send(peer, Type.HELLO, helloPayload().put("hdrVideoVersion", 1))
+                assertEquals(Type.HELLO, read(peer).type)
+                send(peer, Type.SESSION_REQUEST, hdrSettings(), 77)
+                MediaSockets.attach(server, read(peer)).use { media ->
+                    val config = JSONObject().put("codec", "h265").put("width", 3840).put("height", 2160)
+                        .put("csd", JSONArray().put(java.util.Base64.getEncoder().encodeToString(HdrVideoTest.configuration())))
+                    Wire.write(media.video.outputStream, Message.json(Type.STREAM_CONFIG, config, 77, 1, 1))
+                    val error = read(peer)
+                    assertEquals(Type.ERROR, error.type)
+                    assertEquals("UNSUPPORTED_CONFIG", error.json().string("code"))
+                }
+            }
+            await { !server.busyForUpdate }
+            connect(server).use { peer ->
+                send(peer, Type.HELLO, helloPayload().put("hdrVideoVersion", 1))
+                assertEquals(Type.HELLO, read(peer).type)
+                send(peer, Type.SESSION_REQUEST, hdrSettings(), 78)
+                assertEquals(Type.SESSION_ACCEPT, read(peer).type)
+                caps.set(ReceiveCapabilities(true, false))
+                server.displayCapabilitiesChanged()
+                val error = read(peer)
+                assertEquals(Type.ERROR, error.type)
+                assertEquals("UNSUPPORTED_CONFIG", error.json().string("code"))
+                assertTrue(error.json().string("message").contains("restart casting with SDR"))
+            }
+        }
+    }
+
+    @Test fun changedDisplayBetweenHelloAndSelectionCannotAcceptHdrAndFutureVersionStaysSdr() {
+        val caps = java.util.concurrent.atomic.AtomicReference(ReceiveCapabilities(true, true))
+        ReceiverServer.forProtocolTests("Receiver", receiveCapabilities = { caps.get() }).use { server ->
+            server.start()
+            connect(server).use { peer ->
+                send(peer, Type.HELLO, helloPayload().put("hdrVideoVersion", 1))
+                assertEquals(Type.HELLO, read(peer).type)
+                caps.set(ReceiveCapabilities(true, null))
+                send(peer, Type.SESSION_REQUEST, hdrSettings(), 77)
+                assertEquals(Type.REJECT, read(peer).type)
+            }
+            await { !server.busyForUpdate }
+            connect(server).use { peer ->
+                hello(peer, helloPayload().put("hdrVideoVersion", 2))
+                send(peer, Type.SESSION_REQUEST, settings(), 78)
+                val accepted = read(peer)
+                assertEquals(Type.SESSION_ACCEPT, accepted.type)
+                assertFalse(accepted.json().has("videoColor"))
+                send(peer, Type.STOP, JSONObject().put("reason", "done"), 78)
+                assertEquals(Type.SESSION_END, read(peer).type)
+            }
+        }
+    }
+
+    private fun hdrSettings() = settings().apply {
+        getJSONObject("video").put("codec", "h265")
+        put("videoColor", HdrVideoColor().json())
+    }
+
+    @Test fun hdrGenerationsReachReadinessWithoutChangingSdrControlOrRetirement() {
+        val formats = ConcurrentLinkedQueue<org.screencopy.receiver.media.VideoFormat>()
+        val closed = AtomicInteger()
+        ReceiverServer.forProtocolTests("Receiver", receiveCapabilities = { ReceiveCapabilities(true, true) },
+            videoFactory = { format, clock, failure, generation ->
+                formats.add(format)
+                val decoder = object : org.screencopy.receiver.media.VideoDecoder {
+                    override val description = "HDR protocol fixture"
+                    override fun dequeueInput() = -1
+                    override fun input(index: Int): java.nio.ByteBuffer? = null
+                    override fun queueInput(index: Int, size: Int, ptsUs: Long, keyFrame: Boolean) = Unit
+                    override fun dequeueOutput(): org.screencopy.receiver.media.VideoOutput? = null
+                    override fun releaseOutput(index: Int, renderAtNs: Long?) = Unit
+                    override fun close() { closed.incrementAndGet() }
+                }
+                org.screencopy.receiver.media.VideoPlayer(format, clock, failure, decoder, generation)
+            }).use { server ->
+            server.start()
+            connect(server).use { peer ->
+                send(peer, Type.HELLO, helloPayload().put("hdrVideoVersion", 1))
+                assertEquals(Type.HELLO, read(peer).type)
+                send(peer, Type.SESSION_REQUEST, hdrSettings(), 77)
+                MediaSockets.attach(server, read(peer)).use { media ->
+                    val config = JSONObject().put("codec", "h265").put("width", 3840).put("height", 2160)
+                        .put("csd", JSONArray().put(java.util.Base64.getEncoder().encodeToString(HdrVideoTest.configuration())))
+                        .put("videoColor", HdrVideoColor().json())
+                    for (generation in 1L..2L) {
+                        Wire.write(media.video.outputStream, Message.json(Type.STREAM_CONFIG, config, 77, 1, generation))
+                        val ready = read(peer)
+                        assertEquals(Type.STREAM_READY, ready.type)
+                        assertEquals(generation, ready.generation)
+                        assertTrue(ready.json().boolean("ok"))
+                    }
+                    assertEquals(2, formats.size)
+                    formats.forEach { assertEquals(HdrVideoColor(), it.videoColor); assertFalse(it.toneMapToSdr) }
+                    send(peer, Type.PING, JSONObject().put("nonce", 123), 77)
+                    assertEquals(Type.PONG, read(peer).type)
+                    send(peer, Type.STOP, JSONObject().put("reason", "done"), 77)
+                    assertEquals(Type.SESSION_END, read(peer).type)
+                }
+            }
+            await { !server.busyForUpdate }
+            assertEquals(2, closed.get())
+        }
+    }
+
     @Test fun mediaEofBeforeControlStopDoesNotMisreportAnOrderlySessionAsFailure() {
         val failures = ConcurrentLinkedQueue<org.screencopy.receiver.ui.FailureDiagnostic>()
         ReceiverServer.forProtocolTests("Receiver", onFailure = failures::add).use { server ->
@@ -394,7 +612,9 @@ class ReceiverServerTest {
                 receiver.receive(packet)
                 val advertisement = StrictJson.decode(packet.data.copyOfRange(packet.offset, packet.offset + packet.length))
                 assertTrue(packet.address.isLoopbackAddress)
-                assertEquals(setOf("protocol", "version", "name", "port", "state", "instanceId"), advertisement.keys().asSequence().toSet())
+                assertEquals(setOf("protocol", "version", "name", "port", "state", "instanceId", "receiveCapabilities"),
+                    advertisement.keys().asSequence().toSet())
+                assertFalse(checkNotNull(ReceiveCapabilities.parse(advertisement.obj("receiveCapabilities"))).acceptsHdr)
                 assertTrue(advertisement.getString("instanceId").matches(Regex("[0-9a-f]{32}")))
                 assertEquals(advertisement.getString("instanceId"), StrictJson.decode(server.advertisement()).getString("instanceId"))
                 assertEquals("screencopy", advertisement.string("protocol"))

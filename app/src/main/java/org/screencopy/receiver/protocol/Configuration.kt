@@ -10,11 +10,13 @@ import java.util.Base64
 data class Request(val videoCodec: String, val audioCodec: String?, val fps: Int, val summary: String,
     val receiverOrientation: ReceiverOrientation = ReceiverOrientation.AUTO,
     val receiverOptions: ReceiverOptions = ReceiverOptions(),
-    val videoBitrate: Int = 0, val audioBitrate: Int? = null) {
+    val videoBitrate: Int = 0, val audioBitrate: Int? = null,
+    val videoColor: HdrVideoColor? = null) {
     val tracks: List<Int> get() = if (audioCodec == null) listOf(1) else listOf(1, 2)
 
     companion object {
-        fun parse(json: JSONObject, negotiated: ReceiverOptionCapabilities = ReceiverOptionCapabilities()): Request {
+        fun parse(json: JSONObject, negotiated: ReceiverOptionCapabilities = ReceiverOptionCapabilities(),
+            hdrNegotiated: Boolean = false, receiveCapabilities: ReceiveCapabilities = ReceiveCapabilities()): Request {
             val options = ReceiverOptionProtocol.selection(json, negotiated)
             protocolRequire(!json.has("mediaTransport"),
                 "Only custom TCP media is supported; omit mediaTransport", "UNSUPPORTED_CONFIG")
@@ -23,6 +25,10 @@ data class Request(val videoCodec: String, val audioCodec: String?, val fps: Int
             val video = json.obj("video")
             val codec = video.string("codec")
             protocolRequire(codec in listOf("h264", "h265", "av1"), "Unsupported video codec", "UNSUPPORTED_CONFIG")
+            val color = if (json.has("videoColor")) HdrVideoColor.parse(json.obj("videoColor")) else null
+            protocolRequire(color == null || hdrNegotiated && receiveCapabilities.acceptsHdr && codec == "h265",
+                "HDR video was not negotiated or the output is unavailable", "UNSUPPORTED_CONFIG")
+            color?.staticMetadata?.descriptor()
             video.string("encoder", 256)
             protocolRequire(video.integer("bitrate") > 0, "Invalid video bitrate")
             protocolRequire(video.integer("maxSize") in 0..16384, "Invalid maxSize")
@@ -49,7 +55,7 @@ data class Request(val videoCodec: String, val audioCodec: String?, val fps: Int
                 "Requested $codec ${video.integer("bitrate")} bps, max ${video.integer("maxSize")} px, $fps fps; " +
                     (if (enabled) "audio $audioCodec ${audio.integer("bitrate")} bps" else "audio disabled"),
                 receiverOrientation, options, video.integer("bitrate"),
-                if (enabled && audioCodec != "raw") audio.integer("bitrate") else null)
+                if (enabled && audioCodec != "raw") audio.integer("bitrate") else null, color)
         }
     }
 }
@@ -58,13 +64,17 @@ object Configuration {
     fun video(json: JSONObject, requested: Request): VideoFormat {
         val codec = json.string("codec")
         protocolRequire(codec == requested.videoCodec, "Actual video codec differs from accepted settings", "UNSUPPORTED_CONFIG")
+        val color = if (json.has("videoColor")) HdrVideoColor.parse(json.obj("videoColor")) else null
+        protocolRequire(color == requested.videoColor, "Actual videoColor differs from accepted settings", "UNSUPPORTED_CONFIG")
         val width = json.integer("width")
         val height = json.integer("height")
         protocolRequire(width in 1..16384 && height in 1..16384, "Invalid actual video dimensions")
         val csd = csd(json)
         protocolRequire(csd.isNotEmpty() && csd.all { it.isNotEmpty() }, "Missing video codec configuration")
         if (codec != "av1") protocolRequire(csd.all { annexB(it) }, "Video codec configuration must be Annex B")
-        return VideoFormat(mime(codec), width, height, csd, requested.fps)
+        val format = VideoFormat(mime(codec), width, height, csd, requested.fps, videoColor = color)
+        if (color != null) org.screencopy.receiver.media.HdrBitstream.validateConfiguration(format)
+        return format
     }
 
     fun audio(json: JSONObject, requested: Request): AudioFormat {

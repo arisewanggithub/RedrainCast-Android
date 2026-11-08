@@ -4,6 +4,75 @@ Authority: current RedrainCast Windows `ScrcpySend.Core/SenderSession.cs`,
 `ScrcpyReceive.Core/ReceiverServer.cs`, `Protocol.cs`, and `Discovery.cs`.
 The sibling checkout is not modified by the Android build or protocol probe.
 
+## Optional native HDR10 video
+
+This additive wire-v3 extension uses root `receiveCapabilities` in discovery
+and in receiver HELLO only when sender HELLO offers integer `hdrVideoVersion:1`.
+Capabilities have `version:1`, `videoModes`, `nativeHdrAvailable` (Boolean or null)
+and Boolean `hdrToSdr`. The supported HDR tuple is exactly
+`{"codec":"h265","profile":"main10","dynamicRange":"hdr10","colorPrimaries":"bt2020","transfer":"pq","matrix":"bt2020nc","range":"limited","bitDepth":10}`.
+Legacy SDR modes are implicit. Unknown positive capability revisions negotiate
+no HDR; malformed known fields, duplicate JSON keys and coerced integer/Boolean
+values are rejected. Both `receiveCapabilities` and `videoColor` envelopes are
+limited to 2048 original UTF-8 bytes, including whitespace and unknown members,
+before revision handling. Discovery retains its 1024-byte total limit.
+
+SESSION_REQUEST root `videoColor` contains `version:1`, that exact tuple and
+optional `staticMetadata`. SESSION_ACCEPT echoes the selected color. Every
+video STREAM_CONFIG generation repeats the same selected color and metadata;
+missing, changed or unsolicited HDR color is an error. Old peers remain SDR,
+never an optimistic HDR fallback. Selection is revalidated against current
+output availability and exact decoder size/rate support before readiness.
+
+Static metadata uses `masteringPrimaries:[Rx,Ry,Gx,Gy,Bx,By,Wx,Wy]` integers
+in 0..50000 with each normalized xy pair satisfying x+y <=50000,
+maximum mastering nits in 1..10000, minimum in ten-thousandths of
+a nit in 0..min(65535,maximum*10000), and content/frame-average light levels in 0..10000
+(zero means unknown). When content light is positive, frame-average light must
+not exceed it; unknown content light permits a positive frame-average value.
+Invalid light relationships are rejected before ACCEPT and descriptor output,
+never clamped. The decoder receives the 25-byte little-endian CTA-861.3
+descriptor with ID zero, not raw SEI. The shared wire schema rejects minimum
+luminance above 65535 during metadata/color parsing, before ACCEPT. The
+descriptor also defensively rejects unrepresentable typed values explicitly,
+never clamps or wraps. A bounded HEVC SPS syntax walker verifies Main10 10-bit 4:2:0,
+the declared raster and exact raw VUI BT2020/PQ/BT2020nc limited-range values
+(9/16/9). Sub-layers, reference sets/pictures and scaling-list traversal are
+bounded before walking untrusted values; no reference-picture arrays are
+allocated from stream counts. Supplied static SEI is checked against selected metadata.
+Only encoded mastering chromaticities may differ by at most one integer 1/50000
+unit, accounting for hardware requantization of Media Foundation float primaries;
+encoded xy pairs must still be normalized and in range. Mastering luminance and
+content/frame-average light levels remain exact. Request/configuration/accept
+metadata equality is unchanged; this allowance applies only to encoded SEI.
+The genuine NVIDIA synthetic VPS/SPS/SEI regression uses a reconstructed metadata
+fixture, not a retained phone capture, and is not proof of real-device HDR playback.
+Unannounced VPS/SPS/PPS changes are rejected. Decoder output color is validated
+before rendering. This verifies the input signaling, not physical HDR scanout.
+The shared canonical schema/metadata fixture is `fixtures/hdr-video.json`.
+
+Android uses a secure SurfaceView and guarded attached-display/current-mode HDR
+queries (API30 baseline; per-mode HDR types API34). Display capability does not
+prove active HDR scanout or expose the user's hidden disabled-HDR settings.
+Hardware decoder capabilities are cached outside the broadcast loop. Android
+uses `nativeHdrAvailable` with the advertised decoder tuple to describe the
+reported eligible native presentation path, not proof that HDR is currently
+being emitted. A missing public active-HDR getter does not disable an otherwise
+eligible path. OEM/user HDR switches and physical emission remain unverified.
+Android currently advertises `hdrToSdr:false`: API31's optional decoder SDR transfer
+request must be confirmed by input-format acknowledgement and SDR output color,
+not inferred from API level. Native HDR display loss stops rendering/fails the
+session with restart guidance rather than silently clipping. Codec substitution
+requires a new session; existing sequential generations/recovery proofs remain.
+HDR playback and SurfaceView rotation/overlay behavior need real-device testing.
+
+Explicit `hdrVideoVersion:1` peers have a bounded 45-second post-HELLO
+SESSION_REQUEST preparation window. Initial socket HELLO, legacy/future peers,
+track setup, liveness and recovery retain their existing deadlines. Preparation
+PING/PONG does not extend the absolute 45-second window. The absolute deadline
+is checked on each preparation message, including SESSION_REQUEST, as well as
+by periodic maintenance, so a late request cannot win a timer race.
+
 ## Optional receiver playback statistics
 
 This additive v3 extension matches Windows `ReceiverOptions.cs`; it does not
@@ -85,9 +154,9 @@ Display dimensions are diagnostic-only, with no wire fields or render-mode
 requests. The main video section includes Encoded size and Display mode
 (Display px in the compact panel).
 Render target is retained only in full display diagnostics and accepts only
-verified compositor-target dimensions; the current TextureView implementation
-has no such measurement and reports N/A. Neither STREAM_CONFIG size,
-TextureView/view bounds nor display mode is a
+verified compositor-target dimensions; the current TextureView/SurfaceView paths
+have no such measurement and report N/A. Neither STREAM_CONFIG size,
+TextureView/SurfaceView bounds nor display mode is a
 valid fallback for that field. Display mode uses the attached display's
 active `Display.Mode.physicalWidth/physicalHeight`, cached on display/lifecycle
 events rather than queried by the statistics refresh. These are Android-reported
@@ -99,6 +168,42 @@ The supplemental Scheduled frames / Audio epoch / Device played row uses the
 same stacked-grid mechanism with three equal columns and start-aligned values.
 
 The display-only golden manifest `fixtures/playback-statistics-display.json`
+uses local `displayContractVersion: 2`, `wireContractChanged: false`. The
+Windows canonical comparison manifest is copied without schema changes to
+`fixtures/playback-statistics-display-contract.json`. Android retains its
+existing platform dimension fields; both begin the video group with
+`videoCodec`, `videoDynamicRange` (Stream range), `videoDecodeFormat`
+(Profile / depth), and `presentationOutput` (Output). The three new fields
+have no numeric unit. Technical identifiers stay technical; new labels,
+output words, unknown text and bit-depth text use Android string resources.
+The existing compact layout uses localized Range/Prof/depth captions and
+removes only separator spacing in these values; full labels and technical
+identifiers remain available in the model and accessibility descriptions.
+Compact panels use 2dp outer vertical insets (normal panels retain 4dp) to
+accommodate the additional rows without changing font size or removing metrics.
+
+Incoming HDR10 is validated independently of presentation; PQ/BT.709 comes
+from actual decoder output color metadata. Missing SDR metadata remains N/A.
+Profile is read from decoder output `KEY_PROFILE`; component depth is reported
+only for explicit decoded planar/semi-planar/flexible 8-bit YUV420 or P010 (10), not
+opaque Surface formats, profile assumptions, capabilities or buffer precision.
+Unknown profile/depth components independently display N/A.
+Output is the last matched successful frame-rendered decoder/Surface path,
+not a scheduled release or the latest format-change event. Validated
+BT2020/PQ/limited direct output can report HDR output, which is not proof of
+physical HDR emission or OEM display state. SDR output needs actual SDR
+transfer metadata. Production does not request tone mapping; the optional
+API31 request/format validation lacks independent runtime mapping proof and
+does not publish SDR (tone-mapped). Unknown presented paths clear any previous
+classification when rendered. A bounded, player-owned PTS cache keeps ambiguous
+duplicate PTS and unmatched/evicted observations unknown, ignores duplicate or
+older callbacks, and rejects retired callbacks. Replacement generations start
+without old output. Malformed optional statistics metadata is logged and remains
+unknown rather than failing otherwise valid playback.
+Sampling reads these typed caches without MediaCodec/display queries or SPS
+parsing on the UI timer.
+
+The Android manifest
 defines common field IDs, labels, order, units and null semantics. It is not a
 wire extension or a shared runtime dependency. Native readings are not expected
 to have equal numerical values across platforms.
@@ -116,7 +221,7 @@ display changes.
 | Peak observed skew | Absolute maximum of the overlay's 1 Hz samples since its baseline | Not a render-thread/per-frame maximum. Any higher-frequency Windows diagnostic peak remains a separate measurement. |
 | Playback epoch | Equivalent native playback-instance lifetime, if available | Android reports N/A; audio epoch is not renamed as a full playback epoch. |
 | Occluded | Cached platform occlusion status, if available | Android reports N/A, not false. |
-| Display mode / diagnostic Render target | Reported active mode dimensions / verified compositor buffer in full diagnostics only | TextureView target is N/A unless measured, not inferred from view size. Android mode dimensions do not establish optical projection resolution. |
+| Display mode / diagnostic Render target | Reported active mode dimensions / verified compositor buffer in full diagnostics only | Video target is N/A unless measured, not inferred from view size. Android mode dimensions do not establish optical projection resolution. |
 | Android details | Scheduled frames, Audio epoch, Device played, full display diagnostics | Device played includes silence and is not source content time. App view size is diagnostic-only, not rendered pixel resolution. |
 
 Common video codec labels are H.264, H.265 (HEVC), AV1; audio labels are PCM,
@@ -263,8 +368,23 @@ separate JSON timestamp envelope**. Encoded payload and encoder raster stay
 unchanged through phone rotations.
 
 The sender's GPU samples natural coordinates, including off-center crops, using
-Android physical-to-logical conventions. Receiver decoder output is rendered by
-TextureView and presented using that picture's rotation. Late UI callbacks must
+Android physical-to-logical conventions. Android routes accepted SDR
+(`videoColor` absent) to the existing TextureView path, applying that picture's
+rotation and aspect-preserving fitting. Accepted HDR (`videoColor` present)
+uses the framework-owned secure SurfaceView directly, never TextureView, and
+only supports zero picture rotation. Nonzero HDR picture rotation explicitly
+logs/fails `UNSUPPORTED_CONFIG` before decoder input dequeue/queue and output
+release rather than silently
+ignoring it or converting HDR to SDR. Rotation extension acknowledgement covers
+the SDR presentation path; it is not a claim of rotating native HDR output.
+The decoder is configured with KEY_ROTATION=0 for every initial format.
+Both surfaces remain attached across mode selection; an opaque SDR panel covers
+inactive native output, while HDR makes that panel and its TextureView
+transparent/non-opaque. MediaCodec retains ownership of HDR buffers/crop.
+Codec retirement precedes owned TextureView Surface release; the framework
+retains ownership of the HDR holder Surface. Late UI callbacks must
+also match the current surface identity; retired destruction/availability
+callbacks cannot replace or retire a newer epoch. Presentation callbacks must
 still own the live session/generation. On portable displays, automatic Activity
 orientation follows the displayed aspect and explicit orientation wins. Android
 TV and Leanback receivers keep their startup window axis; declared landscape-only
@@ -272,6 +392,16 @@ or portrait-only displays use their supported axis in all receiver orientation
 modes, taking precedence over the TV default. Picture rotation and
 aspect-preserving fitting remain unchanged. Teardown restores the prior Activity
 policy in both cases.
+
+The experimental child-SurfaceControl bridge was removed after landscape
+rendering went black. Its oracle transposed compositor matrix fields:
+[RequestedLayerState](https://android.googlesource.com/platform/frameworks/native/+/android-15.0.0_r1/services/surfaceflinger/FrontEnd/RequestedLayerState.cpp)
+applies `set(dsdx,dtdy,dtdx,dsdy)`, and
+[Transform](https://android.googlesource.com/platform/frameworks/native/+/android-15.0.0_r1/libs/ui/Transform.cpp)
+maps `x'=dsdx*x+dtdy*y`, `y'=dtdx*x+dsdy*y`.
+The former 270-degree configuration mapped 1080x1920 into
+`[-1920,1080,0,2160]`, entirely outside a 1920x1080 parent. Earlier rectangle
+tests therefore provided false confidence, not actual pixel evidence.
 
 Current Windows receiver source supports this extension: HELLO acknowledges true
 only for a Boolean true offer and a rotation-capable playback factory. Absent or
@@ -283,6 +413,16 @@ Do not remove the required capability check or silently fall back for old peers.
 Windows-to-Android frames without rotation bits legitimately present at zero.
 
 ## Evidence
+
+Rotation geometry regressions cover 0/90/180/270 degrees, all four mapped
+corners, fixed projector and portable window sizes, cropped/noncropped natural
+rasters, and landscape/portrait/landscape reconfiguration. The manually gated
+synthetic rendering diagnostic uses the same SDR TextureView path
+(an isolated non-secure fixture window permits PixelCopy). It is not an HDR
+surface test. Passing unit geometry/route tests alone does not establish physical projector
+rendering or HDR emission; the literal-frame diagnostic and actual projector
+portrait/landscape retest remain required when an idle, authorized target is
+available.
 
 `fixtures/windows-v3-*.hex` were produced and decoded by the actual Windows
 protocol source with `tools/WindowsProtocolCheck`, not handwritten packet mocks.

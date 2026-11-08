@@ -1,0 +1,38 @@
+{
+  "wireVersion": 3,
+  "receiveCapabilities": {
+    "version": 1,
+    "videoModes": [
+      {
+        "codec": "h265",
+        "profile": "main10",
+        "dynamicRange": "hdr10",
+        "colorPrimaries": "bt2020",
+        "transfer": "pq",
+        "matrix": "bt2020nc",
+        "range": "limited",
+        "bitDepth": 10
+      }
+    ],
+    "nativeHdrAvailable": true,
+    "hdrToSdr": true
+  },
+  "videoColor": {
+    "version": 1,
+    "codec": "h265",
+    "profile": "main10",
+    "dynamicRange": "hdr10",
+    "colorPrimaries": "bt2020",
+    "transfer": "pq",
+    "matrix": "bt2020nc",
+    "range": "limited",
+    "bitDepth": 10,
+    "staticMetadata": {
+      "masteringPrimaries": [35400, 14600, 8500, 39850, 6550, 2300, 15635, 16450],
+      "maxMasteringNits": 1000,
+      "minMasteringTenThousandths": 50,
+      "maxContentLightNits": 1000,
+      "maxFrameAverageLightNits": 400
+    }
+  }
+}

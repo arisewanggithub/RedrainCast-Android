@@ -68,8 +68,14 @@ data class VideoDiagnostic(
     }
 }
 
+private fun selectionFailureDetail(diagnostic: VideoDiagnostic, cause: Exception?): String {
+    if (diagnostic.stage != VideoStage.SELECT || diagnostic.fault != VideoFault.UNSUPPORTED) return ""
+    val original = if (cause is VideoInitializationFailure) cause.failure else cause
+    return (original as? PlaybackException)?.message?.let { "$it: " } ?: ""
+}
+
 class VideoPlaybackException(val diagnostic: VideoDiagnostic, cause: Exception? = null) :
-    PlaybackException("Video failure: ${diagnostic.logMessage()}",
+    PlaybackException("${selectionFailureDetail(diagnostic, cause)}Video failure: ${diagnostic.logMessage()}",
         if (diagnostic.fault == VideoFault.UNSUPPORTED) "UNSUPPORTED_CONFIG" else "DECODER_FAILED") {
     init { if (cause != null) initCause(cause) }
 }

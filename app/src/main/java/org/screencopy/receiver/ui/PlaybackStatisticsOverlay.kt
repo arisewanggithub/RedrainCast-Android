@@ -11,11 +11,13 @@ import android.widget.LinearLayout
 import android.widget.TableLayout
 import android.widget.TableRow
 import android.widget.TextView
+import dev.redrain.cast.R
 import org.screencopy.receiver.media.PlaybackStatisticsDisplay
 import org.screencopy.receiver.media.PlaybackStatisticsSnapshot
 import org.screencopy.receiver.media.PlaybackStatisticsText
 import org.screencopy.receiver.media.StatisticsField
 import org.screencopy.receiver.media.PlaybackDisplayMeasurements
+import org.screencopy.receiver.media.VideoPresentationOutput
 
 /** Display-only grid; every pointer remains owned by the underlying player. */
 class PlaybackStatisticsOverlay @JvmOverloads constructor(
@@ -85,6 +87,8 @@ class PlaybackStatisticsOverlay @JvmOverloads constructor(
     private fun table(parent: LinearLayout, fields: List<StatisticsField>, size: Float,
         labelWeight: Float = 1f, valueWeight: Float = 1f) {
         fun caption(field: StatisticsField): String = if (size <= 12f) when (field.id) {
+            "videoDynamicRange" -> context.getString(R.string.rc_stats_stream_range_compact)
+            "videoDecodeFormat" -> context.getString(R.string.rc_stats_profile_depth_compact)
             "encodedSize" -> "Encoded"
             "captureLimit" -> "FPS limit"
             "receiverCanvas" -> "Canvas px"
@@ -209,6 +213,7 @@ class PlaybackStatisticsOverlay @JvmOverloads constructor(
 
     private fun fieldValue(field: StatisticsField, size: Float): String = if (size > 12f) field.value else
         when (field.id) {
+            "videoDynamicRange", "videoDecodeFormat" -> field.value.replace(" · ", "·")
             "encodedSize" -> field.value.replace(" × ", "×")
             "receiverCanvas" -> field.value.replace(" × ", "×").removeSuffix(" px")
             "renderTarget", "displayOutput" -> field.value.replace(" × ", "×").removeSuffix(" px")
@@ -222,6 +227,8 @@ class PlaybackStatisticsOverlay @JvmOverloads constructor(
         removeAllViews()
         values.clear()
         val compact = layoutMode != 0
+        val verticalInset = dp(if (compact) 2 else 4)
+        setPadding(dp(6), verticalInset, dp(6), verticalInset)
         val size = if (compact) 10f else 16f
         val heading = label(model.header, size, bold = true).apply {
             tag = "statisticsHeader"
@@ -313,6 +320,30 @@ class PlaybackStatisticsOverlay @JvmOverloads constructor(
         stackedFields(this, model.footer, size, "statisticsFooter")
     }
 
+    private fun localizedModel(snapshot: PlaybackStatisticsSnapshot, canvasWidth: Int, canvasHeight: Int,
+        measurements: PlaybackDisplayMeasurements): PlaybackStatisticsDisplay {
+        val model = PlaybackStatisticsText.display(snapshot, canvasWidth, canvasHeight, measurements)
+        val unknown = context.getString(R.string.rc_stats_unknown)
+        return model.copy(video = model.video.map { field ->
+            when (field.id) {
+                "videoDynamicRange" -> field.copy(label = context.getString(R.string.rc_stats_stream_range),
+                    value = field.value.replace("N/A", unknown))
+                "videoDecodeFormat" -> field.copy(label = context.getString(R.string.rc_stats_profile_depth),
+                    value = PlaybackStatisticsText.decodeFormat(snapshot.input.decodedVideo) {
+                        context.getString(R.string.rc_stats_bit_depth, it)
+                    }.replace("N/A", unknown))
+                "presentationOutput" -> field.copy(label = context.getString(R.string.rc_stats_output),
+                    value = when (snapshot.input.presentation?.output) {
+                        VideoPresentationOutput.Hdr -> context.getString(R.string.rc_stats_hdr_output)
+                        VideoPresentationOutput.Sdr -> context.getString(R.string.rc_stats_sdr_output)
+                        VideoPresentationOutput.SdrToneMapped -> context.getString(R.string.rc_stats_sdr_tone_mapped)
+                        null -> unknown
+                    })
+                else -> field
+            }
+        })
+    }
+
     fun show(snapshot: PlaybackStatisticsSnapshot?, canvasWidth: Int, canvasHeight: Int,
         availableWidth: Int = canvasWidth, availableHeight: Int = canvasHeight,
         measurements: PlaybackDisplayMeasurements = PlaybackDisplayMeasurements()) {
@@ -339,7 +370,7 @@ class PlaybackStatisticsOverlay @JvmOverloads constructor(
             panelWidth / density < 600 -> 1
             else -> 0
         }
-        val model = PlaybackStatisticsText.display(snapshot, canvasWidth, canvasHeight, measurements)
+        val model = localizedModel(snapshot, canvasWidth, canvasHeight, measurements)
         if (mode != layoutMode) {
             mode = layoutMode
             build(model, layoutMode)

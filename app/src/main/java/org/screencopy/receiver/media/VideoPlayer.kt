@@ -16,28 +16,37 @@ class VideoPlayer private constructor(
     factory: (VideoFormat, () -> Unit) -> VideoDecoder,
     private val generation: Long,
     private val onPresentation: (VideoDiagnostic) -> Unit,
-    private val onRotation: (Int) -> Unit
+    private val onRotation: (Int) -> Unit,
+    private val outputAvailable: () -> Boolean = { true }
 ) : TrackWorker("ScreenCopy-video", 8 * 1024 * 1024, failure, track = 1) {
     constructor(format: VideoFormat, surface: Surface, clock: PlaybackClock, report: (String) -> Unit,
         failure: (String, String) -> Unit, onPresented: () -> Unit = {}, generation: Long = 1,
-        onRotation: (Int) -> Unit = {}) :
+        onRotation: (Int) -> Unit = {}, outputAvailable: () -> Boolean = { true }) :
         this(format, clock, report, failure, onPresented, { selected, presented -> AndroidVideoDecoder(selected, surface, presented) },
-            generation, { android.util.Log.i("ScreenCopyReceiver", "event=VIDEO_PRESENTATION ${it.logMessage()}") }, onRotation)
+            generation, { android.util.Log.i("ScreenCopyReceiver", "event=VIDEO_PRESENTATION ${it.logMessage()}") }, onRotation,
+            outputAvailable)
 
     internal constructor(format: VideoFormat, clock: PlaybackClock, failure: (String, String) -> Unit, decoder: VideoDecoder,
-        generation: Long = 1, onPresentation: (VideoDiagnostic) -> Unit = {}, onRotation: (Int) -> Unit = {}) :
-        this(format, clock, {}, failure, {}, { _, _ -> decoder }, generation, onPresentation, onRotation)
+        generation: Long = 1, onPresentation: (VideoDiagnostic) -> Unit = {}, onRotation: (Int) -> Unit = {},
+        outputAvailable: () -> Boolean = { true }) :
+        this(format, clock, {}, failure, {}, { _, _ -> decoder }, generation, onPresentation, onRotation, outputAvailable)
 
     internal constructor(format: VideoFormat, clock: PlaybackClock, failure: (String, String) -> Unit,
         factory: (VideoFormat, () -> Unit) -> VideoDecoder, generation: Long = 1) :
         this(format, clock, {}, failure, {}, factory, generation, {}, {})
 
     private val decoder: VideoDecoder
+    private val hdrAdmission = format.videoColor?.let { HdrBitstream.Admission(format) }
     private var waiting: AccessUnit? = null
     private var firstKeyFrame = false
     private var heldOutput = -1
     private var heldPtsUs = 0L
     private var heldRotation = 0
+    private var heldPath = VideoPathStatistics(null, null)
+    private val pathStatistics = VideoPathStatisticsCache(
+        if (format.videoColor != null) DecodedVideoStatistics(VideoStreamFormat.Hdr10, null, null, null) else null)
+    internal fun videoPathStatistics(): VideoPathStatistics =
+        if (running.get()) pathStatistics.snapshot() else VideoPathStatistics(null, null)
     private var presentedRotation = -1
     private val rotations = VideoRotationTimeline()
     private var heldAtNs = 0L
@@ -73,9 +82,13 @@ class VideoPlayer private constructor(
     init {
         require(format.width in 1..8192 && format.height in 1..8192 && format.frameRate in 1..240 &&
             format.rotation in listOf(0, 90, 180, 270) && generation > 0) { "Invalid video output format" }
-        decoder = try { factory(format) { if (running.get()) onPresented() } } catch (e: Exception) { throw failure(e) }
+        decoder = try {
+            requireSupportedRotation(format.videoColor != null, format.rotation)
+            factory(format) { if (running.get()) onPresented() }
+        } catch (e: Exception) { throw failure(e) }
         decoder.renderedStatistics { pts, atNs ->
             if (running.get() && statisticsEnabled) {
+                pathStatistics.rendered(pts, atNs)
                 renderedObservation = SourceTimestampObservation(pts, atNs)
                 renderedFrames.incrementAndGet()
             }
@@ -106,10 +119,14 @@ class VideoPlayer private constructor(
             delayUs = clock.delayUs(heldPtsUs)
             if (delayUs?.let { it < -250_000 } == true) lateRendered++
             stage = VideoStage.OUTPUT_RELEASE
+            requireSupportedRotation(format.videoColor != null, heldRotation)
             if (presentedRotation != heldRotation) {
                 onRotation(heldRotation)
                 presentedRotation = heldRotation
             }
+            if (format.videoColor != null && !outputAvailable())
+                throw PlaybackException("HDR output became unavailable; restart casting with SDR", "UNSUPPORTED_CONFIG")
+            if (statisticsEnabled) pathStatistics.scheduled(heldPtsUs, heldPath)
             decoder.releaseOutput(heldOutput, clock.monotonicNs())
             renderSubmitted++
             heldOutput = -1
@@ -129,10 +146,15 @@ class VideoPlayer private constructor(
             stage = VideoStage.INPUT_KEYFRAME
             if (!firstKeyFrame && !packet.keyFrame) fail(VideoFault.FIRST_KEYFRAME)
             if (packet.ptsUs < 0 || lastInputPtsUs?.let { packet.ptsUs < it } == true) fail(VideoFault.INPUT_PTS)
+            requireSupportedRotation(format.videoColor != null, packet.rotation)
             stage = VideoStage.INPUT_DEQUEUE
             val index = decoder.dequeueInput()
             if (index >= 0) {
                 stage = VideoStage.INPUT_BUFFER
+                try { hdrAdmission?.validate(packet.bytes) }
+                catch (error: org.screencopy.receiver.protocol.ProtocolException) {
+                    throw PlaybackException(checkNotNull(error.message), error.code).apply { initCause(error) }
+                }
                 val input = decoder.input(index) ?: fail(VideoFault.INPUT_BUFFER)
                 inputCapacity = input.capacity()
                 if (inputCapacity < packet.bytes.size) fail(VideoFault.INPUT_CAPACITY)
@@ -178,6 +200,7 @@ class VideoPlayer private constructor(
                 stage = VideoStage.OUTPUT_VALIDATE
                 if (output.ptsUs < 0 || lastOutputPtsUs?.let { output.ptsUs < it } == true) fail(VideoFault.OUTPUT_PTS)
                 lastOutputPtsUs = output.ptsUs
+                if (statisticsEnabled) pathStatistics.decoded(output.path)
                 decodedFrames++
                 onDecoded(output.ptsUs)
                 // A codec may omit an earlier picture; latest output PTS, not 1:1 counts, proves progress.
@@ -191,6 +214,7 @@ class VideoPlayer private constructor(
     private fun hold(output: VideoOutput) {
         heldOutput = output.index
         heldPtsUs = output.ptsUs
+        heldPath = output.path
         heldRotation = rotations.at(output.ptsUs)
         heldAtNs = clock.monotonicNs()
         outputBytes = output.size
@@ -238,23 +262,45 @@ class VideoPlayer private constructor(
     override fun describeFailure(error: Exception): String {
         if (error is AudioClockException) return super.describeFailure(error)
         val diagnostic = failure(error).diagnostic
-        return "Video stage=${diagnostic.stage} exception=${diagnostic.exceptionType}: Video failure: ${diagnostic.logMessage()}"
+        val admissionError = (error as? PlaybackException)?.cause as? org.screencopy.receiver.protocol.ProtocolException
+        val reason = admissionError?.message?.let { ": $it" } ?: ""
+        return "Video stage=${diagnostic.stage} exception=${diagnostic.exceptionType}$reason: Video failure: ${diagnostic.logMessage()}"
     }
 
     override fun release() {
         stage = VideoStage.CLOSE
+        pathStatistics.close()
         try { decoder.close() } catch (e: Exception) { throw failure(e) }
     }
 
     companion object {
+        internal fun requireSupportedRotation(hdr: Boolean, rotation: Int) {
+            require(rotation in listOf(0, 90, 180, 270))
+            if (hdr && rotation != 0) {
+                android.util.Log.e("ScreenCopyReceiver", "event=UNSUPPORTED_HDR_ROTATION rotation=$rotation")
+                throw PlaybackException("HDR picture rotation is unsupported by direct SurfaceView output", "UNSUPPORTED_CONFIG")
+            }
+        }
+
         fun mediaFormat(format: VideoFormat): MediaFormat {
             require(format.width in 1..8192 && format.height in 1..8192) { "Unsupported video dimensions" }
             require(format.frameRate in 1..240) { "Unsupported video frame rate" }
             require(format.rotation in listOf(0, 90, 180, 270)) { "Invalid video rotation" }
             return MediaFormat.createVideoFormat(format.mime, format.width, format.height).apply {
                 setInteger(MediaFormat.KEY_FRAME_RATE, format.frameRate)
-                setInteger(MediaFormat.KEY_ROTATION, format.rotation)
+                setInteger(MediaFormat.KEY_ROTATION, 0)
                 setInteger(MediaFormat.KEY_MAX_INPUT_SIZE, 8 * 1024 * 1024)
+                format.videoColor?.let { color ->
+                    setInteger(MediaFormat.KEY_PROFILE, MediaCodecInfo.CodecProfileLevel.HEVCProfileMain10HDR10)
+                    setInteger(MediaFormat.KEY_COLOR_STANDARD, MediaFormat.COLOR_STANDARD_BT2020)
+                    setInteger(MediaFormat.KEY_COLOR_TRANSFER, MediaFormat.COLOR_TRANSFER_ST2084)
+                    setInteger(MediaFormat.KEY_COLOR_RANGE, MediaFormat.COLOR_RANGE_LIMITED)
+                    color.staticMetadata?.let { setByteBuffer(MediaFormat.KEY_HDR_STATIC_INFO, it.descriptor()) }
+                    if (format.toneMapToSdr) {
+                        require(android.os.Build.VERSION.SDK_INT >= 31) { "Decoder HDR-to-SDR requires Android 12 or newer" }
+                        setInteger(MediaFormat.KEY_COLOR_TRANSFER_REQUEST, MediaFormat.COLOR_TRANSFER_SDR_VIDEO)
+                    }
+                }
                 format.configuration.forEachIndexed { index, bytes ->
                     setByteBuffer("csd-$index", ByteBuffer.wrap(bytes))
                 }
@@ -263,12 +309,21 @@ class VideoPlayer private constructor(
     }
 }
 
-internal fun findPreferredDecoder(format: MediaFormat): String? {
+internal fun findPreferredDecoder(format: MediaFormat,
+    candidates: List<MediaCodecInfo>? = null): String? {
+    if (format.containsKey(MediaFormat.KEY_PROFILE) &&
+        format.getInteger(MediaFormat.KEY_PROFILE) == MediaCodecInfo.CodecProfileLevel.HEVCProfileMain10HDR10) {
+        val selected = if (candidates == null) HdrDecoderCapabilities.find(format) else HdrDecoderCapabilities.find(format, candidates)
+        return selected ?: throw PlaybackException(HdrDecoderCapabilities.rejection(format,
+            candidates ?: MediaCodecList(MediaCodecList.REGULAR_CODECS).codecInfos.toList()), "UNSUPPORTED_CONFIG")
+    }
     val mime = checkNotNull(format.getString(MediaFormat.KEY_MIME))
-    return MediaCodecList(MediaCodecList.REGULAR_CODECS).codecInfos.asSequence()
+    val available = candidates ?: MediaCodecList(MediaCodecList.REGULAR_CODECS).codecInfos.toList()
+    return available.asSequence()
         .filter { !it.isEncoder && it.supportedTypes.any { type -> type.equals(mime, true) } }
         .sortedBy { isSoftwareDecoder(it) }
         .firstOrNull { it.getCapabilitiesForType(mime).isFormatSupported(format) }?.name
+        ?: throw PlaybackException(HdrDecoderCapabilities.rejection(format, available), "UNSUPPORTED_CONFIG")
 }
 
 internal fun isSoftwareDecoder(info: MediaCodecInfo): Boolean =

@@ -2,6 +2,16 @@
     <string name="rc_playback_statistics">Show playback statistics on receiver (next cast)</string>
     <string name="rc_playback_statistics_hint">Displays diagnostic statistics over receiver video.</string>
     <string name="rc_playback_diagnostics">Full playback diagnostics</string>
+    <string name="rc_stats_stream_range">Stream range</string>
+    <string name="rc_stats_stream_range_compact">Range</string>
+    <string name="rc_stats_profile_depth">Profile / depth</string>
+    <string name="rc_stats_profile_depth_compact">Prof/depth</string>
+    <string name="rc_stats_output">Output</string>
+    <string name="rc_stats_bit_depth">%1$d-bit</string>
+    <string name="rc_stats_hdr_output">HDR output</string>
+    <string name="rc_stats_sdr_output">SDR output</string>
+    <string name="rc_stats_sdr_tone_mapped">SDR (tone-mapped)</string>
+    <string name="rc_stats_unknown">N/A</string>
     <string name="rc_playback_diagnostics_unavailable">No active receiver statistics. Enable playback statistics on the sender before the next cast.</string>
     <string name="rc_app_name">RedrainCast</string>
     <string name="rc_subtitle">Send and receive screens.</string>
