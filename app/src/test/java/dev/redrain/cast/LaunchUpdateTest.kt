@@ -87,8 +87,8 @@ class LaunchUpdateTest {
     @Test fun debugBuildComparesItsBaseVersionWithoutTreatingDebugAsAPrerelease() {
         result = null
         open()
-        assertEquals("0.4.14", checkedVersion)
-        assertEquals(if (BuildConfig.DEBUG) "0.4.14-debug" else "0.4.14", BuildConfig.VERSION_NAME)
+        assertEquals("0.4.15", checkedVersion)
+        assertEquals(if (BuildConfig.DEBUG) "0.4.15-debug" else "0.4.15", BuildConfig.VERSION_NAME)
         assertEquals(1, checks)
         assertNull(ShadowAlertDialog.getLatestAlertDialog())
     }
