@@ -181,6 +181,8 @@ removes only separator spacing in these values; full labels and technical
 identifiers remain available in the model and accessibility descriptions.
 Compact panels use 2dp outer vertical insets (normal panels retain 4dp) to
 accommodate the additional rows without changing font size or removing metrics.
+Compact landscape panel width is capped at 60% of the viewport so the taller
+video metadata group still leaves more than half the player area uncovered.
 
 Incoming HDR10 is validated independently of presentation; PQ/BT.709 comes
 from actual decoder output color metadata. Missing SDR metadata remains N/A.

@@ -356,7 +356,7 @@ class PlaybackStatisticsOverlay @JvmOverloads constructor(
         val density = resources.displayMetrics.density
         val compact = minOf(availableWidth, availableHeight) / density < 600
         val panelWidth = if (!detailed && compact)
-            minOf((availableWidth * if (availableWidth > availableHeight) 0.65f else 0.90f).toInt(), dp(760))
+            minOf((availableWidth * if (availableWidth > availableHeight) 0.60f else 0.90f).toInt(), dp(760))
             else minOf(availableWidth, dp(1100))
         layoutParams?.let {
             if (panelWidth > 0 && it.width != panelWidth) {
