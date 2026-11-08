@@ -25,8 +25,11 @@ internal object HdrDecoderCapabilities {
         val caps = info.getCapabilitiesForType("video/hevc")
         val width = format.getInteger(MediaFormat.KEY_WIDTH)
         val height = format.getInteger(MediaFormat.KEY_HEIGHT)
+        val rate = if (format.containsKey(MediaFormat.KEY_FRAME_RATE)) format.getInteger(MediaFormat.KEY_FRAME_RATE) else null
+        val video = caps.videoCapabilities
         caps.isFormatSupported(format) &&
-            caps.videoCapabilities?.areSizeAndRateSupported(width, height, format.getInteger(MediaFormat.KEY_FRAME_RATE).toDouble()) == true
+            video != null && if (rate == null) video.isSizeSupported(width, height)
+                else video.areSizeAndRateSupported(width, height, rate.toDouble())
     }?.name
 
     internal fun rejection(format: MediaFormat, candidates: List<MediaCodecInfo>,
@@ -34,13 +37,13 @@ internal object HdrDecoderCapabilities {
         val mime = checkNotNull(format.getString(MediaFormat.KEY_MIME))
         val width = format.getInteger(MediaFormat.KEY_WIDTH)
         val height = format.getInteger(MediaFormat.KEY_HEIGHT)
-        val rate = format.getInteger(MediaFormat.KEY_FRAME_RATE)
+        val rate = if (format.containsKey(MediaFormat.KEY_FRAME_RATE)) format.getInteger(MediaFormat.KEY_FRAME_RATE) else null
         val profile = if (format.containsKey(MediaFormat.KEY_PROFILE)) format.getInteger(MediaFormat.KEY_PROFILE) else null
         val requestedProfile = if (profile == MediaCodecInfo.CodecProfileLevel.HEVCProfileMain10HDR10)
             "HEVC Main10 HDR10 ($profile)" else profile?.toString() ?: "unspecified"
         val hardware = candidates.filter { !it.isEncoder && it.isHardwareAccelerated &&
             it.supportedTypes.any { type -> type.equals(mime, true) } }
-        val request = "No device decoder supports requested $mime ${width}x$height@$rate profile=$requestedProfile;"
+        val request = "No device decoder supports requested $mime ${width}x$height@${rate ?: "uncapped"} profile=$requestedProfile;"
         report("event=VIDEO_DECODER_SELECTION_REJECT $request hardware_candidates=${hardware.size}")
         val constraints = hardware.joinToString("; ") { info ->
             val caps = info.getCapabilitiesForType(mime)
@@ -51,10 +54,12 @@ internal object HdrDecoderCapabilities {
                 val rates = if (sizeSupported) video.getSupportedFrameRatesFor(width, height).toString() else "unavailable_for_requested_raster"
                 val widthAlignment = video.widthAlignment
                 val heightAlignment = video.heightAlignment
+                val sizeRateSupported = if (rate == null) "not_requested"
+                    else video.areSizeAndRateSupported(width, height, rate.toDouble()).toString()
                 "widths=${video.supportedWidths} heights=${video.supportedHeights}" +
                     " alignment=${widthAlignment}x$heightAlignment aligned=${width % widthAlignment == 0 && height % heightAlignment == 0}" +
                     " raster_supported=$sizeSupported" +
-                    " rates_at_raster=$rates size_rate_supported=${video.areSizeAndRateSupported(width, height, rate.toDouble())}"
+                    " rates_at_raster=$rates size_rate_supported=$sizeRateSupported"
             }
             val detail = "${info.name}: profile_levels=$profiles profile_supported=${profile == null || caps.profileLevels.any { it.profile == profile }}" +
                 " $raster format_supported=${caps.isFormatSupported(format)}"

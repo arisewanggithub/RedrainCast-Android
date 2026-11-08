@@ -157,6 +157,9 @@ settings are changed by statistics.
   `uncappedFps:true` in HELLO. Older Android/Windows receivers need an explicit
   FPS cap until updated; unsupported uncapped selections fail clearly without
   silently imposing a cap.
+  HDR decoder selection checks the requested raster without a rate constraint
+  for Uncapped; positive FPS caps require both raster and rate support. Rejection
+  diagnostics retain the uncapped request and never change resolution or impose a cap.
   Invalid settings and persistence failures stay visible without codec/quality/
   audio fallback. Errors appear at the top; each new home error is brought into
   view once, rather than repeatedly stealing scroll position during updates.

@@ -79,6 +79,44 @@ class DecoderSelectionTest {
         assertEquals(1920, requested.getInteger(MediaFormat.KEY_WIDTH))
     }
 
+    @Test fun uncappedHdrSelectsSupportedRasterWithoutImposingARate() {
+        val requested = format(1920, 1080, 0)
+        val info = candidate()
+        assertFalse(requested.containsKey(MediaFormat.KEY_FRAME_RATE))
+        assertEquals(info.name, HdrDecoderCapabilities.find(requested, listOf(info)))
+        assertEquals(info.name, findPreferredDecoder(requested, listOf(info)))
+        assertFalse(requested.containsKey(MediaFormat.KEY_FRAME_RATE))
+        assertEquals(1920, requested.getInteger(MediaFormat.KEY_WIDTH))
+        assertEquals(1080, requested.getInteger(MediaFormat.KEY_HEIGHT))
+    }
+
+    @Test fun uncappedHdrRejectsUnsupportedRasterWithoutReadingAMissingRate() {
+        val requested = format(rate = 0)
+        val candidates = listOf(candidate())
+        assertNull(HdrDecoderCapabilities.find(requested, candidates))
+        val error = assertThrows(PlaybackException::class.java) { findPreferredDecoder(requested, candidates) }
+        assertEquals("UNSUPPORTED_CONFIG", error.code)
+        for (field in listOf("3840x2400@uncapped", "raster_supported=false",
+            "rates_at_raster=unavailable_for_requested_raster", "size_rate_supported=not_requested",
+            "format_supported=false", "No settings were changed")) {
+            assertTrue(error.message, checkNotNull(error.message).contains(field))
+        }
+        assertFalse(requested.containsKey(MediaFormat.KEY_FRAME_RATE))
+        assertEquals(3840, requested.getInteger(MediaFormat.KEY_WIDTH))
+        assertEquals(2400, requested.getInteger(MediaFormat.KEY_HEIGHT))
+    }
+
+    @Test fun uncappedHdrStillRejectsUnalignedRaster() {
+        val requested = format(1921, 1080, 0)
+        val candidates = listOf(candidate())
+        assertNull(HdrDecoderCapabilities.find(requested, candidates))
+        val error = assertThrows(PlaybackException::class.java) { findPreferredDecoder(requested, candidates) }
+        assertEquals("UNSUPPORTED_CONFIG", error.code)
+        assertTrue(checkNotNull(error.message).contains("1921x1080@uncapped"))
+        assertTrue(checkNotNull(error.message).contains("alignment=8x8 aligned=false raster_supported=false"))
+        assertFalse(requested.containsKey(MediaFormat.KEY_FRAME_RATE))
+    }
+
     @Test fun unsupportedAlignmentRemainsARejection() {
         val error = assertThrows(PlaybackException::class.java) {
             findPreferredDecoder(format(1921, 1080, 60), listOf(candidate()))
@@ -88,12 +126,14 @@ class DecoderSelectionTest {
     }
 
     @Test fun hdrRequiresHardwareAndExactProfileEvenWhenFormatIsOtherwiseSupported() {
-        for (info in listOf(candidate(hardware = false),
-            candidate(profile = MediaCodecInfo.CodecProfileLevel.HEVCProfileMain10))) {
-            assertThrows(PlaybackException::class.java) { findPreferredDecoder(format(1920, 1080, 60), listOf(info)) }
+        for (rate in listOf(0, 60)) {
+            for (info in listOf(candidate(hardware = false),
+                candidate(profile = MediaCodecInfo.CodecProfileLevel.HEVCProfileMain10))) {
+                assertThrows(PlaybackException::class.java) { findPreferredDecoder(format(1920, 1080, rate), listOf(info)) }
+            }
+            val info = candidate()
+            assertEquals(info.name, findPreferredDecoder(format(1920, 1080, rate), listOf(info)))
         }
-        val info = candidate()
-        assertEquals(info.name, findPreferredDecoder(format(1920, 1080, 60), listOf(info)))
     }
 
     @Test fun sdrKeepsHardwarePreferenceAndExistingSoftwareFallback() {
@@ -104,35 +144,41 @@ class DecoderSelectionTest {
     }
 
     @Test fun missingHardwareIsExplicitAndCapabilityErrorsAreNotHidden() {
-        val requested = format()
-        val absent = assertThrows(PlaybackException::class.java) { findPreferredDecoder(requested, emptyList()) }
-        assertTrue(checkNotNull(absent.message).contains("hardware_candidates=0: none"))
         val info = Mockito.mock(MediaCodecInfo::class.java)
         Mockito.`when`(info.isHardwareAccelerated).thenReturn(true)
         Mockito.`when`(info.supportedTypes).thenReturn(arrayOf("video/hevc"))
         Mockito.`when`(info.getCapabilitiesForType("video/hevc")).thenThrow(IllegalStateException("fixture capability query failed"))
-        val failure = assertThrows(IllegalStateException::class.java) { findPreferredDecoder(requested, listOf(info)) }
-        assertEquals("fixture capability query failed", failure.message)
+        for (rate in listOf(0, 120)) {
+            val requested = format(rate = rate)
+            val absent = assertThrows(PlaybackException::class.java) { findPreferredDecoder(requested, emptyList()) }
+            assertTrue(checkNotNull(absent.message).contains("hardware_candidates=0: none"))
+            val failure = assertThrows(IllegalStateException::class.java) { findPreferredDecoder(requested, listOf(info)) }
+            assertEquals("fixture capability query failed", failure.message)
+        }
     }
 
     @Test fun allCandidateDetailsAreLoggedWhileWireReasonRemainsBounded() {
         val logged = mutableListOf<String>()
         val candidates = (1..10).map { candidate(name = "fixture.hardware.$it",
             profile = MediaCodecInfo.CodecProfileLevel.HEVCProfileMain) }
-        val reason = HdrDecoderCapabilities.rejection(format(), candidates, logged::add)
-        assertTrue(reason.length <= 1100)
-        assertTrue(reason.contains("constraints truncated"))
-        assertEquals(11, logged.size)
-        for (index in 1..10) {
-            assertTrue(logged[index].contains("fixture.hardware.$index:"))
-            assertTrue(logged[index].contains("profile_supported=false"))
-            assertTrue(logged[index].contains("format_supported=false"))
+        for (rate in listOf(0, 120)) {
+            logged.clear()
+            val reason = HdrDecoderCapabilities.rejection(format(rate = rate), candidates, logged::add)
+            assertTrue(reason.length <= 1100)
+            assertTrue(reason.contains("constraints truncated"))
+            assertEquals(11, logged.size)
+            for (index in 1..10) {
+                assertTrue(logged[index].contains("fixture.hardware.$index:"))
+                assertTrue(logged[index].contains("profile_supported=false"))
+                assertTrue(logged[index].contains("format_supported=false"))
+                if (rate == 0) assertTrue(logged[index].contains("size_rate_supported=not_requested"))
+            }
         }
     }
 
     @Test fun selectionFailurePreservesReasonAndExistingStructuredErrorEnvelope() {
-        for (count in listOf(1, 10)) {
-            val requested = VideoFormat("video/hevc", 3840, 2400, emptyList(), 120, videoColor = HdrVideoColor())
+        for ((count, rate) in listOf(1 to 0, 10 to 0, 1 to 120, 10 to 120)) {
+            val requested = VideoFormat("video/hevc", 3840, 2400, emptyList(), rate, videoColor = HdrVideoColor())
             val candidates = (1..count).map { candidate(name = "fixture.hardware.$it") }
             val error = assertThrows(VideoPlaybackException::class.java) {
                 VideoPlayer(requested, PlaybackClock(), { _, _ -> }, factory = { selected, _ ->
@@ -157,7 +203,7 @@ class DecoderSelectionTest {
             assertEquals(0L, error.diagnostic.renderSubmitted)
             assertEquals(3840, requested.width)
             assertEquals(2400, requested.height)
-            assertEquals(120, requested.frameRate)
+            assertEquals(rate, requested.frameRate)
             assertNotNull(requested.videoColor)
             val otherStage = VideoPlaybackException(error.diagnostic.copy(stage = VideoStage.CONFIGURE),
                 PlaybackException("fixture unrelated API message", "UNSUPPORTED_CONFIG"))
