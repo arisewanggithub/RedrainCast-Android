@@ -4,6 +4,24 @@ Authority: current RedrainCast Windows `ScrcpySend.Core/SenderSession.cs`,
 `ScrcpyReceive.Core/ReceiverServer.cs`, `Protocol.cs`, and `Discovery.cs`.
 The sibling checkout is not modified by the Android build or protocol probe.
 
+## Optional uncapped capture FPS
+
+Updated Android control HELLO advertises Boolean `uncappedFps:true`. The
+receiver advertises its support even to legacy senders; unknown HELLO members
+remain additive. Offered/acknowledged values, when present, must be Boolean.
+Senders may request `video.maxFps:0` only after the receiver explicitly
+advertises support. Absence or false means an explicit positive cap is required;
+do not silently replace Uncapped with a guessed cap. Current older Windows and
+Android receivers reject zero and remain compatible with capped requests.
+
+`maxFps` accepts exact integers 0..240 on updated Android: zero is uncapped,
+positive values are capture limits, not measured throughput. Uncapped removes
+both GPU pacing and the encoder maximum-FPS key; the independent encoder
+frame-rate hint remains 60. Preflight still validates size/alignment but does
+not test a fictitious zero-FPS rate. Receiver decoder configuration omits an
+unknown frame-rate hint for zero, and statistics display Uncapped.
+Existing positive-cap wire fixtures and behavior are unchanged.
+
 ## Optional native HDR10 video
 
 This additive wire-v3 extension uses root `receiveCapabilities` in discovery
@@ -393,7 +411,10 @@ retains ownership of the HDR holder Surface. Late UI callbacks must
 also match the current surface identity; retired destruction/availability
 callbacks cannot replace or retire a newer epoch. Presentation callbacks must
 still own the live session/generation. On portable displays, automatic Activity
-orientation follows the displayed aspect and explicit orientation wins. Android
+orientation follows the displayed aspect and explicit orientation wins. Decoder
+setup/recovery retains the last picture rotation and does not update automatic
+orientation until the new generation supplies presentation metadata; the
+unrotated codec raster is not a new portrait/landscape instruction. Android
 TV and Leanback receivers keep their startup window axis; declared landscape-only
 or portrait-only displays use their supported axis in all receiver orientation
 modes, taking precedence over the TV default. Picture rotation and
@@ -449,15 +470,15 @@ first/subsequent continuity rules.
 These establish framing/lifecycle behavior, **not native/GPU playback or live
 Android-to-Windows hardware media acceptance**, which remains unverified.
 
-## Optional bounded stream recovery v1
+## Optional independent track recovery v2
 
 This extension is independent of rotation. The sender offers and the receiver
 explicitly acknowledges **both** Boolean `streamRecovery:true` and integer
-`streamRecoveryVersion:1` in their control HELLOs. NonBoolean capabilities,
+`streamRecoveryVersion:2` in their control HELLOs. NonBoolean capabilities,
 noninteger/nonpositive revisions are protocol errors. Absent/false capability,
 missing revision or an unsupported positive offer revision does not negotiate
 recovery. A sender rejects a true ACK with a missing/incompatible revision.
-The revision distinguishes this contract from Android 0.3.0's unfrozen prototype.
+Revision 1's shared recovery and the unfrozen prototype are not fallbacks.
 Windows v0.1.15 does not acknowledge recovery; its strict congestion behavior
 remains unchanged. Receipt of a generic STATUS is never an ACK.
 
@@ -466,13 +487,14 @@ remains unchanged. Receipt of a generic STATUS is never an ACK.
 All recovery STATUS packets belong to the currently accepted control session:
 header track/generation zero, PTS -1, flags zero. Required JSON fields are
 `state` (at most 80 characters), `message` (at most 2048 characters) and
-`generation` (current video generation, positive signed int32).
+`track` (1 for video, 2 for enabled audio), and `generation` (that track's current
+wire generation, positive signed int32).
 
 | Direction | `state` | Additional required fields |
 |---|---|---|
 | Receiver to sender | `stream-recovery-request` | None |
-| Receiver to sender | `stream-recovery-key` | `keyPtsUs` |
-| Receiver to sender | `stream-recovery-complete` | `keyPtsUs`; `audioPtsUs` only when audio is enabled |
+| Receiver to sender | `stream-recovery-key` | Video only: `keyPtsUs` |
+| Receiver to sender | `stream-recovery-complete` | Video: `keyPtsUs`; audio: `audioPtsUs`, never both |
 
 Timestamp values are **canonical nonnegative decimal strings** in signed int64
 range: `"0"` or a nonzero leading digit followed by digits, without whitespace,
@@ -480,16 +502,27 @@ sign, leading zero, exponent or fraction. They are not JSON numbers. Windows'
 signed-int32 validation still applies to every JSON number, including extras.
 No packet type or flag bit changes.
 
-The accepted session ID plus sequential video generation identify the recovery
+The accepted session ID, track and sequential wire generation identify the recovery
 transaction; no additional request ID is needed. Invalid/future generations
 fail; well-formed stale generations are ignored. Requests are coalesced while
-waiting for READY/key, and repeated old-generation requests cannot start another
+waiting for that track's READY, and repeated old-generation requests cannot start another
 reset after the sender advances generation. A new current-generation pressure
-request while waiting for proof/audio/completion can retire that attempt.
-KEY must match the exact sent random-access picture PTS. COMPLETE must follow
-KEY and actual audio release (or KEY alone for disabled audio). Matching duplicate
-proofs are idempotent; conflicting PTS/audio proofs fail. Duplicate STREAM_READY
+request while waiting for source/proof/completion can retire only that track's attempt.
+Video KEY and COMPLETE match the exact sent random-access picture PTS; COMPLETE
+follows KEY without waiting for audio. Audio COMPLETE proves actual source-sample
+submission at/after its own cutoff, with no video key field or dependency.
+Matching duplicate proofs are idempotent; conflicting proofs fail. Duplicate STREAM_READY
 is a protocol error, not permission to re-enable an epoch.
+Audio completion must additionally belong to an actual successfully written
+packet's source interval in its current generation, after cutoff trimming.
+End timestamps are exclusive. Queued/not-started packets, holes between sent
+intervals and impossible future timestamps are not proof of output. A matching
+proof racing the completion of its in-flight write is retained without clearing
+the original deadline, and completed only after that write succeeds.
+Already-written eligibility intervals are coalesced without filling timestamp
+holes, and capped at 4096 disjoint intervals per attempt. Exceeding that bound
+reports capacity pressure and retries only audio under its original deadline,
+rather than accepting guessed proofs or prematurely terminating healthy video.
 
 ### Ordered retirement and random access
 
@@ -504,17 +537,24 @@ Unsent terminal cleanup may discard pending control/media; started control write
 remain ordered ahead of Stop/SESSION_END. Per-write deadlines remain 10 seconds.
 
 The sender drains capture without changing its encoder/quality/raster, advances
-the video wire generation, and sends STREAM_CONFIG behind the completing old
-video frame. Only one bounded queued chain plus an in-flight frame can precede
-that boundary; obsolete queued media is removed rather than endlessly extending
-the backlog. Video TCP ordering is the barrier; the audio socket has no barrier.
-The receiver reconstructs video/audio outputs on a dedicated serialized worker,
-discards delayed old decoder output, and sends READY only after configuring real
-outputs from valid CSD. No first-keyframe/READY dependency cycle is allowed.
+only the affected track's wire generation, and sends cached STREAM_CONFIG behind
+that lane's completing old packet. The other lane's queued/in-flight packets,
+generation, decoder and output remain unchanged. Each lane's TCP ordering is its
+own retirement barrier. The receiver reconstructs only the affected output on
+its playback worker and sends READY after real initialization from valid CSD.
+Both tracks retain the same PlaybackClock. There is no shared reset path.
+The initial barrier is distinct from recovery: neither track activates until
+all initial requested tracks are READY. Initial audio retains bounded latest
+preroll while waiting, instead of overflowing into an early generation reset.
+Its first release trims the obsolete prefix and preserves compressed admission
+order. If initial compressed priming has been retired and cannot be safely
+released at the initial boundary, restart only audio after both tracks are READY
+so the receiver can apply its explicit recovery cutoff. Later track recoveries
+do not reintroduce this initial all-tracks barrier.
 
-After all enabled tracks are READY, request a hardware sync frame, retrying no
+After video is READY, request a hardware sync frame, retrying no
 faster than every 500 ms. Suppress stale/dependent video until a verified fresh
-random-access picture: original PTS at/after READY, adequate audio-preroll time,
+random-access picture: original PTS at/after video READY,
 and at most 250 ms old at admission. H.264 requires IDR, H.265 IRAP 16..21, AV1 a
 shown key frame (not show-existing/intra-only). Flags alone are insufficient.
 Cached CSD must match any embedded parameter/sequence headers; an unannounced
@@ -524,48 +564,61 @@ visible raster, including alignment crop, must match that configuration.
 Picture PTS and rotation remain associated unchanged through decode/presentation.
 
 Allow dependent video after the verified key so the decoder can produce output.
-KEY acknowledges decoded output at/after that key, not merely packet admission.
+KEY acknowledges usable decoded output at/after that key, not merely admission.
+Pictures more than 250 ms behind the continuing source clock are discarded only
+after decode; compressed dependencies are still consumed. A late decoded key
+can be followed by usable dependent output without resetting healthy audio.
 KEY proof is validated by the live generation and exact sent key PTS, not its
 wall-clock age at sender receipt. Legitimate network/decode/control-return delay
 does not invalidate a key that met source freshness at admission. KEY and
-COMPLETE still cannot arrive at or after the first-unresolved 10-second deadline.
+COMPLETE still cannot arrive at or after that track's first-unresolved deadline.
 
 ### Audio resynchronization
 
-Audio wire generation and negotiated format remain unchanged. New native audio
-gets a fresh clock/output epoch; original packet PTS/bytes are never retimed.
-Midstream Opus reconstruction uses pre-skip zero; the header pre-skip is
-initial-only. Until KEY proof, source audio stays in the existing bounded mux,
-dropping only its obsolete prefix on pressure. Receiver audio admission/output
-remains gated; old socket backlog continues to be consumed/discarded.
+Audio recovery advances the audio wire generation, leaving video unchanged.
+Its cached STREAM_CONFIG additionally requires canonical int64-string
+`recoveryPtsUs`: the sender's current source time plus codec preroll. The format
+must match the accepted audio configuration; a format change requires a new
+session. Initial configuration has no recovery cutoff.
+New native audio gets a fresh decoder/resampler/output epoch, but not a new
+PlaybackClock. Audio detach snapshots the presented source position and keeps
+it advancing monotonically until the resumed output takes ownership.
+Original packet PTS/bytes are never retimed. Opus pre-skip is initial-only.
+Only recovering audio is held in its bounded mux while awaiting audio READY
+and its own preroll coverage. Healthy audio is never held for a video proof.
 
-On KEY, retain enough **duration-aware** prefix for PCM (zero preroll), Opus
+Retain enough **duration-aware** prefix around `recoveryPtsUs` for PCM (zero preroll), Opus
 (negotiated 80 ms), or AAC-LC (one 960/1024-sample AU). Derive Opus durations from
 TOC (including 60/120 ms packets), AAC from ASC and PCM from aligned sample count.
 Release compressed audio only with contiguous preroll coverage (one sample of
-timestamp rounding tolerance) and a packet extending past key PTS. If audio has
-not arrived or has not yet reached the key, continue bounded buffering under the
+timestamp rounding tolerance) and a packet extending past the audio cutoff. If audio has
+not arrived or has not yet reached that cutoff, continue bounded buffering under the
 original deadline. Do not reset just because 250 ms of wall-clock time elapsed.
 A present AAC prefix starting after its required preroll start, a known gap in
-that monotonic prefix, or RAW first-source audio beyond key + 250 ms requires a
+that monotonic prefix, or RAW first-source audio beyond cutoff + 250 ms requires a
 new bounded attempt. Opus source PTS may move backward, so an apparent prefix
 gap is WAITING, not proof that the source window is LOST. Coverage is checked
 in original admission order, not as a reordered interval union; an unproven
 Opus prefix remains bounded by the existing caps and original deadline.
 Queue limits do not grow to retain an obsolete source window.
-Local cap-pressure eviction of a packet intersecting the selected key's required
+Local cap-pressure eviction of a packet intersecting the selected cutoff's required
 Opus decode window is explicit loss evidence, not an inference from PTS order.
 The removed decode-chain packet is the evidence even if later equal/reversed
 intervals cover the same timestamps; do not reconstruct that chain by sorting
 or an interval union.
-Latch that evidence for the selected key until its proof is handled; then retry
+Latch that evidence for the selected cutoff until coverage is checked; then retry only audio
 under the original deadline. Evictions ending at/before the preroll start do not
 count. Clear the evidence when retiring the attempt, and collect fresh preroll
-before selecting the next compressed-audio key. This is local state only, with
-no new wire fields or packet reordering.
+before selecting the next audio cutoff. No packet reordering is allowed.
 Discard packets whose **end** is at/before the preroll window, not just by
 start PTS. Decode retained Opus/AAC packets in order to preserve overlap/state,
-then discard decoded samples strictly before key PTS. Trim PCM on sample-frame
+then discard decoded samples strictly before the audio cutoff. Before admitting
+the first retained packet, the receiver may advance the cutoff to its continuing
+clock and discard an obsolete complete prefix before that new preroll window.
+Once decoding begins, preserve compressed admission order. Pending decoded
+startup PCM is retrimmed against the current clock, so delayed startup never
+rewinds the healthy video timeline or fails merely because audio became stale.
+Trim PCM on sample-frame
 boundaries, including packets straddling the cutoff. Initial pre-skip is not
 reapplied during resets. The preroll is intentionally inaudible (80 ms for Opus,
 one AU for AAC, plus the straddling prefix); the whole retired backlog is skipped,
@@ -574,7 +627,7 @@ Android applies bounded FFmpeg compensation after source-domain trimming.
 Filter lookahead and converted frame ratios retain their original source spans;
 completion/presentation use mapped source timestamps, not nominal output-frame
 counts. Each retired native audio epoch releases its resampler, and the next
-starts with fresh filter state while the wire audio generation stays unchanged.
+starts with fresh filter state at the new audio wire generation.
 During startup catch-up Android pauses decoding at its existing decoded-FIFO
 target while continuing output servicing and the no-progress check, including
 after the first source submission. A temporarily full native ring must not
@@ -584,34 +637,45 @@ one target's worth of original source audio has actually been presented.
 Steady-state low-latency decoded trimming and compensation remain unchanged;
 network admission and all caps stay bounded.
 
-COMPLETE proves the first actual source-audio sample submission (not inserted
-silence), with its sample-aligned original `audioPtsUs` at/after key and no more
-than 250 ms later. Video-only sends COMPLETE after KEY without `audioPtsUs`.
-The sender clears the unresolved deadline only after this matching proof.
+Audio COMPLETE proves actual source-audio sample submission (not inserted
+silence), with its sample-aligned original `audioPtsUs` at/after the audio cutoff.
+There is no key-relative 250 ms A/V failure rule. Temporary offsets are resolved
+by stale decoded-data trimming and source-time scheduling, not shared resets.
+The sender clears only that track's unresolved deadline after its matching proof.
 This is admission/startup resynchronization, not permission to skip compressed
 dependencies within a retained epoch. Long-idle/no-fresh-media recovery still
 times out; disabled audio does not wait for an audio proof.
-This is a recovery-v1 semantic correction without new fields/types. Older peers
-may retain the stricter receipt-age behavior; negotiation alone does not prove
-that their implementation includes the correction.
 
 ### Bounds, Stop and failures
 
-One **10-second deadline anchored to the first unresolved recovery** covers
-reset/cooldown, READY, sync retries, key decode and A/V completion. Initial
+Each track has a **10-second deadline anchored to its first unresolved recovery**
+covering reset/cooldown, READY and usable source output. Initial
 negotiated startup is also bounded. Repeated reset/config/READY/key/request
-events cannot extend it. Native resets are spaced at least one second apart;
+events cannot extend it. One track's completion never resets the other's deadline.
+Audio recovery before first playback explicitly uses its own recovery startup
+state: video completion cannot restore the initial three-second timeout, and
+fresh audio is not compared to an obsolete first-video timestamp. The common
+clock remains continuous; ordinary non-recovery startup keeps its original rules.
+Before any audio has played, fresh submitted video can advance this bootstrap
+clock so audio does not wait behind an obsolete initial video-arrival delay.
+Once audio takes clock ownership, video presentation does not re-anchor it.
+Native resets are spaced at least one second apart per track;
 sync requests at least 500 ms apart. These are rate limits, not new deadlines.
-Video generation exhaustion at signed-int32 maximum is fatal, never wraparound.
-Existing byte/PTS/count caps, independent heartbeats and socket deadlines remain.
+Track generation exhaustion at signed-int32 maximum is fatal, never wraparound.
+Sender queue byte limits are track-local: video 8 MiB and audio 512 KiB, matching
+receiver track capacity. Their aggregate queued-media bound is 8.5 MiB; neither
+lane borrows the other's capacity. Existing PTS/count caps, independent
+heartbeats and socket deadlines remain.
 
 Stop serializes resource retirement with reconstruction. Every worker install,
 failure/proof callback and READY must still own its accepted session and current
-video generation/audio epoch; retired completions cannot revive or poison a
+track generation/audio epoch; retired completions cannot revive or poison a
 new epoch. Current codec/output failures remain fatal, not success-shaped READY.
 Pending Stop cannot start new audio, and SESSION_END follows retirement.
 Audio-format changes require a new capture session. A successful recovery keeps
-the session/presentation lease; no software, codec, quality or audio fallback.
+the session/presentation lease; no shared, software, codec, quality or audio fallback.
+Fatal errors mean a required stream cannot recover, a current decoder/output
+fails, or the transport/protocol is broken; A/V mismatch by itself is not fatal.
 
 The real TCP recovery tests use fake codecs/output; they establish bounded
 protocol/worker behavior, not native hardware recovery or live Windows casting.

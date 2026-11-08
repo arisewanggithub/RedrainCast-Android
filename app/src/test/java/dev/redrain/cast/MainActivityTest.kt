@@ -142,6 +142,43 @@ class MainActivityTest {
         await { activity.resourcesRetired }
     }
 
+    @Test fun decoderRecoveryPreservesQuarterTurnWithoutRequestingATemporaryPortraitAxis() {
+        val controller = Robolectric.buildActivity(MainActivity::class.java).setup()
+        val activity = controller.get()
+        try {
+            surfaceReady(activity)
+            val format = org.screencopy.receiver.media.VideoFormat("video/hevc", 1080, 1920, emptyList(), 60)
+            activity.selectVideoSurface(format)
+            val policy = org.robolectric.util.ReflectionHelpers.getField<org.screencopy.receiver.ui.SessionOrientation>(
+                activity, "sessionOrientation")
+            policy.begin(Any(), org.screencopy.receiver.protocol.ReceiverOrientation.AUTO)
+            for (degrees in listOf(90, 270)) {
+                org.robolectric.util.ReflectionHelpers.setField(activity, "rotation", degrees)
+                org.robolectric.util.ReflectionHelpers.setField(activity, "hasPresentation", true)
+                org.robolectric.util.ReflectionHelpers.callInstanceMethod<Void>(activity, "fitVideo")
+                assertEquals(android.content.pm.ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE, activity.requestedOrientation)
+                repeat(3) {
+                    activity.selectVideoSurface(format)
+                    assertEquals("Decoder setup must not request an unrotated portrait axis",
+                        android.content.pm.ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE, activity.requestedOrientation)
+                    assertEquals(degrees, org.robolectric.util.ReflectionHelpers.getField<Int>(activity, "rotation"))
+                    assertFalse(org.robolectric.util.ReflectionHelpers.getField<Boolean>(activity, "hasPresentation"))
+                    org.robolectric.util.ReflectionHelpers.setField(activity, "hasPresentation", true)
+                    org.robolectric.util.ReflectionHelpers.callInstanceMethod<Void>(activity, "fitVideo")
+                    assertEquals(android.content.pm.ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE, activity.requestedOrientation)
+                }
+            }
+            activity.selectVideoSurface(format.copy(width = 1920, height = 1080))
+            assertEquals("A new raster must wait for its own presentation metadata",
+                android.content.pm.ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE, activity.requestedOrientation)
+            org.robolectric.util.ReflectionHelpers.setField(activity, "rotation", 90)
+            org.robolectric.util.ReflectionHelpers.setField(activity, "hasPresentation", true)
+            org.robolectric.util.ReflectionHelpers.callInstanceMethod<Void>(activity, "fitVideo")
+            assertEquals(android.content.pm.ActivityInfo.SCREEN_ORIENTATION_PORTRAIT, activity.requestedOrientation)
+        } finally { controller.pause().stop().destroy() }
+        await { activity.resourcesRetired }
+    }
+
     @Test fun retiredTextureCallbacksCannotRetireOrReplaceCurrentSurfaceEpoch() {
         val controller = Robolectric.buildActivity(MainActivity::class.java).setup()
         val activity = controller.get()

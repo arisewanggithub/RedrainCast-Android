@@ -86,7 +86,7 @@ class ReceiverOptionsPipelineTest {
                     val hello = JSONObject().put("role", "sender").put("name", "wire fixture")
                         .put("versions", JSONArray().put(3))
                     if (offer) hello.put("receiverOptions", ReceiverOptionProtocol.IMPLEMENTED.wireValue())
-                    if (recovery) hello.put("streamRecovery", true).put("streamRecoveryVersion", 1)
+                    if (recovery) hello.put("streamRecovery", true).put("streamRecoveryVersion", 2)
                     Wire.write(peer.outputStream, Message.json(Type.HELLO, hello))
                     val response = Wire.read(peer.inputStream)
                     assertEquals(Type.HELLO, response.type)

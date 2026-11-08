@@ -8,7 +8,7 @@ import java.nio.file.Path
 class VideoGeometryTest {
     private fun inventory(rotation: Int = 0) = DisplayInventory(listOf(
         CaptureDisplay(7, "Panel", if (rotation % 2 == 0) 1440 else 3168, if (rotation % 2 == 0) 3168 else 1440, rotation, 1)))
-    private fun settings() = Settings().apply { displayId = 7; videoCodec = "h265" }
+    private fun settings() = Settings().apply { displayId = 7; videoCodec = "h265"; maxFps = 60 }
     private fun limits(min: Int = 128, alignment: Int = 2, maxFps: Double = 60.0) =
         VideoLimits(min, 4096, min, 4096, alignment, alignment, 1.0, maxFps)
     @Test fun exactPinnedSizingReportsRequested100SquareAndEncoded96Square() {
@@ -25,6 +25,25 @@ class VideoGeometryTest {
         val decoded = assertThrows(VideoGeometryException::class.java) { VideoPreflightReport.decode(VideoPreflightReport.encode(plan, error)) }
         assertEquals(error.limits, decoded.limits)
         assertEquals(VideoSize(128, 128), decoded.suggestion?.first)
+    }
+
+    @Test fun uncappedGeometryRetainsZeroAndDoesNotInventACapInReportsOrSuggestions() {
+        val settings = settings().apply { maxFps = 0 }
+        val plan = ScrcpyVideoSizing.calculate(settings, inventory())
+        assertEquals(0, plan.fps)
+        assertTrue(plan.description().contains("uncapped capture FPS"))
+        assertEquals(plan, VideoPreflightReport.decode(VideoPreflightReport.encode(plan)))
+        VideoGeometryValidation.validate(plan, listOf(EncoderGeometryCheck(limits(), true, true)), false)
+        val error = assertThrows(VideoGeometryException::class.java) {
+            VideoGeometryValidation.validate(plan,
+                listOf(EncoderGeometryCheck(limits(), false, false, VideoSize(128, 128) to 0)), false)
+        }
+        assertTrue(error.message!!.contains("128x128 with uncapped capture FPS"))
+        val restored = assertThrows(VideoGeometryException::class.java) {
+            VideoPreflightReport.decode(VideoPreflightReport.encode(plan, error))
+        }
+        assertEquals(0, restored.suggestion?.second)
+        assertEquals(0, settings.maxFps)
     }
     @Test fun realMetadataThatAccepts96DoesNotGloballyBanSmallH265Crop() {
         val plan = ScrcpyVideoSizing.calculate(settings().apply { cropWidth = 100; cropHeight = 100 }, inventory())

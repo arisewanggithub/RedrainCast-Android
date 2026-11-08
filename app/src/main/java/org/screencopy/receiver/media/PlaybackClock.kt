@@ -8,6 +8,7 @@ class PlaybackClock(
     private var baseNs = 0L
     private var audioPositionUs: (() -> Long)? = null
     private var audioSource: AudioSourceClock? = null
+    private var lastPositionUs: Long? = null
     @Volatile private var observedAudio: SourceTimestampObservation? = null
     internal fun cachedPlayedAudioSource(): Long? = observedAudio?.ptsUs
     internal fun cachedPlayedAudioObservation(): SourceTimestampObservation? = observedAudio
@@ -16,6 +17,9 @@ class PlaybackClock(
     private var firstVideoPtsUs: Long? = null
     private var startupAtNs: Long? = null
     private var audioStarted = false
+    @Volatile private var resumingAudio = false
+    private var recoveringAudio = false
+    private var firstVideoAtNs: Long? = null
     private var prerollEpochUs: Long? = null
     private var videoPrerollEnded = false
 
@@ -23,6 +27,7 @@ class PlaybackClock(
     fun anchorVideo(ptsUs: Long) {
         if (firstVideoPtsUs == null) {
             firstVideoPtsUs = ptsUs
+            firstVideoAtNs = nanoTime()
             if (audioExpected && !audioStarted && prerollEpochUs?.let { ptsUs > it } == true) {
                 prerollEpochUs = ptsUs
                 basePtsUs = -1
@@ -37,13 +42,21 @@ class PlaybackClock(
 
     @Synchronized
     fun checkStartup() {
-        if (!recoveryStartup && audioExpected && !audioStarted && startupAtNs?.let { nanoTime() - it >= 3_000_000_000L } == true)
+        if (!recoveryStartup && !recoveringAudio && audioExpected && !audioStarted &&
+            startupAtNs?.let { nanoTime() - it >= 3_000_000_000L } == true)
             throw PlaybackException("Audio/video startup did not complete within three seconds")
     }
 
     @Synchronized
     fun prepareAudio(slice: TrimmedAudio, rate: Int): TrimmedAudio? {
         if (!audioExpected || audioStarted) return slice
+        if (resumingAudio) {
+            if (basePtsUs < 0) {
+                basePtsUs = slice.audiblePtsUs
+                baseNs = nanoTime() + 50_000_000L
+            }
+            return slice
+        }
         checkStartup()
         val videoPts = firstVideoPtsUs ?: return null
         val epoch = maxOf(videoPts, slice.audiblePtsUs)
@@ -60,7 +73,35 @@ class PlaybackClock(
     }
 
     @Synchronized
-    fun canPrepareAudio(): Boolean = !audioExpected || firstVideoPtsUs != null || audioStarted
+    fun canPrepareAudio(): Boolean = !audioExpected || firstVideoPtsUs != null || audioStarted || resumingAudio
+
+    @Synchronized
+    internal fun beginAudioRecovery() {
+        recoveringAudio = true
+        resumingAudio = true
+        if (basePtsUs < 0) firstVideoPtsUs?.let {
+            basePtsUs = it
+            baseNs = checkNotNull(firstVideoAtNs)
+        }
+    }
+
+    @Synchronized
+    internal fun endAudioRecovery() {
+        recoveringAudio = false
+        resumingAudio = false
+    }
+
+    @Synchronized
+    internal fun videoPresented(ptsUs: Long) {
+        require(ptsUs >= 0) { "Negative video presentation timestamp" }
+        if (!recoveringAudio || audioStarted) return
+        val current = currentUs()
+        if (current == null || ptsUs > current) {
+            basePtsUs = ptsUs
+            baseNs = nanoTime()
+            lastPositionUs = ptsUs
+        }
+    }
 
     @Synchronized
     fun videoDelayUs(ptsUs: Long): Long? {
@@ -76,8 +117,8 @@ class PlaybackClock(
     fun audioStartDelayUs(ptsUs: Long): Long {
         anchor(ptsUs)
         val delay = Math.subtractExact(ptsUs, checkNotNull(currentUs()))
-        if (delay > 3_000_000) throw PlaybackException("Audio startup exceeds the three-second synchronization budget")
-        if (delay < -250_000) throw PlaybackException("Audio arrived over 250 ms behind the presentation clock")
+        if (!resumingAudio && delay > 3_000_000) throw PlaybackException("Audio startup exceeds the three-second synchronization budget")
+        if (!resumingAudio && delay < -250_000) throw PlaybackException("Audio arrived over 250 ms behind the presentation clock")
         return delay
     }
 
@@ -85,12 +126,17 @@ class PlaybackClock(
         val started = nanoTime()
         while (running()) {
             synchronized(this) {
-                if (audioExpected && !audioStarted && (basePtsUs < 0 || prerollEpochUs?.let { ptsUs < it } == true))
+                if (audioExpected && !audioStarted && !resumingAudio &&
+                    (basePtsUs < 0 || prerollEpochUs?.let { ptsUs < it } == true))
                     return false
             }
-            if (audioStartDelayUs(ptsUs) <= 0) return true
-            if (nanoTime() - started >= 3_000_000_000L)
-                throw PlaybackException("Audio startup did not complete within three seconds")
+            val delay = audioStartDelayUs(ptsUs)
+            if (resumingAudio && delay < -250_000) return false
+            if (delay <= 0) return true
+            if (nanoTime() - started >= if (resumingAudio) 10_000_000_000L else 3_000_000_000L)
+                throw PlaybackException(if (resumingAudio) "Audio recovery produced no usable source audio within ten seconds"
+                    else "Audio startup did not complete within three seconds",
+                    if (resumingAudio) "AUDIO_FAILED" else "DECODER_FAILED")
             sleepMs(2)
         }
         return false
@@ -103,6 +149,7 @@ class PlaybackClock(
         audioSource = AudioSourceClock(ptsUs, sampleRate)
         observedAudio = null
         audioStarted = true
+        resumingAudio = recoveringAudio
     }
 
     @Synchronized
@@ -122,10 +169,11 @@ class PlaybackClock(
     fun detachAudio() {
         try {
             audioPositionUs?.let {
-                basePtsUs = checkNotNull(audioSource).current(it())
+                basePtsUs = maxOf(checkNotNull(audioSource).current(it()), lastPositionUs ?: Long.MIN_VALUE)
                 baseNs = nanoTime()
             }
         } finally {
+            resumingAudio = audioStarted || recoveringAudio
             audioPositionUs = null
             audioSource = null
             observedAudio = null
@@ -134,13 +182,15 @@ class PlaybackClock(
 
     @Synchronized
     fun currentUs(): Long? {
-        audioPositionUs?.let {
-            return checkNotNull(audioSource).current(it()).also { observed ->
+        val position = audioPositionUs?.let {
+            checkNotNull(audioSource).current(it()).also { observed ->
                 observedAudio = SourceTimestampObservation(observed, nanoTime())
             }
+        } ?: run {
+            if (basePtsUs < 0) return null
+            basePtsUs + (nanoTime() - baseNs) / 1000
         }
-        if (basePtsUs < 0) return null
-        return basePtsUs + (nanoTime() - baseNs) / 1000
+        return maxOf(position, lastPositionUs ?: position).also { lastPositionUs = it }
     }
 
     fun delayUs(ptsUs: Long): Long? = currentUs()?.let { ptsUs - it }

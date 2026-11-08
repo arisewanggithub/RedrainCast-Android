@@ -6,7 +6,7 @@ import org.screencopy.receiver.protocol.RandomAccessPoint
 import java.io.IOException
 import java.util.Base64
 
-/** The ordered config, decoded-key proof and audio proof define one bounded recovery transaction. */
+/** Each track owns its recovery generation; the other TCP lane keeps its original timeline. */
 internal class StreamRecoverySender(
     private val session: Long,
     private val budget: MediaBudget,
@@ -14,115 +14,171 @@ internal class StreamRecoverySender(
     private val diagnostic: (String) -> Unit = {},
     private val withAudio: Boolean = true
 ) {
-    private enum class State { WAIT_READY, WAIT_KEY, WAIT_KEY_PROOF, WAIT_AUDIO, WAIT_COMPLETE, ACTIVE }
-    private var state = State.WAIT_READY
+    private enum class State { WAIT_READY, WAIT_SOURCE, WAIT_PROOF, ACTIVE }
+    private val state = Array(3) { State.WAIT_READY }
     private val sourceGeneration = IntArray(3)
     private val wireGeneration = IntArray(3)
     private val sourcePts = LongArray(3) { -1 }
-    private var opus = false
-    private var videoConfig: JSONObject? = null
-    private var audioTiming: AudioPacketTiming? = null
-    private var unresolvedAt: Long? = null
-    private var attemptAt: Long? = null
+    private val configs = arrayOfNulls<JSONObject>(3)
+    private val unresolvedAt = arrayOfNulls<Long>(3)
+    private val minimumPts = LongArray(3)
+    private val sentKeyPts = arrayOfNulls<Long>(3)
+    private val completedPts = arrayOfNulls<Long>(3)
+    private var keyProved = false
     private var lastKeyRequest: Long? = null
-    private var minimumKeyPts = 0L
-    private var sentKeyPts: Long? = null
-    private var completedAudioPts: Long? = null
-
-    init { budget.discardMediaForRecovery() }
+    private var audioTiming: AudioPacketTiming? = null
+    private var initialReady = false
+    private var initialAudioCutoffPending = false
+    // Sent-interval eligibility is separate from admission-ordered decoder preroll coverage.
+    private val writtenAudio = ArrayList<Pair<Long, Long>>()
+    private var pendingAudioCompletion: Long? = null
 
     @Synchronized fun config(track: Int, generation: Int, config: JSONObject) {
-        require(track in 1..2)
+        requireTrack(track)
+        requireWithinDeadline()
         if (generation != sourceGeneration[track] + 1)
             throw IOException("PROTOCOL: nonsequential capture configuration during recovery")
         if (track == 2 && sourceGeneration[track] > 0)
             throw IOException("AUDIO_FAILED: audio format changes require a new capture session")
         sourceGeneration[track] = generation
         sourcePts[track] = -1
-        if (track == 2) {
-            opus = config.opt("codec") == "opus"
-            audioTiming = AudioPacketTiming.fromConfig(config)
-        } else {
-            videoConfig = JSONObject(config.toString())
-            val started = now()
-            if (unresolvedAt == null) unresolvedAt = started
-            attemptAt = started
-            if (wireGeneration[1] > 0) budget.discardMediaForRecovery()
-            sentKeyPts = null
-            state = State.WAIT_READY
-        }
-        wireGeneration[track] = next(wireGeneration[track])
-        budget.offer(Wire.config(session, track, wireGeneration[track], config))
+        configs[track] = JSONObject(config.toString())
+        if (track == 2) audioTiming = AudioPacketTiming.fromConfig(config)
+        begin(track, "capture", initial = wireGeneration[track] == 0)
     }
 
     @Synchronized fun ready(): Boolean {
-        if (state != State.WAIT_READY || !budget.allReady()) return false
-        state = State.WAIT_KEY
-        val preroll = if (withAudio) checkNotNull(audioTiming).prerollUs else 0
-        minimumKeyPts = maxOf(now() / 1000, checkNotNull(attemptAt) / 1000 + preroll)
+        requireWithinDeadline()
+        if (!initialReady) {
+            if (!budget.allReady()) return false
+            initialReady = true
+        }
+        for (track in 1..if (withAudio) 2 else 1) {
+            if (state[track] != State.WAIT_READY || !budget.trackReady(track)) continue
+            if (track == 2 && wireGeneration[track] == 1) {
+                val first = budget.firstQueuedAudioPts()
+                initialAudioCutoffPending = first == null
+                minimumPts[2] = maxOf(now() / 1000,
+                    first ?: 0)
+                state[track] = State.WAIT_SOURCE
+                unresolvedAt[track] = null
+            } else {
+                state[track] = State.WAIT_SOURCE
+                if (track == 1) minimumPts[track] = now() / 1000
+            }
+        }
+        releaseAudioIfReady()
         return retryKeyFrame()
     }
 
-    @Synchronized fun request(generation: Int) {
-        if (generation <= 0 || generation > wireGeneration[1])
-            throw IOException("PROTOCOL: recovery request has an invalid video generation")
-        if (generation != wireGeneration[1] || state == State.WAIT_READY || state == State.WAIT_KEY) return
-        reset("receiver")
+    @Synchronized fun request(track: Int, generation: Int) {
+        requireTrack(track)
+        requireWithinDeadline()
+        validateGeneration(track, generation)
+        if (generation != wireGeneration[track] || state[track] == State.WAIT_READY) return
+        begin(track, "receiver")
     }
 
     @Synchronized fun keyProved(generation: Int, pts: Long) {
         requireWithinDeadline()
-        if (!acknowledgement(generation, pts)) return
-        if (state == State.ACTIVE || state == State.WAIT_AUDIO || state == State.WAIT_COMPLETE) return
-        if (state != State.WAIT_KEY_PROOF) throw IOException("PROTOCOL: unexpected decoded-key proof")
-        state = if (withAudio) State.WAIT_AUDIO else State.WAIT_COMPLETE
-        releaseAudioIfReady()
+        if (!acknowledgement(1, generation, pts)) return
+        if (state[1] != State.WAIT_PROOF && state[1] != State.ACTIVE)
+            throw IOException("PROTOCOL: unexpected decoded-key proof")
+        keyProved = true
     }
 
-    @Synchronized fun completed(generation: Int, pts: Long, audioPts: Long?) {
+    @Synchronized fun completed(track: Int, generation: Int, pts: Long) {
+        requireTrack(track)
         requireWithinDeadline()
-        if (!acknowledgement(generation, pts)) return
-        if (state == State.ACTIVE) {
-            if (audioPts != completedAudioPts) throw IOException("PROTOCOL: conflicting recovery completion proof")
+        if (!acknowledgement(track, generation, pts)) return
+        if (state[track] == State.ACTIVE) {
+            if (completedPts[track] != pts) throw IOException("PROTOCOL: conflicting recovery completion proof")
             return
         }
-        if (state != State.WAIT_COMPLETE || withAudio && audioPts == null ||
-            audioPts?.let { it < pts || it - pts > 250_000 } == true)
-            throw IOException("PROTOCOL: invalid recovery completion proof")
-        unresolvedAt = null
-        completedAudioPts = audioPts
-        state = State.ACTIVE
-        diagnostic("event=STREAM_RECOVERY_COMPLETE generation=$generation pts_us=$pts")
+        if (state[track] != State.WAIT_PROOF || track == 1 && !keyProved)
+            throw IOException("PROTOCOL: unexpected track recovery completion")
+        if (track == 2) {
+            if (pendingAudioCompletion?.let { it != pts } == true)
+                throw IOException("PROTOCOL: conflicting recovery completion proof")
+            if (writtenAudio.none { pts >= it.first && pts < it.second }) {
+                val writing = budget.writingAudio()
+                if (writing == null || writing.generation != generation || pts < writing.pts ||
+                    pts >= checkNotNull(audioTiming).endPts(writing.pts, writing.payload))
+                    throw IOException("PROTOCOL: audio completion does not match submitted source audio")
+                pendingAudioCompletion = pts
+                return
+            }
+            pendingAudioCompletion = null
+            writtenAudio.clear()
+        }
+        completedPts[track] = pts
+        unresolvedAt[track] = null
+        state[track] = State.ACTIVE
+        diagnostic("event=STREAM_RECOVERY_COMPLETE track=$track generation=$generation pts_us=$pts")
     }
 
-    private fun acknowledgement(generation: Int, pts: Long): Boolean {
-        if (generation <= 0 || generation > wireGeneration[1]) throw IOException("PROTOCOL: invalid proof generation")
-        if (generation < wireGeneration[1]) return false
-        if (pts != sentKeyPts) throw IOException("PROTOCOL: proof does not match the recovery keyframe")
+    @Synchronized fun written(packet: Wire.Message) {
+        if (packet.type != Wire.AUDIO_PACKET) return
+        if (!withAudio || packet.track != 2 || packet.session != session || packet.generation > wireGeneration[2])
+            throw IOException("PROTOCOL: invalid audio write completion")
+        if (packet.generation != wireGeneration[2] || state[2] != State.WAIT_PROOF) return
+        requireWithinDeadline()
+        var start = maxOf(packet.pts, minimumPts[2])
+        var end = checkNotNull(audioTiming).endPts(packet.pts, packet.payload)
+        if (start >= end) return
+        var index = 0
+        while (index < writtenAudio.size && writtenAudio[index].second < start) index++
+        while (index < writtenAudio.size && writtenAudio[index].first <= end) {
+            val merged = writtenAudio.removeAt(index)
+            start = minOf(start, merged.first)
+            end = maxOf(end, merged.second)
+        }
+        if (writtenAudio.size >= 4096) {
+            diagnostic("event=STREAM_RECOVERY_PROOF_CAPACITY track=2 generation=${wireGeneration[2]} intervals=${writtenAudio.size} max_intervals=4096")
+            begin(2, "audio-proof-window-capacity")
+            return
+        }
+        writtenAudio.add(index, start to end)
+        pendingAudioCompletion?.let { completed(2, packet.generation, it) }
+    }
+
+    private fun acknowledgement(track: Int, generation: Int, pts: Long): Boolean {
+        validateGeneration(track, generation)
+        if (generation < wireGeneration[track]) return false
+        if (pts < 0 || track == 1 && pts != sentKeyPts[1] || track == 2 && pts < minimumPts[2])
+            throw IOException("PROTOCOL: proof does not match the track recovery source window")
         return true
     }
 
     @Synchronized fun packet(packet: Wire.Message) {
+        requireWithinDeadline()
         Wire.validate(packet.type, packet.flags, packet.session, packet.track, packet.generation, packet.pts, packet.payload.size)
         val track = packet.track
-        if (track !in 1..2 || packet.generation != sourceGeneration[track])
-            throw IOException("PROTOCOL: capture packet does not match its configuration")
-        if (packet.session != session || packet.type != (if (track == 1) Wire.VIDEO_FRAME else Wire.AUDIO_PACKET) ||
-            (track == 1 || !opus) && packet.pts < sourcePts[track])
-            throw IOException("PROTOCOL: invalid capture media during recovery")
+        requireTrack(track)
+        if (packet.generation != sourceGeneration[track] || packet.session != session ||
+            packet.type != (if (track == 1) Wire.VIDEO_FRAME else Wire.AUDIO_PACKET) ||
+            (track == 1 || audioTiming?.codec != "opus") && packet.pts < sourcePts[track])
+            throw IOException("PROTOCOL: invalid capture media during track recovery")
         sourcePts[track] = packet.pts
         val mapped = packet.copy(generation = wireGeneration[track])
-        if (track == 2 && state != State.ACTIVE && state != State.WAIT_COMPLETE) {
-            val pressure = budget.holdRecoveryAudio(mapped, checkNotNull(audioTiming), sentKeyPts)
-            if (pressure != null) reset("audio-preroll-capacity")
+        if (track == 2 && state[2] in setOf(State.WAIT_READY, State.WAIT_SOURCE)) {
+            if (initialReady && wireGeneration[2] == 1 && initialAudioCutoffPending) {
+                minimumPts[2] = maxOf(now() / 1000, packet.pts)
+                initialAudioCutoffPending = false
+            }
+            val pressure = budget.holdRecoveryAudio(mapped, checkNotNull(audioTiming),
+                if (initialReady && !initialAudioCutoffPending) minimumPts[2] else null)
+            if (pressure != null) {
+                if (!initialReady) throw SenderCongestionException(pressure)
+                begin(2, "audio-preroll-capacity")
+            }
             releaseAudioIfReady()
             return
         }
-        if (state == State.WAIT_READY) return
-        if (state == State.WAIT_KEY) {
-            if (track != 1 || packet.flags and 1 == 0 || packet.pts < minimumKeyPts ||
-                now() / 1000 - packet.pts > 250_000) return
-            val config = checkNotNull(videoConfig)
+        if (state[track] == State.WAIT_READY) return
+        if (track == 1 && state[1] == State.WAIT_SOURCE) {
+            if (packet.flags and 1 == 0 || packet.pts < minimumPts[1] || now() / 1000 - packet.pts > 250_000) return
+            val config = checkNotNull(configs[1])
             val csd = config.optJSONArray("csd")
             RandomAccessPoint.verify(config.getString("codec"), packet.payload,
                 if (csd == null) emptyList() else (0 until csd.length()).map { Base64.getDecoder().decode(csd.getString(it)) })
@@ -130,22 +186,30 @@ internal class StreamRecoverySender(
         val pressure = budget.tryOfferMedia(mapped)
         if (pressure != null) {
             diagnostic("event=STREAM_RECOVERY_PRESSURE ${pressure.fields()}")
-            reset("sender")
+            begin(track, "sender")
             return
         }
-        if (state == State.WAIT_KEY) {
-            state = State.WAIT_KEY_PROOF
-            sentKeyPts = packet.pts
-            diagnostic("event=STREAM_RECOVERY_KEY generation=${wireGeneration[1]} pts_us=${packet.pts}")
+        if (track == 1 && state[1] == State.WAIT_SOURCE) {
+            state[1] = State.WAIT_PROOF
+            sentKeyPts[1] = packet.pts
+            diagnostic("event=STREAM_RECOVERY_KEY track=1 generation=${wireGeneration[1]} pts_us=${packet.pts}")
         }
     }
 
     private fun releaseAudioIfReady() {
-        if (state != State.WAIT_AUDIO) return
-        val key = checkNotNull(sentKeyPts)
-        when (budget.releaseRecoveryAudio(key, checkNotNull(audioTiming))) {
-            RecoveryAudioCoverage.READY -> state = State.WAIT_COMPLETE
-            RecoveryAudioCoverage.LOST -> reset("audio-source-window-lost")
+        if (!withAudio || state[2] != State.WAIT_SOURCE) return
+        if (wireGeneration[2] == 1) budget.firstQueuedAudioPts()?.let { first ->
+            val timing = checkNotNull(audioTiming)
+            val primed = Math.addExact(first, timing.prerollUs)
+            if (timing.prerollUs > 0 && primed > minimumPts[2] && budget.initialAudioPrefixRetired()) {
+                begin(2, "initial-audio-preroll-retired")
+                return
+            }
+            minimumPts[2] = maxOf(minimumPts[2], primed)
+        }
+        when (budget.releaseRecoveryAudio(minimumPts[2], checkNotNull(audioTiming))) {
+            RecoveryAudioCoverage.READY -> state[2] = if (wireGeneration[2] == 1) State.ACTIVE else State.WAIT_PROOF
+            RecoveryAudioCoverage.LOST -> begin(2, "audio-source-window-lost")
             RecoveryAudioCoverage.WAITING -> Unit
         }
     }
@@ -156,32 +220,53 @@ internal class StreamRecoverySender(
     }
 
     private fun requireWithinDeadline() {
-        if (unresolvedAt?.let { now() - it >= 10_000_000_000L } == true)
-            throw IOException("TIMEOUT: stream recovery did not complete within ten seconds of the first unresolved request")
+        for (track in 1..if (withAudio) 2 else 1) {
+            if (unresolvedAt[track]?.let { now() - it >= 10_000_000_000L } == true)
+                throw IOException("TIMEOUT: track $track recovery produced no usable fresh media within ten seconds")
+        }
     }
 
     @Synchronized fun retryKeyFrame(): Boolean {
-        if (state != State.WAIT_KEY || now() / 1000 < minimumKeyPts ||
+        requireWithinDeadline()
+        if (state[1] != State.WAIT_SOURCE ||
             lastKeyRequest?.let { now() - it < 500_000_000L } == true) return false
         lastKeyRequest = now()
         return true
     }
 
-    private fun reset(reason: String) {
-        val config = videoConfig ?: throw IOException("PROTOCOL: recovery preceded video configuration")
-        val started = now()
-        if (unresolvedAt == null) unresolvedAt = started
-        attemptAt = started
-        budget.discardMediaForRecovery()
-        wireGeneration[1] = next(wireGeneration[1])
-        sentKeyPts = null
-        state = State.WAIT_READY
-        budget.offer(Wire.config(session, 1, wireGeneration[1], config))
-        diagnostic("event=STREAM_RECOVERY_BEGIN reason=$reason generation=${wireGeneration[1]}")
+    private fun begin(track: Int, reason: String, initial: Boolean = false) {
+        if (unresolvedAt[track] == null) unresolvedAt[track] = now()
+        if (!initial || track == 2) budget.discardMediaForRecovery(track)
+        state[track] = State.WAIT_READY
+        completedPts[track] = null
+        if (track == 1) {
+            sentKeyPts[1] = null
+            keyProved = false
+        } else {
+            minimumPts[2] = Math.addExact(now() / 1000, checkNotNull(audioTiming).prerollUs)
+            initialAudioCutoffPending = false
+            writtenAudio.clear()
+            pendingAudioCompletion = null
+        }
+        wireGeneration[track] = next(wireGeneration[track])
+        val config = JSONObject(checkNotNull(configs[track]).toString())
+        if (track == 2 && !initial) config.put("recoveryPtsUs", minimumPts[2].toString())
+        budget.offer(Wire.config(session, track, wireGeneration[track], config))
+        diagnostic("event=STREAM_RECOVERY_BEGIN track=$track reason=$reason generation=${wireGeneration[track]}")
     }
 
-    private fun next(value: Int): Int {
-        if (value == Int.MAX_VALUE) throw IOException("PROTOCOL: stream generation exhausted")
-        return value + 1
+    private fun validateGeneration(track: Int, generation: Int) {
+        if (generation <= 0 || generation > wireGeneration[track])
+            throw IOException("PROTOCOL: invalid track recovery generation")
+    }
+
+    private fun requireTrack(track: Int) {
+        if (track !in 1..2 || track == 2 && !withAudio)
+            throw IOException("PROTOCOL: recovery track is not enabled")
+    }
+
+    private fun next(generation: Int): Int {
+        if (generation == Int.MAX_VALUE) throw IOException("PROTOCOL: track recovery generation exhausted")
+        return generation + 1
     }
 }

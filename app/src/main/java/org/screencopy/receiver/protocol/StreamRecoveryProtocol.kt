@@ -3,7 +3,7 @@ package org.screencopy.receiver.protocol
 import org.json.JSONObject
 
 internal object StreamRecoveryProtocol {
-    const val VERSION = 1
+    const val VERSION = 2
     const val REQUEST = "stream-recovery-request"
     const val KEY = "stream-recovery-key"
     const val COMPLETE = "stream-recovery-complete"
@@ -14,12 +14,16 @@ internal object StreamRecoveryProtocol {
         return text.toLongOrNull() ?: throw ProtocolException("PROTOCOL", "$name exceeds int64")
     }
 
-    fun status(state: String, generation: Long, keyPts: Long, audioPts: Long? = null): JSONObject {
-        protocolRequire(generation in 1..Int.MAX_VALUE.toLong() && keyPts >= 0 && (audioPts == null || audioPts >= 0),
+    fun track(json: JSONObject): Int = json.integer("track").also {
+        protocolRequire(it in 1..2, "Invalid recovery track")
+    }
+
+    fun status(state: String, track: Int, generation: Long, pts: Long): JSONObject {
+        protocolRequire(state in setOf(KEY, COMPLETE) && track in 1..2 && (state != KEY || track == 1) &&
+            generation in 1..Int.MAX_VALUE.toLong() && pts >= 0,
             "Invalid recovery proof fields")
-        return JSONObject().put("state", state).put("message", "Stream recovery $state")
-            .put("generation", generation.toInt()).put("keyPtsUs", keyPts.toString()).apply {
-                if (audioPts != null) put("audioPtsUs", audioPts.toString())
-            }
+        return JSONObject().put("state", state).put("message", "Track $track recovery $state")
+            .put("track", track).put("generation", generation.toInt())
+            .put(if (track == 1) "keyPtsUs" else "audioPtsUs", pts.toString())
     }
 }

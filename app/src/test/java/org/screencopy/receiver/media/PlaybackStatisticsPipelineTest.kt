@@ -19,9 +19,11 @@ class PlaybackStatisticsPipelineTest {
 
     private fun stream(recovery: Boolean) {
         val failures = ConcurrentLinkedQueue<String>()
+        val clocks = ConcurrentLinkedQueue<PlaybackClock>()
         ReceiverServer.forProtocolTests("Receiver", supportsPlaybackStatistics = true,
             onFailure = { failures.add(it.logMessage()) },
             videoFactory = { format, clock, failed, generation ->
+                clocks.add(clock)
                 VideoPlayer(format, clock, failed, Decoder(), generation)
             }).use { server ->
             server.start()
@@ -47,27 +49,30 @@ class PlaybackStatisticsPipelineTest {
                 val hello = JSONObject().put("role", "sender").put("name", "stats fixture")
                     .put("versions", JSONArray().put(3))
                     .put("receiverOptions", ReceiverOptionProtocol.IMPLEMENTED.wireValue())
-                if (recovery) hello.put("streamRecovery", true).put("streamRecoveryVersion", 1)
+                if (recovery) hello.put("streamRecovery", true).put("streamRecoveryVersion", 2)
                 send(Type.HELLO, hello, 0)
                 assertTrue(ReceiverOptionProtocol.capabilities(expect(Type.HELLO).json()).playbackStats)
                 send(Type.SESSION_REQUEST, ReceiverOptionProtocol.apply(Settings().apply { audio = false }.request(), ReceiverOptions(true)))
                 MediaSockets.attach(server, expect(Type.SESSION_ACCEPT)).use { media ->
-                    fun configure(generation: Long) {
+                    fun configure(generation: Long): Long {
                         Wire.write(media.video.outputStream, Message.json(Type.STREAM_CONFIG,
                             JSONObject().put("codec", "h264").put("width", 640).put("height", 360)
                                 .put("csd", JSONArray().put("AAAAAWdC")), 73, 1, generation))
                         expect(Type.STREAM_READY)
+                        val pts = maxOf(1_000_000 + generation * 20_000,
+                            clocks.last().currentUs() ?: 0)
                         Wire.write(media.video.outputStream, Message(Type.VIDEO_FRAME, 73, 1, generation,
-                            1_000_000 + generation * 20_000, 1, byteArrayOf(0, 0, 0, 1, 0x65, 1)))
+                            pts, 1, byteArrayOf(0, 0, 0, 1, 0x65, 1)))
+                        return pts
                     }
                     server.showPlaybackStatistics(true)
-                    configure(1)
+                    val firstPts = configure(1)
                     await { server.playbackStatistics?.input?.video?.rendered == 1L }
                     val first = checkNotNull(server.playbackStatistics)
                     assertEquals(1L, first.input.generation)
                     assertEquals(6L, first.input.videoBytes)
                     assertEquals(1L, first.input.receivedVideo)
-                    assertEquals(1_020_000L, first.input.video?.renderedPtsUs)
+                    assertEquals(firstPts, first.input.video?.renderedPtsUs)
                     assertEquals(640, first.input.encodedWidth)
                     assertNotNull(first.input.videoLastPacketAgeMs)
                     assertTrue(checkNotNull(first.input.videoLastPacketAgeMs) >= 0)
@@ -81,11 +86,12 @@ class PlaybackStatisticsPipelineTest {
                     server.showPlaybackStatistics(true)
                     await { server.playbackStatistics != null }
                     assertNull(checkNotNull(server.playbackStatistics).rxFps)
-                    configure(2)
+                    val nextPts = configure(2)
                     await { server.playbackStatistics?.input?.generation == 2L }
                     val next = checkNotNull(server.playbackStatistics)
                     assertEquals(1L, next.input.video?.rendered)
-                    assertEquals(1_040_000L, next.input.video?.renderedPtsUs)
+                    assertEquals(nextPts, next.input.video?.renderedPtsUs)
+                    if (recovery) assertSame(clocks.first(), clocks.last())
                     assertNull(next.presentedFps)
                     send(Type.STOP, JSONObject().put("reason", "statistics complete"))
                     expect(Type.SESSION_END)

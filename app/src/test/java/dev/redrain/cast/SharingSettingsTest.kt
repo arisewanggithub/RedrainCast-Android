@@ -245,7 +245,7 @@ class SharingSettingsTest {
             assertNoSpinners(dialog.window!!.decorView)
             for ((key, checked, selected) in listOf(
                 Triple("videoCodec", 1, 2),
-                Triple("maxFps", 6, 8),
+                Triple("maxFps", 0, 9),
                 Triple("receiverOrientation", 2, 1),
                 Triple("audioCodec", 2, 1),
                 Triple("audioSource", 1, 0)
@@ -368,7 +368,7 @@ class SharingSettingsTest {
         assertSame(shownDialog, dialog)
         try {
             field<EditText>(dialog, "maxSize").setText("0")
-            choose(dialog, "maxFps", 7)
+            choose(dialog, "maxFps", 8)
             field<EditText>(dialog, "videoBitrate").setText("12.5")
             choose(dialog, "videoCodec", 1)
             choose(dialog, "receiverOrientation", 2)
@@ -401,10 +401,61 @@ class SharingSettingsTest {
         }
     }
 
-    @Test fun fpsPickerMatchesWindowsPresetsAndPersistsEveryOption() {
+    @Test fun maximumCaptureFpsLabelAndSummaryDescribeTheDefaultAsUncapped() {
         val controller = activity()
         val activity = controller.get()
-        val presets = listOf(15, 24, 25, 30, 48, 50, 60, 90, 120)
+        val current = SharingSettings.load(activity) { throw it }
+        val dialog = show(activity, current, {}, {})
+        latestDialog()
+        try {
+            val fps = field<Button>(dialog, "maxFps")
+            val body = fps.parent as LinearLayout
+            val caption = (0 until body.childCount).map(body::getChildAt)
+                .filterIsInstance<TextView>().single { it.labelFor == fps.id }
+            assertEquals("Maximum capture FPS", caption.text.toString())
+            assertEquals(activity.getString(R.string.rc_fps_uncapped), fps.text.toString())
+            assertEquals(0, current.maxFps)
+            assertEquals(1920, current.maxSize)
+            assertEquals("raw", current.audioCodec)
+            assertEquals(192_000, current.audioBitrate)
+            assertTrue(SharingSettings.summary(current).contains("Uncapped FPS"))
+            assertFalse(SharingSettings.summary(current).contains("0 fps"))
+            assertTrue(SharingSettings.summary(current.apply { maxFps = 30 }).contains("30 fps max"))
+        } finally {
+            dialog.dismiss()
+            controller.pause().stop().destroy()
+        }
+    }
+
+    @Test fun savedLegacyCapsAndRawAudioAreNotMigratedToNewDefaultsWhenEditing() {
+        val controller = activity()
+        val activity = controller.get()
+        val legacy = Settings().apply { maxFps = 60; audioCodec = "raw"; audioBitrate = 192_000 }
+        activity.getSharedPreferences(SharingSettings.PREFERENCES, Context.MODE_PRIVATE).edit()
+            .putString(SharingSettings.REQUEST, legacy.saved().toString()).commit()
+        val loaded = SharingSettings.load(activity) { throw it }
+        var saved: Settings? = null
+        val dialog = show(activity, loaded, { saved = it }, {})
+        latestDialog()
+        try {
+            assertEquals("60", field<Button>(dialog, "maxFps").text.toString())
+            click(dialog, AlertDialog.BUTTON_POSITIVE)
+            val result = checkNotNull(saved)
+            assertEquals(60, result.maxFps)
+            assertEquals("raw", result.audioCodec)
+            assertEquals(192_000, result.audioBitrate)
+            assertEquals(legacy.saved().toString(), result.saved().toString())
+        } finally {
+            dialog.dismiss()
+            controller.pause().stop().destroy()
+        }
+    }
+
+    @Test fun fpsPickerIncludesUncappedAndPersistsEveryCommonCap() {
+        val controller = activity()
+        val activity = controller.get()
+        val presets = listOf(0, 15, 24, 25, 30, 48, 50, 60, 90, 120)
+        val labels = presets.map { if (it == 0) activity.getString(R.string.rc_fps_uncapped) else it.toString() }
         try {
             for ((position, expected) in presets.withIndex()) {
                 val current = Settings()
@@ -412,15 +463,15 @@ class SharingSettingsTest {
                 val dialog = show(activity, current, { saved = it }, {})
                 latestDialog()
                 assertEquals(Button::class.java, field<Button>(dialog, "maxFps").javaClass)
-                assertEquals("60", field<Button>(dialog, "maxFps").text.toString())
+                assertEquals(activity.getString(R.string.rc_fps_uncapped), field<Button>(dialog, "maxFps").text.toString())
                 val picker = openChoice(dialog, "maxFps")
-                assertEquals(presets.map(Int::toString),
+                assertEquals(labels,
                     (0 until picker.listView.count).map { picker.listView.getItemAtPosition(it).toString() })
-                assertEquals(6, picker.listView.checkedItemPosition)
+                assertEquals(0, picker.listView.checkedItemPosition)
                 click(picker, AlertDialog.BUTTON_NEGATIVE)
                 choose(dialog, "maxFps", position)
-                assertEquals(expected.toString(), field<Button>(dialog, "maxFps").text.toString())
-                assertEquals(60, current.maxFps)
+                assertEquals(labels[position], field<Button>(dialog, "maxFps").text.toString())
+                assertEquals(0, current.maxFps)
                 click(dialog, AlertDialog.BUTTON_POSITIVE)
                 assertFalse(dialog.isShowing)
                 assertEquals(expected, checkNotNull(saved).maxFps)
@@ -443,12 +494,12 @@ class SharingSettingsTest {
             latestDialog()
             assertEquals("47", field<Button>(dialog, "maxFps").text.toString())
             val picker = openChoice(dialog, "maxFps")
-            assertEquals(listOf("15", "24", "25", "30", "47", "48", "50", "60", "90", "120"),
+            assertEquals(listOf(activity.getString(R.string.rc_fps_uncapped), "15", "24", "25", "30", "47", "48", "50", "60", "90", "120"),
                 (0 until picker.listView.count).map { picker.listView.getItemAtPosition(it).toString() })
-            assertEquals(4, picker.listView.checkedItemPosition)
+            assertEquals(5, picker.listView.checkedItemPosition)
             click(picker, AlertDialog.BUTTON_NEGATIVE)
             assertEquals("47", field<Button>(dialog, "maxFps").text.toString())
-            choose(dialog, "maxFps", 9)
+            choose(dialog, "maxFps", 10)
             click(dialog, AlertDialog.BUTTON_NEGATIVE)
             assertEquals(original, preferences.getString(SharingSettings.REQUEST, null))
             assertEquals(47, current.maxFps)
@@ -777,18 +828,18 @@ class SharingSettingsTest {
     @Test fun invalidPersistedDataWarnsExplicitlyAndOnlyThenReturnsDefaults() {
         val context = RuntimeEnvironment.getApplication()
         val preferences = context.getSharedPreferences(SharingSettings.PREFERENCES, Context.MODE_PRIVATE)
-        for (invalid in listOf("{broken", Settings().apply { maxFps = 0 }.request().toString())) {
+        for (invalid in listOf("{broken", Settings().apply { maxFps = -1 }.request().toString())) {
             preferences.edit().putString(SharingSettings.REQUEST, invalid).commit()
             val errors = mutableListOf<Exception>()
             val result = SharingSettings.load(context, errors::add)
             assertEquals(1, errors.size)
             assertNotNull(errors.single().cause)
             assertEquals(context.getString(R.string.rc_settings_read_error), errors.single().message)
-            assertEquals(60, result.maxFps)
+            assertEquals(0, result.maxFps)
             assertEquals(invalid, preferences.getString(SharingSettings.REQUEST, null))
         }
         preferences.edit().clear().commit()
         val result = SharingSettings.load(context) { fail("New installation must not warn") }
-        assertEquals(60, result.maxFps)
+        assertEquals(0, result.maxFps)
     }
 }

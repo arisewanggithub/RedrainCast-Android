@@ -8,19 +8,25 @@ import org.screencopy.receiver.media.TrimmedAudio
 
 class StreamRecoveryProtocolTest {
     @Test fun proofTimestampsAreCanonicalInt64StringsNeverJsonNumbers() {
-        val proof = StreamRecoveryProtocol.status(StreamRecoveryProtocol.COMPLETE, Int.MAX_VALUE.toLong(),
-            Long.MAX_VALUE - 1, Long.MAX_VALUE)
+        val proof = StreamRecoveryProtocol.status(StreamRecoveryProtocol.COMPLETE, 1, Int.MAX_VALUE.toLong(),
+            Long.MAX_VALUE - 1)
         val decoded = StrictJson.decode(proof.toString().toByteArray())
+        assertEquals(1, StreamRecoveryProtocol.track(decoded))
         assertEquals(Long.MAX_VALUE - 1, StreamRecoveryProtocol.timestamp(decoded, "keyPtsUs"))
-        assertEquals(Long.MAX_VALUE, StreamRecoveryProtocol.timestamp(decoded, "audioPtsUs"))
+        val audio = StreamRecoveryProtocol.status(StreamRecoveryProtocol.COMPLETE, 2, 2, Long.MAX_VALUE)
+        assertEquals(Long.MAX_VALUE, StreamRecoveryProtocol.timestamp(audio, "audioPtsUs"))
+        assertFalse(audio.has("keyPtsUs"))
         for (value in listOf<Any>("01", "-1", "+1", "1.0", "9223372036854775808", "", 123, JSONObject.NULL)) {
             assertThrows(ProtocolException::class.java) {
                 StreamRecoveryProtocol.timestamp(JSONObject().put("keyPtsUs", value), "keyPtsUs")
             }
         }
         assertThrows(ProtocolException::class.java) {
-            StreamRecoveryProtocol.status(StreamRecoveryProtocol.KEY, Int.MAX_VALUE.toLong() + 1, 0)
+            StreamRecoveryProtocol.status(StreamRecoveryProtocol.KEY, 1, Int.MAX_VALUE.toLong() + 1, 0)
         }
+        assertThrows(ProtocolException::class.java) { StreamRecoveryProtocol.status(StreamRecoveryProtocol.KEY, 2, 1, 0) }
+        for (track in listOf<Any>(0, 3, "1", JSONObject.NULL))
+            assertThrows(ProtocolException::class.java) { StreamRecoveryProtocol.track(JSONObject().put("track", track)) }
     }
 
     @Test fun opusDurationUsesTheTocIncludingLongAndMultiFramePackets() {

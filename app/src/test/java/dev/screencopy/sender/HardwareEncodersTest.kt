@@ -161,7 +161,7 @@ class HardwareEncodersTest {
         }
         assertEquals("", settings.videoEncoder)
         assertEquals(8_000_000, settings.videoBitrate)
-        assertEquals(60, settings.maxFps)
+        assertEquals(0, settings.maxFps)
     }
 
     @Test fun rawAudioBypassesEncodingWithoutInventingHardwareAndUnavailableInventoryFailsClosed() {

@@ -53,7 +53,9 @@ object SharingSettings {
         val audio = if (settings.audio) settings.audioCodec.uppercase(Locale.ROOT)
             else context.getString(R.string.rc_summary_audio_off)
         return context.getString(
-            R.string.rc_summary, settings.videoCodec.uppercase(Locale.ROOT), size, settings.maxFps,
+            R.string.rc_summary, settings.videoCodec.uppercase(Locale.ROOT), size,
+            if (settings.maxFps == 0) context.getString(R.string.rc_fps_uncapped_summary)
+                else context.getString(R.string.rc_summary_fps, settings.maxFps),
             decimal(settings.videoBitrate, 1_000_000), audio
         )
     }
@@ -190,9 +192,10 @@ object SharingSettings {
         }
         val size = edit(body, R.string.rc_max_size, current.maxSize.toString(), "maxSize", hint = R.string.rc_max_size_hint)
         label(body, R.string.rc_max_size_hint)
-        val fpsValues = (listOf(15, 24, 25, 30, 48, 50, 60, 90, 120) + current.maxFps)
+        val fpsValues = (listOf(0, 15, 24, 25, 30, 48, 50, 60, 90, 120) + current.maxFps)
             .distinct().sorted().map(Int::toString)
-        val fps = choice(body, R.string.rc_fps, fpsValues, fpsValues, current.maxFps.toString(), "maxFps")
+        val fpsLabels = fpsValues.map { if (it == "0") activity.getString(R.string.rc_fps_uncapped) else it }
+        val fps = choice(body, R.string.rc_fps, fpsValues, fpsLabels, current.maxFps.toString(), "maxFps")
         val bitrate = edit(body, R.string.rc_bitrate, decimal(current.videoBitrate, 1_000_000), "videoBitrate")
         val orientations = listOf("auto", "landscape", "portrait")
         val orientation = choice(

@@ -22,6 +22,35 @@ import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
 
 class ReceiverServerTest {
+    @Test fun uncappedCapabilityIsAdvertisedAndZeroFpsCanBeAcceptedWithoutInventingACap() {
+        ReceiverServer.forProtocolTests("Receiver").use { server ->
+            server.start()
+            connect(server).use { peer ->
+                val response = hello(peer, helloPayload().put("uncappedFps", true))
+                assertTrue(response.json().getBoolean("uncappedFps"))
+                val request = settings().apply { getJSONObject("video").put("maxFps", 0) }
+                send(peer, Type.SESSION_REQUEST, request, 77)
+                assertEquals(Type.SESSION_ACCEPT, read(peer).type)
+                send(peer, Type.STOP, JSONObject().put("reason", "done"), 77)
+                assertEquals(Type.SESSION_END, read(peer).type)
+            }
+            await { !server.busyForUpdate }
+        }
+    }
+
+    @Test fun malformedUncappedCapabilityFailsBeforeSessionAdmission() {
+        for (invalid in listOf("true", 1, JSONObject.NULL)) ReceiverServer.forProtocolTests("Receiver").use { server ->
+            server.start()
+            connect(server).use { peer ->
+                send(peer, Type.HELLO, helloPayload().put("uncappedFps", invalid))
+                val response = read(peer)
+                assertEquals(Type.ERROR, response.type)
+                assertTrue(response.json().string("message").contains("uncappedFps must be boolean"))
+            }
+            assertFalse(server.busyForUpdate)
+        }
+    }
+
     @Test fun frameAverageAboveKnownContentLightIsRejectedBeforeAccept() {
         ReceiverServer.forProtocolTests("Receiver",
             receiveCapabilities = { ReceiveCapabilities(true, true) }).use { server ->
@@ -821,7 +850,7 @@ class ReceiverServerTest {
         val response = read(peer)
         assertEquals(Type.HELLO, response.type)
         assertEquals(0L, response.session)
-        assertEquals(setOf("role", "versions", "name"), response.json().keys().asSequence().toSet())
+        assertEquals(setOf("role", "versions", "name", "uncappedFps"), response.json().keys().asSequence().toSet())
         assertEquals("receiver", response.json().string("role"))
         assertEquals(3, response.json().array("versions").getInt(0))
         return response

@@ -92,18 +92,8 @@ internal class ProjectionCapture(
 
     private fun configureVideo(settings: Settings, source: CaptureDisplay) {
         val geometry = VideoEncoderPreflight.validate(settings, DisplayInventory(listOf(source)))
-        val mime = checkNotNull(HardwareEncoderPolicy.mimeTypes[settings.videoCodec])
         val encoder = MediaCodec.createByCodecName(settings.videoEncoder).also { video = it }
-        val format = MediaFormat.createVideoFormat(mime, geometry.output.width, geometry.output.height).apply {
-            setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface)
-            setInteger(MediaFormat.KEY_BIT_RATE, settings.videoBitrate)
-            setInteger(MediaFormat.KEY_FRAME_RATE, settings.maxFps)
-            setFloat(MediaFormat.KEY_MAX_FPS_TO_ENCODER, settings.maxFps.toFloat())
-            setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 1)
-            setInteger(MediaFormat.KEY_MAX_B_FRAMES, 0)
-            setLong(MediaFormat.KEY_REPEAT_PREVIOUS_FRAME_AFTER, 100_000)
-            ProjectionPackets.options(this, settings.videoOptions)
-        }
+        val format = videoEncoderFormat(settings, geometry.output)
         encoder.configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
         val surface = encoder.createInputSurface().also { input = it }
         encoder.start(); videoStarted = true
@@ -229,6 +219,26 @@ internal class ProjectionCapture(
                 frames += count / 4
             }
         }
+    }
+
+    companion object {
+        internal fun videoEncoderFormat(settings: Settings, size: VideoSize): MediaFormat {
+            val mime = checkNotNull(HardwareEncoderPolicy.mimeTypes[settings.videoCodec])
+            return MediaFormat.createVideoFormat(mime, size.width, size.height).apply {
+                setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface)
+                setInteger(MediaFormat.KEY_BIT_RATE, settings.videoBitrate)
+                setInteger(MediaFormat.KEY_FRAME_RATE, 60)
+                if (settings.maxFps > 0) setFloat(MediaFormat.KEY_MAX_FPS_TO_ENCODER, settings.maxFps.toFloat())
+                setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 10)
+                setInteger(MediaFormat.KEY_MAX_B_FRAMES, 0)
+                setInteger(MediaFormat.KEY_COLOR_RANGE, MediaFormat.COLOR_RANGE_LIMITED)
+                setInteger(MediaFormat.KEY_PRIORITY, 0)
+                setInteger(MediaFormat.KEY_LATENCY, 1)
+                setLong(MediaFormat.KEY_REPEAT_PREVIOUS_FRAME_AFTER, 100_000)
+                ProjectionPackets.options(this, settings.videoOptions)
+            }
+        }
+
     }
 
     private fun worker(name: String, action: () -> Unit) {

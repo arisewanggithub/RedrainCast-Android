@@ -62,7 +62,10 @@
     <string name="rc_video_codec">Video codec</string>
     <string name="rc_max_size">Maximum natural edge (pixels)</string>
     <string name="rc_max_size_hint">0 keeps the original size</string>
-    <string name="rc_fps">Frames per second</string>
+    <string name="rc_fps">Maximum capture FPS</string>
+    <string name="rc_fps_uncapped">Uncapped (default)</string>
+    <string name="rc_fps_uncapped_summary">Uncapped FPS</string>
+    <string name="rc_summary_fps">%1$d fps max</string>
     <string name="rc_bitrate">Video bitrate (Mbps)</string>
     <string name="rc_receiver_orientation">Receiver orientation</string>
     <string name="rc_orientation_auto">Automatic</string>
@@ -101,6 +104,6 @@
     <string name="rc_invalid_number">Enter a valid number for %1$s.</string>
     <string name="rc_original_size">Original size</string>
     <string name="rc_summary_audio_off">Audio off</string>
-    <string name="rc_summary">%1$s · %2$s · %3$d fps · %4$s Mbps · %5$s</string>
+    <string name="rc_summary">%1$s · %2$s · %3$s · %4$s Mbps · %5$s</string>
     <string name="rc_summary_size">%1$d px</string>
 </resources>

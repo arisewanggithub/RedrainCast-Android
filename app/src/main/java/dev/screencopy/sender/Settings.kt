@@ -10,7 +10,7 @@ class Settings {
     var videoOptions = ""
     var videoBitrate = 8_000_000
     var maxSize = 1920
-    var maxFps = 60
+    var maxFps = 0
     var displayId = 0
     var cropWidth = 0
     var cropHeight = 0
@@ -35,7 +35,7 @@ class Settings {
         range(videoBitrate, 100_000, 200_000_000, "Video bitrate")
         if (audioCodec != "raw") range(audioBitrate, 16_000, 512_000, "Audio bitrate")
         else require(audioBitrate > 0, "Raw audio bitrate placeholder must remain positive; actual PCM rate is not selectable")
-        range(maxSize, 0, 16384, "Maximum size"); range(maxFps, 1, 240, "Maximum FPS")
+        range(maxSize, 0, 16384, "Maximum size"); range(maxFps, 0, 240, "Maximum capture FPS")
         range(displayId, 0, Int.MAX_VALUE, "Display")
         require(videoEncoder.isEmpty() || name.matches(videoEncoder), "Invalid video encoder name")
         require(audioEncoder.isEmpty() || name.matches(audioEncoder), "Invalid audio encoder name")

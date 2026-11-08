@@ -159,7 +159,8 @@ class AudioPlayer(
         require(samples.size % format.channels == 0) { "PCM packet is not frame aligned" }
         var slice = startup.apply(samples.size / format.channels, ptsUs)
         recoveryCutoffUs?.let { cutoff ->
-            slice = trimRecoveryAudio(slice, cutoff, format.sampleRate)
+            slice = trimRecoveryAudio(slice, if (firstPtsUs == null) maxOf(cutoff, clock.currentUs() ?: cutoff) else cutoff,
+                format.sampleRate)
         }
         if (slice.frames == 0) return
         if (firstPtsUs == null) {
@@ -173,7 +174,11 @@ class AudioPlayer(
         stage = "STARTUP_SYNC"
         val decoded = pending ?: return
         while (running.get()) {
-            val slice = clock.prepareAudio(decoded.slice, format.sampleRate) ?: return
+            val fresh = recoveryCutoffUs?.let { cutoff ->
+                trimRecoveryAudio(decoded.slice, maxOf(cutoff, clock.currentUs() ?: cutoff), format.sampleRate)
+            } ?: decoded.slice
+            if (fresh.frames == 0) { pending = null; return }
+            val slice = clock.prepareAudio(fresh, format.sampleRate) ?: return
             if (slice.frames == 0) { pending = null; return }
             if (!clock.awaitAudioStart(slice.audiblePtsUs) { running.get() }) continue
             pending = null

@@ -78,9 +78,10 @@ class VideoPlayer private constructor(
     private var lastReportedLate = 0L
     internal var onDecoded: (Long) -> Unit = {}
     @Volatile internal var discardOutputBeforePts: Long? = null
+    @Volatile internal var dropStaleOutput = false
 
     init {
-        require(format.width in 1..8192 && format.height in 1..8192 && format.frameRate in 1..240 &&
+        require(format.width in 1..8192 && format.height in 1..8192 && format.frameRate in 0..240 &&
             format.rotation in listOf(0, 90, 180, 270) && generation > 0) { "Invalid video output format" }
         decoder = try {
             requireSupportedRotation(format.videoColor != null, format.rotation)
@@ -117,6 +118,12 @@ class VideoPlayer private constructor(
             }
             stage = VideoStage.CLOCK
             delayUs = clock.delayUs(heldPtsUs)
+            if (dropStaleOutput && delayUs?.let { it < -250_000 } == true) {
+                decoder.releaseOutput(heldOutput, null)
+                decodedSkipped++
+                heldOutput = -1
+                return
+            }
             if (delayUs?.let { it < -250_000 } == true) lateRendered++
             stage = VideoStage.OUTPUT_RELEASE
             requireSupportedRotation(format.videoColor != null, heldRotation)
@@ -128,6 +135,7 @@ class VideoPlayer private constructor(
                 throw PlaybackException("HDR output became unavailable; restart casting with SDR", "UNSUPPORTED_CONFIG")
             if (statisticsEnabled) pathStatistics.scheduled(heldPtsUs, heldPath)
             decoder.releaseOutput(heldOutput, clock.monotonicNs())
+            clock.videoPresented(heldPtsUs)
             renderSubmitted++
             heldOutput = -1
             reportPresentation()
@@ -284,10 +292,10 @@ class VideoPlayer private constructor(
 
         fun mediaFormat(format: VideoFormat): MediaFormat {
             require(format.width in 1..8192 && format.height in 1..8192) { "Unsupported video dimensions" }
-            require(format.frameRate in 1..240) { "Unsupported video frame rate" }
+            require(format.frameRate in 0..240) { "Unsupported video frame rate" }
             require(format.rotation in listOf(0, 90, 180, 270)) { "Invalid video rotation" }
             return MediaFormat.createVideoFormat(format.mime, format.width, format.height).apply {
-                setInteger(MediaFormat.KEY_FRAME_RATE, format.frameRate)
+                if (format.frameRate > 0) setInteger(MediaFormat.KEY_FRAME_RATE, format.frameRate)
                 setInteger(MediaFormat.KEY_ROTATION, 0)
                 setInteger(MediaFormat.KEY_MAX_INPUT_SIZE, 8 * 1024 * 1024)
                 format.videoColor?.let { color ->

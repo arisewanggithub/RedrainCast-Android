@@ -87,6 +87,13 @@ class PlaybackStatisticsTest {
         assertEquals(0.0, sampler.sample(3000, input(count = 60)).rxFps!!, 0.0)
     }
 
+    @Test fun uncappedCaptureLimitIsNotShownAsZeroFpsOrAsMeasuredThroughput() {
+        val snapshot = PlaybackStatisticsSampler().sample(1000, input().copy(requestedFps = 0))
+        val display = PlaybackStatisticsText.display(snapshot, 1080, 1920)
+        assertEquals("Uncapped", display.video.first { it.id == "captureLimit" }.value)
+        assertNull(snapshot.rxFps)
+    }
+
     @Test fun skippedPercentageUsesActualPresentedPlusSkippedRatherThanDecodedOrReceived() {
         val sampler = PlaybackStatisticsSampler()
         sampler.sample(1000, input())

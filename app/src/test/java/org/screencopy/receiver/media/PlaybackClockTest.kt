@@ -94,6 +94,42 @@ class PlaybackClockTest {
         assertThrows(PlaybackException::class.java) { clock.audioStartDelayUs(1_000_000) }
     }
 
+    @Test fun recoveringAudioKeepsTheSourceTimelineAndTemporaryOffsetIsNotFatal() {
+        val time = FakeTime()
+        val clock = time.clock()
+        clock.anchorVideo(1_000_000)
+        clock.anchorAudio(1_000_000) { 20_000 }
+        clock.audioWritten(40_000)
+        clock.detachAudio()
+        assertEquals(1_020_000L, clock.currentUs())
+        time.advanceUs(500_000)
+        assertFalse("Stale samples must be retrimmed, not fail or rewind the source clock",
+            clock.awaitAudioStart(1_000_000) { true })
+        assertEquals(1_520_000L, clock.currentUs())
+        assertTrue(clock.awaitAudioStart(5_020_000) { true })
+        assertEquals(5_020_000L, clock.currentUs())
+        clock.anchorAudio(5_020_000) { 0 }
+        assertEquals(5_020_000L, clock.currentUs())
+    }
+
+    @Test fun resumedOutputCannotRewindTheClockWhenStartupSleepOvershootsItsSamplePts() {
+        val time = FakeTime()
+        val clock = time.clock()
+        clock.anchorVideo(1_000_000)
+        clock.anchorAudio(1_000_000) { 20_000 }
+        clock.audioWritten(40_000)
+        assertEquals(1_020_000L, clock.currentUs())
+        clock.detachAudio()
+        time.advanceUs(500_000)
+        assertEquals(1_520_000L, clock.currentUs())
+        var presented = 0L
+        clock.anchorAudio(1_519_000) { presented }
+        assertEquals(1_520_000L, clock.currentUs())
+        clock.audioWritten(20_000)
+        presented = 2_000
+        assertEquals(1_521_000L, clock.currentUs())
+    }
+
     @Test fun defaultVideoNeverWaitsForTheAudioSourceClockEvenAfterPreroll() {
         val time = FakeTime()
         val clock = time.clock().apply { audioExpected = true }
@@ -108,6 +144,71 @@ class PlaybackClockTest {
         playedUs = 3_000_000
         assertEquals(0L, clock.videoDelayUs(1_000_000))
         assertEquals(0L, clock.videoDelayUs(9_000_000))
+    }
+
+    @Test fun recoveringBeforeFirstAudioUsesItsOwnStartupStateWithoutRebasingVideo() {
+        val time = FakeTime()
+        val clock = time.clock().apply { audioExpected = true; recoveryStartup = true }
+        clock.anchorVideo(1_000_000)
+        time.advanceUs(2_000_000)
+        clock.beginAudioRecovery()
+        clock.recoveryStartup = false
+        clock.detachAudio()
+        time.advanceUs(2_000_000)
+        clock.checkStartup()
+        assertEquals(5_000_000L, clock.currentUs())
+        val slice = TrimmedAudio(0, 960, 5_000_000)
+        assertEquals(slice, clock.prepareAudio(slice, 48000))
+        assertEquals(5_000_000L, clock.currentUs())
+        assertTrue(clock.awaitAudioStart(slice.audiblePtsUs) { true })
+        clock.anchorAudio(slice.audiblePtsUs) { 0 }
+        clock.endAudioRecovery()
+        clock.checkStartup()
+        assertEquals(5_000_000L, clock.currentUs())
+    }
+
+    @Test fun recoveringAudioCanInitializeAnUnanchoredClockWithoutWaitingForVideo() {
+        val time = FakeTime()
+        val clock = time.clock().apply { audioExpected = true }
+        clock.beginAudioRecovery()
+        assertTrue(clock.canPrepareAudio())
+        val slice = TrimmedAudio(0, 960, 9_000_000)
+        assertEquals(slice, clock.prepareAudio(slice, 48000))
+        assertTrue(clock.awaitAudioStart(slice.audiblePtsUs) { true })
+        clock.anchorAudio(slice.audiblePtsUs) { 0 }
+        clock.endAudioRecovery()
+        clock.anchorVideo(7_000_000)
+        assertEquals(9_000_000L, clock.currentUs())
+    }
+
+    @Test fun ordinaryInitialStartupRetainsTheThreeSecondDeadline() {
+        val time = FakeTime()
+        val clock = time.clock().apply { audioExpected = true }
+        clock.anchorVideo(1_000_000)
+        time.advanceUs(2_999_999)
+        clock.checkStartup()
+        time.advanceUs(1)
+        assertThrows(PlaybackException::class.java) { clock.checkStartup() }
+    }
+
+    @Test fun freshVideoPresentationBootstrapsRecoveringAudioWithoutPreservingAnOldArrivalDelay() {
+        val time = FakeTime()
+        val clock = time.clock().apply { audioExpected = true }
+        time.advanceUs(300_000)
+        clock.anchorVideo(1_000_000)
+        time.advanceUs(300_000)
+        clock.beginAudioRecovery()
+        assertEquals(1_300_000L, clock.currentUs())
+        clock.videoPresented(1_600_000)
+        assertEquals(1_600_000L, clock.currentUs())
+        val slice = TrimmedAudio(0, 960, 1_600_000)
+        assertEquals(slice, clock.prepareAudio(slice, 48000))
+        assertTrue(clock.awaitAudioStart(slice.audiblePtsUs) { true })
+        assertEquals(600_000_000L, time.ns)
+        clock.anchorAudio(slice.audiblePtsUs) { 0 }
+        clock.endAudioRecovery()
+        clock.videoPresented(1_900_000)
+        assertEquals(1_600_000L, clock.currentUs())
     }
 
     private class FakeTime {
