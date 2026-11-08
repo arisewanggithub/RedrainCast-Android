@@ -288,7 +288,7 @@ class PlaybackStatisticsOverlay @JvmOverloads constructor(
             return column
         }
         val video = bodySection("VIDEO STREAM")
-        if (layoutMode == 2) video.layoutParams = LayoutParams(0, -2, 1f)
+        if (layoutMode == 2) video.layoutParams = LayoutParams(0, -2, 1.35f)
         table(video, model.video, size)
         val audio = bodySection("AUDIO & SYNC")
         if (layoutMode == 2) audio.layoutParams = LayoutParams(0, -2, 1.25f)
@@ -299,7 +299,7 @@ class PlaybackStatisticsOverlay @JvmOverloads constructor(
         } else if (layoutMode == 2) {
             val queues = bodySection("CONNECTIONS")
             queues.removeAllViews()
-            queues.layoutParams = LayoutParams(0, -2, 1.35f)
+            queues.layoutParams = LayoutParams(0, -2, 1f)
             connections(queues, model, size)
         }
         addView(body, LayoutParams(-1, -2))

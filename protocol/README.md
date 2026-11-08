@@ -183,6 +183,8 @@ Compact panels use 2dp outer vertical insets (normal panels retain 4dp) to
 accommodate the additional rows without changing font size or removing metrics.
 Compact landscape panel width is capped at 60% of the viewport so the taller
 video metadata group still leaves more than half the player area uncovered.
+Within that panel, video receives a 1.35 column share, audio 1.25 and queues 1.0
+to fit decoded metadata and raster values without unnecessary wrapping.
 
 Incoming HDR10 is validated independently of presentation; PQ/BT.709 comes
 from actual decoder output color metadata. Missing SDR metadata remains N/A.

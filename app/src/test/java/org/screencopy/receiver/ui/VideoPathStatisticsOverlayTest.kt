@@ -12,6 +12,7 @@ import org.robolectric.Robolectric
 import org.robolectric.RobolectricTestRunner
 import org.robolectric.annotation.Config
 import org.robolectric.annotation.ConscryptMode
+import org.robolectric.annotation.GraphicsMode
 import org.screencopy.receiver.media.*
 
 @RunWith(RobolectricTestRunner::class)
@@ -78,7 +79,14 @@ class VideoPathStatisticsOverlayTest {
         } finally { controller.pause().stop().destroy() }
     }
 
-    @Test fun legacyLayoutRetainsMetadataRowsAtPhoneDensityAndFontScaleInBothOrientations() {
+    @Test fun legacyLayoutRetainsMetadataRowsAtPhoneDensityAndFontScaleInBothOrientations() =
+        verifyMetadataRowsAtPhoneDensity()
+
+    @Test @GraphicsMode(GraphicsMode.Mode.NATIVE)
+    fun nativeLayoutRetainsMetadataRowsAtPhoneDensityAndFontScaleInBothOrientations() =
+        verifyMetadataRowsAtPhoneDensity()
+
+    private fun verifyMetadataRowsAtPhoneDensity() {
         val controller = Robolectric.buildActivity(Activity::class.java).setup()
         try {
             val activity = controller.get()
