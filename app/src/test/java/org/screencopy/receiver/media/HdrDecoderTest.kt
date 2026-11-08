@@ -109,6 +109,15 @@ class HdrDecoderTest {
         assertFalse(sdr.containsKey(MediaFormat.KEY_PROFILE))
         assertFalse(sdr.containsKey(MediaFormat.KEY_COLOR_TRANSFER))
     }
+    @Test fun uncappedHdrMediaFormatPreservesRasterAndColorWithoutAFrameRateHint() {
+        val format = VideoPlayer.mediaFormat(VideoFormat("video/hevc", 3456, 2160, emptyList(), 0,
+            videoColor = HdrVideoColor()))
+        assertFalse(format.containsKey(MediaFormat.KEY_FRAME_RATE))
+        assertEquals(3456, format.getInteger(MediaFormat.KEY_WIDTH))
+        assertEquals(2160, format.getInteger(MediaFormat.KEY_HEIGHT))
+        assertEquals(MediaCodecInfo.CodecProfileLevel.HEVCProfileMain10HDR10, format.getInteger(MediaFormat.KEY_PROFILE))
+        AndroidVideoDecoder.validateColor(format, false)
+    }
     @Test fun missingUnsupportedOrIncorrectOutputDoesNotVerifyToneMapping() {
         val input = MediaFormat()
         assertThrows(PlaybackException::class.java) { AndroidVideoDecoder.validateToneMapInput(input) }
