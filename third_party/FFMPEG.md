@@ -44,6 +44,10 @@ published by this
 [successful GitHub Actions run](https://github.com/arisewanggithub/RedrainCast-Native/actions/runs/42103770241).
 Its release includes checksums, upstream source, build/relink materials,
 provenance and per-ABI static/Prefab consumer validation.
+The Android consumer also accepts future platform-specific release paths such
+as `redraincast-ffmpeg-android-pcm-7.1.3-r2`; the AAR module and asset naming
+remain `ffmpeg-pcm-android`. Windows decoder releases are separate and do not
+change this Android dependency.
 
 Use the normal Gradle build commands in the repository README. No Bash/make
 FFmpeg toolchain is required for these application builds. NDK/CMake remain
