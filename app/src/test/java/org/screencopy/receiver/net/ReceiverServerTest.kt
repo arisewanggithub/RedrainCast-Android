@@ -718,9 +718,14 @@ class ReceiverServerTest {
                 }.toByteArray()
                 peer.outputStream.write(coalesced)
                 peer.outputStream.flush()
-                assertEquals(Type.SESSION_ACCEPT, read(peer).type)
-                assertEquals(Type.PONG, read(peer).type)
-                assertEquals(Type.SESSION_END, read(peer).type)
+                var response = read(peer)
+                if (response.type == Type.SESSION_ACCEPT) response = read(peer)
+                if (response.type == Type.PONG) {
+                    assertEquals(7, response.json().getInt("nonce"))
+                    response = read(peer)
+                }
+                assertEquals(Type.SESSION_END, response.type)
+                assertEquals("coalesced", response.json().string("reason"))
             }
         }
     }
