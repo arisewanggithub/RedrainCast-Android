@@ -13,6 +13,61 @@ import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 
 class SenderSessionTeardownTest {
+    @Test(timeout = 15_000) fun mediaEofWaitsForTerminalWriteResultWithoutMaskingWriteFailure() {
+        for ((remoteStop, failWrite) in listOf(false to false, true to false, false to true)) {
+            runSession { server, session, link ->
+                val flushed = CountDownLatch(1)
+                val resume = CountDownLatch(1)
+                val mediaClosed = CountDownLatch(1)
+                val readersCaughtEof = CountDownLatch(2)
+                val readersFinished = CountDownLatch(2)
+                val peer = CompletableFuture.runAsync {
+                    attachPeer(server, v2 = true) { control, video, audio ->
+                        if (remoteStop)
+                            Wire.write(control.outputStream, Wire.control(Wire.STOP, ID, Wire.obj("reason" to "user")))
+                        assertEquals(if (remoteStop) Wire.SESSION_END else Wire.STOP, terminal(control).type)
+                        video.shutdownOutput()
+                        audio.shutdownOutput()
+                        mediaClosed.countDown()
+                        if (!remoteStop)
+                            Wire.write(control.outputStream, Wire.control(Wire.SESSION_END, ID, Wire.obj("reason" to "user")))
+                        assertEquals(-1, control.inputStream.read())
+                    }
+                }
+                negotiate(link)
+                val connected = Mockito.mock(ReceiverLink::class.java,
+                    Mockito.withSettings().spiedInstance(link).defaultAnswer { invocation ->
+                        val result = invocation.callRealMethod()
+                        val message = invocation.arguments.firstOrNull() as? Wire.Message
+                        if (invocation.method.name == "send" && message?.type in setOf(Wire.STOP, Wire.SESSION_END)) {
+                            flushed.countDown()
+                            check(resume.await(5, TimeUnit.SECONDS))
+                            if (failWrite) throw java.net.SocketTimeoutException("terminal write deadline")
+                        }
+                        result
+                    })
+                try {
+                    session.prepare(connected)
+                    if (!remoteStop) session.sender.stop()
+                    session.startWorkers(watchMedia = true, mediaEof = readersCaughtEof, mediaFinished = readersFinished)
+                    assertTrue(flushed.await(2, TimeUnit.SECONDS))
+                    assertTrue(mediaClosed.await(2, TimeUnit.SECONDS))
+                    assertTrue(readersCaughtEof.await(2, TimeUnit.SECONDS))
+                    assertFalse("EOF classification must wait for the in-flight terminal write",
+                        readersFinished.await(100, TimeUnit.MILLISECONDS))
+                    assertNull(session.outcome.failure)
+                    resume.countDown()
+                    assertTrue(readersFinished.await(2, TimeUnit.SECONDS))
+                    session.sender.retireTransport()
+                    peer.get(3, TimeUnit.SECONDS)
+                    if (failWrite)
+                        assertEquals("TIMEOUT", SessionOutcome.errorCode(checkNotNull(session.outcome.failure)))
+                    else assertNull(session.outcome.failure)
+                } finally { resume.countDown() }
+            }
+        }
+    }
+
     @Test(timeout = 15_000) fun crossedStopsDrainStartedMediaAndAcknowledgeWithoutDuplicateTerminalWrites() {
         val failures = java.util.concurrent.ConcurrentLinkedQueue<org.screencopy.receiver.ui.FailureDiagnostic>()
         org.screencopy.receiver.net.ReceiverServer.forProtocolTests("Receiver", onFailure = failures::add).use { receiver ->
@@ -386,7 +441,8 @@ class SenderSessionTeardownTest {
 
         fun receiverStopSeen(): Boolean = field("remoteStop").getBoolean(sender)
 
-        fun startWorkers(media: Boolean = false) {
+        fun startWorkers(media: Boolean = false, watchMedia: Boolean = false,
+                         mediaEof: CountDownLatch? = null, mediaFinished: CountDownLatch? = null) {
             val entered = CountDownLatch(1)
             val read = SenderSession::class.java.getDeclaredMethod("readLoop").apply { isAccessible = true }
             val write = SenderSession::class.java.getDeclaredMethod("writeLoop", Int::class.javaPrimitiveType)
@@ -394,6 +450,13 @@ class SenderSessionTeardownTest {
             workers.add(Thread({ entered.countDown(); read.invoke(sender) }, "fixture-control-reader").also { it.start() })
             workers.add(Thread({ write.invoke(sender, 0) }, "fixture-control-writer").also { it.start() })
             if (media) workers.add(Thread({ write.invoke(sender, 1) }, "fixture-media-writer").also { it.start() })
+            if (watchMedia) for (track in 1..2) workers.add(Thread({
+                try { checkNotNull(field("link").get(sender) as? ReceiverLink).watchMedia(track) }
+                catch (error: java.io.IOException) {
+                    if (error is EOFException) mediaEof?.countDown()
+                    sender.recordMediaFailure(error, SessionOutcome.Origin.RECEIVER_READ)
+                } finally { mediaFinished?.countDown() }
+            }, "fixture-media-reader-$track").also { it.start() })
             assertTrue(entered.await(1, TimeUnit.SECONDS))
         }
 

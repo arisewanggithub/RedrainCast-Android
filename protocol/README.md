@@ -311,6 +311,11 @@ Pending receiver STOP delivery has its own 22-second bound, with each selected
 control write still limited to ten seconds. Crossed local Stops acknowledge
 terminal intent without adding another terminal frame; retirement still waits
 for the already-serialized receiver STOP write to finish successfully.
+Local and peer Stop intents are arbitrated atomically before closing media or
+choosing a terminal frame. A queued fatal ERROR supersedes an unsent orderly
+terminal and cannot be replaced by STOP/SESSION_END. Sender media EOF received
+while its terminal write is completing waits for that write's result: successful
+delivery permits peer media retirement, but a failed write remains fatal.
 Stop halts installed workers before waiting for serialized recovery retirement,
 outside the playback-state lock. An in-flight replacement must recheck ownership
 and stopping state before installation or readiness publication.

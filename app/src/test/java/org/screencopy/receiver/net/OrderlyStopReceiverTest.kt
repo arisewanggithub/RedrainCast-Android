@@ -137,6 +137,52 @@ class OrderlyStopReceiverTest {
         }
     }
 
+    @Test(timeout = 10_000) fun peerStopRacingLocalStopArbitratesBeforeClosingMediaOrChoosingTerminal() {
+        val clock = AtomicLong(100_000)
+        val entered = CountDownLatch(1)
+        val resume = CountDownLatch(1)
+        val failures = ConcurrentLinkedQueue<FailureDiagnostic>()
+        ReceiverServer.forProtocolTests("Receiver", timeMilliseconds = clock::get, onFailure = failures::add,
+            controlWrite = { socket, message ->
+                if (message.type == Type.PONG) {
+                    entered.countDown()
+                    check(resume.await(5, TimeUnit.SECONDS))
+                }
+                Wire.write(socket.outputStream, message)
+            }).use { server ->
+            try {
+                server.start()
+                control(server).use { peer ->
+                    MediaSockets.attach(server, negotiate(peer)).use {
+                        val owner = owner(server)
+                        send(peer, Type.PING, JSONObject().put("nonce", 23))
+                        assertTrue(entered.await(2, TimeUnit.SECONDS))
+                        synchronized(checkNotNull(field(owner, "playbackLock"))) {
+                            send(peer, Type.STOP, JSONObject().put("reason", "racing sender Stop"))
+                            await {
+                                Thread.getAllStackTraces().any { (thread, trace) ->
+                                    thread.state == Thread.State.BLOCKED &&
+                                        trace.any { it.methodName == "receiveStop" }
+                                }
+                            }
+                            server.disconnect("racing receiver Stop")
+                        }
+                        clock.addAndGet(3000)
+                        tick(owner)
+                        assertEquals(true, field(owner, "accepted"))
+                        assertTrue(failures.toString(), failures.isEmpty())
+                        resume.countDown()
+                        assertEquals(Type.PONG, Wire.read(peer.inputStream).type)
+                        assertEquals(Type.STOP, Wire.read(peer.inputStream).type)
+                        assertEquals(-1, peer.inputStream.read())
+                        await { !server.busyForUpdate }
+                        assertTrue(failures.toString(), failures.isEmpty())
+                    }
+                }
+            } finally { resume.countDown() }
+        }
+    }
+
     @Test(timeout = 10_000) fun controlEofOrFatalPeerErrorDuringStopCannotBecomeCleanRetirement() {
         for (peerError in listOf(false, true)) {
             val failures = ConcurrentLinkedQueue<FailureDiagnostic>()

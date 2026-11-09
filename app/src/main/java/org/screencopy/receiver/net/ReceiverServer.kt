@@ -671,10 +671,9 @@ class ReceiverServer private constructor(
                         if (orderlyStop) awaitStopWrite()
                         return
                     }
-                    if (orderlyStop && message.type == Type.STOP) {
-                        message.json().string("reason", 1024)
-                        awaitStopWrite()
-                        return
+                    if (message.type == Type.STOP) {
+                        if (receiveStop(message.json().string("reason", 1024))) return
+                        continue
                     }
                     if (stopping.get() && !(orderlyStop && message.type == Type.ERROR)) continue
                     when (message.type) {
@@ -697,15 +696,6 @@ class ReceiverServer private constructor(
                                 throw ProtocolException(code, "Sender: $detail")
                             }
                             onStatus("Sender warning: $code", detail)
-                        }
-                        Type.STOP -> {
-                            val reason = message.json().string("reason", 1024)
-                            stopAt = now()
-                            stopping.set(true)
-                            closeMedia()
-                            stopPlayback()
-                            send(Type.SESSION_END, JSONObject().put("reason", reason))
-                            return
                         }
                         else -> throw ProtocolException("PROTOCOL", "Message is not allowed in current session state")
                     }
@@ -1110,10 +1100,12 @@ class ReceiverServer private constructor(
         }
 
         private fun playbackFailed(code: String, reason: String, origin: FailureOrigin) {
-            if (!playbackError.compareAndSet(null, reason)) return
-            terminalError = true
-            stopAt = now()
-            stopping.set(true)
+            synchronized(playbackLock) {
+                if (stopping.get() || !playbackError.compareAndSet(null, reason)) return
+                terminalError = true
+                stopAt = now()
+                stopping.set(true)
+            }
             onStatus("Playback failed", "$reason\nReconnect after reducing sender load or fixing the output device.")
             if (active.get() === this) reportFailure(code, reason, if (code == "AUDIO_FAILED") FailureOrigin.AUDIO else origin)
             try {
@@ -1178,6 +1170,23 @@ class ReceiverServer private constructor(
                 }
             }
 
+        }
+
+        private fun receiveStop(reason: String): Boolean {
+            val crossed = synchronized(playbackLock) {
+                if (orderlyStop) true else {
+                    if (stopping.get()) return false
+                    stopAt = now()
+                    stopping.set(true)
+                    false
+                }
+            }
+            if (crossed) awaitStopWrite() else {
+                closeMedia()
+                stopPlayback()
+                send(Type.SESSION_END, JSONObject().put("reason", reason))
+            }
+            return true
         }
 
         private fun failOrderlyStop(error: Exception) {

@@ -61,6 +61,7 @@ class SenderSession internal constructor(
     @Volatile private var remoteStop = false
     @Volatile private var closing = false
     @Volatile private var mediaRetiring = false
+    @Volatile private var terminalWriting = false
     @Volatile private var lastIncoming = 0L
     @Volatile private var writeStarted = 0L
     @Volatile private var phaseDeadline = 0L
@@ -133,6 +134,21 @@ class SenderSession internal constructor(
     }
     fun captureFailed(error: Exception) = fail(error, SessionOutcome.Origin.CAPTURE)
     internal fun recordMediaFailure(error: Exception, origin: SessionOutcome.Origin) {
+        if (origin == SessionOutcome.Origin.RECEIVER_READ && error is java.io.EOFException &&
+            terminalWriting && link?.streamRecovery == true) {
+            try {
+                if (!terminalSent.await(22, TimeUnit.SECONDS)) {
+                    fail(IOException("TIMEOUT: terminal write did not finish after media EOF", error), origin)
+                    closeLink()
+                    return
+                }
+            } catch (interrupted: InterruptedException) {
+                Thread.currentThread().interrupt()
+                fail(IOException("Media EOF classification interrupted", interrupted), origin)
+                closeLink()
+                return
+            }
+        }
         if ((stopping || closing) && !linkClosed && !mediaRetiring && outcome.failure == null && link?.streamRecovery == true &&
             error is IOException) {
             fail(IOException("${if (error is java.net.SocketTimeoutException) "TIMEOUT" else "PROTOCOL"}: " +
@@ -454,6 +470,7 @@ class SenderSession internal constructor(
                 if (message != null) {
                     if (lane == 0) writeStarted = now()
                     mux.beginWrite(message)
+                    if (message.type in setOf(Wire.STOP, Wire.SESSION_END, Wire.ERROR)) terminalWriting = true
                     try {
                         connected.send(message)
                         writeCompleted(message)
