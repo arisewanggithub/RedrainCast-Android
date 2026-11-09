@@ -9,6 +9,32 @@ import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicLong
 
 class MediaBudgetTest {
+    @Test fun orderlyTerminalWaitsForBothSelectedMediaFramesAndDropsUnsentFrames() {
+        val mux = MediaBudget(true)
+        val started = (1..2).map { track ->
+            configure(mux, track, 1)
+            mux.pollLane(track, 1)?.let(mux::endWrite)
+            mux.ready(track, 1)
+            frame(track, 1, 0, 10).also { mux.offer(it) }
+        }
+        for (message in started) {
+            assertSame(message, mux.pollLane(message.track, 1))
+            mux.beginWrite(message)
+            mux.offer(frame(message.track, 1, 1, 20))
+        }
+        val terminal = Wire.control(Wire.SESSION_END, 1, Wire.obj("reason" to "user"))
+        mux.finish(terminal, drainStartedMedia = true)
+        assertEquals(0, mux.queuedBytes())
+        assertNull(mux.pollLane(0, 1))
+        mux.endWrite(started[0])
+        assertNull("Completing video cannot cancel started audio", mux.pollLane(0, 1))
+        mux.endWrite(started[1])
+        assertSame(terminal, mux.pollLane(0, 1))
+        assertNull(mux.pollLane(1, 1))
+        assertNull(mux.pollLane(2, 1))
+        assertThrows(SessionCancelledException::class.java) { mux.offer(frame(1, 1, 2, 1)) }
+    }
+
     private fun frame(track: Int, generation: Int, pts: Long, size: Int) =
         Wire.Message(if (track == 1) Wire.VIDEO_FRAME else Wire.AUDIO_PACKET, 0, 1, track, generation, pts, ByteArray(size))
     private fun configure(mux: MediaBudget, track: Int, generation: Int) =

@@ -7,6 +7,7 @@ import java.io.DataInputStream
 import java.io.IOException
 import java.io.InputStream
 import java.io.OutputStream
+import java.io.EOFException
 import java.nio.ByteBuffer
 import java.nio.charset.CharacterCodingException
 import java.nio.charset.CodingErrorAction
@@ -59,9 +60,14 @@ object Wire {
         if (if (media) pts < 0 else pts != -1L) throw IOException("PROTOCOL: invalid PTS")
     }
 
-    fun read(source: InputStream): Message {
+    fun read(source: InputStream, started: () -> Unit = {}): Message {
+        val first = source.read()
+        if (first < 0) throw EOFException()
+        started()
         val input = DataInputStream(source)
-        if (input.readInt() != 0x53435059) throw IOException("VERSION: SCPY wire magic required; TLS is unsupported")
+        val magic = (first shl 24) or (input.readUnsignedByte() shl 16) or
+            (input.readUnsignedByte() shl 8) or input.readUnsignedByte()
+        if (magic != 0x53435059) throw IOException("VERSION: SCPY wire magic required; TLS is unsupported")
         if (input.readUnsignedShort() != VERSION) throw IOException("VERSION: wire protocol version 3 is required")
         val type = input.readUnsignedShort()
         val size = input.readInt()

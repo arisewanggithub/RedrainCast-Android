@@ -14,6 +14,132 @@ import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 
 class CongestionDiagnosticsTest {
+    @Test fun fatalErrorWinsOverQueuedOrderlyTerminalsAndCannotBeAbandoned() {
+        for (offered in listOf(
+            listOf(Type.ERROR, Type.STOP, Type.SESSION_END),
+            listOf(Type.STOP, Type.ERROR, Type.SESSION_END),
+            listOf(Type.SESSION_END, Type.ERROR, Type.STOP)
+        )) {
+            val entered = CountDownLatch(1)
+            val resume = CountDownLatch(1)
+            val delivered = CountDownLatch(1)
+            val written = ConcurrentLinkedQueue<Type>()
+            val failures = ConcurrentLinkedQueue<String>()
+            val socket = Socket()
+            ControlWriter(socket, {
+                written.add(it.type)
+                if (it.type == Type.ERROR) delivered.countDown()
+            }, failures::add, writeFrame = { _, message ->
+                if (message.type == Type.PING) {
+                    entered.countDown()
+                    check(resume.await(3, TimeUnit.SECONDS))
+                }
+            }).use { writer ->
+                try {
+                    writer.offer(Message.json(Type.PING, JSONObject().put("nonce", 1), 1))
+                    assertTrue(entered.await(2, TimeUnit.SECONDS))
+                    for (type in offered) writer.offer(Message.json(type, if (type == Type.ERROR)
+                        JSONObject().put("code", "DECODER_FAILED").put("message", "Output failed").put("fatal", true)
+                        else JSONObject().put("reason", "user"), 1))
+                    resume.countDown()
+                    assertTrue(delivered.await(2, TimeUnit.SECONDS))
+                } finally { resume.countDown(); socket.close() }
+            }
+            assertEquals(listOf(Type.PING, Type.ERROR), written.toList())
+            assertTrue(failures.toString(), failures.isEmpty())
+        }
+    }
+
+    @Test fun firstOrderlyTerminalIsNotReplacedOrDuplicated() {
+        val entered = CountDownLatch(1)
+        val resume = CountDownLatch(1)
+        val written = ConcurrentLinkedQueue<Type>()
+        val failures = ConcurrentLinkedQueue<String>()
+        val socket = Socket()
+        ControlWriter(socket, { written.add(it.type) }, failures::add, writeFrame = { _, message ->
+            if (message.type == Type.PING) {
+                entered.countDown()
+                check(resume.await(3, TimeUnit.SECONDS))
+            }
+        }).use { writer ->
+            try {
+                writer.offer(Message.json(Type.PING, JSONObject().put("nonce", 1), 1))
+                assertTrue(entered.await(2, TimeUnit.SECONDS))
+                writer.offer(Message.json(Type.STOP, JSONObject().put("reason", "user"), 1))
+                writer.offer(Message.json(Type.SESSION_END, JSONObject().put("reason", "crossed"), 1))
+            } finally { resume.countDown() }
+        }
+        socket.close()
+        assertEquals(listOf(Type.PING, Type.STOP), written.toList())
+        assertTrue(failures.toString(), failures.isEmpty())
+    }
+
+    @Test fun stopAbandonsUnsentRecoveryButFinishesTheStartedControlFrameFirst() {
+        val entered = CountDownLatch(1)
+        val resume = CountDownLatch(1)
+        val written = ConcurrentLinkedQueue<Type>()
+        val failures = ConcurrentLinkedQueue<String>()
+        val socket = Socket()
+        ControlWriter(socket, { written.add(it.type) }, failures::add, writeFrame = { _, message ->
+            if (message.type == Type.PING) {
+                entered.countDown()
+                check(resume.await(3, TimeUnit.SECONDS))
+            }
+        }).use { writer ->
+            try {
+                writer.offer(Message.json(Type.PING, JSONObject().put("nonce", 1), 1))
+                assertTrue(entered.await(2, TimeUnit.SECONDS))
+                repeat(64) {
+                    writer.offer(Message.json(Type.STATUS,
+                        JSONObject().put("state", "stream-recovery-request").put("message", "obsolete"), 1))
+                }
+                writer.offer(Message.json(Type.STOP, JSONObject().put("reason", "user"), 1))
+                assertTrue(written.isEmpty())
+                resume.countDown()
+                val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(2)
+                while (written.size < 2 && System.nanoTime() < deadline) Thread.sleep(1)
+                assertEquals(listOf(Type.PING, Type.STOP), written.toList())
+                assertTrue(failures.toString(), failures.isEmpty())
+            } finally { resume.countDown(); socket.close() }
+        }
+    }
+
+    @Test fun stopWrittenFenceRequiresSuccessfulWholeFrameFlush() {
+        for (failFlush in listOf(false, true)) {
+            val flushing = CountDownLatch(1)
+            val resume = CountDownLatch(1)
+            val written = ConcurrentLinkedQueue<Message>()
+            val failed = ConcurrentLinkedQueue<String>()
+            val socket = object : Socket() {
+                override fun getOutputStream(): OutputStream = object : java.io.ByteArrayOutputStream() {
+                    override fun flush() {
+                        flushing.countDown()
+                        check(resume.await(3, TimeUnit.SECONDS))
+                        if (failFlush) throw java.io.IOException("flush failed")
+                    }
+                }
+            }
+            ControlWriter(socket, { written.add(it) }, failed::add).use { writer ->
+                try {
+                    val stop = Message.json(Type.STOP, JSONObject().put("reason", "user"), 1)
+                    writer.offer(stop)
+                    assertTrue(flushing.await(2, TimeUnit.SECONDS))
+                    assertTrue("A fully buffered but unflushed STOP is not written", written.isEmpty())
+                    resume.countDown()
+                    val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(2)
+                    while (written.isEmpty() && failed.isEmpty() && System.nanoTime() < deadline) Thread.sleep(1)
+                    if (failFlush) {
+                        assertTrue(written.isEmpty())
+                        assertEquals(1, failed.size)
+                    } else {
+                        assertEquals(listOf(stop), written.toList())
+                        assertTrue(failed.isEmpty())
+                    }
+                } finally { resume.countDown(); socket.close() }
+            }
+        }
+    }
+
     @Test fun actualControlWriterRejectReportsControlTrackAndPacketLimit() {
         val writing = CountDownLatch(1)
         val resume = CountDownLatch(1)

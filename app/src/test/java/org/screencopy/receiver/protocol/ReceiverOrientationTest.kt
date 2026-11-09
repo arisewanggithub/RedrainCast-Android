@@ -77,8 +77,12 @@ class ReceiverOrientationTest {
                     hello(peer)
                     send(peer, Type.SESSION_REQUEST, request().put("receiverOrientation", "landscape"))
                     MediaSockets.attach(server, Wire.read(peer.inputStream)).use { media ->
-                    configure(peer, media.video, 1)
-                    val error = Wire.read(peer.inputStream)
+                    configure(peer, media.video, 1, awaitReady = false)
+                    var error = Wire.read(peer.inputStream)
+                    if (error.type == Type.STREAM_READY) {
+                        assertTrue(error.json().boolean("ok"))
+                        error = Wire.read(peer.inputStream)
+                    }
                     assertEquals(Type.ERROR, error.type)
                     assertEquals("UNSUPPORTED_CONFIG", error.json().string("code"))
                     await { diagnostics.isNotEmpty() }
@@ -142,11 +146,11 @@ class ReceiverOrientationTest {
             JSONObject().put("role", "sender").put("versions", org.json.JSONArray().put(3)).put("name", "Test")))
         assertEquals(Type.HELLO, Wire.read(peer.inputStream).type)
     }
-    private fun configure(peer: Socket, video: Socket, generation: Long) {
+    private fun configure(peer: Socket, video: Socket, generation: Long, awaitReady: Boolean = true) {
         Wire.write(video.outputStream, Message.json(Type.STREAM_CONFIG,
             JSONObject().put("codec", "h264").put("width", 640).put("height", 360)
                 .put("csd", org.json.JSONArray().put("AAAAAWdkACg=")), 47, 1, generation))
-        assertEquals(Type.STREAM_READY, Wire.read(peer.inputStream).type)
+        if (awaitReady) assertEquals(Type.STREAM_READY, Wire.read(peer.inputStream).type)
     }
     private fun await(condition: () -> Boolean) {
         val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(3)

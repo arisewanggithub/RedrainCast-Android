@@ -82,8 +82,11 @@ class ReceiverServer private constructor(
     private val receiveCapabilities: () -> org.screencopy.receiver.protocol.ReceiveCapabilities = {
         org.screencopy.receiver.protocol.ReceiveCapabilities()
     },
-    private val videoSurface: ((VideoFormat) -> Surface)? = null
+    private val videoSurface: ((VideoFormat) -> Surface)? = null,
+    private val timeMilliseconds: () -> Long = { System.nanoTime() / 1_000_000 },
+    private val controlWrite: (Socket, Message) -> Unit = { target, message -> Wire.write(target.outputStream, message) }
 ) : AutoCloseable {
+    private fun now() = timeMilliseconds()
     constructor(
         name: String, surface: Surface,
         onStatus: (String, String) -> Unit, onVideoSize: (Int, Int) -> Unit,
@@ -291,6 +294,12 @@ class ReceiverServer private constructor(
         private var senderName = ""
         private val stopping = AtomicBoolean(false)
         @Volatile private var stopAt = 0L
+        @Volatile private var stopWrittenAt: Long? = null
+        private val stopWritten = CountDownLatch(1)
+        @Volatile private var readStartedAt: Long? = null
+        @Volatile private var receiverStopRequested = false
+        private val orderlyStop: Boolean get() =
+            receiverStopRequested && streamRecovery && accepted && stopping.get() && !terminalError
         private val playbackError = AtomicReference<String?>()
         private val firstFailure = AtomicReference<FailureDiagnostic?>()
         private val connectionError = AtomicReference<Pair<String, String>?>()
@@ -411,9 +420,12 @@ class ReceiverServer private constructor(
                 "Both video and audio media connections are required", "TIMEOUT")
             socket.soTimeout = 0
             phase = "Media"
-            while (running.get() && !socket.isClosed && !owner.stopping.get()) {
+            while (running.get() && !socket.isClosed && (!owner.stopping.get() || owner.orderlyStop)) {
                 val message = read()
-                if (owner.stopping.get()) return
+                if (owner.stopping.get()) {
+                    if (owner.orderlyStop) continue
+                    return
+                }
                 protocolRequire(message.session == owner.session && message.track == mediaTrack &&
                     (message.type == Type.STREAM_CONFIG ||
                         message.type == if (mediaTrack == 1) Type.VIDEO_FRAME else Type.AUDIO_PACKET),
@@ -429,7 +441,8 @@ class ReceiverServer private constructor(
                 (message.flags ushr 1) * 90)
             var admissionEpoch = 0L
             val target: TrackWorker? = synchronized(playbackLock) {
-                protocolRequire(accepted && !stopping.get(), "Session has ended")
+                if (stopping.get()) return@synchronized null
+                protocolRequire(accepted, "Session has ended")
                 protocolRequire(videoRotation || message.flags <= 1, "Video rotation was not negotiated")
                 checkNotNull(tracks).media(message)
                 if (request?.receiverOptions?.playbackStats == true) {
@@ -475,9 +488,9 @@ class ReceiverServer private constructor(
             }
             if (target == null) return
             // Admission may wait; never hold the other media lane behind a full track.
-            if (!streamRecovery) target.offer(packet)
-            else try {
-                target.tryOffer(packet)?.let { pressure -> requestRecovery(pressure) }
+            try {
+                if (!streamRecovery) target.offer(packet)
+                else target.tryOffer(packet)?.let { pressure -> requestRecovery(pressure) }
             } catch (retired: TrackStoppedException) {
                 val oldEpoch = synchronized(playbackLock) {
                     if (message.track == 1) video !== target || message.generation <= retiredVideoThrough
@@ -570,10 +583,18 @@ class ReceiverServer private constructor(
             try {
                 socket.tcpNoDelay = true
                 socket.soTimeout = 10_000
-                writer = ControlWriter(socket, { lastWrite = now() }, { detail ->
+                writer = ControlWriter(socket, { message ->
+                    lastWrite = now()
+                    if (message.type == Type.STOP) {
+                        stopWrittenAt = lastWrite
+                        stopWritten.countDown()
+                    }
+                }, { detail ->
                     connectionError.compareAndSet(null, "INTERNAL" to detail)
-                    socket.close()
-                })
+                    if (orderlyStop && running.get() && !socket.isClosed)
+                        failOrderlyStop(ProtocolException("PROTOCOL", detail))
+                    else socket.close()
+                }, controlWrite, ::now)
                 val hello = read()
                 protocolRequire(hello.type == Type.HELLO, "Expected HELLO")
                 val h = hello.json()
@@ -640,15 +661,21 @@ class ReceiverServer private constructor(
                 send(Type.SESSION_ACCEPT, JSONObject().put("tracks", JSONArray(settings.tracks)).put("mediaToken", mediaToken).apply {
                     settings.videoColor?.let { put("videoColor", it.json()) }
                 })
+                if (streamRecovery) socket.soTimeout = 0
                 while (running.get() && !socket.isClosed) {
                     val message = read()
                     protocolRequire(message.session == session, "Session ID changed")
                     if (message.type == Type.SESSION_END) {
                         protocolRequire(stopping.get(), "Unexpected SESSION_END")
                         message.json().string("reason", 1024)
+                        if (orderlyStop) awaitStopWrite()
                         return
                     }
-                    if (stopping.get()) continue
+                    if (message.type == Type.STOP) {
+                        if (receiveStop(message.json().string("reason", 1024))) return
+                        continue
+                    }
+                    if (stopping.get() && !(orderlyStop && message.type == Type.ERROR)) continue
                     when (message.type) {
                         Type.STREAM_CONFIG, Type.VIDEO_FRAME, Type.AUDIO_PACKET ->
                             throw ProtocolException("PROTOCOL", "Media and configuration require their dedicated connections")
@@ -670,24 +697,20 @@ class ReceiverServer private constructor(
                             }
                             onStatus("Sender warning: $code", detail)
                         }
-                        Type.STOP -> {
-                            val reason = message.json().string("reason", 1024)
-                            stopAt = now()
-                            stopping.set(true)
-                            closeMedia()
-                            stopPlayback()
-                            send(Type.SESSION_END, JSONObject().put("reason", reason))
-                            return
-                        }
                         else -> throw ProtocolException("PROTOCOL", "Message is not allowed in current session state")
                     }
                     controlStatistics.validControl(now())
                 }
             } catch (e: Exception) {
+                val stoppingOrderly = orderlyStop
                 terminalError = true
                 val owner = mediaOwner
                 if (owner != null) {
-                    owner.mediaFailed(e)
+                    if (owner.orderlyStop && !socket.isClosed &&
+                        !(e is EOFException && readStartedAt == null)) owner.failOrderlyStop(e)
+                    else owner.mediaFailed(e)
+                } else if (stoppingOrderly && running.get() && !socket.isClosed) {
+                    failOrderlyStop(e)
                 } else if (running.get() && !stopping.get() && playbackError.get() == null) {
                     val externalError = connectionError.get()
                     val code = externalError?.first ?: when (e) {
@@ -764,7 +787,10 @@ class ReceiverServer private constructor(
             }
         }
 
-        private fun read(): Message = Wire.read(socket.inputStream).also { lastRead = now() }
+        private fun read(): Message = Wire.read(socket.inputStream, { readStartedAt = now() }).also {
+            readStartedAt = null
+            lastRead = now()
+        }
 
         private fun readControlUntilRequest(): Message {
             while (true) {
@@ -789,6 +815,7 @@ class ReceiverServer private constructor(
                 return
             }
             synchronized(playbackOperations) {
+                if (stopping.get()) return
                 val retired: Pair<VideoPlayer?, AudioPlayer?> = synchronized(playbackLock) {
                     protocolRequire(accepted && !stopping.get(), "Session has ended")
                     if (message.track == 1) {
@@ -809,6 +836,7 @@ class ReceiverServer private constructor(
         }
 
         private fun configureInitial(message: Message) {
+            if (stopping.get()) return
             resetStatistics()
             if (message.track == 1) lastVideoPacketAt = null else lastAudioPacketAt = null
             protocolRequire(accepted && !stopping.get(), "Session has ended")
@@ -859,6 +887,7 @@ class ReceiverServer private constructor(
             val videoFormat: VideoFormat?
             val audioFormat: AudioFormat?
             synchronized(playbackLock) {
+                if (stopping.get()) return
                 protocolRequire(accepted && !stopping.get() && tracksReady, "Recovery preceded initialized tracks")
                 protocolRequire(message.generation <= Int.MAX_VALUE, "Recovery track generation exhausted")
                 settings = checkNotNull(request)
@@ -1055,7 +1084,10 @@ class ReceiverServer private constructor(
         }
 
         private fun send(type: Type, json: JSONObject, track: Int = 0, generation: Long = 0) {
-            checkNotNull(writer) { "TCP writer is not available" }.offer(Message.json(type, json, session, track, generation))
+            synchronized(playbackLock) {
+                if (stopping.get() && type in setOf(Type.STATUS, Type.STREAM_READY)) return
+                checkNotNull(writer) { "TCP writer is not available" }.offer(Message.json(type, json, session, track, generation))
+            }
         }
 
         private fun reportFailure(code: String, detail: String, origin: FailureOrigin, pressure: QueuePressure? = null,
@@ -1068,10 +1100,12 @@ class ReceiverServer private constructor(
         }
 
         private fun playbackFailed(code: String, reason: String, origin: FailureOrigin) {
-            if (!playbackError.compareAndSet(null, reason)) return
-            terminalError = true
-            stopAt = now()
-            stopping.set(true)
+            synchronized(playbackLock) {
+                if (stopping.get() || !playbackError.compareAndSet(null, reason)) return
+                terminalError = true
+                stopAt = now()
+                stopping.set(true)
+            }
             onStatus("Playback failed", "$reason\nReconnect after reducing sender load or fixing the output device.")
             if (active.get() === this) reportFailure(code, reason, if (code == "AUDIO_FAILED") FailureOrigin.AUDIO else origin)
             try {
@@ -1111,15 +1145,23 @@ class ReceiverServer private constructor(
 
         fun requestStop(reason: String) {
             if (active.get() === this) playbackStatistics = null
-            stopAt = now()
-            if (!stopping.compareAndSet(false, true)) return
+            synchronized(playbackLock) {
+                if (stopping.get() || terminalError) return
+                receiverStopRequested = true
+                stopAt = now()
+                if (!stopping.compareAndSet(false, true)) {
+                    receiverStopRequested = false
+                    return
+                }
+            }
             try {
+                if (orderlyStop) socket.soTimeout = 0
                 send(Type.STOP, JSONObject().put("reason", reason))
             } catch (e: Exception) {
                 onStatus("Disconnect error", "${e.message ?: e.javaClass.simpleName}; connection closed")
                 abort()
             } finally {
-                closeMedia()
+                if (!orderlyStop) closeMedia()
                 try {
                     stopPlayback()
                 } catch (e: Exception) {
@@ -1127,9 +1169,55 @@ class ReceiverServer private constructor(
                     socket.close()
                 }
             }
+
         }
 
-        private fun stopPlayback() = synchronized(playbackOperations) { retirePlayers() }
+        private fun receiveStop(reason: String): Boolean {
+            val crossed = synchronized(playbackLock) {
+                if (orderlyStop) true else {
+                    if (stopping.get()) return false
+                    stopAt = now()
+                    stopping.set(true)
+                    false
+                }
+            }
+            if (crossed) awaitStopWrite() else {
+                closeMedia()
+                stopPlayback()
+                send(Type.SESSION_END, JSONObject().put("reason", reason))
+            }
+            return true
+        }
+
+        private fun failOrderlyStop(error: Exception) {
+            val code = when (error) {
+                is ProtocolException -> error.code
+                is java.net.SocketTimeoutException -> "TIMEOUT"
+                is IOException -> "PROTOCOL"
+                else -> "INTERNAL"
+            }
+            val detail = "Orderly Stop failed: ${error.message ?: error.javaClass.simpleName}"
+            connectionError.compareAndSet(null, code to detail)
+            terminalError = true
+            if (active.get() === this) {
+                reportFailure(code, detail, FailureOrigin.SESSION)
+                onStatus("Session error: $code", "$detail; reconnect")
+            } else {
+                onDiscoveryDiagnostic("event=UNOWNED_CONNECTION_FAILURE code=$code phase=$phase exception=${error.javaClass.simpleName}")
+            }
+            abort()
+        }
+
+        private fun awaitStopWrite() {
+            protocolRequire(stopWritten.await(22, TimeUnit.SECONDS) && stopWrittenAt != null,
+                "Receiver STOP did not finish before terminal acknowledgement", "TIMEOUT")
+        }
+
+        private fun stopPlayback() {
+            val installed = synchronized(playbackLock) { video to audio }
+            try { installed.first?.halt() } finally { installed.second?.halt() }
+            synchronized(playbackOperations) { retirePlayers() }
+        }
 
         private fun retirePlayers() {
             playbackStatistics = null
@@ -1163,9 +1251,27 @@ class ReceiverServer private constructor(
                 if (phase == "Playing" || phase == "Recovering" || stopping.get()) 0 else time - phaseAt)
             sampleStatistics(time)
             if (mediaOwner != null) {
-                if (writer?.stalled(time) == true) {
+                if (readStartedAt?.let { time - it >= 10_000 } == true) {
+                    val error = ProtocolException("TIMEOUT", "Media frame read blocked for 10 seconds")
+                    val owner = checkNotNull(mediaOwner)
+                    if (owner.orderlyStop) owner.failOrderlyStop(error) else owner.mediaFailed(error)
+                    socket.close()
+                } else if (writer?.stalled(time) == true) {
                     mediaOwner?.mediaFailed(ProtocolException("TIMEOUT", "Media HELLO write blocked"))
                     socket.close()
+                }
+                return
+            }
+            if (orderlyStop) {
+                when {
+                    writer?.stalled(time) == true ->
+                        failOrderlyStop(ProtocolException("TIMEOUT", "Control write blocked for 10 seconds"))
+                    readStartedAt?.let { time - it >= 10_000 } == true ->
+                        failOrderlyStop(ProtocolException("TIMEOUT", "Control frame read blocked for 10 seconds"))
+                    stopWrittenAt == null && time - stopAt >= 22_000 ->
+                        failOrderlyStop(ProtocolException("TIMEOUT", "Receiver STOP was not written within 22 seconds"))
+                    stopWrittenAt?.let { time - it >= 22_000 } == true ->
+                        failOrderlyStop(ProtocolException("TIMEOUT", "SESSION_END did not arrive within 22 seconds of STOP write"))
                 }
                 return
             }
@@ -1175,7 +1281,7 @@ class ReceiverServer private constructor(
                 return
             }
             when {
-                streamRecovery && (videoRecoveryAt > 0 && time - videoRecoveryAt >= 10_000 ||
+                !stopping.get() && streamRecovery && (videoRecoveryAt > 0 && time - videoRecoveryAt >= 10_000 ||
                     audioRecoveryAt > 0 && time - audioRecoveryAt >= 10_000) -> {
                     val track = if (videoRecoveryAt > 0 && time - videoRecoveryAt >= 10_000) 1 else 2
                     connectionError.compareAndSet(null, "TIMEOUT" to "Track $track recovery produced no usable fresh media within 10 seconds")
@@ -1202,7 +1308,9 @@ class ReceiverServer private constructor(
 
         fun abort() {
             if (active.get() === this) playbackStatistics = null
+            receiverStopRequested = false
             stopping.set(true)
+            stopWritten.countDown()
             closeMedia()
             socket.close()
         }
@@ -1247,7 +1355,6 @@ class ReceiverServer private constructor(
         const val DEFAULT_NAME = "RedrainCast"
         private val ERROR_CODES = setOf("VERSION", "BUSY", "UNSUPPORTED_CONFIG", "PROTOCOL",
             "CAPTURE_FAILED", "AUDIO_FAILED", "DECODER_FAILED", "TIMEOUT", "CONGESTION", "INTERNAL")
-        private fun now() = System.nanoTime() / 1_000_000
         internal fun forProtocolTests(name: String, onStatus: (String, String) -> Unit = { _, _ -> },
             onListener: (String) -> Unit = {}, validateRequest: (Request) -> Unit = {},
             onScreenEvent: (ReceiverScreenEvent) -> Unit = {}, port: Int = 0,
@@ -1263,11 +1370,13 @@ class ReceiverServer private constructor(
             supportsPlaybackStatistics: Boolean = false,
             receiveCapabilities: () -> org.screencopy.receiver.protocol.ReceiveCapabilities = {
                 org.screencopy.receiver.protocol.ReceiveCapabilities()
-            }) =
+            },
+            timeMilliseconds: () -> Long = { System.nanoTime() / 1_000_000 },
+            controlWrite: (Socket, Message) -> Unit = { target, message -> Wire.write(target.outputStream, message) }) =
             ReceiverServer(name, null, onStatus, onVideoSize, onListener, port, ResourceSlot(), validateRequest, onScreenEvent,
                 onFailure, onPresentationStart, videoFactory, audioFactory, clockFactory, onVideoRotation = onVideoRotation,
                 acquireSession = acquireSession, instanceId = instanceId, supportsPlaybackStatistics = supportsPlaybackStatistics,
-                receiveCapabilities = receiveCapabilities)
+                receiveCapabilities = receiveCapabilities, timeMilliseconds = timeMilliseconds, controlWrite = controlWrite)
 
         private fun validateCapabilities(settings: Request) {
             val types = MediaCodecList(MediaCodecList.REGULAR_CODECS).codecInfos.filter { !it.isEncoder }.flatMap { it.supportedTypes.toList() }

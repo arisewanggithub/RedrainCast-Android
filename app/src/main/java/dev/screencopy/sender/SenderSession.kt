@@ -60,9 +60,12 @@ class SenderSession internal constructor(
     @Volatile private var acceptedSession = false
     @Volatile private var remoteStop = false
     @Volatile private var closing = false
+    @Volatile private var mediaRetiring = false
+    @Volatile private var terminalWriting = false
     @Volatile private var lastIncoming = 0L
     @Volatile private var writeStarted = 0L
     @Volatile private var phaseDeadline = 0L
+    @Volatile private var terminalWrittenAt: Long? = null
 
     private fun phase(value: String, stage: SessionStopTrace.Phase) {
         trace.phase(stage)
@@ -87,9 +90,10 @@ class SenderSession internal constructor(
         trace.mark(SessionStopTrace.Stage.REQUESTED)
         status("Stopping")
         queueTerminal()
+        val orderlyRemoteStop = remoteStop && acceptedSession && link?.streamRecovery == true && link?.mediaAttached == true
         if (!playing) Thread({
             trace.mark(SessionStopTrace.Stage.STARTUP_CANCEL)
-            if (!playing) {
+            if (!playing && !orderlyRemoteStop) {
                 if (requestSent) try { terminalSent.await(500, TimeUnit.MILLISECONDS) }
                 catch (e: InterruptedException) { Thread.currentThread().interrupt(); fail(e, SessionOutcome.Origin.CLEANUP) }
                 startupTransportAborted = true
@@ -130,6 +134,28 @@ class SenderSession internal constructor(
     }
     fun captureFailed(error: Exception) = fail(error, SessionOutcome.Origin.CAPTURE)
     internal fun recordMediaFailure(error: Exception, origin: SessionOutcome.Origin) {
+        if (origin == SessionOutcome.Origin.RECEIVER_READ && error is java.io.EOFException &&
+            terminalWriting && link?.streamRecovery == true) {
+            try {
+                if (!terminalSent.await(22, TimeUnit.SECONDS)) {
+                    fail(IOException("TIMEOUT: terminal write did not finish after media EOF", error), origin)
+                    closeLink()
+                    return
+                }
+            } catch (interrupted: InterruptedException) {
+                Thread.currentThread().interrupt()
+                fail(IOException("Media EOF classification interrupted", interrupted), origin)
+                closeLink()
+                return
+            }
+        }
+        if ((stopping || closing) && !linkClosed && !mediaRetiring && outcome.failure == null && link?.streamRecovery == true &&
+            error is IOException) {
+            fail(IOException("${if (error is java.net.SocketTimeoutException) "TIMEOUT" else "PROTOCOL"}: " +
+                "media transport failed during orderly Stop", error), origin)
+            closeLink()
+            return
+        }
         val transport = error is java.io.EOFException || error is java.net.SocketException ||
             error is java.io.InterruptedIOException
         fail(if (transport && error is IOException) MediaConnectionFailure(error) else error, origin)
@@ -144,7 +170,7 @@ class SenderSession internal constructor(
     internal fun terminalMessage(): Wire.Message = outcome.terminal(session, remoteStop)
     private fun queueTerminal() {
         if (requestSent && terminalQueued.compareAndSet(false, true)) {
-            mux.finish(terminalMessage())
+            mux.finish(terminalMessage(), drainStartedMedia = orderlyTeardown)
             trace.mark(SessionStopTrace.Stage.TERMINAL_QUEUED)
         }
     }
@@ -234,14 +260,25 @@ class SenderSession internal constructor(
     internal fun retireTransport() {
         synchronized(this) { closing = true }
         trace.phase(SessionStopTrace.Phase.CLEANUP)
-        phaseDeadline = now() + 2_000_000_000L
+        val orderly = orderlyTeardown
+        val timeoutNanos = if (orderly) 22_000_000_000L else 2_000_000_000L
+        phaseDeadline = if (orderly && !remoteStop && terminalWrittenAt != null)
+            checkNotNull(terminalWrittenAt) + 2_000_000_000L else now() + timeoutNanos
         status("Stopping")
         trace.mark(SessionStopTrace.Stage.CLOSING)
         queueTerminal()
         closeCapture()
         try {
-            if (requestSent) terminalSent.await(minOf(500_000_000L,
-                (phaseDeadline - now()).coerceAtLeast(0)), TimeUnit.NANOSECONDS)
+            if (requestSent) {
+                val delivered = terminalSent.await(
+                    if (orderly) (phaseDeadline - now()).coerceAtLeast(0) else minOf(500_000_000L,
+                        (phaseDeadline - now()).coerceAtLeast(0)), TimeUnit.NANOSECONDS)
+                if (orderly && !delivered)
+                    fail(IOException("TIMEOUT: orderly terminal frame did not finish within 22 seconds"),
+                        SessionOutcome.Origin.CLEANUP)
+            }
+            if (orderly && !remoteStop) terminalWrittenAt?.let { phaseDeadline = it + 2_000_000_000L }
+            mediaRetiring = true
             try { link?.closeMedia() } catch (error: IOException) { fail(error, SessionOutcome.Origin.CLEANUP) }
             if (acceptedSession) {
                 val drained = receiverReleased.await((phaseDeadline - now()).coerceAtLeast(0), TimeUnit.NANOSECONDS)
@@ -263,11 +300,19 @@ class SenderSession internal constructor(
         }
     }
 
+    private val orderlyTeardown: Boolean get() =
+        link?.streamRecovery == true && (playing || remoteStop && link?.mediaAttached == true) &&
+            acceptedSession && outcome.failure == null
+
     private fun watchdog() {
         val current = now()
         if (closing) {
             // Bound terminal TCP delivery without interrupting independently bounded codec cleanup.
             if (current > phaseDeadline) {
+                if (orderlyTeardown && (terminalSent.count != 0L || !receiverTerminal.get()))
+                    fail(IOException(if (terminalSent.count != 0L)
+                        "TIMEOUT: orderly terminal frame did not finish within 22 seconds"
+                        else "TIMEOUT: receiver terminal response did not arrive within two seconds"), SessionOutcome.Origin.CLEANUP)
                 if (sizeSwitch.requested && !sizeSwitch.receiverClosed)
                     fail(IOException("TIMEOUT: size change receiver cleanup was not acknowledged"), SessionOutcome.Origin.CLEANUP)
                 closeLink()
@@ -313,7 +358,7 @@ class SenderSession internal constructor(
                 lastIncoming = now()
                 if (message.session != session) throw IOException("PROTOCOL: wrong session")
                 val json = message.json()
-                if (closing && message.type !in setOf(Wire.ERROR, Wire.STOP, Wire.SESSION_END)) continue
+                if ((stopping || closing) && message.type !in setOf(Wire.ERROR, Wire.STOP, Wire.SESSION_END)) continue
                 when (message.type) {
                     Wire.STREAM_READY -> {
                         if (!Json.bool(json, "ok")) throw IOException("DECODER_FAILED: track not ready")
@@ -384,11 +429,32 @@ class SenderSession internal constructor(
             if (sizeSwitch.requested && !linkClosed) {
                 if (e is java.io.EOFException && sizeSwitch.acknowledged) sizeSwitch.peerClosed()
                 else fail(IOException("Size change lost receiver before confirmed cleanup", e), SessionOutcome.Origin.RECEIVER_READ)
+            } else if ((stopping || closing) && !linkClosed && link?.streamRecovery == true &&
+                e is IOException && e !is ReceiverReportedFailure) {
+                fail(IOException("${if (e is java.net.SocketTimeoutException) "TIMEOUT" else "PROTOCOL"}: " +
+                    "control transport failed during orderly Stop", e),
+                    SessionOutcome.Origin.RECEIVER_READ)
+                closeLink()
             } else fail(e, SessionOutcome.Origin.RECEIVER_READ)
         } finally { receiverReleased.countDown() }
     }
     @Synchronized private fun writeCompleted(message: Wire.Message) {
         if (!stopping && !closing) recovery?.written(message)
+    }
+
+    private fun writeFailed(lane: Int, error: Exception) {
+        if (lane == 0) {
+            if ((stopping || closing) && !linkClosed && link?.streamRecovery == true && error is IOException)
+                fail(IOException("${if (error is java.net.SocketTimeoutException) "TIMEOUT" else "PROTOCOL"}: " +
+                    "control write failed during orderly Stop", error), SessionOutcome.Origin.RECEIVER_WRITE)
+            else fail(error, SessionOutcome.Origin.RECEIVER_WRITE)
+            if (outcome.failure != null) closeLink()
+            terminalSent.countDown()
+        } else {
+            val orderly = orderlyTeardown && (stopping || closing) && !linkClosed && !mediaRetiring
+            recordMediaFailure(error, SessionOutcome.Origin.RECEIVER_WRITE)
+            if (orderly && outcome.failure != null && !linkClosed) closeLink()
+        }
     }
 
     private fun writeLoop(lane: Int) {
@@ -404,23 +470,30 @@ class SenderSession internal constructor(
                 if (message != null) {
                     if (lane == 0) writeStarted = now()
                     mux.beginWrite(message)
+                    if (message.type in setOf(Wire.STOP, Wire.SESSION_END, Wire.ERROR)) terminalWriting = true
                     try {
                         connected.send(message)
                         writeCompleted(message)
+                    } catch (error: Exception) {
+                        writeFailed(lane, error)
+                        return
                     } finally {
                         mux.endWrite(message)
                         if (lane == 0) writeStarted = 0
                     }
                     if (message.type in setOf(Wire.STOP, Wire.SESSION_END, Wire.ERROR)) {
+                        terminalWrittenAt = now()
+                        if (orderlyTeardown) {
+                            mediaRetiring = true
+                            if (message.type == Wire.STOP) phaseDeadline = checkNotNull(terminalWrittenAt) + 2_000_000_000L
+                        }
                         trace.mark(SessionStopTrace.Stage.TERMINAL_SENT); terminalSent.countDown(); return
                     }
                 }
                 if (closing && terminalSent.count == 0L) return
             }
         } catch (e: Exception) {
-            if (lane == 0) fail(e, SessionOutcome.Origin.RECEIVER_WRITE)
-            else recordMediaFailure(e, SessionOutcome.Origin.RECEIVER_WRITE)
-            if (lane == 0) terminalSent.countDown()
+            writeFailed(lane, e)
         }
     }
     override fun config(track: Int, generation: Int, config: JSONObject) {

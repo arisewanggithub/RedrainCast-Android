@@ -286,14 +286,46 @@ TCP listener ports are dynamic; 27184 is not an implicit receiver endpoint.
    Cleanup closes all three sockets and retires playback/capture ownership.
 
 Control connects before the token-bound media lanes. Graceful teardown keeps
-its reader alive after Stop or media EOF: send the terminal intent, retire both
-media sockets, drain the peer's ERROR/STOP/SESSION_END, and close control last.
-The sender's existing two-second teardown deadline bounds that drain, including
-terminal write/capture cleanup; an absent acknowledgement fails explicitly.
-Intentional startup cancellation can abort transport before playback is ready
+its reader alive after Stop or media EOF and closes control last. With negotiated
+`streamRecoveryVersion:2`, orderly Stop abandons unsent media/control but finishes
+each already-selected/started media frame under its original 10-second write
+deadline before sending the sender's terminal frame and retiring media sockets.
+The Android sender bounds pending orderly drain/terminal delivery at 22 seconds.
+After its own STOP is successfully written, its peer acknowledgement wait remains
+two seconds: started media has already drained. Legacy and fatal teardown retain
+their original two-second total bound.
+
+For receiver-initiated v2 Stop, the 22-second SESSION_END acknowledgement window
+starts only after the complete STOP control frame is successfully written/flushed,
+not when it is enqueued or an earlier control frame completes. This allows two
+started 10-second media-frame drain windows plus terminal acknowledgement.
+The receiver retires playback immediately but continues reading/discarding whole
+framed media without admission, decoder recreation, rendering or recovery.
+Every started media/control frame retains its original 10-second absolute I/O
+deadline; idle media reads have no frame deadline. Control's normal 10-second idle
+timeout must not truncate the v2 acknowledgement window. Actual I/O failures,
+truncated started frames, write deadlines and absent acknowledgements are fatal,
+not intentional cancellation. No terminal message reuses a partially written
+frame. Legacy receiver-initiated Stop retains its two-second cutoff.
+Pending receiver STOP delivery has its own 22-second bound, with each selected
+control write still limited to ten seconds. Crossed local Stops acknowledge
+terminal intent without adding another terminal frame; retirement still waits
+for the already-serialized receiver STOP write to finish successfully.
+Local and peer Stop intents are arbitrated atomically before closing media or
+choosing a terminal frame. A queued fatal ERROR supersedes an unsent orderly
+terminal and cannot be replaced by STOP/SESSION_END. Sender media EOF received
+while its terminal write is completing waits for that write's result: successful
+delivery permits peer media retirement, but a failed write remains fatal.
+Stop halts installed workers before waiting for serialized recovery retirement,
+outside the playback-state lock. An in-flight replacement must recheck ownership
+and stopping state before installation or readiness publication.
+Intentional local startup cancellation can abort transport before playback is ready
 without requiring an acknowledgement on that deliberately closed connection.
 This exception records the startup-abort intent before closing; a generic
 closed control socket or an unexplained peer EOF is not exempt.
+Receiving v2 STOP after media attachment still drains started configuration/media
+frames before SESSION_END, even before initial STREAM_READY. Capture startup is
+cancelled without using the local-startup transport-abort exception.
 A media transport failure is provisional: a valid fatal receiver ERROR received
 during draining supersedes that fallback, but never an earlier capture, codec or
 congestion failure. Matching user-stop cancellation stays nonfatal.
