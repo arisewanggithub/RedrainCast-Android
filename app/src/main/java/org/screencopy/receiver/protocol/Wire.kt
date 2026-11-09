@@ -5,6 +5,7 @@ import java.io.DataInputStream
 import java.io.DataOutputStream
 import java.io.InputStream
 import java.io.OutputStream
+import java.io.EOFException
 
 enum class Type(val number: Int) {
     HELLO(1), SESSION_REQUEST(3), SESSION_ACCEPT(4), REJECT(5),
@@ -35,9 +36,14 @@ object Wire {
     const val MAX_AUDIO = 256 * 1024
     const val MAX_CONTROL = 65536
 
-    fun read(input: InputStream): Message {
+    fun read(input: InputStream, started: () -> Unit = {}): Message {
+        val first = input.read()
+        if (first < 0) throw EOFException()
+        started()
         val stream = DataInputStream(input)
-        protocolRequire(stream.readInt() == MAGIC, "Invalid protocol magic")
+        val magic = (first shl 24) or (stream.readUnsignedByte() shl 16) or
+            (stream.readUnsignedByte() shl 8) or stream.readUnsignedByte()
+        protocolRequire(magic == MAGIC, "Invalid protocol magic")
         protocolRequire(stream.readUnsignedShort() == VERSION, "Unsupported protocol version", "VERSION")
         val number = stream.readUnsignedShort()
         val type = Type.entries.firstOrNull { it.number == number }

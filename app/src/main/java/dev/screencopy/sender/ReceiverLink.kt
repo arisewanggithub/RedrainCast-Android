@@ -9,6 +9,7 @@ import java.net.Socket
 import java.net.SocketTimeoutException
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.ScheduledFuture
 import java.util.concurrent.atomic.AtomicBoolean
 import org.screencopy.receiver.protocol.StreamRecoveryProtocol
 import org.screencopy.receiver.protocol.ReceiverOptionProtocol
@@ -22,6 +23,7 @@ class ReceiverLink(private val target: ReceiverTarget) : Closeable {
     private val closed = AtomicBoolean()
     private val mediaClosed = AtomicBoolean()
     @Volatile private var attached = false
+    internal val mediaAttached get() = attached
     @Volatile private var activeSession = 0L
     var videoRotation: Boolean = false
         private set
@@ -99,6 +101,7 @@ class ReceiverLink(private val target: ReceiverTarget) : Closeable {
                     throw IOException("PROTOCOL: invalid stream recovery version")
                 if (streamRecovery && recoveryVersion != StreamRecoveryProtocol.VERSION)
                     throw IOException("UNSUPPORTED_CONFIG: incompatible stream recovery protocol; update the receiver")
+                if (streamRecovery) sockets[0].soTimeout = 0
             }
         } catch (error: Exception) { close(); throw error }
     }
@@ -164,7 +167,21 @@ class ReceiverLink(private val target: ReceiverTarget) : Closeable {
         }
     }
 
-    fun receive(): Wire.Message = Wire.read(sockets[0].inputStream)
+    fun receive(): Wire.Message {
+        if (!streamRecovery) return Wire.read(sockets[0].inputStream)
+        val expired = AtomicBoolean()
+        var timeout: ScheduledFuture<*>? = null
+        try {
+            val message = Wire.read(sockets[0].inputStream) {
+                timeout = timer.schedule({ expired.set(true); close() }, 10_000, TimeUnit.MILLISECONDS)
+            }
+            if (expired.get()) throw SocketTimeoutException("TIMEOUT: control frame exceeded its deadline")
+            return message
+        } catch (error: IOException) {
+            if (expired.get()) throw SocketTimeoutException("TIMEOUT: control frame exceeded its deadline").apply { initCause(error) }
+            throw error
+        } finally { timeout?.cancel(false) }
+    }
 
     internal fun watchMedia(track: Int) {
         require(track in 1..2 && attached)

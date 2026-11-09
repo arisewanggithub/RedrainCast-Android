@@ -28,6 +28,7 @@ class MediaBudget internal constructor(private val withAudio: Boolean, private v
     private val opusSourcePts = BooleanArray(3)
     private var started = false
     private var ending = false
+    private var drainStartedMedia = false
     private var recoveryAudioHeld = false
     private var evictedRecoveryCutoffUs: Long? = null
     private var initialAudioPrefixRetired = false
@@ -283,11 +284,12 @@ class MediaBudget internal constructor(private val withAudio: Boolean, private v
         require(lane in 0..2)
         take(lane) ?: run { monitor.wait(waitMs); take(lane) }
     }
-    fun finish(message: Wire.Message) = synchronized(monitor) {
+    fun finish(message: Wire.Message, drainStartedMedia: Boolean = false) = synchronized(monitor) {
         require(message.type in setOf(Wire.STOP, Wire.SESSION_END, Wire.ERROR))
         if (ending) return
         // Explicit session termination abandons unsent media, never normal congestion recovery.
         ending = true
+        this.drainStartedMedia = drainStartedMedia
         controls.clear(); video.clear(); audio.clear()
         mediaBytes = 0; controlBytes = message.payload.size; configCount = 0
         controls.add(Entry(message, clock()))
@@ -295,6 +297,7 @@ class MediaBudget internal constructor(private val withAudio: Boolean, private v
     }
     private fun take(lane: Int? = null): Wire.Message? {
         if ((lane == null || lane == 0) && controls.isNotEmpty()) {
+            if (drainStartedMedia && (pendingWrites[1] != null || pendingWrites[2] != null)) return null
             val entry = controls.remove()
             controlBytes -= entry.message.payload.size; pendingWrites[0] = entry; monitor.notifyAll()
             return entry.message

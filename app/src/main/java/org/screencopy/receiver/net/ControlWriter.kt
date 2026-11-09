@@ -2,6 +2,7 @@ package org.screencopy.receiver.net
 
 import org.screencopy.receiver.protocol.Message
 import org.screencopy.receiver.protocol.Wire
+import org.screencopy.receiver.protocol.Type
 import org.screencopy.receiver.media.QueueCongestionException
 import org.screencopy.receiver.media.QueueLimit
 import org.screencopy.receiver.media.QueuePressure
@@ -12,8 +13,10 @@ import java.net.Socket
 
 internal class ControlWriter(
     private val socket: Socket,
-    private val written: () -> Unit,
-    private val failed: (String) -> Unit
+    private val written: (Message) -> Unit,
+    private val failed: (String) -> Unit,
+    private val writeFrame: (Socket, Message) -> Unit = { target, message -> Wire.write(target.outputStream, message) },
+    private val clock: () -> Long = { System.nanoTime() / 1_000_000 }
 ) : AutoCloseable {
     private val queue = ArrayBlockingQueue<Message>(64)
     private var queuedBytes = 0
@@ -25,6 +28,12 @@ internal class ControlWriter(
     @Synchronized
     fun offer(message: Message) {
         check(accepting.get()) { "Connection writer has stopped" }
+        if (message.type == Type.STOP || message.type == Type.SESSION_END) {
+            val abandoned = mutableListOf<Message>()
+            queue.drainTo(abandoned)
+            queuedBytes -= abandoned.sumOf { 40 + it.payload.size }
+            queuedPackets -= abandoned.size
+        }
         val size = 40 + message.payload.size
         if (queuedBytes + size > 256 * 1024 || !queue.offer(message)) {
             throw QueueCongestionException(QueuePressure(0,
@@ -40,10 +49,10 @@ internal class ControlWriter(
             while (accepting.get() || queue.isNotEmpty()) {
                 val message = queue.poll(100, TimeUnit.MILLISECONDS) ?: continue
                 synchronized(this) { queuedBytes -= 40 + message.payload.size; queuedPackets-- }
-                writingSince = System.nanoTime() / 1_000_000
-                Wire.write(socket.outputStream, message)
+                writingSince = clock()
+                writeFrame(socket, message)
                 writingSince = 0
-                written()
+                written(message)
             }
         } catch (e: java.io.IOException) {
             accepting.set(false)
