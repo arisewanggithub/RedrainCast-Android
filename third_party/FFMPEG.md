@@ -2,10 +2,10 @@
 
 The receiver's `screencopy_resampler` JNI library statically links only FFmpeg
 **7.1.3** `libswresample` and `libavutil`. Ordinary local and app-CI builds
-consume the pinned public `ffmpeg-pcm-android:7.1.3-r1` AAR/Prefab package from
+consume the pinned public `ffmpeg-pcm-android:7.1.3-r2` AAR/Prefab package from
 <https://github.com/arisewanggithub/RedrainCast-Native/releases>.
 Gradle verifies the complete AAR against
-`ffmpeg-pcm-android-7.1.3-r1.sha256` before native configuration.
+`ffmpeg-pcm-android-7.1.3-r2.sha256` before native configuration.
 Only the app's small JNI wrapper is built against those FFmpeg archives.
 The existing small bundled Opus library is still built from its pinned source.
 
@@ -38,16 +38,10 @@ targets `redrain_ffmpeg::swresample` and `redrain_ffmpeg::avutil`.
 The package contains all three ABIs and their installed public/generated headers,
 and does not change universal APK packaging or end-user downloads.
 
-The initial immutable package is
-[`ffmpeg-pcm-android-7.1.3-r1`](https://github.com/arisewanggithub/RedrainCast-Native/releases/tag/ffmpeg-pcm-android-7.1.3-r1),
-published by this
-[successful GitHub Actions run](https://github.com/arisewanggithub/RedrainCast-Native/actions/runs/42103770241).
-Its release includes checksums, upstream source, build/relink materials,
-provenance and per-ABI static/Prefab consumer validation.
-The Android consumer also accepts future platform-specific release paths such
-as `redraincast-ffmpeg-android-pcm-7.1.3-r2`; the AAR module and asset naming
-remain `ffmpeg-pcm-android`. Windows decoder releases are separate and do not
-change this Android dependency.
+The unified immutable release contains Android and Windows packages together;
+each package keeps its platform-specific asset name and checksum. The Android
+consumer resolves the AAR from the shared release tag while retaining the
+`ffmpeg-pcm-android` module coordinate.
 
 Use the normal Gradle build commands in the repository README. No Bash/make
 FFmpeg toolchain is required for these application builds. NDK/CMake remain

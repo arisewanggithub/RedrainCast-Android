@@ -20,17 +20,17 @@ guard_spec = importlib.util.spec_from_file_location("guard", Path(__file__).with
 guard = importlib.util.module_from_spec(guard_spec)
 guard_spec.loader.exec_module(guard)
 ASSETS = {
-    "ffmpeg-pcm-android-7.1.3-r1.aar":
-        "6157824cb3f8238a3879b3d22ddf6cc2be61abb26f2cb6ac742131f2abde462b",
+    "ffmpeg-pcm-android-7.1.3-r2.aar":
+        "61bdd1952bcdfe77e6ea7dcb00c7cd5585731a30c1c9ec44cc0a0715285c4738",
     "ffmpeg-7.1.3.tar.xz":
         "f0bf043299db9e3caacb435a712fc541fbb07df613c4b893e8b77e67baf3adbe",
-    "ffmpeg-pcm-android-7.1.3-r1-build-materials.tar.gz":
-        "be3c282119612d8f8ff3c4f01c40e40b8d151d4519efd9a53a0fb5b50e8bdfbb",
-    "ffmpeg-pcm-android-7.1.3-r1-compliance.tar.gz":
-        "c4eb05e081ed9e505ed6ef58e6d0109643bed5d8afaadd71d3dfd1ba9d162304",
+    "redraincast-ffmpeg-7.1.3-r2-build-materials.tar.gz":
+        "d23e69cae01234eede748bab9349356fc1bb98aeddc0f620109a4688a74e0c93",
+    "redraincast-ffmpeg-7.1.3-r2-compliance.tar.gz":
+        "218a6aeb150a1c4e1ed422807f0d884a9edc03565bae142324095827fe0d05f8",
 }
 BASE = ("https://github.com/arisewanggithub/RedrainCast-Native/releases/download/"
-        "ffmpeg-pcm-android-7.1.3-r1/")
+        "redraincast-ffmpeg-7.1.3-r2/")
 
 
 def link_metadata(ninja):

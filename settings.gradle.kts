@@ -18,6 +18,7 @@ dependencyResolutionManagement {
                     patternLayout {
                         artifact("[module]-[revision]/[artifact]-[revision].[ext]")
                         artifact("redraincast-ffmpeg-android-pcm-[revision]/[artifact]-[revision].[ext]")
+                        artifact("redraincast-ffmpeg-[revision]/[artifact]-[revision].[ext]")
                     }
                     metadataSources { artifact() }
                 }

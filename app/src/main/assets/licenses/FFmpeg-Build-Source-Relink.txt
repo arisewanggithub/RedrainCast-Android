@@ -17,9 +17,10 @@ f0bf043299db9e3caacb435a712fc541fbb07df613c4b893e8b77e67baf3adbe
 Project: https://github.com/arisewanggithub/RedrainCast-Android
 Native build/package project:
 https://github.com/arisewanggithub/RedrainCast-Native
-The application consumes the pinned public ffmpeg-pcm-android 7.1.3-r1
-AAR/Prefab package. GitHub Actions builds that package for each ABI;
-normal local and application CI builds do not compile FFmpeg from source.
+The application consumes the pinned public ffmpeg-pcm-android 7.1.3-r2
+AAR/Prefab package from the unified Android and Windows release. GitHub Actions
+builds that package for each ABI. Normal local and application CI builds do not
+compile FFmpeg from source.
 The package release includes upstream source/configuration/provenance
 and checksums. The application verifies the complete AAR checksum.
 

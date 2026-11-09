@@ -55,7 +55,7 @@ android {
     }
 }
 
-val ffmpegPackage = "dev.redraincast.native:ffmpeg-pcm-android:7.1.3-r1@aar"
+val ffmpegPackage = "dev.redraincast.native:ffmpeg-pcm-android:7.1.3-r2@aar"
 val ffmpegVerification by configurations.creating {
     isCanBeConsumed = false
     isTransitive = false
@@ -92,7 +92,7 @@ abstract class VerifyFfmpegPackage : DefaultTask() {
 
 val verifyFfmpegPackage = tasks.register<VerifyFfmpegPackage>("verifyFfmpegPackage") {
     archive.set(layout.file(providers.provider { ffmpegVerification.singleFile }))
-    expectedChecksum.set(rootProject.layout.projectDirectory.file("third_party/ffmpeg-pcm-android-7.1.3-r1.sha256"))
+    expectedChecksum.set(rootProject.layout.projectDirectory.file("third_party/ffmpeg-pcm-android-7.1.3-r2.sha256"))
 }
 tasks.named("preBuild") { dependsOn(verifyFfmpegPackage) }
 tasks.configureEach {
