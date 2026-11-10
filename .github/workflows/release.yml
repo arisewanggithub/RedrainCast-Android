@@ -84,7 +84,6 @@ jobs:
           mkdir "$work"
           echo "RELEASE_WORK=$work" >> "$GITHUB_ENV"
           mkdir "$work/public-assets" "$work/temp"
-          echo "TMPDIR=$work/temp" >> "$GITHUB_ENV"
       - name: Sign, verify and prepare public assets
         env:
           KEYSTORE: ${{ secrets.ANDROID_RELEASE_KEYSTORE_BASE64 }}
@@ -123,6 +122,8 @@ jobs:
           "$tools/zipalign" -c -P 16 4 "$apk"
           tar -czf "$RELEASE_WORK/public-assets/licenses.tar.gz" -C app/src/main/assets NOTICE.txt OPUS-NOTICE.txt licenses
       - name: Build and smoke-test exact-build LGPL relink kit
+        env:
+          TMPDIR: ${{ env.RELEASE_WORK }}/temp
         run: |
           set -euo pipefail
           python3 -B tools/release-kit.py \
