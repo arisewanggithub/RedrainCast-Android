@@ -10,6 +10,17 @@ download documentation, not this application.
 
 ## Required configuration
 
+The release job uses the trusted self-hosted Linux x64 runner labeled
+`arise-local`, matching Android validation. It requires JDK 21, the Android SDK
+and access to install the pinned SDK/NDK/CMake packages, Python 3, Bash and GitHub
+Actions network access. Only trusted maintainers should control this runner,
+which handles production signing secrets; keep its host and runner account
+restricted. Release files use a private per-run/per-attempt directory, with
+keystore removal on signing exit and an always-run cleanup of that precise
+directory after artifact/draft upload. A hard host/process kill can prevent
+cleanup; maintainers must securely remove that attempt's leftover directory
+before reusing the runner. Never delete shared runner directories.
+
 Signing is blocked unless all four signing secrets are configured. Public
 draft upload additionally requires the scoped publisher secret:
 
