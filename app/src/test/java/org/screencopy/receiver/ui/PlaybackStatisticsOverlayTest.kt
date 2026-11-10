@@ -239,22 +239,70 @@ class PlaybackStatisticsOverlayTest {
         } finally { controller.pause().stop().destroy() }
     }
 
-    private fun assertConnectionsAligned(overlay: PlaybackStatisticsOverlay) {
+    @Test fun connectionColumnsWrapWithoutClippingAtAccessibilityFontScale() {
+        val controller = Robolectric.buildActivity(Activity::class.java).setup()
+        val activity = controller.get()
+        val configuration = android.content.res.Configuration(activity.resources.configuration).apply {
+            densityDpi = 160
+            fontScale = 2f
+        }
+        val context = activity.createConfigurationContext(configuration)
+        val parent = FrameLayout(context)
+        val overlay = PlaybackStatisticsOverlay(context)
+        parent.addView(overlay, FrameLayout.LayoutParams(-1, -2))
+        activity.setContentView(parent)
+        try {
+            for ((width, height) in listOf(360 to 800, 800 to 360)) {
+                for (large in listOf(false, true, false)) {
+                    val original = snapshot()
+                    val input = if (large) original.input.copy(
+                        videoQueue = EncodedQueueStatistics(48, 8388608, 250000, 250, 8388608),
+                        audioQueue = EncodedQueueStatistics(48, 524288, 250000, 250, 524288),
+                        videoLastPacketAgeMs = 10000, audioLastPacketAgeMs = 10000,
+                        controlAgeMs = 10000, rttMs = 9999) else original.input
+                    overlay.show(original.copy(input = input), width, height)
+                    shadowOf(Looper.getMainLooper()).idle()
+                    parent.measure(View.MeasureSpec.makeMeasureSpec(width, View.MeasureSpec.EXACTLY),
+                        View.MeasureSpec.makeMeasureSpec(height, View.MeasureSpec.EXACTLY))
+                    parent.layout(0, 0, width, height)
+                    val table = overlay.findViewWithTag<ViewGroup>("connectionTable")
+                    // Isolate column wrapping from the non-scrolling overlay's viewport height limit.
+                    table.measure(View.MeasureSpec.makeMeasureSpec(table.width, View.MeasureSpec.EXACTLY),
+                        View.MeasureSpec.makeMeasureSpec(0, View.MeasureSpec.UNSPECIFIED))
+                    table.layout(table.left, table.top, table.right, table.top + table.measuredHeight)
+                    assertConnectionsAligned(overlay, allowWrapping = true)
+                    descendants(table).filterIsInstance<TextView>().forEach {
+                        assertEquals(20f * context.resources.displayMetrics.density, it.textSize, 0.1f)
+                    }
+                }
+            }
+        } finally { controller.pause().stop().destroy() }
+    }
+
+    private fun assertConnectionsAligned(overlay: PlaybackStatisticsOverlay, allowWrapping: Boolean = false) {
         val table = overlay.findViewWithTag<ViewGroup>("connectionTable")
         assertTrue("Connections must use the full panel, not a narrow body column",
             table.width >= overlay.width - overlay.paddingLeft - overlay.paddingRight - 1)
         for (column in 0..4) {
             val header = overlay.findViewWithTag<TextView>("connection:header:$column")
-            for (id in listOf("video", "audio", "control")) {
+            for (id in listOf("header", "video", "audio", "control")) {
                 val value = overlay.findViewWithTag<TextView>("connection:$id:$column")
                 assertEquals("Column $column must align for $id", header.left, value.left)
                 assertEquals(header.width, value.width)
-                assertEquals("Connection value must not wrap: ${value.text}", 1, value.lineCount)
-                assertTrue("Connection cell outside table: ${value.text}", value.right <= table.width)
-                assertTrue("Connection text clipped: ${value.text}",
-                    value.layout.getLineWidth(0) <= value.width -
-                        value.compoundPaddingLeft - value.compoundPaddingRight + 1)
-                assertEquals(0, value.layout.getEllipsisCount(0))
+                if (!allowWrapping) assertEquals("Connection value must not wrap: ${value.text}", 1, value.lineCount)
+                assertTrue("Connection cell has no width: ${value.text}", value.width > 0)
+                assertTrue("Connection cell outside table: ${value.text}", value.left >= 0)
+                assertTrue("Connection cell outside table: ${value.text}, left=${value.left}, right=${value.right}, table=${table.width}",
+                    value.right <= table.width)
+                assertTrue("Connection text vertically clipped: ${value.text}",
+                    value.layout.height <= value.height - value.compoundPaddingTop - value.compoundPaddingBottom)
+                repeat(value.lineCount) { line ->
+                    assertTrue("Connection text clipped: ${value.text}",
+                        value.layout.getLineLeft(line) >= -1 &&
+                            value.layout.getLineRight(line) <= value.width -
+                            value.compoundPaddingLeft - value.compoundPaddingRight + 1)
+                    assertEquals(0, value.layout.getEllipsisCount(line))
+                }
             }
         }
     }

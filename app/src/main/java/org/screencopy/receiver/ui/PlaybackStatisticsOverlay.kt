@@ -173,6 +173,7 @@ class PlaybackStatisticsOverlay @JvmOverloads constructor(
         val table = TableLayout(context).apply {
             tag = "connectionTable"
             isStretchAllColumns = true
+            isShrinkAllColumns = true
         }
         fun row(id: String?, content: List<String>) = TableRow(context).apply {
             content.forEachIndexed { index, text ->
@@ -192,7 +193,8 @@ class PlaybackStatisticsOverlay @JvmOverloads constructor(
                     tag = "connection:${id ?: "header"}:$index"
                 }
                 if (id != null && index > 0) values["connection:$id:$index"] = cell
-                addView(cell, TableRow.LayoutParams(-2, -2))
+                // Row weights absorb pixel remainders from TableLayout's column shrinking.
+                addView(cell, TableRow.LayoutParams(-2, -2, 1f))
             }
         }
         table.addView(row(null, model.connectionHeaders), LayoutParams(-1, -2))

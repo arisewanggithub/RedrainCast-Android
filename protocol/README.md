@@ -205,6 +205,8 @@ Within that panel, video and audio receive column shares of 1.35 and 1.25.
 Connections and queues occupy a full-width table below them rather than a
 narrow third column. Shared content-sized columns align all channel rows and
 headers as live queue sizes change, without reducing text size or removing units.
+When larger accessibility fonts exceed the available width, the shared columns
+shrink and cells wrap rather than clipping the rightmost metrics.
 Compact landscape preserves both two-row summary grids side by side, and puts
 the unchanged source-skew explanation under audio to use the shorter column's
 space rather than growing the full panel.
