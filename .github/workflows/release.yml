@@ -28,7 +28,7 @@ concurrency:
 jobs:
   release:
     if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' && github.repository == 'arisewanggithub/RedrainCast-Android'
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, Linux, X64, arise-local]
     timeout-minutes: 45
     env:
       RELEASE_REPOSITORY: arisewanggithub/RedrainCast-Releases
@@ -76,6 +76,14 @@ jobs:
         run: bash ./gradlew :app:testDebugUnitTest :app:lintDebug :app:assembleRelease --console=plain
       - name: Test release tooling
         run: python3 -B tools/release-test.py
+      - name: Create private per-attempt release directory
+        run: |
+          set -euo pipefail
+          umask 077
+          work="$RUNNER_TEMP/redraincast-release-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          mkdir "$work"
+          echo "RELEASE_WORK=$work" >> "$GITHUB_ENV"
+          mkdir "$work/public-assets" "$work/temp"
       - name: Sign, verify and prepare public assets
         env:
           KEYSTORE: ${{ secrets.ANDROID_RELEASE_KEYSTORE_BASE64 }}
@@ -86,7 +94,7 @@ jobs:
           set -euo pipefail
           python3 -B tools/release-guard.py
           umask 077
-          key="$RUNNER_TEMP/release.jks"
+          key="$RELEASE_WORK/release.jks"
           trap 'rm -f "$key"' EXIT
           printf '%s' "$KEYSTORE" | base64 --decode > "$key"
           tools="$ANDROID_HOME/build-tools/37.0.0"
@@ -94,40 +102,41 @@ jobs:
           version=$("$tools/aapt" dump badging "$unsigned" | sed -n "s/.*versionName='\([^']*\)'.*/\1/p" | head -n 1)
           python3 -B tools/release-guard.py --release-tag "$RELEASE_TAG" --apk-version "$version"
           echo "Unsigned APK version verified: $version"
-          mkdir -p "$RUNNER_TEMP/public-assets"
-          apk="$RUNNER_TEMP/public-assets/RedrainCast-$version.apk"
-          "$tools/zipalign" -P 16 -f 4 "$unsigned" "$RUNNER_TEMP/aligned.apk"
+          apk="$RELEASE_WORK/public-assets/RedrainCast-$version.apk"
+          "$tools/zipalign" -P 16 -f 4 "$unsigned" "$RELEASE_WORK/aligned.apk"
           "$tools/apksigner" sign --ks "$key" --ks-key-alias "$KEY_ALIAS" \
             --ks-pass env:STORE_PASSWORD --key-pass env:KEY_PASSWORD \
             --v4-signing-enabled false \
-            --out "$apk" "$RUNNER_TEMP/aligned.apk"
-          if ! "$tools/apksigner" verify --verbose --print-certs "$apk" > "$RUNNER_TEMP/public-assets/signing-certificate.txt"; then
-            cat "$RUNNER_TEMP/public-assets/signing-certificate.txt"
+            --out "$apk" "$RELEASE_WORK/aligned.apk"
+          if ! "$tools/apksigner" verify --verbose --print-certs "$apk" > "$RELEASE_WORK/public-assets/signing-certificate.txt"; then
+            cat "$RELEASE_WORK/public-assets/signing-certificate.txt"
             echo "::error::Signed APK signature verification failed"
             exit 1
           fi
-          if grep -q 'CN=Android Debug' "$RUNNER_TEMP/public-assets/signing-certificate.txt"; then
+          if grep -q 'CN=Android Debug' "$RELEASE_WORK/public-assets/signing-certificate.txt"; then
             echo "::error::A development debug signing certificate cannot be published as a production release"
             exit 1
           fi
           python3 -B tools/release-guard.py \
-            --certificate-report "$RUNNER_TEMP/public-assets/signing-certificate.txt"
+            --certificate-report "$RELEASE_WORK/public-assets/signing-certificate.txt"
           "$tools/zipalign" -c -P 16 4 "$apk"
-          tar -czf "$RUNNER_TEMP/public-assets/licenses.tar.gz" -C app/src/main/assets NOTICE.txt OPUS-NOTICE.txt licenses
+          tar -czf "$RELEASE_WORK/public-assets/licenses.tar.gz" -C app/src/main/assets NOTICE.txt OPUS-NOTICE.txt licenses
       - name: Build and smoke-test exact-build LGPL relink kit
+        env:
+          TMPDIR: ${{ env.RELEASE_WORK }}/temp
         run: |
           set -euo pipefail
           python3 -B tools/release-kit.py \
             --ndk "$ANDROID_HOME/ndk/27.2.12479018" \
-            --apk "$RUNNER_TEMP/public-assets/RedrainCast-${RELEASE_TAG#v}.apk" \
-            --version "${RELEASE_TAG#v}" --cache "$RUNNER_TEMP/native-assets" \
-            --output "$RUNNER_TEMP/public-assets/android-lgpl-relink.tar.gz"
-          cd "$RUNNER_TEMP/public-assets"
+            --apk "$RELEASE_WORK/public-assets/RedrainCast-${RELEASE_TAG#v}.apk" \
+            --version "${RELEASE_TAG#v}" --cache "$RELEASE_WORK/native-assets" \
+            --output "$RELEASE_WORK/public-assets/android-lgpl-relink.tar.gz"
+          cd "$RELEASE_WORK/public-assets"
           sha256sum ./*.apk ./*.tar.gz signing-certificate.txt > SHA256SUMS
       - uses: actions/upload-artifact@v4
         with:
           name: signed-testing-candidate
-          path: ${{ runner.temp }}/public-assets/
+          path: ${{ env.RELEASE_WORK }}/public-assets/
           retention-days: 3
           if-no-files-found: error
       - name: Upload public draft release
@@ -142,7 +151,17 @@ jobs:
           if [[ "$kind" = prerelease ]]; then
             options+=(--prerelease)
           fi
-          gh release create "$RELEASE_TAG" "$RUNNER_TEMP/public-assets/"* \
+          gh release create "$RELEASE_TAG" "$RELEASE_WORK/public-assets/"* \
             --repo "$RELEASE_REPOSITORY" "${options[@]}" \
             --title "RedrainCast $RELEASE_TAG (candidate)" \
             --notes "Draft release candidate; version suffix determines prerelease status. One universal APK supports arm64-v8a, armeabi-v7a and x86_64; Android 11/API 30 or newer. The intermittent first-rotation tiny-strip rendering bug remains unresolved; live Windows interoperability is not verified. A production-signed APK cannot update earlier debug-signed installations in place. Checksums, signing certificate, licenses and exact-build LGPL relink materials are attached. Application source remains private. Review all assets, runtime acceptance and stability before manually publishing this draft."
+      - name: Remove this attempt's private release files
+        if: always() && env.RELEASE_WORK != ''
+        run: |
+          set -euo pipefail
+          expected="$RUNNER_TEMP/redraincast-release-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          [[ "$RELEASE_WORK" = "$expected" && -d "$RELEASE_WORK" && ! -L "$RELEASE_WORK" ]] || {
+            echo "::error::Refusing cleanup outside this release attempt"
+            exit 1
+          }
+          rm -rf -- "$RELEASE_WORK"
