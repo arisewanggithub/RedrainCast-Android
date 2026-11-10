@@ -171,6 +171,11 @@ class PlaybackStatisticsOverlayTest {
                 assertNotNull(overlay.findViewWithTag<View>("statisticsKpis"))
                 assertNotNull(overlay.findViewWithTag<View>("statisticsTotals"))
                 assertNotNull(overlay.findViewWithTag<View>("connectionTable"))
+                assertConnectionsAligned(overlay)
+                for (id in listOf("decoded", "presented", "skipped")) {
+                    val value = overlay.findViewWithTag<TextView>("value:$id")
+                    assertEquals("Generation totals must not split digits: ${value.text}", 1, value.lineCount)
+                }
                 assertTrue(overlay.text.contains("Encoded size: 2496 × 1664"))
                 assertTrue(overlay.text.contains("Network loss"))
                 assertTrue(overlay.text.contains("Inserted silence"))
@@ -200,6 +205,58 @@ class PlaybackStatisticsOverlayTest {
                 }
             }
         } finally { controller.pause().stop().destroy() }
+    }
+
+    @Test fun connectionColumnsFitLargeLiveValuesAndStayAlignedAfterUpdates() {
+        val controller = Robolectric.buildActivity(Activity::class.java).setup()
+        val activity = controller.get()
+        val configuration = android.content.res.Configuration(activity.resources.configuration).apply {
+            densityDpi = 450
+            fontScale = 1.15f
+        }
+        val context = activity.createConfigurationContext(configuration)
+        val parent = FrameLayout(context)
+        val overlay = PlaybackStatisticsOverlay(context)
+        parent.addView(overlay, FrameLayout.LayoutParams(-1, -2))
+        activity.setContentView(parent)
+        try {
+            for ((width, height) in listOf(2236 to 1080, 1080 to 2236, 1013 to 2250)) {
+                for (large in listOf(false, true, false)) {
+                    val original = snapshot()
+                    val input = if (large) original.input.copy(
+                        videoQueue = EncodedQueueStatistics(48, 8388608, 250000, 250, 8388608),
+                        audioQueue = EncodedQueueStatistics(48, 524288, 250000, 250, 524288),
+                        videoLastPacketAgeMs = 10000, audioLastPacketAgeMs = 10000,
+                        controlAgeMs = 10000, rttMs = 9999) else original.input
+                    overlay.show(original.copy(input = input), width, height)
+                    shadowOf(Looper.getMainLooper()).idle()
+                    parent.measure(View.MeasureSpec.makeMeasureSpec(width, View.MeasureSpec.EXACTLY),
+                        View.MeasureSpec.makeMeasureSpec(height, View.MeasureSpec.EXACTLY))
+                    parent.layout(0, 0, width, height)
+                    assertConnectionsAligned(overlay)
+                }
+            }
+        } finally { controller.pause().stop().destroy() }
+    }
+
+    private fun assertConnectionsAligned(overlay: PlaybackStatisticsOverlay) {
+        val table = overlay.findViewWithTag<ViewGroup>("connectionTable")
+        assertTrue("Connections must use the full panel, not a narrow body column",
+            table.width >= overlay.width - overlay.paddingLeft - overlay.paddingRight - 1)
+        for (column in 0..4) {
+            val header = overlay.findViewWithTag<TextView>("connection:header:$column")
+            for (id in listOf("video", "audio", "control")) {
+                val value = overlay.findViewWithTag<TextView>("connection:$id:$column")
+                assertEquals("Column $column must align for $id", header.left, value.left)
+                assertEquals(header.width, value.width)
+                assertEquals("Connection value must not wrap: ${value.text}", 1, value.lineCount)
+                assertTrue("Connection cell outside table: ${value.text}", value.right <= table.width)
+                assertTrue("Connection text clipped: ${value.text}",
+                    value.layout.getLineWidth(0) <= value.width -
+                        value.compoundPaddingLeft - value.compoundPaddingRight + 1)
+                assertEquals(0, value.layout.getEllipsisCount(0))
+            }
+        }
     }
 
     @Test fun fullDiagnosticsScrollsToEveryMetricAt115PercentWithoutChangingReceiverCanvas() {

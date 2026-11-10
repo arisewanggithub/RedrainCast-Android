@@ -199,10 +199,12 @@ removes only separator spacing in these values; full labels and technical
 identifiers remain available in the model and accessibility descriptions.
 Compact panels use 2dp outer vertical insets (normal panels retain 4dp) to
 accommodate the additional rows without changing font size or removing metrics.
-Compact landscape panel width is capped at 60% of the viewport so the taller
+Compact landscape panel width is capped at 50% of the viewport so the taller
 video metadata group still leaves more than half the player area uncovered.
-Within that panel, video receives a 1.35 column share, audio 1.25 and queues 1.0
-to fit decoded metadata and raster values without unnecessary wrapping.
+Within that panel, video and audio receive column shares of 1.35 and 1.25.
+Connections and queues occupy a full-width table below them rather than a
+narrow third column. Shared content-sized columns align all channel rows and
+headers as live queue sizes change, without reducing text size or removing units.
 Compact landscape preserves both two-row summary grids side by side, and puts
 the unchanged source-skew explanation under audio to use the shorter column's
 space rather than growing the full panel.

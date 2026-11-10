@@ -170,22 +170,18 @@ class PlaybackStatisticsOverlay @JvmOverloads constructor(
 
     private fun connections(parent: LinearLayout, model: PlaybackStatisticsDisplay, size: Float) {
         parent.addView(label("CONNECTIONS & QUEUES", size, bold = true))
-        val table = LinearLayout(context).apply {
+        val table = TableLayout(context).apply {
             tag = "connectionTable"
-            orientation = VERTICAL
+            isStretchAllColumns = true
         }
-        val weights = if (size <= 12f) floatArrayOf(1.4f, 2.2f, 1.25f, 1.15f, 1.15f)
-            else floatArrayOf(1.35f, 1.9f, 1f, 1.15f, 1f)
-        fun row(id: String?, content: List<String>) = LinearLayout(context).apply {
-            orientation = HORIZONTAL
-            isBaselineAligned = false
+        fun row(id: String?, content: List<String>) = TableRow(context).apply {
             content.forEachIndexed { index, text ->
                 val title = if (size <= 12f) {
                     if (id == null) when (index) {
                         0 -> "Ch."
-                        2 -> "Span\nms"
-                        3 -> "Last\nms"
-                        4 -> "RTT\nms"
+                        2 -> "Span ms"
+                        3 -> "Last ms"
+                        4 -> "RTT ms"
                         else -> text
                     } else if (index == 0 && text == "Control") "Ctrl"
                     else if (index >= 2) text.removeSuffix(" ms") else text
@@ -196,7 +192,7 @@ class PlaybackStatisticsOverlay @JvmOverloads constructor(
                     tag = "connection:${id ?: "header"}:$index"
                 }
                 if (id != null && index > 0) values["connection:$id:$index"] = cell
-                addView(cell, LayoutParams(0, -2, weights[index]))
+                addView(cell, TableRow.LayoutParams(-2, -2))
             }
         }
         table.addView(row(null, model.connectionHeaders), LayoutParams(-1, -2))
@@ -252,7 +248,15 @@ class PlaybackStatisticsOverlay @JvmOverloads constructor(
         val kpiLabels = TableRow(context)
         val kpiValues = TableRow(context)
         model.kpis.forEach { field ->
-            kpiLabels.addView(label(field.label, size), TableRow.LayoutParams(0, -2, 1f))
+            val caption = if (layoutMode == 2) when (field.id) {
+                "receivedFps" -> "Rx FPS"
+                "decodedFps" -> "Dec FPS"
+                "presentedFps" -> "Out FPS"
+                "skippedRecent" -> "Skip %"
+                else -> field.label
+            } else field.label
+            kpiLabels.addView(label(caption, size).apply { contentDescription = field.label },
+                TableRow.LayoutParams(0, -2, 1f))
             val value = label(field.value, size, numeric = true).apply { tag = "value:${field.id}"; gravity = Gravity.START }
             values[field.id] = value
             kpiValues.addView(value, TableRow.LayoutParams(0, -2, 1f))
@@ -281,7 +285,7 @@ class PlaybackStatisticsOverlay @JvmOverloads constructor(
             addView(LinearLayout(context).apply {
                 orientation = HORIZONTAL
                 isBaselineAligned = false
-                addView(kpis, LayoutParams(0, -2, 1.5f))
+                addView(kpis, LayoutParams(0, -2, 1f))
                 addView(totals, LayoutParams(0, -2, 1f))
             }, LayoutParams(-1, -2))
         } else {
@@ -308,16 +312,10 @@ class PlaybackStatisticsOverlay @JvmOverloads constructor(
             model.notes.forEach { audio.addView(label(it, size)) }
         } else if (layoutMode == 2) {
             audio.addView(label(compactNote, size))
-            val queues = bodySection("CONNECTIONS")
-            queues.removeAllViews()
-            queues.layoutParams = LayoutParams(0, -2, 1f)
-            connections(queues, model, size)
         }
         addView(body, LayoutParams(-1, -2))
-        if (layoutMode != 2) {
-            rule(this)
-            connections(this, model, size)
-        }
+        rule(this)
+        connections(this, model, size)
         stackedFields(this, model.details, size, "statisticsPlatformDetails")
         if (layoutMode == 4) {
             addView(label(compactNote, size))
@@ -367,7 +365,7 @@ class PlaybackStatisticsOverlay @JvmOverloads constructor(
         val density = resources.displayMetrics.density
         val compact = minOf(availableWidth, availableHeight) / density < 600
         val panelWidth = if (!detailed && compact)
-            minOf((availableWidth * if (availableWidth > availableHeight) 0.60f else 0.90f).toInt(), dp(760))
+            minOf((availableWidth * if (availableWidth > availableHeight) 0.50f else 0.90f).toInt(), dp(760))
             else minOf(availableWidth, dp(1100))
         layoutParams?.let {
             if (panelWidth > 0 && it.width != panelWidth) {
@@ -376,7 +374,7 @@ class PlaybackStatisticsOverlay @JvmOverloads constructor(
             }
         }
         val layoutMode = when {
-            compact && panelWidth / density >= 460 && availableWidth > availableHeight -> 2
+            compact && panelWidth / density >= 380 && availableWidth > availableHeight -> 2
             compact && !detailed -> 4
             panelWidth / density < 600 -> 1
             else -> 0
