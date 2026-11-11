@@ -28,7 +28,7 @@ concurrency:
 jobs:
   release:
     if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' && github.repository == 'arisewanggithub/RedrainCast-Android'
-    runs-on: [self-hosted, Linux, X64, arise-local]
+    runs-on: ubuntu-latest
     timeout-minutes: 45
     env:
       RELEASE_REPOSITORY: arisewanggithub/RedrainCast-Releases

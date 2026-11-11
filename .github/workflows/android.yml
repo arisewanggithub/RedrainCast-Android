@@ -7,7 +7,7 @@ permissions:
   contents: read
 jobs:
   validate:
-    runs-on: [self-hosted, Linux, X64, arise-local]
+    runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
