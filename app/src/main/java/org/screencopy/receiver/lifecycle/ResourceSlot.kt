@@ -3,12 +3,17 @@ package org.screencopy.receiver.lifecycle
 /** Serializes construction and retirement, including an in-flight Surface decoder configuration. */
 class ResourceSlot<T : AutoCloseable> : AutoCloseable {
     private var resource: T? = null
+    private val lifetime = Any()
     @Volatile var isClosed = false
         private set
 
-    @Synchronized
     fun replace(create: () -> T): T {
-        check(!isClosed) { "Surface lifetime has ended" }
+        return checkNotNull(replaceIfOpen(create)) { "Surface lifetime has ended" }
+    }
+
+    @Synchronized
+    fun replaceIfOpen(create: () -> T): T? {
+        if (synchronized(lifetime) { isClosed }) return null
         retire()
         return create().also { resource = it }
     }
@@ -18,10 +23,15 @@ class ResourceSlot<T : AutoCloseable> : AutoCloseable {
         if (resource === value) retire()
     }
 
-    @Synchronized
+    fun whileOpen(action: () -> Unit): Boolean = synchronized(lifetime) {
+        if (isClosed) return false
+        action()
+        true
+    }
+
     override fun close() {
-        isClosed = true
-        retire()
+        synchronized(lifetime) { isClosed = true }
+        synchronized(this) { retire() }
     }
 
     private fun retire() {

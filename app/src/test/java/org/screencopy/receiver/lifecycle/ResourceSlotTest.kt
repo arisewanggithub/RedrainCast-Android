@@ -80,6 +80,64 @@ class ResourceSlotTest {
         assertFalse(constructed.get())
     }
 
+    @Test fun closedSurfaceRejectsOwnershipCommits() {
+        val slot = ResourceSlot<Renderer>()
+        val commits = AtomicInteger()
+        assertTrue(slot.whileOpen { commits.incrementAndGet() })
+        slot.close()
+        assertFalse(slot.whileOpen { commits.incrementAndGet() })
+        assertEquals(1, commits.get())
+    }
+
+    @Test fun closureCannotPublishInsideAnAdmittedOwnershipCommit() {
+        val slot = ResourceSlot<Renderer>()
+        val committing = CountDownLatch(1)
+        val finishCommit = CountDownLatch(1)
+        val closing = CountDownLatch(1)
+        val order = java.util.concurrent.ConcurrentLinkedQueue<String>()
+        val threads = Executors.newFixedThreadPool(2)
+        try {
+            val commit = threads.submit {
+                assertTrue(slot.whileOpen {
+                    committing.countDown()
+                    check(finishCommit.await(3, TimeUnit.SECONDS))
+                    assertFalse(slot.isClosed)
+                    order.add("READY")
+                })
+            }
+            assertTrue(committing.await(2, TimeUnit.SECONDS))
+            val close = threads.submit {
+                closing.countDown()
+                slot.close()
+                order.add("CLOSED")
+            }
+            assertTrue(closing.await(2, TimeUnit.SECONDS))
+            assertFalse(slot.isClosed)
+            finishCommit.countDown()
+            commit.get(3, TimeUnit.SECONDS)
+            close.get(3, TimeUnit.SECONDS)
+            assertEquals(listOf("READY", "CLOSED"), order.toList())
+            assertFalse(slot.whileOpen { fail("Closed lifetime admitted a commit") })
+        } finally {
+            finishCommit.countDown()
+            threads.shutdownNow()
+            assertTrue(threads.awaitTermination(3, TimeUnit.SECONDS))
+            slot.close()
+        }
+    }
+
+    @Test fun closedConstructionAdmissionDoesNotInvokeFactoryOrHideFactoryFailures() {
+        val closed = ResourceSlot<Renderer>()
+        closed.close()
+        assertNull(closed.replaceIfOpen { fail("Closed lifetime invoked codec factory"); Renderer() })
+        val open = ResourceSlot<Renderer>()
+        val failure = IllegalStateException("Codec failure")
+        assertSame(failure, assertThrows(IllegalStateException::class.java) {
+            open.replaceIfOpen { throw failure }
+        })
+        open.close()
+    }
+
     private class Renderer : TrackWorker("test-renderer", 1024, { code, detail -> throw AssertionError("$code: $detail") }) {
         val drawing = CountDownLatch(1)
         val released = AtomicInteger()
