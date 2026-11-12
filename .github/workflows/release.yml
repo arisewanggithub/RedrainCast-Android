@@ -1,13 +1,13 @@
-name: Public Android release candidate
+name: Public Android release
 on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Exact APK tag: v0.5.0 or v0.5.0-rc.1 (also alpha.N/beta.N)"
+        description: "Exact APK tag, such as v0.5.1 or v0.5.1-rc.1"
         required: true
         type: string
       source_validated:
-        description: "I reviewed this exact source revision and authorize a signed release candidate"
+        description: "I reviewed this exact source revision and authorize its signed release build"
         required: true
         type: boolean
         default: false
