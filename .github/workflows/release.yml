@@ -174,10 +174,12 @@ jobs:
           if [[ "$kind" = prerelease ]]; then
             options+=(--prerelease)
           fi
+          python3 -B tools/release-guard.py --release-tag "$RELEASE_TAG" --create-tag
           gh release create "$RELEASE_TAG" \
             "candidate/RedrainCast-${RELEASE_TAG#v}.apk" \
             candidate/SHA256SUMS candidate/signing-certificate.txt \
             candidate/licenses.tar.gz candidate/android-lgpl-relink.tar.gz \
-            --repo "$GITHUB_REPOSITORY" --target "$REVIEWED_COMMIT" "${options[@]}" \
+            --repo "$GITHUB_REPOSITORY" --verify-tag "${options[@]}" \
             --title "RedrainCast $RELEASE_TAG (candidate)" \
             --notes "Draft release candidate; version suffix determines prerelease status. One universal APK supports arm64-v8a, armeabi-v7a and x86_64; Android 11/API 30 or newer. The intermittent first-rotation tiny-strip rendering bug remains unresolved; live Windows interoperability is not verified. A production-signed APK cannot update earlier debug-signed installations in place. Checksums, signing certificate, licenses and exact-build LGPL relink materials are attached. Source archives correspond to this public Android repository. Review all assets, runtime acceptance and stability before manually publishing this draft."
+          python3 -B tools/release-guard.py --release-tag "$RELEASE_TAG" --verify-tag
