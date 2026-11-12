@@ -13,7 +13,7 @@ unchanged.
 
 ## Required configuration and permissions
 
-The manually dispatched `Public Android release candidate` workflow runs on
+The manually dispatched `Public Android release` workflow runs on
 GitHub-hosted `ubuntu-latest` with JDK 21, the pinned Android SDK/NDK/CMake,
 Python 3 and Bash. Signing requires four existing Actions secrets:
 
