@@ -13,6 +13,12 @@
     <string name="rc_stats_sdr_tone_mapped">SDR (tone-mapped)</string>
     <string name="rc_stats_unknown">N/A</string>
     <string name="rc_playback_diagnostics_unavailable">No active receiver statistics. Enable playback statistics on the sender before the next cast.</string>
+    <string name="rc_statistics_os_unsupported">Statistics overlay unavailable: secure independent rendering requires Android 12 or later.</string>
+    <string name="rc_statistics_secure_window_required">Statistics overlay unavailable: its host must be protected from initial window creation until safe surface retirement. A window previously used for screen sharing or recreated with preserved content may not qualify.</string>
+    <string name="rc_statistics_window_stays_secure">Receiver statistics keep this window protected for its lifetime. Screen sharing may hide this app’s own window.</string>
+    <string name="rc_statistics_window_retirement_pending">Receiver statistics keep this app window hidden from screen sharing until secure surface retirement is confirmed. Without confirmation, protection lasts until this window closes.</string>
+    <string name="rc_statistics_rendering_unavailable">Statistics overlay unavailable: its rendering surface could not be started.</string>
+    <string name="rc_statistics_host_unavailable">Statistics overlay unavailable: its secure panel window could not be attached.</string>
     <string name="rc_app_name">RedrainCast</string>
     <string name="rc_subtitle">Send and receive screens.</string>
     <string name="rc_settings">Sharing settings</string>

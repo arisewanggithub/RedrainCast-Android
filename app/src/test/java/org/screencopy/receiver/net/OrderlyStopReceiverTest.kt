@@ -82,7 +82,7 @@ class OrderlyStopReceiverTest {
                             assertTrue("Healthy output must halt before waiting for recovery retirement",
                                 paused.await(1, TimeUnit.SECONDS))
                             assertFalse(active.get())
-                            assertFalse("Recovery still owns playbackOperations", stopping.isDone)
+                            assertFalse("Recovery still owns its track operation", stopping.isDone)
                             resume.countDown()
                             stopping.get(3, TimeUnit.SECONDS)
                             send(peer, Type.SESSION_END, JSONObject().put("reason", "user"))

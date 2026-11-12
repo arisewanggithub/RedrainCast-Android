@@ -5,8 +5,140 @@ import org.junit.Test
 import org.screencopy.receiver.protocol.AudioPacketTiming
 import java.io.IOException
 import java.util.concurrent.atomic.AtomicLong
+import dev.redrain.cast.diagnostics.*
 
 class StreamRecoverySenderTest {
+    @Test fun remoteVideoDistinguishesSourceFilteringQueueAdmissionRemovalAndRecoveryDiscard() {
+        val diagnostics = RemoteDiagnostics.recorder
+        diagnostics.grantConsent()
+        diagnostics.sessionStarted("sender", 73)
+        val id = diagnostics.start("sender", 73, setOf("video.progress", "recovery"), 10000, 1000)
+            .getString("captureId")
+        mux.diagnosticSession = 73
+        try {
+            configure()
+            recovery.packet(video(1_000_000))
+            recovery.packet(video(1_020_000, true))
+            assertEquals(1_020_000L, finishWrite(1).pts)
+            recovery.packet(video(1_040_000))
+            mux.discardMediaForRecovery(1)
+            diagnostics.end(id)
+            val all = ArrayList<org.json.JSONObject>()
+            var cursor = 0L
+            do {
+                val page = diagnostics.fetch(id, cursor, 32)
+                val records = page.getJSONArray("records")
+                repeat(records.length()) { all.add(records.getJSONObject(it)) }
+                cursor = page.getString("nextAfterSeq").toLong()
+            } while (page.getBoolean("hasMore"))
+            val progress = all.filter { it.getString("kind") == "VIDEO_PROGRESS" }
+                .associate { it.getJSONObject("data").getJSONObject("metrics").let { metrics ->
+                    metrics.getString("videoStage") to metrics
+                } }
+            assertEquals("1", progress.getValue("source_dropped").getString("count"))
+            assertEquals("2", progress.getValue("queued").getString("count"))
+            assertEquals("1", progress.getValue("queue_removed").getString("count"))
+            assertEquals("1020000", progress.getValue("queue_removed").getString("lastPtsUs"))
+            assertEquals("1", progress.getValue("queue_dropped").getJSONObject("reasons").getString("stale"))
+            assertEquals("1040000", progress.getValue("queue_dropped").getString("lastPtsUs"))
+        } finally {
+            diagnostics.revoke()
+            diagnostics.sessionEnded("sender", 73)
+        }
+    }
+    @Test fun delayedRawReadinessReleasesFreshSuffixWithoutRestartingOrRebasingProofs() {
+        activate()
+        recovery.request(2, 1)
+        val config = finishWrite(2)
+        val cutoff = config.json().getString("recoveryPtsUs").toLong()
+        repeat(50) { index ->
+            now.set(1_000_000_000 + index * 20_000_000L)
+            recovery.packet(audio(1_000_000 + index * 20_000L))
+        }
+        assertTrue(mux.firstQueuedAudioPts()!! - cutoff > 250_000)
+        assertTrue(mux.queuedSpanUs(2) <= 500_000)
+        mux.ready(2, 2)
+        recovery.ready()
+        val first = finishWrite(2)
+        assertEquals(Wire.AUDIO_PACKET, first.type)
+        assertEquals(2, first.generation)
+        assertEquals(1_980_000L, first.pts)
+        assertArrayEquals(audio(first.pts).payload, first.payload)
+        assertNull("Only the fresh PCM suffix is released", mux.pollLane(2, 1))
+        recovery.packet(video(1_980_000))
+        assertEquals("Healthy video keeps its generation", 1, finishWrite(1).generation)
+        assertEquals(cutoff, config.json().getString("recoveryPtsUs").toLong())
+        assertThrows(IOException::class.java) { recovery.completed(2, 2, cutoff) }
+        assertThrows(IOException::class.java) { recovery.completed(2, 2, first.pts + 20_000) }
+        recovery.completed(2, 2, first.pts)
+        now.set(11_000_000_000)
+        recovery.checkDeadline()
+    }
+
+    @Test fun delayedRawReadinessDoesNotRestartOrExtendAnUnprovedRecovery() {
+        activate()
+        recovery.request(2, 1)
+        finishWrite(2)
+        repeat(50) { index ->
+            now.set(1_000_000_000 + index * 20_000_000L)
+            recovery.packet(audio(1_000_000 + index * 20_000L))
+        }
+        mux.ready(2, 2)
+        recovery.ready()
+        assertEquals(2, finishWrite(2).generation)
+        now.set(10_999_999_999)
+        recovery.checkDeadline()
+        assertNull(mux.pollLane(2, 1))
+        now.set(11_000_000_000)
+        assertThrows(IOException::class.java) { recovery.checkDeadline() }
+    }
+
+    @Test fun diagnosticsRetainRepeatedAacWindowRejectionsBeforeResetWithoutChangingRecovery() {
+        val diagnostics = RemoteDiagnostics.recorder
+        diagnostics.grantConsent()
+        diagnostics.sessionStarted("sender", 73)
+        val id = diagnostics.start("sender", 73, setOf("recovery", "audio.queue"), 10000, 1000).getString("captureId")
+        mux.diagnosticSession = 73
+        try {
+            recovery.config(1, 1, Wire.obj("codec" to "h264"))
+            recovery.config(2, 1, Wire.obj("codec" to "aac", "sampleRate" to 48000, "channels" to 2,
+                "csd" to org.json.JSONArray().put("EZA=")))
+            for (track in 1..2) { finishWrite(track); mux.ready(track, 1) }
+            recovery.ready()
+            recovery.request(2, 1)
+            repeat(3) { index ->
+                val config = finishWrite(2)
+                assertEquals(index + 2, config.generation)
+                mux.ready(2, config.generation)
+                recovery.ready()
+                recovery.packet(audio(now.get() / 1000 + 300_001))
+                now.addAndGet(100_000_000)
+            }
+            val all = ArrayList<org.json.JSONObject>()
+            var cursor = 0L
+            repeat(4) {
+                val page = diagnostics.fetch(id, cursor, 32)
+                val records = page.getJSONArray("records")
+                for (i in 0 until records.length()) all.add(records.getJSONObject(i))
+                cursor = page.getString("nextAfterSeq").toLong()
+            }
+            val rejected = all.filter {
+                it.getString("kind") == "RECOVERY" &&
+                    it.getJSONObject("data").optString("reason") == "source_window_lost" &&
+                    it.getJSONObject("data").optString("stage") == "rejected"
+            }
+            assertEquals(3, rejected.size)
+            rejected.forEach {
+                val data = it.getJSONObject("data")
+                assertTrue(data.getString("ptsUs").toLong() - data.getString("cutoffUs").toLong() > 250_000)
+                assertEquals("aac", data.getJSONObject("metrics").getString("codec"))
+                assertEquals("21334", data.getJSONObject("metrics").getString("prerollUs"))
+            }
+        } finally {
+            diagnostics.revoke()
+            diagnostics.sessionEnded("sender", 73)
+        }
+    }
     private val now = AtomicLong(1_000_000_000)
     private val mux = MediaBudget(true, now::get, 1)
     private val recovery = StreamRecoverySender(73, mux, now::get)

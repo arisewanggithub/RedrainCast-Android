@@ -2,6 +2,7 @@ package org.screencopy.receiver.media
 
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
+import dev.redrain.cast.diagnostics.*
 
 internal class TrackStoppedException : IllegalStateException("Track decoder is stopped")
 
@@ -14,6 +15,20 @@ abstract class TrackWorker(
     private val queue = ArrayDeque<AccessUnit>()
     private val admittedAt = ArrayDeque<Long>()
     @Volatile internal var statisticsEnabled = false
+    @Volatile internal var diagnosticSession = 0L
+    @Volatile internal var diagnosticGeneration = 0
+    private fun diagnosticQueue(stage: DiagnosticStage, packet: AccessUnit) {
+        val diagnostics = RemoteDiagnostics.recorder
+        if (track != 2 || !diagnostics.enabled("receiver", diagnosticSession, DiagnosticKind.AUDIO_QUEUE)) return
+        diagnostics.observe("receiver", diagnosticSession, DiagnosticKind.AUDIO_QUEUE, stage, track, diagnosticGeneration,
+            pts = queue.firstOrNull()?.ptsUs ?: packet.ptsUs, endPts = queue.lastOrNull()?.ptsUs ?: packet.ptsUs,
+            count = queue.size.toLong(), bytes = queue.sumOf { it.bytes.size.toLong() },
+            reason = if (stage == DiagnosticStage.REJECTED) DiagnosticReason.CAPACITY else DiagnosticReason.NONE,
+            point = DiagnosticPoint.QUEUE,
+            metadata = DiagnosticQueue(queue.size, 48, queue.sumOf { it.bytes.size }, maxBytes,
+                admittedAt.firstOrNull()?.let { (System.nanoTime() - it).coerceAtLeast(0) },
+                if (queue.isEmpty()) 0 else queue.maxOf { it.ptsUs } - queue.minOf { it.ptsUs }, 250_000))
+    }
     private val monitor = Object()
     private val budget = PacketBudget(maxBytes, 250_000)
     protected val running = AtomicBoolean(true)
@@ -22,10 +37,20 @@ abstract class TrackWorker(
     fun start() = thread.start()
 
     internal fun queuedPackets(): Int = synchronized(monitor) { queue.size }
-    internal fun queueStatistics(): EncodedQueueStatistics = synchronized(monitor) {
-        EncodedQueueStatistics(queue.size, queue.sumOf { it.bytes.size },
+    private data class QueueObservation(val value: EncodedQueueStatistics, val oldestAtNs: Long?)
+    @Volatile private var queueObservation = QueueObservation(
+        EncodedQueueStatistics(0, 0, 0, null, maxBytes), null)
+    internal fun queueStatistics(): EncodedQueueStatistics {
+        val observed = queueObservation
+        return observed.value.copy(oldestAgeMs =
+            observed.oldestAtNs?.let { (System.nanoTime() - it).coerceAtLeast(0) / 1_000_000 })
+    }
+
+    private fun publishQueueStatistics() {
+        if (!statisticsEnabled) return
+        queueObservation = QueueObservation(EncodedQueueStatistics(queue.size, queue.sumOf { it.bytes.size },
             if (queue.isEmpty()) 0 else queue.maxOf { it.ptsUs } - queue.minOf { it.ptsUs },
-            admittedAt.firstOrNull()?.let { (System.nanoTime() - it).coerceAtLeast(0) / 1_000_000 }, maxBytes)
+            null, maxBytes), admittedAt.firstOrNull())
     }
 
     fun tryOffer(packet: AccessUnit): QueuePressure? = synchronized(monitor) {
@@ -35,8 +60,10 @@ abstract class TrackWorker(
             budget.add(packet)
             queue.addLast(packet)
             if (statisticsEnabled) admittedAt.addLast(System.nanoTime())
+            publishQueueStatistics()
             monitor.notifyAll()
         }
+        diagnosticQueue(if (pressure == null) DiagnosticStage.ADMITTED else DiagnosticStage.REJECTED, packet)
         pressure
     }
 
@@ -51,7 +78,9 @@ abstract class TrackWorker(
                     budget.add(packet)
                     queue.addLast(packet)
                     if (statisticsEnabled) admittedAt.addLast(System.nanoTime())
+                    publishQueueStatistics()
                     monitor.notifyAll()
+                    diagnosticQueue(DiagnosticStage.ADMITTED, packet)
                     return
                 }
                 val remaining = deadline - System.nanoTime()
@@ -67,6 +96,8 @@ abstract class TrackWorker(
         if (queue.isEmpty()) null else queue.removeFirst().also {
             if (admittedAt.isNotEmpty()) admittedAt.removeFirst()
             budget.remove()
+            publishQueueStatistics()
+            diagnosticQueue(DiagnosticStage.COMPLETE, it)
             monitor.notifyAll()
         }
     }
@@ -109,7 +140,11 @@ abstract class TrackWorker(
                 }
                 release()
             } finally {
-                synchronized(monitor) { queue.clear(); admittedAt.clear(); budget.clear(); monitor.notifyAll() }
+                synchronized(monitor) {
+                    queue.clear(); admittedAt.clear(); budget.clear()
+                    publishQueueStatistics()
+                    monitor.notifyAll()
+                }
             }
         }
     }

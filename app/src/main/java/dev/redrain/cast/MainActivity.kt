@@ -39,8 +39,10 @@ import org.screencopy.receiver.protocol.ReceiverOrientation
 import org.screencopy.receiver.ui.ReceiverScreenEvent
 import org.screencopy.receiver.ui.SessionOrientation
 import org.screencopy.receiver.ui.VideoPresentation
-import org.screencopy.receiver.ui.PlaybackStatisticsOverlay
+import org.screencopy.receiver.ui.PlaybackStatisticsSurface
 import org.screencopy.receiver.ui.PlaybackStatisticsDetails
+import org.screencopy.receiver.ui.StatisticsWindowProtection
+import org.screencopy.receiver.ui.InlineStatisticsHost
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
@@ -67,7 +69,10 @@ class MainActivity : Activity(), SurfaceHolder.Callback, TextureView.SurfaceText
     private var presentationMode = VideoPresentation.Mode.SDR_TEXTURE
     private val nativeHdrDisplay = AtomicReference<Boolean?>(null)
     private val receiveCapabilities = AtomicReference(org.screencopy.receiver.protocol.ReceiveCapabilities())
-    private lateinit var playbackStatistics: PlaybackStatisticsOverlay
+    private lateinit var playbackStatistics: PlaybackStatisticsSurface
+    private lateinit var inlineStatisticsHost: InlineStatisticsHost
+    private val statisticsWindowProtection by lazy { StatisticsWindowProtection.forWindow(window) }
+    private var reportedStatisticsProtection = false
     private var statisticsDetails: PlaybackStatisticsDetails? = null
     private var statisticsDialog: AlertDialog? = null
     private var displayOutput: PixelDimensions? = null
@@ -79,14 +84,18 @@ class MainActivity : Activity(), SurfaceHolder.Callback, TextureView.SurfaceText
     }
     private val statisticsRefresh = object : Runnable {
         override fun run() {
-            val visible = foreground && resumed && playing && listenerRun?.server?.playbackStatisticsRequested == true
-            listenerRun?.server?.showPlaybackStatistics(visible)
-            val snapshot = if (visible) listenerRun?.server?.playbackStatistics else null
+            val server = listenerRun?.server
+            val visible = foreground && server?.playbackStatisticsRequested == true
+            server?.showPlaybackStatistics(visible)
             val measurements = PlaybackDisplayMeasurements(displayOutput = displayOutput)
-            playbackStatistics.show(snapshot, videoBox.width, videoBox.height, measurements = measurements)
-            statisticsDetails?.show(snapshot, videoBox.width, videoBox.height, measurements)
+            if (visible && server != null) {
+                inlineStatisticsHost.start(videoBox.width, videoBox.height, measurements,
+                    { server.playbackStatisticsRequested }) { server.playbackStatistics }
+                statisticsDetails?.start({ server.playbackStatistics }, videoBox.width, videoBox.height, measurements,
+                    selected = { server.playbackStatisticsRequested })
+            } else inlineStatisticsHost.stop()
             videoBox.isLongClickable = visible
-            if (visible) main.postDelayed(this, 1000)
+            if (visible || foreground && server?.playbackStatisticsPending == true) main.postDelayed(this, 1000)
         }
     }
     private lateinit var settings: Settings
@@ -136,11 +145,16 @@ class MainActivity : Activity(), SurfaceHolder.Callback, TextureView.SurfaceText
         sessionOrientation = SessionOrientation.forActivity(this)
         networkPermissionRequested = savedInstanceState?.getBoolean("networkPermissionRequested") ?: false
         networkPermissionDenied = savedInstanceState?.getBoolean("networkPermissionDenied") ?: false
-        if (CastState.roles.role() != RoleOwner.Role.SEND) window.addFlags(WindowManager.LayoutParams.FLAG_SECURE)
+        if (CastState.roles.role() != RoleOwner.Role.SEND) {
+            window.addFlags(WindowManager.LayoutParams.FLAG_SECURE)
+            statisticsWindowProtection.secureForReceiving()
+        }
         savedInstanceState?.takeIf { it.containsKey("previousOrientation") }?.let {
             requestedOrientation = it.getInt("previousOrientation")
         }
         settings = SharingSettings.load(this, ::showError)
+        if (!settings.showPlaybackStatistics)
+            dev.redrain.cast.diagnostics.DiagnosticAccess.setEnabled(this, false, false)
         val pending = CastState.requests.snapshot()
         if (savedInstanceState?.getLong("pendingRequest", -1) == pending?.id && pending?.adopted == false) {
             pendingRequestId = pending.id
@@ -170,8 +184,12 @@ class MainActivity : Activity(), SurfaceHolder.Callback, TextureView.SurfaceText
         }
         home.onLocalNetworkPermission = ::requestLocalNetworkPermission
         root.addView(home, FrameLayout.LayoutParams(-1, -1))
-        playbackStatistics = PlaybackStatisticsOverlay(this)
-        root.addView(playbackStatistics, FrameLayout.LayoutParams(-1, -2, Gravity.TOP or Gravity.START))
+        playbackStatistics = PlaybackStatisticsSurface(this)
+        playbackStatistics.bindWindow(statisticsWindowProtection)
+        val statisticsAnchor = FrameLayout(this)
+        statisticsAnchor.addView(playbackStatistics, FrameLayout.LayoutParams(-1, -1))
+        root.addView(statisticsAnchor, FrameLayout.LayoutParams(-1, -1, Gravity.TOP or Gravity.START))
+        inlineStatisticsHost = InlineStatisticsHost(this, statisticsAnchor, playbackStatistics, statisticsWindowProtection)
         setContentView(root)
         root.setOnApplyWindowInsetsListener { view, insets ->
             val bars = insets.getInsets(WindowInsets.Type.systemBars() or WindowInsets.Type.displayCutout())
@@ -237,7 +255,9 @@ class MainActivity : Activity(), SurfaceHolder.Callback, TextureView.SurfaceText
 
     private fun reconcile() {
         if (!foreground || isDestroyed) return
+        if (CastState.roles.role() != RoleOwner.Role.SEND) statisticsWindowProtection.secureForReceiving()
         if (!LocalNetworkPermission.granted(this)) {
+            dev.redrain.cast.diagnostics.DiagnosticAccess.setEnabled(this, false, false)
             if (listenerRun != null) retireListener()
             closeDiscovery()
             readiness = "PERMISSION REQUIRED"
@@ -286,7 +306,7 @@ class MainActivity : Activity(), SurfaceHolder.Callback, TextureView.SurfaceText
     }
 
     private fun startListener() {
-        window.addFlags(WindowManager.LayoutParams.FLAG_SECURE)
+        statisticsWindowProtection.secureForReceiving()
         val surface = decoderSurface ?: return
         val hdrSurface = hdrDecoderSurface ?: return
         val run = ListenerRun(surface, hdrSurface)
@@ -339,6 +359,8 @@ class MainActivity : Activity(), SurfaceHolder.Callback, TextureView.SurfaceText
                             showPlayer()
                         }
                     } }, supportsPlaybackStatistics = true, receiveCapabilities = { receiveCapabilities.get() },
+                    diagnosticDiscovery = { dev.redrain.cast.diagnostics.DiagnosticAccess.discoveryFor(it) },
+                    diagnosticSessionAccess = dev.redrain.cast.diagnostics.DiagnosticAccess.sessionAccess(this),
                     videoSurface = { format -> presentationSurface(format, run) })
                 checkNotNull(run.server).start()
                 run.port = checkNotNull(run.server).listeningPort
@@ -379,6 +401,8 @@ class MainActivity : Activity(), SurfaceHolder.Callback, TextureView.SurfaceText
                 dialog?.dismiss(); dialog = null
                 settingsDialog?.dismiss(); settingsDialog = null
                 closePlaybackDiagnostics()
+                main.removeCallbacks(statisticsRefresh)
+                main.post(statisticsRefresh)
             }
             ReceiverScreenEvent.CleanupFinished -> {
                 hidePlayer()
@@ -445,7 +469,7 @@ class MainActivity : Activity(), SurfaceHolder.Callback, TextureView.SurfaceText
                 if (pendingRequestId != request.id) return@retireListener
                 if (!success || !foreground) cancelPending(getString(R.string.flow_send_cancelled))
                 else try {
-                    window.clearFlags(WindowManager.LayoutParams.FLAG_SECURE)
+                    clearSecureWindowForSending()
                     if (android.os.Build.VERSION.SDK_INT >= 33 &&
                         checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
                         CastState.requests.beginConsent(request.id)
@@ -600,17 +624,22 @@ class MainActivity : Activity(), SurfaceHolder.Callback, TextureView.SurfaceText
         statisticsDialog = prompt
         statisticsDetails = content
         prompt.setOnDismissListener {
+            content.stop()
             content.show(null, 0, 0)
             if (statisticsDialog === prompt) { statisticsDialog = null; statisticsDetails = null }
         }
         if (window.attributes.flags and WindowManager.LayoutParams.FLAG_SECURE != 0)
             prompt.window?.addFlags(WindowManager.LayoutParams.FLAG_SECURE)
+        prompt.window?.let { content.bindWindow(StatisticsWindowProtection.forWindow(it)) }
         prompt.show()
         prompt.window?.setLayout(-1, -1)
         content.post {
             if (statisticsDialog === prompt && resumed)
-                content.show(if (playing) listenerRun?.server?.playbackStatistics else null, videoBox.width, videoBox.height,
-                    PlaybackDisplayMeasurements(displayOutput = displayOutput))
+                listenerRun?.server?.takeIf { it.playbackStatisticsRequested }?.let { server ->
+                    content.start({ server.playbackStatistics }, videoBox.width, videoBox.height,
+                        PlaybackDisplayMeasurements(displayOutput = displayOutput),
+                        selected = { server.playbackStatisticsRequested })
+                }
         }
     }
 
@@ -803,7 +832,7 @@ class MainActivity : Activity(), SurfaceHolder.Callback, TextureView.SurfaceText
         main.removeCallbacks(statisticsRefresh)
         videoBox.isLongClickable = false
         closePlaybackDiagnostics()
-        if (::playbackStatistics.isInitialized) playbackStatistics.show(null, 0, 0)
+        if (::inlineStatisticsHost.isInitialized) inlineStatisticsHost.stop()
         listenerRun?.server?.showPlaybackStatistics(false)
         if (::home.isInitialized) home.visibility = View.VISIBLE
         restoreOrientation()
@@ -821,7 +850,7 @@ class MainActivity : Activity(), SurfaceHolder.Callback, TextureView.SurfaceText
         updateDisplayOutput()
         resumed = true
         main.removeCallbacks(statisticsRefresh)
-        if (playing) main.post(statisticsRefresh)
+        main.post(statisticsRefresh)
         if (muteRecoveryPending) {
             muteRecoveryPending = false
             try { PlaybackMute.create(this).restore() } catch (error: Exception) { showError(error) }
@@ -837,11 +866,8 @@ class MainActivity : Activity(), SurfaceHolder.Callback, TextureView.SurfaceText
 
     override fun onPause() {
         resumed = false
-        main.removeCallbacks(statisticsRefresh)
-        listenerRun?.server?.showPlaybackStatistics(false)
-        playbackStatistics.show(null, 0, 0)
         videoBox.isLongClickable = false
-        closePlaybackDiagnostics()
+        if (listenerRun?.server?.playbackStatisticsRequested != true) closePlaybackDiagnostics()
         updateDialog?.dismiss()
         updateDialog = null
         super.onPause()
@@ -889,8 +915,8 @@ class MainActivity : Activity(), SurfaceHolder.Callback, TextureView.SurfaceText
         }
         updateDisplayOutput()
         foreground = true
-        if (CastState.roles.role() == RoleOwner.Role.SEND) window.clearFlags(WindowManager.LayoutParams.FLAG_SECURE)
-        else window.addFlags(WindowManager.LayoutParams.FLAG_SECURE)
+        if (CastState.roles.role() == RoleOwner.Role.SEND) clearSecureWindowForSending()
+        else statisticsWindowProtection.secureForReceiving()
         listenerFault = false
         readiness = "STARTING"
         detail = getString(R.string.flow_starting)
@@ -899,8 +925,22 @@ class MainActivity : Activity(), SurfaceHolder.Callback, TextureView.SurfaceText
         main.post(refresh)
     }
 
+    private fun clearSecureWindowForSending() {
+        if (!statisticsWindowProtection.clearSecureFlag() && !reportedStatisticsProtection) {
+            reportedStatisticsProtection = true
+            android.util.Log.w("ScreenCopyReceiver", "Keeping statistics host window secure until safe retirement")
+            val reason = if (android.os.Build.VERSION.SDK_INT >= 33) R.string.rc_statistics_window_retirement_pending
+                else R.string.rc_statistics_window_stays_secure
+            android.widget.Toast.makeText(this, reason,
+                android.widget.Toast.LENGTH_LONG).show()
+        }
+    }
+
     override fun onStop() {
         foreground = false
+        main.removeCallbacks(statisticsRefresh)
+        inlineStatisticsHost.stop()
+        listenerRun?.server?.showPlaybackStatistics(false)
         if (observingDisplay) {
             getSystemService(DisplayManager::class.java).unregisterDisplayListener(displayChanges)
             observingDisplay = false
@@ -925,6 +965,9 @@ class MainActivity : Activity(), SurfaceHolder.Callback, TextureView.SurfaceText
     }
 
     override fun onDestroy() {
+        main.removeCallbacks(statisticsRefresh)
+        if (::inlineStatisticsHost.isInitialized) inlineStatisticsHost.stop()
+        listenerRun?.server?.showPlaybackStatistics(false)
         closePlaybackDiagnostics()
         if (::updateCheck.isInitialized) {
             updateCheck.detach()

@@ -11,13 +11,14 @@ data class Request(val videoCodec: String, val audioCodec: String?, val fps: Int
     val receiverOrientation: ReceiverOrientation = ReceiverOrientation.AUTO,
     val receiverOptions: ReceiverOptions = ReceiverOptions(),
     val videoBitrate: Int = 0, val audioBitrate: Int? = null,
-    val videoColor: HdrVideoColor? = null) {
+    val videoColor: HdrVideoColor? = null, val diagnosticRequested: Boolean = false) {
     val tracks: List<Int> get() = if (audioCodec == null) listOf(1) else listOf(1, 2)
 
     companion object {
         fun parse(json: JSONObject, negotiated: ReceiverOptionCapabilities = ReceiverOptionCapabilities(),
             hdrNegotiated: Boolean = false, receiveCapabilities: ReceiveCapabilities = ReceiveCapabilities()): Request {
             val options = ReceiverOptionProtocol.selection(json, negotiated)
+            val diagnosticRequested = DiagnosticDelegation.requested(json)
             protocolRequire(!json.has("mediaTransport"),
                 "Only custom TCP media is supported; omit mediaTransport", "UNSUPPORTED_CONFIG")
             val receiverOrientation = if (json.has("receiverOrientation")) ReceiverOrientation.parse(json.opt("receiverOrientation"))
@@ -56,7 +57,7 @@ data class Request(val videoCodec: String, val audioCodec: String?, val fps: Int
                     (if (fps == 0) "uncapped capture FPS; " else "$fps fps max; ") +
                     (if (enabled) "audio $audioCodec ${audio.integer("bitrate")} bps" else "audio disabled"),
                 receiverOrientation, options, video.integer("bitrate"),
-                if (enabled && audioCodec != "raw") audio.integer("bitrate") else null, color)
+                if (enabled && audioCodec != "raw") audio.integer("bitrate") else null, color, diagnosticRequested)
         }
     }
 }

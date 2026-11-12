@@ -94,8 +94,8 @@ class PlaybackClock(
     @Synchronized
     internal fun videoPresented(ptsUs: Long) {
         require(ptsUs >= 0) { "Negative video presentation timestamp" }
-        if (!recoveringAudio || audioStarted) return
-        val current = currentUs()
+        if (!recoveringAudio || audioSource != null) return
+        val current = positionLocked()
         if (current == null || ptsUs > current) {
             basePtsUs = ptsUs
             baseNs = nanoTime()
@@ -113,10 +113,14 @@ class PlaybackClock(
     @Synchronized
     fun endVideoPreroll() { videoPrerollEnded = true }
 
-    @Synchronized
     fun audioStartDelayUs(ptsUs: Long): Long {
+        observeCallback()
+        return synchronized(this) { audioStartDelayLocked(ptsUs) }
+    }
+
+    private fun audioStartDelayLocked(ptsUs: Long): Long {
         anchor(ptsUs)
-        val delay = Math.subtractExact(ptsUs, checkNotNull(currentUs()))
+        val delay = Math.subtractExact(ptsUs, checkNotNull(positionLocked()))
         if (!resumingAudio && delay > 3_000_000) throw PlaybackException("Audio startup exceeds the three-second synchronization budget")
         if (!resumingAudio && delay < -250_000) throw PlaybackException("Audio arrived over 250 ms behind the presentation clock")
         return delay
@@ -142,22 +146,43 @@ class PlaybackClock(
         return false
     }
 
-    @Synchronized
     internal fun anchorAudio(ptsUs: Long, sampleRate: Int = 48000, positionUs: () -> Long) {
-        check(audioStartDelayUs(ptsUs) <= 0) { "Audio cannot start before its source presentation time" }
-        audioPositionUs = positionUs
-        audioSource = AudioSourceClock(ptsUs, sampleRate)
-        observedAudio = null
-        audioStarted = true
-        resumingAudio = recoveringAudio
+        observeCallback()
+        synchronized(this) {
+            attachAudio(ptsUs, sampleRate)
+            audioPositionUs = positionUs
+        }
     }
 
     @Synchronized
+    internal fun anchorObservedAudio(ptsUs: Long, sampleRate: Int): AudioSourceClock =
+        attachAudio(ptsUs, sampleRate)
+
+    private fun attachAudio(ptsUs: Long, sampleRate: Int): AudioSourceClock {
+        check(audioStartDelayLocked(ptsUs) <= 0) { "Audio cannot start before its source presentation time" }
+        audioPositionUs = null
+        return AudioSourceClock(ptsUs, sampleRate).also {
+            audioSource = it
+            observedAudio = null
+            audioStarted = true
+            resumingAudio = recoveringAudio
+        }
+    }
+
+    @Synchronized
+    internal fun observeAudio(source: AudioSourceClock, sampleUs: Long, observedAtNs: Long) {
+        if (audioSource !== source) return
+        if (observedAudio?.let { observedAtNs < it.observedAtNs } == true) return
+        observedAudio = SourceTimestampObservation(source.current(sampleUs), observedAtNs)
+    }
+
     internal fun audioPacket(sampleUs: Long, ptsUs: Long): AudioClockCorrection? {
-        val source = checkNotNull(audioSource)
-        val observedPts = source.current(checkNotNull(audioPositionUs).invoke())
-        observedAudio = SourceTimestampObservation(observedPts, nanoTime())
-        return source.packet(sampleUs, ptsUs)
+        val source = synchronized(this) { checkNotNull(audioSource) }
+        observeCallback()
+        return synchronized(this) {
+            check(audioSource === source) { "Audio source changed during packet observation" }
+            source.packet(sampleUs, ptsUs)
+        }
     }
 
     @Synchronized
@@ -165,14 +190,26 @@ class PlaybackClock(
 
     internal fun monotonicNs(): Long = nanoTime()
 
-    @Synchronized
     fun detachAudio() {
+        val source = synchronized(this) { audioSource }
         try {
-            audioPositionUs?.let {
-                basePtsUs = maxOf(checkNotNull(audioSource).current(it()), lastPositionUs ?: Long.MIN_VALUE)
+            observeCallback()
+        } finally {
+            detachAudioIfCurrent(source)
+        }
+    }
+
+    internal fun detachObservedAudio(source: AudioSourceClock) {
+        detachAudioIfCurrent(source)
+    }
+
+    private fun detachAudioIfCurrent(source: AudioSourceClock?) {
+        synchronized(this) {
+            if (audioSource !== source) return
+            if (source != null) {
+                basePtsUs = checkNotNull(positionLocked())
                 baseNs = nanoTime()
             }
-        } finally {
             resumingAudio = audioStarted || recoveringAudio
             audioPositionUs = null
             audioSource = null
@@ -180,12 +217,30 @@ class PlaybackClock(
         }
     }
 
-    @Synchronized
     fun currentUs(): Long? {
-        val position = audioPositionUs?.let {
-            checkNotNull(audioSource).current(it()).also { observed ->
-                observedAudio = SourceTimestampObservation(observed, nanoTime())
-            }
+        observeCallback()
+        return synchronized(this) { positionLocked() }
+    }
+
+    @Synchronized
+    internal fun canProveVideo(ptsUs: Long, previousObservation: SourceTimestampObservation?): Boolean {
+        if (audioSource != null && (observedAudio == null || observedAudio === previousObservation)) return false
+        return positionLocked()?.let { ptsUs - it >= -250_000 } != false
+    }
+
+    private fun observeCallback() {
+        val (source, callback) = synchronized(this) {
+            val source = audioSource ?: return
+            val callback = audioPositionUs ?: return
+            source to callback
+        }
+        val sampleUs = callback()
+        observeAudio(source, sampleUs, nanoTime())
+    }
+
+    private fun positionLocked(): Long? {
+        val position = audioSource?.let {
+            observedAudio?.ptsUs ?: it.current(0)
         } ?: run {
             if (basePtsUs < 0) return null
             basePtsUs + (nanoTime() - baseNs) / 1000
@@ -201,7 +256,7 @@ class PlaybackClock(
         if (basePtsUs < 0) {
             basePtsUs = ptsUs
             baseNs = now
-        } else if (audioPositionUs == null && now < baseNs && ptsUs < basePtsUs) {
+        } else if (audioSource == null && now < baseNs && ptsUs < basePtsUs) {
             basePtsUs = ptsUs
         }
     }

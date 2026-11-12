@@ -289,18 +289,29 @@ class SenderSessionTeardownTest {
     @Test(timeout = 10_000) fun intentionalStartupStopDoesNotRequireAnAckAfterLocalTransportAbort() {
         runSession { server, session, link ->
             val closed = CountDownLatch(1)
+            val pingRead = CountDownLatch(1)
+            val localClosed = CountDownLatch(1)
+            val connected = Mockito.spy(link)
+            Mockito.doAnswer { invocation ->
+                invocation.callRealMethod().also { localClosed.countDown() }
+            }.`when`(connected).close()
             val peer = CompletableFuture.runAsync {
                 attachPeer(server) { control, video, audio ->
-                    assertEquals(Wire.STOP, terminal(control).type)
+                    assertEquals(Wire.PING, Wire.read(control.inputStream).type)
+                    pingRead.countDown()
+                    assertTrue(localClosed.await(2, TimeUnit.SECONDS))
+                    // This peer deliberately sends no response after the intentional local abort.
+                    assertEquals(Wire.STOP, Wire.read(control.inputStream).type)
                     assertEquals(-1, video.inputStream.read())
                     assertEquals(-1, audio.inputStream.read())
                     assertEquals(-1, control.inputStream.read())
                     closed.countDown()
                 }
             }
-            negotiate(link)
-            session.prepare(link, playing = false)
+            negotiate(connected)
+            session.prepare(connected, playing = false)
             session.startWorkers()
+            assertTrue(pingRead.await(2, TimeUnit.SECONDS))
             session.sender.stop()
             assertTrue("Startup cancellation must actively unblock transport", closed.await(2, TimeUnit.SECONDS))
             session.sender.retireTransport()

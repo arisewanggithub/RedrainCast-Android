@@ -169,6 +169,8 @@ jobs:
           cd candidate
           sha256sum --check SHA256SUMS
           cd ..
+          notes="tools/release-notes-${RELEASE_TAG}.md"
+          [[ -s "$notes" ]] || { echo "::error::Missing versioned release notes: $notes"; exit 1; }
           kind="$(python3 -B tools/release-guard.py --release-tag "$RELEASE_TAG")"
           options=(--draft)
           if [[ "$kind" = prerelease ]]; then
@@ -180,6 +182,5 @@ jobs:
             candidate/SHA256SUMS candidate/signing-certificate.txt \
             candidate/licenses.tar.gz candidate/android-lgpl-relink.tar.gz \
             --repo "$GITHUB_REPOSITORY" --verify-tag "${options[@]}" \
-            --title "RedrainCast $RELEASE_TAG (candidate)" \
-            --notes "Draft release candidate; version suffix determines prerelease status. One universal APK supports arm64-v8a, armeabi-v7a and x86_64; Android 11/API 30 or newer. The intermittent first-rotation tiny-strip rendering bug remains unresolved; live Windows interoperability is not verified. A production-signed APK cannot update earlier debug-signed installations in place. Checksums, signing certificate, licenses and exact-build LGPL relink materials are attached. Source archives correspond to this public Android repository. Review all assets, runtime acceptance and stability before manually publishing this draft."
+            --title "RedrainCast $RELEASE_TAG" --notes-file "$notes"
           python3 -B tools/release-guard.py --release-tag "$RELEASE_TAG" --verify-tag

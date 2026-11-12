@@ -5,6 +5,7 @@ import org.junit.Test
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.util.concurrent.ConcurrentLinkedQueue
+import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
@@ -12,7 +13,7 @@ import java.util.concurrent.atomic.AtomicLong
 class AudioUnderrunRecoveryTest {
     @Test fun moreThanEightLifetimeUnderrunsDoNotAbortSuccessfulPcmWrites() = stream(240, 20)
     @Test fun slowlyAccumulatingLifetimeEventsRemainRecoverableOverFiftySeconds() = stream(2500, 200)
-    @Test fun clusteredEventsAndShortEmptyOutputRecoverWithoutChangingAudioOrVideoEpoch() =
+    @Test(timeout = 15_000) fun clusteredEventsAndShortEmptyOutputRecoverWithoutChangingAudioOrVideoEpoch() =
         stream(300, 0, withGapAndVideo = true)
 
     private fun stream(packets: Int, counterEvery: Int, withGapAndVideo: Boolean = false) {
@@ -47,6 +48,7 @@ class AudioUnderrunRecoveryTest {
         var renderer = if (withGapAndVideo) video(1) else null
         var captured = 0
         var previousClock = Long.MIN_VALUE
+        var audioPtsAtVideoReplacement: Long? = null
         val totalPackets = packets + if (withGapAndVideo) 16 else 0
         try {
             player.start()
@@ -66,11 +68,34 @@ class AudioUnderrunRecoveryTest {
                 }
                 if (withGapAndVideo && index == 150) {
                     await { decoders.last().completed.get() == decoders.last().inputs.get() || errors.isNotEmpty() }
-                    val before = clock.currentUs()
-                    renderer?.close()
-                    clock.endVideoPreroll()
-                    renderer = video(2)
-                    assertEquals(before, clock.currentUs())
+                    val timingEntered = CountDownLatch(1)
+                    val resumeTiming = CountDownLatch(1)
+                    native.beforeTiming = {
+                        timingEntered.countDown()
+                        check(resumeTiming.await(3, TimeUnit.SECONDS))
+                    }
+                    try {
+                        assertTrue("The sole native-timing publisher must be gated before comparing epochs",
+                            timingEntered.await(2, TimeUnit.SECONDS))
+                        val observed = checkNotNull(clock.cachedPlayedAudioObservation())
+                        val before = checkNotNull(clock.currentUs())
+                        audioPtsAtVideoReplacement = before
+                        renderer?.close()
+                        clock.endVideoPreroll()
+                        renderer = video(2)
+                        assertSame("Video replacement cannot clear or replace the audio source observation",
+                            observed, clock.cachedPlayedAudioObservation())
+                        assertEquals("Without a new native observation, video replacement cannot rebase audio",
+                            before, clock.currentUs())
+                        native.beforeTiming = {}
+                        resumeTiming.countDown()
+                        await { clock.cachedPlayedAudioObservation() !== observed || errors.isNotEmpty() }
+                        assertTrue("Normal audio observation resumes independently of video replacement",
+                            checkNotNull(clock.currentUs()) >= before)
+                    } finally {
+                        native.beforeTiming = {}
+                        resumeTiming.countDown()
+                    }
                 }
                 if (renderer != null && index < packets && index !in 140..149) {
                     renderer?.offer(AccessUnit(8_000_000_000 + index * 20_000L + gapUs, byteArrayOf(1), index == 0 || index == 150))
@@ -101,6 +126,8 @@ class AudioUnderrunRecoveryTest {
                 assertEquals(captured, decoders.sumOf { it.inputs.get() })
                 assertTrue(decoders.first().closed)
                 assertTrue(errors.toString(), errors.isEmpty())
+                assertTrue("Source audio must continue advancing after the video epoch changes",
+                    checkNotNull(clock.currentUs()) > checkNotNull(audioPtsAtVideoReplacement))
             }
         } finally { try { renderer?.close() } finally { player.close() } }
         assertTrue(native.closed)
@@ -166,6 +193,7 @@ class AudioUnderrunRecoveryTest {
         val sampleSum = AtomicLong()
         val maximumQueued = AtomicLong()
         @Volatile var writeResult: Int? = null
+        @Volatile var beforeTiming: () -> Unit = {}
         @Volatile var closed = false
         private var consumed = 0.0
         private var previousNs = 0L
@@ -194,6 +222,7 @@ class AudioUnderrunRecoveryTest {
             return frames * channels
         }
         @Synchronized override fun timing(): AudioOutputTiming {
+            beforeTiming()
             advance()
             val head = consumed.toLong()
             return AudioOutputTiming(sampleRate, bufferFrames, written.get(), head, head, 0, AudioClockSource.TIMESTAMP)

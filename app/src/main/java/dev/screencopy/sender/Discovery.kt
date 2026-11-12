@@ -15,7 +15,8 @@ import java.net.SocketTimeoutException
 class Discovery(context: Context, private val update: (List<Receiver>) -> Unit, private val error: (String) -> Unit) : Closeable {
     data class Receiver(val name: String, val host: String, val port: Int, val state: String, val seen: Long,
         val instanceId: String? = null,
-        val receiveCapabilities: org.screencopy.receiver.protocol.ReceiveCapabilities? = null) {
+        val receiveCapabilities: org.screencopy.receiver.protocol.ReceiveCapabilities? = null,
+        val diagnostic: org.screencopy.receiver.protocol.DiagnosticDiscovery? = null) {
         fun target() = ReceiverTarget(host, port, name)
         override fun toString() = "$host:$port - $name ($state)"
     }
@@ -112,7 +113,9 @@ class Discovery(context: Context, private val update: (List<Receiver>) -> Unit, 
                 throw IOException("Invalid discovery instance identity")
             val capabilities = if (json.has("receiveCapabilities"))
                 org.screencopy.receiver.protocol.ReceiveCapabilities.parse(json.getJSONObject("receiveCapabilities")) else null
-            return Receiver(name, source, port, state, now, identity, capabilities)
+            val diagnostic = if (json.has("diagnostic"))
+                org.screencopy.receiver.protocol.DiagnosticDiscovery.parse(json.opt("diagnostic")) else null
+            return Receiver(name, source, port, state, now, identity, capabilities, diagnostic)
         }
     }
 }

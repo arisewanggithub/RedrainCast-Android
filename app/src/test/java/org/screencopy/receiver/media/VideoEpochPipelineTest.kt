@@ -4,6 +4,7 @@ import org.junit.Assert.*
 import org.junit.Test
 import java.nio.ByteBuffer
 import java.util.concurrent.ConcurrentLinkedQueue
+import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
@@ -32,6 +33,7 @@ class VideoEpochPipelineTest {
         var captured = 0
         var liveStart = 0L
         var previousClock = Long.MIN_VALUE
+        var audioPtsAtVideoReplacement: Long? = null
         try {
             audio.start()
             for (index in 0 until 3266) {
@@ -39,12 +41,35 @@ class VideoEpochPipelineTest {
                 if (index == 2625) {
                     await { renderer.queuedPackets() == 0 && decoders.last().completed.get() == decoders.last().inputs.get() || errors.isNotEmpty() }
                     assertTrue(errors.toString(), errors.isEmpty())
-                    val before = clock.currentUs()
-                    renderer.close()
-                    assertTrue(decoders.last().closed)
-                    clock.endVideoPreroll()
-                    renderer = video(2)
-                    assertEquals("Video generation must not reset the running audio/source clock", before, clock.currentUs())
+                    val timingEntered = CountDownLatch(1)
+                    val resumeTiming = CountDownLatch(1)
+                    output.beforeTiming = {
+                        timingEntered.countDown()
+                        check(resumeTiming.await(3, TimeUnit.SECONDS))
+                    }
+                    try {
+                        assertTrue("The sole native-timing publisher must be gated before comparing epochs",
+                            timingEntered.await(2, TimeUnit.SECONDS))
+                        val observed = checkNotNull(clock.cachedPlayedAudioObservation())
+                        val before = checkNotNull(clock.currentUs())
+                        audioPtsAtVideoReplacement = before
+                        renderer.close()
+                        assertTrue(decoders.last().closed)
+                        clock.endVideoPreroll()
+                        renderer = video(2)
+                        assertSame("Video generation must preserve the running audio source observation",
+                            observed, clock.cachedPlayedAudioObservation())
+                        assertEquals("Video generation must not reset the running audio/source clock", before, clock.currentUs())
+                        output.beforeTiming = {}
+                        resumeTiming.countDown()
+                        await { clock.cachedPlayedAudioObservation() !== observed || errors.isNotEmpty() }
+                        assertTrue(errors.toString(), errors.isEmpty())
+                        assertTrue("Normal audio observation resumes independently of video replacement",
+                            checkNotNull(clock.currentUs()) >= before)
+                    } finally {
+                        output.beforeTiming = {}
+                        resumeTiming.countDown()
+                    }
                 }
                 // Static-screen gaps contain no missing encoded packets. Audio continues throughout.
                 val capture = index < 3250 && index !in 1501..1539 && index !in 2601..2624
@@ -81,6 +106,8 @@ class VideoEpochPipelineTest {
             assertTrue(output.maxQueued.get() <= 6240)
             assertTrue(decoders.all { it.maxBuffered.get() <= 8 })
             assertTrue(output.speeds.all { it in 0.98f..1.02f })
+            assertTrue("Source audio must continue advancing after the video epoch changes",
+                checkNotNull(clock.currentUs()) > checkNotNull(audioPtsAtVideoReplacement))
             assertTrue(abs(checkNotNull(clock.currentUs()) - (base + audio.sourcePositionUs() + 149_651)) < 1000)
         } finally {
             try { renderer.close() } finally { audio.close() }
@@ -124,6 +151,7 @@ class VideoEpochPipelineTest {
         val maxQueued = AtomicLong()
         val speeds = ConcurrentLinkedQueue<Float>()
         @Volatile var closed = false
+        @Volatile var beforeTiming: () -> Unit = {}
         private var playing = false
         private var previousNs = 0L
         private var consumed = 0.0
@@ -145,6 +173,7 @@ class VideoEpochPipelineTest {
             return frames * 2
         }
         @Synchronized override fun timing(): AudioOutputTiming {
+            beforeTiming()
             advance()
             val head = consumed.toLong()
             return AudioOutputTiming(48000, 6240, written.get(), head, (head - 8000).coerceAtLeast(0), 0, AudioClockSource.TIMESTAMP)

@@ -5,6 +5,7 @@ import android.media.MediaCodecList
 import android.media.MediaCodecInfo
 import android.media.MediaFormat
 import android.view.Surface
+import dev.redrain.cast.diagnostics.*
 import java.nio.ByteBuffer
 
 class VideoPlayer private constructor(
@@ -36,6 +37,7 @@ class VideoPlayer private constructor(
         this(format, clock, {}, failure, {}, factory, generation, {}, {})
 
     private val decoder: VideoDecoder
+    private val supportsRenderedStatistics: Boolean
     private val hdrAdmission = format.videoColor?.let { HdrBitstream.Admission(format) }
     private var waiting: AccessUnit? = null
     private var firstKeyFrame = false
@@ -65,11 +67,19 @@ class VideoPlayer private constructor(
     @Volatile private var renderSubmitted = 0L
     @Volatile private var decodedSkipped = 0L
     private val renderedFrames = java.util.concurrent.atomic.AtomicLong()
+    private var diagnosticConfigurationCapture: String? = null
+    private fun diagnosticVideo(stage: DiagnosticVideoStage, pts: Long, bytes: Long = -1,
+                                reason: DiagnosticReason = DiagnosticReason.NONE, sourceAtNs: Long? = null,
+                                keyFrame: Boolean? = null) {
+        if (!running.get()) return
+        RemoteDiagnostics.recorder.video("receiver", diagnosticSession, diagnosticGeneration,
+            stage, pts, bytes, keyFrame = keyFrame, reason = reason, sourceAtNs = sourceAtNs)
+    }
     @Volatile private var renderedObservation: SourceTimestampObservation? = null
     internal fun videoStatistics(): VideoStatistics {
         val observed = renderedObservation
         return VideoStatistics(decodedFrames, renderSubmitted, decodedSkipped,
-            if (decoder.supportsRenderedStatistics) renderedFrames.get() else null, observed?.ptsUs, observed?.observedAtNs)
+            if (supportsRenderedStatistics) renderedFrames.get() else null, observed?.ptsUs, observed?.observedAtNs)
     }
     private var lateRendered = 0L
     private var pendingOutputAtNs: Long? = null
@@ -77,6 +87,7 @@ class VideoPlayer private constructor(
     private var lastReportedSkipped = 0L
     private var lastReportedLate = 0L
     internal var onDecoded: (Long) -> Unit = {}
+    internal var onPlaybackStep: () -> Unit = {}
     @Volatile internal var discardOutputBeforePts: Long? = null
     @Volatile internal var dropStaleOutput = false
 
@@ -87,7 +98,9 @@ class VideoPlayer private constructor(
             requireSupportedRotation(format.videoColor != null, format.rotation)
             factory(format) { if (running.get()) onPresented() }
         } catch (e: Exception) { throw failure(e) }
+        supportsRenderedStatistics = decoder.supportsRenderedStatistics
         decoder.renderedStatistics { pts, atNs ->
+            diagnosticVideo(DiagnosticVideoStage.RENDERED, pts, sourceAtNs = atNs)
             if (running.get() && statisticsEnabled) {
                 pathStatistics.rendered(pts, atNs)
                 renderedObservation = SourceTimestampObservation(pts, atNs)
@@ -105,6 +118,14 @@ class VideoPlayer private constructor(
     }
 
     override fun step() {
+        val diagnostics = RemoteDiagnostics.recorder
+        if (diagnostics.enabled("receiver", diagnosticSession, DiagnosticKind.VIDEO_PROGRESS) &&
+            diagnosticConfigurationCapture != diagnostics.captureIdentity) {
+            diagnosticConfigurationCapture = diagnostics.captureIdentity
+            diagnostics.videoConfigured("receiver", diagnosticSession, diagnosticGeneration, DiagnosticVideoConfiguration(
+                    DiagnosticCodec.from(format.mime), format.width, format.height, format.frameRate, supportsRenderedStatistics))
+        }
+        onPlaybackStep()
         if (heldOutput >= 0) {
             stage = VideoStage.CLOCK
             clock.checkStartup()
@@ -113,6 +134,7 @@ class VideoPlayer private constructor(
                 val newer = dequeuePicture() ?: break
                 stage = VideoStage.OUTPUT_RELEASE
                 decoder.releaseOutput(heldOutput, null)
+                diagnosticVideo(DiagnosticVideoStage.SKIPPED, heldPtsUs, reason = DiagnosticReason.REPLACED)
                 decodedSkipped++
                 hold(newer)
             }
@@ -120,6 +142,7 @@ class VideoPlayer private constructor(
             delayUs = clock.delayUs(heldPtsUs)
             if (dropStaleOutput && delayUs?.let { it < -250_000 } == true) {
                 decoder.releaseOutput(heldOutput, null)
+                diagnosticVideo(DiagnosticVideoStage.SKIPPED, heldPtsUs, reason = DiagnosticReason.STALE)
                 decodedSkipped++
                 heldOutput = -1
                 return
@@ -134,7 +157,9 @@ class VideoPlayer private constructor(
             if (format.videoColor != null && !outputAvailable())
                 throw PlaybackException("HDR output became unavailable; restart casting with SDR", "UNSUPPORTED_CONFIG")
             if (statisticsEnabled) pathStatistics.scheduled(heldPtsUs, heldPath)
-            decoder.releaseOutput(heldOutput, clock.monotonicNs())
+            val renderAtNs = clock.monotonicNs()
+            decoder.releaseOutput(heldOutput, renderAtNs)
+            diagnosticVideo(DiagnosticVideoStage.RELEASED, heldPtsUs, sourceAtNs = renderAtNs)
             clock.videoPresented(heldPtsUs)
             renderSubmitted++
             heldOutput = -1
@@ -171,6 +196,8 @@ class VideoPlayer private constructor(
                 clock.anchorVideo(packet.ptsUs)
                 stage = VideoStage.INPUT_QUEUE
                 decoder.queueInput(index, packet.bytes.size, packet.ptsUs, packet.keyFrame)
+                diagnosticVideo(DiagnosticVideoStage.DECODER_INPUT, packet.ptsUs, packet.bytes.size.toLong(),
+                    keyFrame = packet.keyFrame)
                 rotations.offer(packet.ptsUs, packet.rotation)
                 lastInputPtsUs = packet.ptsUs
                 queuedFrames++
@@ -198,8 +225,10 @@ class VideoPlayer private constructor(
                 stage = VideoStage.OUTPUT_RELEASE
                 decoder.releaseOutput(output.index, null)
             } else {
+                diagnosticVideo(DiagnosticVideoStage.DECODED, output.ptsUs, output.size.toLong())
                 if (discardOutputBeforePts?.let { output.ptsUs < it } == true) {
                     decoder.releaseOutput(output.index, null)
+                    diagnosticVideo(DiagnosticVideoStage.SKIPPED, output.ptsUs, reason = DiagnosticReason.STALE)
                     decodedSkipped++
                     return null
                 }
@@ -268,14 +297,20 @@ class VideoPlayer private constructor(
     }
 
     override fun describeFailure(error: Exception): String {
-        if (error is AudioClockException) return super.describeFailure(error)
         val diagnostic = failure(error).diagnostic
+        if (RemoteDiagnostics.recorder.enabled("receiver", diagnosticSession, DiagnosticKind.VIDEO_PROGRESS))
+            RemoteDiagnostics.recorder.observe("receiver", diagnosticSession, DiagnosticKind.VIDEO_PROGRESS,
+                DiagnosticStage.FAILED, 1, diagnosticGeneration, pts = waiting?.ptsUs ?: lastInputPtsUs ?: -1,
+                reason = DiagnosticReason.FAILURE, metadata = DiagnosticVideoFailure(diagnostic.stage, diagnostic.fault))
+        if (error is AudioClockException) return super.describeFailure(error)
         val admissionError = (error as? PlaybackException)?.cause as? org.screencopy.receiver.protocol.ProtocolException
         val reason = admissionError?.message?.let { ": $it" } ?: ""
         return "Video stage=${diagnostic.stage} exception=${diagnostic.exceptionType}$reason: Video failure: ${diagnostic.logMessage()}"
     }
 
     override fun release() {
+        RemoteDiagnostics.recorder.observe("receiver", diagnosticSession, DiagnosticKind.VIDEO_PROGRESS,
+            DiagnosticStage.RESET, 1, diagnosticGeneration, pts = lastOutputPtsUs ?: -1, reason = DiagnosticReason.STOPPED)
         stage = VideoStage.CLOSE
         pathStatistics.close()
         try { decoder.close() } catch (e: Exception) { throw failure(e) }

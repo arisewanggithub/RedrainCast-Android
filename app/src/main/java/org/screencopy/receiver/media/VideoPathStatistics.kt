@@ -27,9 +27,13 @@ internal class VideoPathStatisticsCache(initial: DecodedVideoStatistics? = null)
     private var presentedAtNs = Long.MIN_VALUE
     private var video = initial
     private var presentation: VideoPresentationStatistics? = null
+    @Volatile private var latest = VideoPathStatistics(initial, null)
 
     @Synchronized fun decoded(path: VideoPathStatistics) {
-        if (!closed) video = path.video
+        if (!closed) {
+            video = path.video
+            latest = VideoPathStatistics(video, presentation)
+        }
     }
 
     @Synchronized fun scheduled(ptsUs: Long, path: VideoPathStatistics) {
@@ -49,9 +53,10 @@ internal class VideoPathStatisticsCache(initial: DecodedVideoStatistics? = null)
         if (rendered.size > 64) rendered.remove(rendered.first())
         presentedAtNs = atNs
         presentation = path?.presentation
+        latest = VideoPathStatistics(video, presentation)
     }
 
-    @Synchronized fun snapshot() = VideoPathStatistics(video, presentation)
+    fun snapshot() = latest
 
     @Synchronized fun close() {
         closed = true
@@ -59,5 +64,6 @@ internal class VideoPathStatisticsCache(initial: DecodedVideoStatistics? = null)
         rendered.clear()
         video = null
         presentation = null
+        latest = VideoPathStatistics(null, null)
     }
 }

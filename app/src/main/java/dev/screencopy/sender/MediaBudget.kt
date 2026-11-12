@@ -3,6 +3,7 @@ package dev.screencopy.sender
 import java.io.IOException
 import java.util.ArrayDeque
 import org.screencopy.receiver.protocol.AudioPacketTiming
+import dev.redrain.cast.diagnostics.*
 
 internal enum class RecoveryAudioCoverage { WAITING, READY, LOST }
 
@@ -38,6 +39,28 @@ class MediaBudget internal constructor(private val withAudio: Boolean, private v
     private val writeBegin = LongArray(3)
     private val writeAdmitted = LongArray(3)
     private val lastWriteMs = LongArray(3)
+    @Volatile internal var diagnosticSession = 0L
+
+    private fun diagnosticQueue(stage: DiagnosticStage, cutoff: Long = -1,
+                                reason: DiagnosticReason = DiagnosticReason.NONE, timing: AudioPacketTiming? = null) {
+        val diagnostics = RemoteDiagnostics.recorder
+        val session = diagnosticSession
+        val queueSelected = diagnostics.enabled("sender", session, DiagnosticKind.AUDIO_QUEUE)
+        val windowSelected = cutoff >= 0 && diagnostics.enabled("sender", session, DiagnosticKind.RECOVERY)
+        if (!queueSelected && !windowSelected) return
+        val first = audio.firstOrNull { it.message.type == Wire.AUDIO_PACKET }?.message
+        val last = audio.lastOrNull { it.message.type == Wire.AUDIO_PACKET }?.message
+        if (queueSelected) diagnostics.observe("sender", session, DiagnosticKind.AUDIO_QUEUE, stage, 2, generation[2],
+            pts = first?.pts ?: -1, endPts = last?.let { timing?.endPts(it.pts, it.payload) ?: it.pts } ?: -1,
+            count = audio.size.toLong(), bytes = audio.sumOf { it.message.payload.size.toLong() }, cutoff = cutoff, reason = reason,
+            metadata = DiagnosticQueue(audio.size, 1024, queuedMediaBytes(audio), mediaByteLimit(2),
+                audio.peek()?.let { (clock() - it.admitted).coerceAtLeast(0) }, sourceSpan(audio), 500_000))
+        if (windowSelected) diagnostics.observe("sender", session, DiagnosticKind.RECOVERY, stage, 2, generation[2],
+            pts = first?.pts ?: -1, endPts = last?.let { timing?.endPts(it.pts, it.payload) ?: it.pts } ?: -1,
+            cutoff = cutoff, reason = reason,
+            metadata = timing?.let { DiagnosticWindow(DiagnosticCodec.from(it.codec),
+                it.prerollUs, it.windowStart(cutoff)) })
+    }
 
     fun offer(message: Wire.Message) = offerInternal(message, admissionNanos)
 
@@ -49,6 +72,7 @@ class MediaBudget internal constructor(private val withAudio: Boolean, private v
 
     internal fun discardMediaForRecovery(track: Int) = synchronized(monitor) {
         require(track in 1..2 && (track != 2 || withAudio))
+        if (track == 2) diagnosticQueue(DiagnosticStage.RESET)
         if (track == 2) {
             recoveryAudioHeld = true
             evictedRecoveryCutoffUs = null
@@ -59,6 +83,7 @@ class MediaBudget internal constructor(private val withAudio: Boolean, private v
             while (entries.hasNext()) {
                 val entry = entries.next()
                 if (entry.message.type in setOf(Wire.VIDEO_FRAME, Wire.AUDIO_PACKET)) {
+                    if (track == 1) diagnosticVideo(entry.message, DiagnosticVideoStage.QUEUE_DROPPED, DiagnosticReason.STALE)
                     mediaBytes -= entry.message.payload.size
                     entries.remove()
                 }
@@ -79,6 +104,7 @@ class MediaBudget internal constructor(private val withAudio: Boolean, private v
                 timing.endPts(oldest.message.pts, oldest.message.payload) > timing.windowStart(recoveryCutoffUs))
                 evictedRecoveryCutoffUs = recoveryCutoffUs
             audio.remove(oldest)
+            diagnosticQueue(DiagnosticStage.EVICTED, recoveryCutoffUs ?: -1, DiagnosticReason.CAPACITY, timing)
             if (oldest.message.generation == 1) initialAudioPrefixRetired = true
             mediaBytes -= oldest.message.payload.size
             pressure = tryOfferMedia(message)
@@ -92,8 +118,24 @@ class MediaBudget internal constructor(private val withAudio: Boolean, private v
 
     internal fun initialAudioPrefixRetired(): Boolean = synchronized(monitor) { initialAudioPrefixRetired }
 
-    internal fun releaseRecoveryAudio(cutoff: Long, timing: AudioPacketTiming): RecoveryAudioCoverage = synchronized(monitor) {
-        if (evictedRecoveryCutoffUs == cutoff) return@synchronized RecoveryAudioCoverage.LOST
+    internal fun releaseRecoveryAudio(cutoff: Long, timing: AudioPacketTiming,
+                                     freshRawWindow: Boolean = false): RecoveryAudioCoverage = synchronized(monitor) {
+        if (evictedRecoveryCutoffUs == cutoff) {
+            diagnosticQueue(DiagnosticStage.REJECTED, cutoff, DiagnosticReason.PREROLL_MISSING, timing)
+            return@synchronized RecoveryAudioCoverage.LOST
+        }
+        // PCM has no decode dependency; the receiver owns precise clock/sample trimming.
+        if (timing.prerollUs == 0L && freshRawWindow) {
+            val newest = audio.lastOrNull { it.message.type == Wire.AUDIO_PACKET }
+            val entries = audio.iterator()
+            while (entries.hasNext()) {
+                val entry = entries.next()
+                if (entry !== newest && entry.message.type == Wire.AUDIO_PACKET) {
+                    mediaBytes -= entry.message.payload.size
+                    entries.remove()
+                }
+            }
+        }
         val start = timing.windowStart(cutoff)
         while (true) {
             val oldest = audio.firstOrNull { it.message.type == Wire.AUDIO_PACKET } ?: break
@@ -103,18 +145,24 @@ class MediaBudget internal constructor(private val withAudio: Boolean, private v
             mediaBytes -= oldest.message.payload.size
         }
         val packets = audio.filter { it.message.type == Wire.AUDIO_PACKET }
-        if (packets.isEmpty()) return@synchronized RecoveryAudioCoverage.WAITING
+        if (packets.isEmpty()) {
+            diagnosticQueue(DiagnosticStage.HOLD, cutoff, DiagnosticReason.SOURCE_PENDING, timing)
+            return@synchronized RecoveryAudioCoverage.WAITING
+        }
         val missingCoverage = if (timing.codec == "opus") RecoveryAudioCoverage.WAITING else RecoveryAudioCoverage.LOST
-        if (timing.prerollUs > 0 && packets.first().message.pts > start ||
-            timing.prerollUs == 0L && packets.first().message.pts > cutoff &&
-            packets.first().message.pts - cutoff > 250_000)
-            return@synchronized missingCoverage
+        if (timing.prerollUs > 0 && packets.first().message.pts > start)
+            {
+                diagnosticQueue(DiagnosticStage.REJECTED, cutoff, DiagnosticReason.SOURCE_WINDOW_LOST, timing)
+                return@synchronized missingCoverage
+            }
         if (timing.prerollUs > 0) {
             var covered = start
             val sampleUs = (1_000_000L + timing.rate - 1) / timing.rate
             for (entry in packets) {
-                if (entry.message.pts > covered && entry.message.pts - covered > sampleUs)
+                if (entry.message.pts > covered && entry.message.pts - covered > sampleUs) {
+                    diagnosticQueue(DiagnosticStage.REJECTED, cutoff, DiagnosticReason.WINDOW_GAP, timing)
                     return@synchronized missingCoverage
+                }
                 covered = maxOf(covered, timing.endPts(entry.message.pts, entry.message.payload))
                 if (covered > cutoff) break
             }
@@ -122,6 +170,7 @@ class MediaBudget internal constructor(private val withAudio: Boolean, private v
         if (packets.none { timing.endPts(it.message.pts, it.message.payload) > cutoff })
             return@synchronized RecoveryAudioCoverage.WAITING
         recoveryAudioHeld = false
+        diagnosticQueue(DiagnosticStage.READY, cutoff, timing = timing)
         monitor.notifyAll()
         RecoveryAudioCoverage.READY
     }
@@ -148,7 +197,11 @@ class MediaBudget internal constructor(private val withAudio: Boolean, private v
             if (remaining <= 0 || message.type in setOf(Wire.VIDEO_FRAME, Wire.AUDIO_PACKET) &&
                 message.payload.size > mediaByteLimit(track) ||
                 message.type !in setOf(Wire.VIDEO_FRAME, Wire.AUDIO_PACKET) && message.payload.size > 256 * 1024)
-                throw SenderCongestionException(snapshot(message, limit, (System.nanoTime() - begin) / 1_000_000))
+                {
+                    if (track == 2) diagnosticQueue(DiagnosticStage.PRESSURE, reason = DiagnosticReason.CAPACITY)
+                    if (track == 1) diagnosticVideo(message, DiagnosticVideoStage.REJECTED, DiagnosticReason.CAPACITY)
+                    throw SenderCongestionException(snapshot(message, limit, (System.nanoTime() - begin) / 1_000_000))
+                }
             monitor.wait(remaining / 1_000_000, (remaining % 1_000_000).toInt())
         }
         val entry = Entry(message, clock())
@@ -163,6 +216,8 @@ class MediaBudget internal constructor(private val withAudio: Boolean, private v
             lastPts[track] = message.pts
             val queue = if (track == 1) video else audio
             queue.add(entry); mediaBytes += message.payload.size
+            if (track == 2) diagnosticQueue(DiagnosticStage.ADMITTED)
+            if (track == 1) diagnosticVideo(message, DiagnosticVideoStage.QUEUED)
         }
         monitor.notifyAll()
     }
@@ -174,6 +229,7 @@ class MediaBudget internal constructor(private val withAudio: Boolean, private v
             Wire.STREAM_READY -> CaptureProtocolStage.MUX_READY
             else -> CaptureProtocolStage.MUX_MEDIA
         }
+
         val current = if (valid) generation[track] else 0
         val delta = if (valid && message.type in setOf(Wire.VIDEO_FRAME, Wire.AUDIO_PACKET) && lastPts[track] >= 0)
             message.pts - lastPts[track] else 0
@@ -182,6 +238,12 @@ class MediaBudget internal constructor(private val withAudio: Boolean, private v
             if (message.type == Wire.STREAM_CONFIG) current + 1 else if (message.type == Wire.STREAM_READY && valid) announced[track] else current,
             current, if (valid) announced[track] else 0, if (valid) ready[track] else 0, delta))
     }
+    private fun diagnosticVideo(message: Wire.Message, stage: DiagnosticVideoStage,
+                                reason: DiagnosticReason = DiagnosticReason.NONE) {
+        RemoteDiagnostics.recorder.video("sender", diagnosticSession, message.generation, stage,
+            message.pts, message.payload.size.toLong(), keyFrame = message.flags and 1 != 0, reason = reason)
+    }
+
     private fun violation(message: Wire.Message): SenderLimit? {
         val media = message.type in setOf(Wire.VIDEO_FRAME, Wire.AUDIO_PACKET)
         val queue = if (message.track == 1) video else audio
@@ -290,6 +352,9 @@ class MediaBudget internal constructor(private val withAudio: Boolean, private v
         // Explicit session termination abandons unsent media, never normal congestion recovery.
         ending = true
         this.drainStartedMedia = drainStartedMedia
+        if (RemoteDiagnostics.recorder.enabled("sender", diagnosticSession, DiagnosticKind.VIDEO_PROGRESS))
+            video.forEach { if (it.message.type == Wire.VIDEO_FRAME)
+                diagnosticVideo(it.message, DiagnosticVideoStage.QUEUE_DROPPED, DiagnosticReason.STOPPED) }
         controls.clear(); video.clear(); audio.clear()
         mediaBytes = 0; controlBytes = message.payload.size; configCount = 0
         controls.add(Entry(message, clock()))
@@ -320,6 +385,7 @@ class MediaBudget internal constructor(private val withAudio: Boolean, private v
                     }
                 } else if (started && ready[track] == message.generation && (track != 2 || !recoveryAudioHeld)) {
                     queue.remove(); mediaBytes -= message.payload.size
+                    if (track == 1) diagnosticVideo(message, DiagnosticVideoStage.QUEUE_REMOVED)
                     pendingWrites[track] = entry; monitor.notifyAll()
                     return message
                 }

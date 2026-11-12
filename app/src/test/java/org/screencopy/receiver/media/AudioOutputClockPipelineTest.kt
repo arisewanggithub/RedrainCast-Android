@@ -4,10 +4,94 @@ import org.junit.Assert.*
 import org.junit.Test
 import java.util.concurrent.ConcurrentLinkedQueue
 import java.util.concurrent.CountDownLatch
+import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
 
 class AudioOutputClockPipelineTest {
+    @Test(timeout = 8000) fun idleAudioPumpsPublishProgressAndBlockedNativeTimingCannotOwnTheSharedClock() {
+        val now = AtomicLong(1_000_000_000)
+        val submitted = AtomicLong()
+        val presented = AtomicLong()
+        val queries = AtomicInteger()
+        val block = AtomicBoolean()
+        val entered = CountDownLatch(1)
+        val release = CountDownLatch(1)
+        val outputClosed = AtomicBoolean()
+        val output = object : AudioOutput {
+            override val underrunCount = 0
+            override fun play() {}
+            override fun pause() {}
+            override fun setSpeed(speed: Float) {}
+            override fun write(samples: ShortArray, offset: Int, count: Int): Int {
+                submitted.addAndGet(count / 2L)
+                return count
+            }
+            override fun timing(): AudioOutputTiming {
+                check(!outputClosed.get()) { "Native timing queried after close" }
+                queries.incrementAndGet()
+                if (block.get()) {
+                    entered.countDown()
+                    check(release.await(3, TimeUnit.SECONDS))
+                }
+                val frames = minOf(presented.get(), submitted.get())
+                return AudioOutputTiming(48000, 6240, submitted.get(), frames, frames, 0,
+                    AudioClockSource.TIMESTAMP)
+            }
+            override fun close() { outputClosed.set(true) }
+        }
+        val clock = PlaybackClock(now::get) { now.addAndGet(it * 1_000_000) }
+            .apply { audioExpected = true; anchorVideo(1_000_000) }
+        val player = testAudioPlayer(AudioFormat("pcm", 48000, 2, byteArrayOf()), clock,
+            { code, detail -> fail("$code: $detail") }, { output })
+        val step = AudioPlayer::class.java.getDeclaredMethod("step").apply { isAccessible = true }
+        val workers = Executors.newFixedThreadPool(2)
+        var closed = false
+        try {
+            player.offer(AccessUnit(1_000_000, ByteArray(3840)))
+            step.invoke(player)
+            assertEquals(960L, player.sourceSubmittedFrames)
+            presented.set(480)
+            now.addAndGet(10_000_000)
+            step.invoke(player)
+            assertEquals("Queued native audio progresses even with no new encoded packet", 1_010_000L, clock.currentUs())
+            assertEquals(10_000L, player.sourcePositionUs())
+            val observation = checkNotNull(clock.cachedPlayedAudioObservation())
+            now.addAndGet(300_000_000)
+            block.set(true)
+            val pumping = workers.submit { step.invoke(player) }
+            assertTrue(entered.await(1, TimeUnit.SECONDS))
+            val beforeReads = queries.get()
+            workers.submit {
+                repeat(100) {
+                    assertEquals(1_010_000L, clock.currentUs())
+                    assertEquals(10_000L, player.sourcePositionUs())
+                    clock.anchorVideo(1_020_000)
+                    clock.beginAudioRecovery()
+                }
+            }.get(1, TimeUnit.SECONDS)
+            assertEquals("Other workers cannot add native output queries", beforeReads, queries.get())
+            assertSame("Reads cannot make stalled native timing look fresh", observation, clock.cachedPlayedAudioObservation())
+            assertFalse(clock.canProveVideo(1_010_000, observation))
+            release.countDown()
+            pumping.get(1, TimeUnit.SECONDS)
+            player.close()
+            closed = true
+            assertTrue(outputClosed.get())
+            val afterClose = queries.get()
+            clock.currentUs()
+            player.sourcePositionUs()
+            assertEquals("Closed output must not remain reachable through clock readers", afterClose, queries.get())
+        } finally {
+            release.countDown()
+            workers.shutdownNow()
+            assertTrue(workers.awaitTermination(1, TimeUnit.SECONDS))
+            if (!closed) player.close()
+        }
+    }
+
     @Test fun preparedOutputWith129msHardwareTransitDoesNotTreatDacLatencyAsClientOccupancy() = stream(false)
 
     @Test fun timestampReturningTrueButStaleDoesNotHideAdvancingClientConsumption() = stream(true)

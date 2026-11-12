@@ -4,6 +4,27 @@ Authority: current RedrainCast Windows `ScrcpySend.Core/SenderSession.cs`,
 `ScrcpyReceive.Core/ReceiverServer.cs`, `Protocol.cs`, and `Discovery.cs`.
 The sibling checkout is not modified by the Android build or protocol probe.
 
+Optional Android [remote diagnostics v1](REMOTE_DIAGNOSTICS.md) uses a separate
+locally enabled, unauthenticated plain LAN TCP listener; it does not extend SCPY framing.
+Receiver UDP advertisements may add root `diagnostic:{"version":1,"port":43210,"access":"lan"}`
+only while local consent or admitted delegation is valid and that listener is live. This is an
+untrusted endpoint hint. Anyone on the LAN can read bounded metadata and control
+diagnostic captures; no media or casting controls are exposed. Collector `--lan`
+is mandatory for this mode, with HELLO rather than AUTH and no fallback.
+The existing 1024-byte advertisement limit and all media capabilities are unchanged.
+Optional SCPY HELLO `diagnostics:{version:1,sessionDelegation:true}` negotiates an
+admitted sender's SESSION_REQUEST `diagnostic:{version:1,enabled:true}`. It opens
+receiver diagnostics only for that cast without receiver preference changes;
+exact-session START is required. Revocation/teardown freezes it for up to120s.
+This intentionally permits reachable LAN clients to access bounded receiver
+metadata after normal cast admission; it does not bypass Android LAN permission.
+Admitted-owner diagnostic STATUS carries the live diagnostic port/version/access
+and exact session. The sender retains this only in process memory, deriving the
+host from its connected cast peer. Diagnostic HELLO/STATUS/CONNECTIONS expose
+that receiver hint and the sender's actual listener endpoint. Collector
+`--lan --sender HOST:PORT --follow-receiver` attaches both exact-session captures
+without a receiver endpoint argument or UDP reception; no capture starts at HELLO.
+
 ## Optional uncapped capture FPS
 
 Updated Android control HELLO advertises Boolean `uncappedFps:true`. The
@@ -149,6 +170,10 @@ Default-off and hidden sessions do not run a recurring statistics UI timer.
 The top-left translucent overlay takes no focus/touch and uses 16sp normal or
 10sp dense diagnostic text, still honoring Android font scaling. This replaces
 the earlier 14sp minimum with the user's requested smaller-font presentation.
+The overlay draws cached snapshots on its own renderer thread and Surface, outside
+the player/activity view traversal. A stalled track or paused main-thread UI can
+therefore leave stale values visible without blocking redraw; the display marks
+samples stale instead of querying or locking the player.
 No network, codec, quality, buffer or audio-rate limit changes.
 The full aligned layout uses four equal KPI cells, generation totals, actual
 label/value grids and a five-column connection table. A phone-sized viewport
@@ -382,25 +407,46 @@ validate/capture track ownership under the receiver lifecycle lock, then wait
 for that track's queue outside the shared lock. Per-track socket readers remain
 serial, and track shutdown rejects/wakes pending admission. Do not retain a
 single-socket read-loop lock around blocking queue offers.
-Worker replacement is serialized by the playback-operation lock. Detach retired
-workers under the shared lifecycle lock, then close/join them outside it so their
-output callbacks can finish. Recheck session ownership before installing and
-acknowledging the replacement.
+Worker replacement is serialized per track. Detach retired workers under the
+shared lifecycle lock, then close/join them outside it so their output callbacks
+can finish. Stop waits for both track operations in a fixed order before final
+retirement. Recheck session ownership before installing and acknowledging the
+replacement.
 Initial and legacy configuration use the same snapshot/create/install discipline:
 codec construction, presentation startup and UI callbacks run outside the shared
-lifecycle lock. Installation and READY require the current session, generation
-and an open Surface lifetime; rejected workers and presentation leases retire
-outside that lock. The initial all-tracks-READY barrier remains in force.
-Surface closure publishes retirement intent before waiting for in-flight decoder
-construction, preventing that construction from acknowledging a retired Surface.
+lifecycle lock and are serialized only against work for the same track. Video
+installation and READY require the current session, generation and an open
+Surface lifetime; audio installation and READY require the current session and
+generation but do not acquire the video Surface lifetime gate. Rejected workers
+and presentation leases retire outside the lifecycle lock. The initial
+all-tracks-READY barrier remains in force, so independent audio configuration
+does not start media before every requested track is ready.
+Surface closure publishes retirement intent before waiting for in-flight video
+decoder construction, preventing that construction from acknowledging a retired
+Surface.
 The short lifetime lock linearizes closure with installation and READY enqueue,
 separately from the resource lock held during codec construction and retirement.
 Construction admission returns a retired result if closure won that race; codec
 factory failures still propagate through the normal failure channel.
-Initial or legacy configuration arriving after that intent is a diagnosed retired
-operation, not a fatal session error; neither track constructs a worker or sends READY.
+Initial or legacy video configuration arriving after that intent is a diagnosed
+retired operation, not a fatal session error. Audio configuration remains
+independent of video Surface lifetime; session teardown retires its worker.
 Decoded video callbacks skip the recovery lock when no recovery key is pending;
 pending proofs still revalidate their generation under the lifecycle lock.
+Native audio timing is sampled only by the audio worker and its joined cleanup,
+not by video, admission, recovery proofs or shared-clock readers. Each output
+service publishes the actually presented source-sample mapping and its original
+monotonic observation time, including during encoded-input gaps. Attached audio
+remains sample-master without extrapolation; reads do not refresh stalled
+observations. Video recovery requires a new attached-audio observation after its
+decoded proof candidate; the video worker retries that candidate during idle
+steps, without requiring another compressed picture or blocking the audio worker.
+The existing 250 ms picture lateness check and recovery deadline still apply.
+Detachment preserves the last observed
+position before switching to the monotonic clock, and retired source identities
+cannot publish into or detach a replacement. Capability callbacks, decoder-name
+queries and discovery logging run outside playback-state transactions; proof,
+READY and terminal enqueue ordering remain inside them.
 
 ## Framing
 
@@ -594,6 +640,13 @@ generation, decoder and output remain unchanged. Each lane's TCP ordering is its
 own retirement barrier. The receiver reconstructs only the affected output on
 its playback worker and sends READY after real initialization from valid CSD.
 Both tracks retain the same PlaybackClock. There is no shared reset path.
+Reset construction/retirement is serialized per track. The one-second reset
+cooldown is scheduled, not slept on a shared worker: neither a cooling track nor
+a slow native reset blocks the other track's recovery. Superseded pending resets
+are cancelled and still check the live session/generation before touching output.
+Stop cancels pending cooldowns, halts installed workers and waits for both track
+operations before final retirement; native joins stay outside the playback state
+lock and video lifetime gate.
 The initial barrier is distinct from recovery: neither track activates until
 all initial requested tracks are READY. Initial audio retains bounded latest
 preroll while waiting, instead of overflowing into an early generation reset.
@@ -634,6 +687,10 @@ session. Initial configuration has no recovery cutoff.
 New native audio gets a fresh decoder/resampler/output epoch, but not a new
 PlaybackClock. Audio detach snapshots the presented source position and keeps
 it advancing monotonically until the resumed output takes ownership.
+While audio is actually detached during recovery, presented video can advance
+that source clock (never rewind it), including after an earlier audio epoch had
+already become master. Attached healthy or resumed audio remains master even
+while recovery completion is pending.
 Original packet PTS/bytes are never retimed. Opus pre-skip is initial-only.
 Only recovering audio is held in its bounded mux while awaiting audio READY
 and its own preroll coverage. Healthy audio is never held for a video proof.
@@ -645,9 +702,21 @@ Release compressed audio only with contiguous preroll coverage (one sample of
 timestamp rounding tolerance) and a packet extending past the audio cutoff. If audio has
 not arrived or has not yet reached that cutoff, continue bounded buffering under the
 original deadline. Do not reset just because 250 ms of wall-clock time elapsed.
-A present AAC prefix starting after its required preroll start, a known gap in
-that monotonic prefix, or RAW first-source audio beyond cutoff + 250 ms requires a
-new bounded attempt. Opus source PTS may move backward, so an apparent prefix
+A present AAC prefix starting after its required preroll start or a known gap in
+that monotonic prefix requires a new bounded attempt. RAW has no decoder
+dependency: after delayed READY, select the newest retained complete PCM packet,
+retiring the older unsent PCM prefix without changing the configured cutoff.
+Use the available source timestamps, not an assumed receiver clock offset.
+A straddling packet keeps its original PTS/bytes for receiver-side sample
+trimming. A suffix starting more than 250 ms after the
+original cutoff is not loss evidence and must not restart the generation.
+The signaled cutoff remains unchanged as a lower bound, not a required exact
+start; existing recovery-v2 receivers already trim to their continuing clock and
+accept later source samples, so this needs no new wire field or revision.
+Completion still requires an actually written source interval in that generation,
+not the skipped prefix, a hole, or the exclusive end of a packet; fresh selection
+does not extend the original unresolved deadline or enlarge either queue.
+Opus source PTS may move backward, so an apparent prefix
 gap is WAITING, not proof that the source window is LOST. Coverage is checked
 in original admission order, not as a reordered interval union; an unproven
 Opus prefix remains bounded by the existing caps and original deadline.
