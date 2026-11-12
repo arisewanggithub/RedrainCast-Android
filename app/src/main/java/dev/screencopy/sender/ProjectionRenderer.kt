@@ -9,6 +9,8 @@ import android.opengl.GLES20
 import android.os.Handler
 import android.os.HandlerThread
 import android.view.Surface
+import dev.redrain.cast.MediaThreadDiagnostic
+import dev.redrain.cast.MediaThreadRole
 import java.io.Closeable
 import java.io.IOException
 import java.nio.ByteBuffer
@@ -23,6 +25,7 @@ internal class ProjectionRenderer(
     private val settings: Settings,
     initialSource: CaptureDisplay = ProjectionInventory.displays(context).displays.single(),
     private val onFrame: (Long, Int) -> Unit = { _, _ -> },
+    private val frameTrace: VideoFrameTrace? = null,
     private val fail: (Exception) -> Unit
 ) : Closeable {
     private val thread = HandlerThread("projection-gl").apply { start() }
@@ -55,6 +58,7 @@ internal class ProjectionRenderer(
     }
 
     private fun initialize() {
+        MediaThreadDiagnostic.report(MediaThreadRole.VIDEO)
         check(EGL14.eglInitialize(display, IntArray(2), 0, IntArray(2), 1)) { "EGL initialization failed" }
         val configs = arrayOfNulls<android.opengl.EGLConfig>(1)
         val count = IntArray(1)
@@ -104,10 +108,15 @@ internal class ProjectionRenderer(
     }
 
     private fun draw() {
+        frameTrace?.record(VideoFrameStage.CAPTURE_CALLBACK)
         val image = checkNotNull(surfaceTexture)
         image.updateTexImage()
         val time = image.timestamp
-        if (!frameDue(time, lastFrame, settings.maxFps)) return
+        frameTrace?.record(VideoFrameStage.CAPTURE_ACQUIRED, time / 1000)
+        if (!frameDue(time, lastFrame, settings.maxFps)) {
+            frameTrace?.record(VideoFrameStage.CAPTURE_FILTERED, time / 1000)
+            return
+        }
         lastFrame = time
         image.getTransformMatrix(matrix)
         val plan = ProjectionTransform.coordinates(settings, source)
@@ -129,7 +138,9 @@ internal class ProjectionRenderer(
         GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, 4)
         check(GLES20.glGetError() == GLES20.GL_NO_ERROR) { "GPU draw failed" }
         onFrame(time / 1000, VideoRotation.degrees(settings, source))
+        frameTrace?.record(VideoFrameStage.SUBMIT_BEGIN, time / 1000)
         check(EGLExt.eglPresentationTimeANDROID(display, window, time) && EGL14.eglSwapBuffers(display, window)) { "GPU frame delivery failed" }
+        frameTrace?.record(VideoFrameStage.SUBMIT_END, time / 1000)
     }
 
     companion object {

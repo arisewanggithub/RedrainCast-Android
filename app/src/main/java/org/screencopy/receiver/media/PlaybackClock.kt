@@ -92,14 +92,14 @@ class PlaybackClock(
     }
 
     @Synchronized
-    internal fun videoPresented(ptsUs: Long) {
+    internal fun videoPresented(ptsUs: Long, presentationAtNs: Long = nanoTime()) {
         require(ptsUs >= 0) { "Negative video presentation timestamp" }
         if (!recoveringAudio || audioSource != null) return
         val current = positionLocked()
         if (current == null || ptsUs > current) {
             basePtsUs = ptsUs
-            baseNs = nanoTime()
-            lastPositionUs = ptsUs
+            baseNs = presentationAtNs
+            lastPositionUs = current
         }
     }
 

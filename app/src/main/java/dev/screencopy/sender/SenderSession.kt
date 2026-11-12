@@ -37,6 +37,7 @@ class SenderSession internal constructor(
     private val mux = MediaBudget(settings.audio)
     private val outcome = SessionOutcome()
     private val trace = SessionStopTrace(diagnostic)
+    private var frameTrace: VideoFrameTrace? = null
     private val terminalQueued = AtomicBoolean()
     private val threads = mutableListOf<Thread>()
     private val terminalSent = CountDownLatch(1)
@@ -184,6 +185,14 @@ class SenderSession internal constructor(
         mux.diagnosticSession = session
         try {
             trace.sessionStarted(session)
+            if (dev.redrain.cast.BuildConfig.DEBUG &&
+                android.util.Log.isLoggable("RedrainVideoTrace", android.util.Log.DEBUG)) {
+                val longWindow = android.util.Log.isLoggable("RedrainVideoTraceLong", android.util.Log.DEBUG)
+                val durationNs = if (longWindow) VideoFrameTrace.LONG_DURATION_NS else 30_000_000_000L
+                val capacity = if (longWindow) VideoFrameTrace.LONG_CAPACITY else 16_384
+                frameTrace = VideoFrameTrace(true, session, capacity = capacity, durationNs = durationNs)
+                diagnostic("event=VIDEO_FRAME_TRACE_ENABLED session=$session duration_ms=${durationNs / 1_000_000} capacity=$capacity")
+            }
             settings.validate()
             timer.scheduleWithFixedDelay(::watchdog, 500, 500, TimeUnit.MILLISECONDS)
             phase("Checking screen-sharing permission", SessionStopTrace.Phase.ACCESS)
@@ -203,7 +212,7 @@ class SenderSession internal constructor(
                     if (line.startsWith("event=STREAM_RECOVERY_COMPLETE")) streamingStatus("Streaming")
                 }, withAudio = settings.audio)
             diagnostic("event=STREAM_RECOVERY_NEGOTIATED enabled=${connected.streamRecovery}")
-            val capture = ProjectionCapture(context, owner, ::captureFailed).also { backend = it }
+            val capture = ProjectionCapture(context, owner, ::captureFailed, frameTrace).also { backend = it }
             settings = capture.validate(settings)
             diagnostic("event=VIDEO_ROTATION_NEGOTIATED fixed_natural=${connected.videoRotation}")
             phase("Negotiating", SessionStopTrace.Phase.NEGOTIATING)
@@ -292,6 +301,7 @@ class SenderSession internal constructor(
                 }
             }
             trace.mark(SessionStopTrace.Stage.READERS_JOINED)
+            dumpVideoTrace(force = true)
             status(outcome.failure?.let { "Error: ${SessionOutcome.safeMessage(it)}" } ?: "Idle")
             trace.mark(SessionStopTrace.Stage.FINISHED)
             cleanupComplete = true
@@ -357,6 +367,7 @@ class SenderSession internal constructor(
             acceptedSession && outcome.failure == null
 
     private fun watchdog() {
+        dumpVideoTrace()
         val current = now()
         if (closing) {
             // Bound terminal TCP delivery without interrupting independently bounded codec cleanup.
@@ -386,6 +397,19 @@ class SenderSession internal constructor(
         }
         mux.expiredTrack()?.let { track ->
             fail(IOException("TIMEOUT: receiver did not initialize track $track"), SessionOutcome.Origin.WATCHDOG); closeLink(); abortCapture()
+        }
+    }
+    private fun dumpVideoTrace(force: Boolean = false) {
+        val snapshot = frameTrace?.takeCompleted(force) ?: return
+        val file = java.io.File(context.filesDir, "video-frame-$session.jsonl")
+        try {
+            file.bufferedWriter(Charsets.UTF_8).use(snapshot::writeTo)
+            diagnostic("event=VIDEO_FRAME_TRACE_SAVED session=$session file=${file.name}" +
+                " events=${snapshot.events.size} reason=${snapshot.reason} dropped=${snapshot.dropped}")
+        } catch (error: IOException) {
+            android.util.Log.e("ScreenCopySender", "event=VIDEO_FRAME_TRACE_WRITE_FAILED session=$session", error)
+        } catch (error: SecurityException) {
+            android.util.Log.e("ScreenCopySender", "event=VIDEO_FRAME_TRACE_WRITE_FAILED session=$session", error)
         }
     }
     private fun abortCapture() {
@@ -539,6 +563,8 @@ class SenderSession internal constructor(
                         RemoteDiagnostics.recorder.observe("sender", session, DiagnosticKind.TRANSPORT_HEALTH,
                             DiagnosticStage.BEGIN, lane, message.generation, operations.health, message.pts,
                             bytes = message.payload.size.toLong(), point = DiagnosticPoint.WRITE)
+                        if (message.type == Wire.VIDEO_FRAME)
+                            frameTrace?.record(VideoFrameStage.WRITE_BEGIN, message.pts, message.generation)
                         try {
                             connected.send(message)
                         } catch (error: Exception) {
@@ -562,6 +588,8 @@ class SenderSession internal constructor(
                         RemoteDiagnostics.recorder.observe("sender", session, DiagnosticKind.TRANSPORT_HEALTH,
                             DiagnosticStage.COMPLETE, lane, message.generation, operations.health, message.pts,
                             bytes = message.payload.size.toLong(), point = DiagnosticPoint.WRITE)
+                        if (message.type == Wire.VIDEO_FRAME)
+                            frameTrace?.record(VideoFrameStage.WRITE_END, message.pts, message.generation)
                         writeCompleted(message)
                     } catch (error: Exception) {
                         writeFailed(lane, error)
@@ -602,6 +630,8 @@ class SenderSession internal constructor(
         check()
         val current = recovery
         if (current == null) mux.offer(packet) else current.packet(packet)
+        if (packet.type == Wire.VIDEO_FRAME)
+            frameTrace?.record(VideoFrameStage.SINK_RETURNED, packet.pts, packet.generation)
     }
     override fun awaitVideoDrain() {
         check()

@@ -3,6 +3,8 @@ package org.screencopy.receiver.media
 import android.media.AudioFormat as PlatformAudioFormat
 import android.media.MediaCodec
 import android.media.MediaFormat
+import dev.redrain.cast.MediaThreadDiagnostic
+import dev.redrain.cast.MediaThreadRole
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import kotlin.math.abs
@@ -18,8 +20,12 @@ class AudioPlayer(
     private val onUnderrunRecovery: (AudioUnderrunDiagnostic) -> Unit = {},
     opusFactory: (AudioFormat) -> OpusPacketDecoder = { OpusDecoder(it.channels, it.outputGainQ8) },
     private val onRegulation: (AudioRegulationDiagnostic) -> Unit = {},
-    resamplerFactory: (Int, Int) -> PcmResampler = ::FfmpegPcmResampler
-) : TrackWorker("ScreenCopy-audio", 512 * 1024, { code, detail -> failure(if (code == "DECODER_FAILED") "AUDIO_FAILED" else code, detail) }, track = 2) {
+    resamplerFactory: (Int, Int) -> PcmResampler = ::FfmpegPcmResampler,
+    private val onServiceDiagnostic: ((String) -> Unit)? = null,
+    private val threadCpuNs: () -> Long = android.os.Debug::threadCpuTimeNanos,
+    prepareThread: () -> Unit = { MediaThreadDiagnostic.report(MediaThreadRole.AUDIO) }
+) : TrackWorker("ScreenCopy-audio", 512 * 1024, { code, detail -> failure(if (code == "DECODER_FAILED") "AUDIO_FAILED" else code, detail) },
+    track = 2, prepareThread = prepareThread) {
     private val output: AudioOutput
     private val opus: OpusPacketDecoder?
     private val aac: MediaCodec?
@@ -85,6 +91,16 @@ class AudioPlayer(
         }
     }
 
+    private val serviceDiagnostic = onServiceDiagnostic?.let { AudioServiceDiagnostic(format.sampleRate) }
+    private val eventHistory = onServiceDiagnostic?.let { AudioEventHistory() }
+
+    internal fun packetReceived(ptsUs: Long, bytes: Int) {
+        eventHistory?.record(clock.monotonicNs(), "receive", ptsUs, bytes.toLong())
+    }
+    override fun packetEvent(kind: String, packet: AccessUnit, queued: Int) {
+        eventHistory?.record(clock.monotonicNs(), kind, packet.ptsUs, queued.toLong())
+    }
+
     val decoderDescription: String
         get() = when (format.codec) {
             "opus" -> "bundled libopus 1.5.2"
@@ -116,35 +132,67 @@ class AudioPlayer(
     }
 
     override fun step() {
+        measured("step") { serviceStep() }
+        reportService()
+    }
+
+    private fun reportService(final: Boolean = false) {
+        serviceDiagnostic?.report(clock.monotonicNs(), regulator.discardedFrames, final)?.let {
+            onServiceDiagnostic?.invoke(it)
+        }
+    }
+
+    private inline fun <T> measured(operation: String, block: () -> T): T {
+        val diagnostic = serviceDiagnostic
+        if (diagnostic == null || !diagnostic.started) return block()
+        val start = clock.monotonicNs()
+        val cpu = threadCpuNs()
+        try {
+            return block()
+        } finally {
+            diagnostic.duration(operation, clock.monotonicNs() - start, threadCpuNs() - cpu)
+        }
+    }
+
+    private fun serviceStep() {
         stage = "STARTUP_CHECK"
         clock.checkStartup()
         if (pending != null && clock.canPrepareAudio()) {
             flushPending()
         }
-        pumpOutput(allowSilence = false)
+        measured("refill") { pumpOutput(allowSilence = false) }
         if (startupCatchup && regulator.bufferedFrames >= regulator.targetFrames) {
             stage = "STARTUP_OUTPUT_WAIT"
             Thread.sleep(2)
         } else if (format.codec == "aac") diagnosticCall(DiagnosticPoint.DECODE) { stepAac() }
-        else next()?.let { packet ->
-            stage = if (opus != null) "OPUS_DECODE" else "PCM_DECODE"
-            val samples = diagnosticCall(DiagnosticPoint.DECODE, packet.ptsUs) {
-                opus?.decode(packet.bytes) ?: pcm16(packet.bytes)
+        else measured("input") { next() }?.let { packet ->
+            measured("decode") {
+                eventHistory?.record(clock.monotonicNs(), "decode_begin", packet.ptsUs, packet.bytes.size.toLong())
+                stage = if (opus != null) "OPUS_DECODE" else "PCM_DECODE"
+                val samples = diagnosticCall(DiagnosticPoint.DECODE, packet.ptsUs) {
+                    opus?.decode(packet.bytes) ?: pcm16(packet.bytes)
+                }
+                write(samples, packet.ptsUs)
+                eventHistory?.record(clock.monotonicNs(), "decode_end", packet.ptsUs, regulator.bufferedFrames.toLong())
             }
-            write(samples, packet.ptsUs)
         }
-        pumpOutput()
+        measured("refill") { pumpOutput() }
         observeUnderruns()
     }
 
     private fun stepAac() {
         stage = "AAC_INPUT"
+        if (waiting == null) waiting = measured("input") { next() }
+        measured("decode") { pumpAac() }
+    }
+
+    private fun pumpAac() {
         val decoder = checkNotNull(aac)
         val info = checkNotNull(info)
-        if (waiting == null) waiting = next()
         waiting?.let { packet ->
             val index = decoder.dequeueInputBuffer(0)
             if (index >= 0) {
+                eventHistory?.record(clock.monotonicNs(), "aac_input", packet.ptsUs, packet.bytes.size.toLong())
                 val input = checkNotNull(decoder.getInputBuffer(index))
                 require(input.capacity() >= packet.bytes.size) { "AAC packet exceeds decoder capacity" }
                 input.clear()
@@ -173,6 +221,8 @@ class AudioPlayer(
                     val bytes = ByteArray(info.size)
                     buffer.get(bytes)
                     write(pcm16(bytes), info.presentationTimeUs)
+                    eventHistory?.record(clock.monotonicNs(), "decode_end", info.presentationTimeUs,
+                        regulator.bufferedFrames.toLong())
                 }
             } finally { decoder.releaseOutputBuffer(index, false) }
         }
@@ -234,7 +284,10 @@ class AudioPlayer(
             regulator.startAfterPreroll()
             output.play()
             lastOutputProgressNs = clock.monotonicNs()
-            underruns.start(output.underrunCount)
+            val count = output.underrunCount
+            underruns.start(count)
+            serviceDiagnostic?.start(lastOutputProgressNs, count)
+            eventHistory?.start(count)
         }
     }
 
@@ -248,6 +301,10 @@ class AudioPlayer(
             throw AudioClockException(AudioClockDiagnostic(AudioClockFault.CLIENT_BUFFER, timing))
         val now = clock.monotonicNs()
         observePresentation(timing, now)
+        eventHistory?.refill(now, timing.bufferedUs, regulator.bufferedFrames)
+        serviceDiagnostic?.beforeRefill(now,
+            (timing.submittedFrames - timing.consumedFrames) * 1_000_000 / format.sampleRate,
+            regulator.bufferedFrames, lastAudioAdmissionNs?.let { (now - it).coerceAtLeast(0) / 1000 })
         if (statisticsEnabled && (statisticsAtNs == Long.MIN_VALUE || now - statisticsAtNs >= 100_000_000)) {
             statisticsAtNs = now
             val diagnostic = regulator.diagnostic()
@@ -277,8 +334,12 @@ class AudioPlayer(
                     output.write(chunk?.samples ?: silence, chunk?.offset ?: 0, frames * format.channels)
                 }
             }
-            if (written == 0) break
+            if (written == 0) {
+                serviceDiagnostic?.wrote(0, chunk != null)
+                break
+            }
             val accepted = written / format.channels
+            serviceDiagnostic?.wrote(accepted, chunk != null)
             if (chunk != null) {
                 sourcePacket(chunk.ptsUs)
                 sourceWrittenUnits = Math.addExact(sourceWrittenUnits, regulator.sourceUnits(accepted))
@@ -286,6 +347,8 @@ class AudioPlayer(
                 totalFrames += accepted
                 clock.audioWritten(sourceWrittenUnits / format.sampleRate)
             } else regulator.insertedSilence(accepted)
+            if (chunk == null) eventHistory?.record(clock.monotonicNs(), "silence", accepted.toLong(),
+                regulator.bufferedFrames.toLong())
             deviceFrames += accepted
             available -= accepted
             lastOutputProgressNs = clock.monotonicNs()
@@ -358,7 +421,14 @@ class AudioPlayer(
         if (lastUnderrunObservationNs?.let { now - it < 20_000_000L } == true) return
         stage = "UNDERRUN_CHECK"
         lastUnderrunObservationNs = now
-        underruns.observe(now, output.underrunCount, output.timing(), queuedPackets(),
+        val count = output.underrunCount
+        val timing = diagnosticCall(DiagnosticPoint.TIMING) { output.timing() }
+        val queued = queuedPackets()
+        eventHistory?.record(now, "observe", count.toLong(), queued.toLong())
+        eventHistory?.dump(now, count)?.forEach { onServiceDiagnostic?.invoke(it) }
+        serviceDiagnostic?.observe(count, timing.submittedFrames - timing.consumedFrames,
+            regulator.bufferedFrames, queued, pending != null || waiting != null)
+        underruns.observe(now, count, timing, queued,
             pending != null || waiting != null, output.playbackActive)?.let {
             onUnderrunRecovery(it)
             if (RemoteDiagnostics.recorder.enabled("receiver", diagnosticSession, DiagnosticKind.AUDIO_OUTPUT))
@@ -389,6 +459,7 @@ class AudioPlayer(
             } finally {
                 try { opus?.close() } finally {
                     pending = null
+                    reportService(final = true)
                     regulator.clear()
                     presentation.clear()
                     try { resampler.close() } finally { output.close() }

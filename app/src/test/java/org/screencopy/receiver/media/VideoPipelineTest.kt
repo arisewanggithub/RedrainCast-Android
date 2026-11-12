@@ -48,6 +48,7 @@ class VideoPipelineTest {
             await { decoder.rendered.isNotEmpty() || errors.isNotEmpty() }
             assertTrue(errors.toString(), errors.isEmpty())
             assertEquals(1, decoder.rendered.size)
+            assertEquals(listOf(now.get()), decoder.renderTimes.toList())
             assertEquals(1, decoder.inputs.size)
         } finally { decoder.resume.countDown(); player.close() }
         assertTrue(decoder.closed)
@@ -165,6 +166,22 @@ class VideoPipelineTest {
         } finally { player.close() }
     }
 
+    @Test fun futureVideoPictureIsScheduledAgainstItsPtsWithoutBlockingTheWorker() {
+        val now = AtomicLong(1_000_000_000)
+        val clock = PlaybackClock(now::get).apply { anchorVideo(8_000_000_000) }
+        val decoder = FakeDecoder(block = false)
+        val errors = ConcurrentLinkedQueue<String>()
+        val player = VideoPlayer(format, clock, { code, detail -> errors.add("$code $detail") }, decoder)
+        try {
+            player.start()
+            player.offer(AccessUnit(8_000_050_000, byteArrayOf(1), true))
+            await { decoder.rendered.isNotEmpty() || errors.isNotEmpty() }
+            assertTrue(errors.toString(), errors.isEmpty())
+            assertEquals(listOf(1_050_000_000L), decoder.renderTimes.toList())
+            assertEquals(1_000_000_000L, now.get())
+        } finally { player.close() }
+    }
+
     @Test fun unsupportedSelectionAndConfigurationFailuresRetainDifferentInitializationCauses() {
         val clock = PlaybackClock()
         val unsupported = assertThrows(VideoPlaybackException::class.java) {
@@ -274,6 +291,7 @@ class VideoPipelineTest {
         val resume = CountDownLatch(1)
         val inputs = ConcurrentLinkedQueue<Long>()
         val rendered = ConcurrentLinkedQueue<Int>()
+        val renderTimes = ConcurrentLinkedQueue<Long>()
         val skipped = ConcurrentLinkedQueue<Int>()
         val maximumOutstanding = AtomicInteger()
         private val outstanding = AtomicInteger()
@@ -299,7 +317,10 @@ class VideoPipelineTest {
         }
         override fun releaseOutput(index: Int, renderAtNs: Long?) {
             releaseFailure?.let { throw it }
-            if (renderAtNs != null) rendered.add(index) else skipped.add(index)
+            if (renderAtNs != null) {
+                rendered.add(index)
+                renderTimes.add(renderAtNs)
+            } else skipped.add(index)
             outstanding.decrementAndGet()
         }
         override fun close() { closed = true }

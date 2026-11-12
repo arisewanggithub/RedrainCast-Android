@@ -666,6 +666,8 @@ change fails. An announced encoder configuration change is serialized as another
 sequential generation, retaining the same unresolved deadline. Decoder-reported
 visible raster, including alignment crop, must match that configuration.
 Picture PTS and rotation remain associated unchanged through decode/presentation.
+Future decoded pictures are released with their PTS-derived deadline mapped onto
+the receiver's monotonic clock; pictures already due remain immediate.
 
 Allow dependent video after the verified key so the decoder can produce output.
 KEY acknowledges usable decoded output at/after that key, not merely admission.

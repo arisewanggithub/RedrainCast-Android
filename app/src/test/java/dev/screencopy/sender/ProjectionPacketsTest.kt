@@ -63,6 +63,21 @@ class ProjectionPacketsTest {
         assertThrows(IOException::class.java) { output.packet(data, -1, false) }
     }
 
+    @Test fun encodedVideoTraceKeepsOutputPtsAndGenerationWithoutChangingPayload() {
+        val sink = Sink()
+        val trace = VideoFrameTrace(true, 123)
+        val output = EncodedOutput(1, "h264", 123, sink, frameTrace = trace)
+        output.configure(BackendTest().sps(640, 480))
+        val frame = WireTest.unhex("000000016588")
+        output.packet(frame, 123_456, true)
+        val event = checkNotNull(trace.takeCompleted(force = true)).events.single()
+        assertEquals(VideoFrameStage.ENCODED, event.stage)
+        assertEquals(123_456L, event.ptsUs)
+        assertEquals(1, event.generation)
+        assertSame(frame, sink.packets.single().payload)
+        assertEquals(event.ptsUs, sink.packets.single().pts)
+    }
+
     @Test fun restartingVideoEncoderAnnouncesANewGenerationEvenWhenCsdIsIdentical() {
         val sink = Sink()
         val output = EncodedOutput(1, "h264", 123, sink)

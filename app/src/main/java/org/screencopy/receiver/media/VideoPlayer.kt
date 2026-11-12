@@ -6,6 +6,8 @@ import android.media.MediaCodecInfo
 import android.media.MediaFormat
 import android.view.Surface
 import dev.redrain.cast.diagnostics.*
+import dev.redrain.cast.MediaThreadDiagnostic
+import dev.redrain.cast.MediaThreadRole
 import java.nio.ByteBuffer
 
 class VideoPlayer private constructor(
@@ -18,14 +20,15 @@ class VideoPlayer private constructor(
     private val generation: Long,
     private val onPresentation: (VideoDiagnostic) -> Unit,
     private val onRotation: (Int) -> Unit,
-    private val outputAvailable: () -> Boolean = { true }
-) : TrackWorker("ScreenCopy-video", 8 * 1024 * 1024, failure, track = 1) {
+    private val outputAvailable: () -> Boolean = { true },
+    prepareThread: () -> Unit = {}
+) : TrackWorker("ScreenCopy-video", 8 * 1024 * 1024, failure, track = 1, prepareThread = prepareThread) {
     constructor(format: VideoFormat, surface: Surface, clock: PlaybackClock, report: (String) -> Unit,
         failure: (String, String) -> Unit, onPresented: () -> Unit = {}, generation: Long = 1,
         onRotation: (Int) -> Unit = {}, outputAvailable: () -> Boolean = { true }) :
         this(format, clock, report, failure, onPresented, { selected, presented -> AndroidVideoDecoder(selected, surface, presented) },
             generation, { android.util.Log.i("ScreenCopyReceiver", "event=VIDEO_PRESENTATION ${it.logMessage()}") }, onRotation,
-            outputAvailable)
+            outputAvailable, { MediaThreadDiagnostic.report(MediaThreadRole.VIDEO) })
 
     internal constructor(format: VideoFormat, clock: PlaybackClock, failure: (String, String) -> Unit, decoder: VideoDecoder,
         generation: Long = 1, onPresentation: (VideoDiagnostic) -> Unit = {}, onRotation: (Int) -> Unit = {},
@@ -157,10 +160,11 @@ class VideoPlayer private constructor(
             if (format.videoColor != null && !outputAvailable())
                 throw PlaybackException("HDR output became unavailable; restart casting with SDR", "UNSUPPORTED_CONFIG")
             if (statisticsEnabled) pathStatistics.scheduled(heldPtsUs, heldPath)
-            val renderAtNs = clock.monotonicNs()
+            val renderDelayUs = delayUs?.coerceAtLeast(0) ?: 0
+            val renderAtNs = Math.addExact(clock.monotonicNs(), Math.multiplyExact(renderDelayUs, 1_000L))
             decoder.releaseOutput(heldOutput, renderAtNs)
             diagnosticVideo(DiagnosticVideoStage.RELEASED, heldPtsUs, sourceAtNs = renderAtNs)
-            clock.videoPresented(heldPtsUs)
+            clock.videoPresented(heldPtsUs, renderAtNs)
             renderSubmitted++
             heldOutput = -1
             reportPresentation()

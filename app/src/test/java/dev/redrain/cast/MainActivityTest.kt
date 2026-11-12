@@ -1002,8 +1002,8 @@ class MainActivityTest {
         assertEquals(if (BuildConfig.DEBUG) "RedrainCast Debug" else "RedrainCast",
             context.applicationInfo.loadLabel(context.packageManager).toString())
         val info = context.packageManager.getPackageInfo(packageName, 0)
-        assertEquals(if (BuildConfig.DEBUG) "0.5.0-debug" else "0.5.0", info.versionName)
-        assertEquals(33L, info.longVersionCode)
+        assertEquals(if (BuildConfig.DEBUG) "0.5.1-rc.1-debug" else "0.5.1-rc.1", info.versionName)
+        assertEquals(34L, info.longVersionCode)
         val activity = context.packageManager.getActivityInfo(
             android.content.ComponentName(context, MainActivity::class.java), 0)
         assertEquals("dev.redrain.cast.MainActivity", activity.name)

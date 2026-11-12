@@ -102,6 +102,30 @@ class AudioRefillPipelineTest {
             assertEquals(1920L, fixture.output.submitted)
             assertEquals(3840, fixture.output.samples.size)
         }
+
+    }
+
+    @Test fun diagnosticsCountNativeUnderrunsAndAcceptedSilenceWithoutChangingSourceWrites() {
+        val logs = mutableListOf<String>()
+        Fixture(diagnostic = logs::add).use { fixture ->
+            fixture.packet(960)
+            fixture.step()
+            fixture.output.mix(1920)
+            fixture.advance(5_000_000_000)
+            fixture.step()
+            val report = logs.single { it.contains("event=AUDIO_SERVICE_WINDOW") }
+            assertTrue(logs.toString(), logs.any { it.contains("event=AUDIO_UNDERRUN_HISTORY") })
+            assertTrue(logs.toString(), logs.any { it.contains(",dequeue,") })
+            assertTrue(logs.toString(), logs.any { it.contains(",decode_end,") })
+            assertTrue(logs.toString(), logs.any { it.contains(",refill,0,0") })
+            assertTrue(report, report.contains("native_underruns=1 "))
+            assertTrue(report, report.contains("inserted_silence_frames=240 "))
+            assertTrue(report, report.contains("silence_episodes=1 "))
+            assertTrue(report, report.contains("min_padding_us=0 "))
+            assertEquals(960L, fixture.player.sourceSubmittedFrames)
+            assertEquals((0 until 1920).map(Int::toShort), fixture.output.samples.take(1920))
+            assertTrue(fixture.output.samples.drop(1920).all { it == 0.toShort() })
+        }
     }
 
     @Test fun decodedPcmIsRefilledBeforeWaitingOnInputAdmission() {
@@ -137,13 +161,14 @@ class AudioRefillPipelineTest {
         }
     }
 
-    private class Fixture(maximumWrite: Int = Int.MAX_VALUE, zeroAfter: Int = Int.MAX_VALUE) : AutoCloseable {
+    private class Fixture(maximumWrite: Int = Int.MAX_VALUE, zeroAfter: Int = Int.MAX_VALUE,
+        diagnostic: ((String) -> Unit)? = null) : AutoCloseable {
         private val time = AtomicLong(1_000_000_000)
         val output = QuantumOutput(maximumWrite, zeroAfter)
         private val clock = PlaybackClock(time::get) { time.addAndGet(it * 1_000_000) }
             .apply { audioExpected = true; anchorVideo(1_000_000) }
         val player = testAudioPlayer(AudioFormat("pcm", 48000, 2, byteArrayOf()), clock,
-            { code, detail -> fail("$code: $detail") }, { output })
+            { code, detail -> fail("$code: $detail") }, { output }, onServiceDiagnostic = diagnostic)
         private val step = AudioPlayer::class.java.getDeclaredMethod("step").apply { isAccessible = true }
         fun packet(frames: Int, pts: Long = 1_000_000, firstSample: Int = 0) {
             val bytes = ByteBuffer.allocate(frames * 4).order(ByteOrder.LITTLE_ENDIAN)
@@ -151,6 +176,7 @@ class AudioRefillPipelineTest {
             player.offer(AccessUnit(pts, bytes.array()))
         }
         fun step() { step.invoke(player) }
+        fun advance(ns: Long) { time.addAndGet(ns) }
         override fun close() = player.close()
     }
 

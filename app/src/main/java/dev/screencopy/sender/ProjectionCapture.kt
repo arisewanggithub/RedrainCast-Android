@@ -19,6 +19,8 @@ import android.os.Handler
 import android.os.Looper
 import android.view.Display
 import android.view.Surface
+import dev.redrain.cast.MediaThreadDiagnostic
+import dev.redrain.cast.MediaThreadRole
 import java.io.Closeable
 import java.io.IOException
 import java.util.concurrent.atomic.AtomicBoolean
@@ -26,7 +28,8 @@ import java.util.concurrent.atomic.AtomicReference
 
 internal class ProjectionCapture(
     private val context: Context, private val owner: ProjectionOwner,
-    private val fail: (Exception) -> Unit
+    private val fail: (Exception) -> Unit,
+    private val frameTrace: VideoFrameTrace? = null
 ) : Closeable {
     private val closed = AtomicBoolean()
     private val workers = mutableListOf<Thread>()
@@ -54,7 +57,7 @@ internal class ProjectionCapture(
     @Synchronized fun start(settings: Settings, session: Long, sink: ScrcpyAdapter.Sink) {
         if (closed.get()) throw SessionCancelledException()
         configureVideo(settings, ProjectionInventory.displays(context).displays.single())
-        val videoOutput = EncodedOutput(1, settings.videoCodec, session, sink, rotations::at)
+        val videoOutput = EncodedOutput(1, settings.videoCodec, session, sink, rotations::at, frameTrace)
         val listener = object : DisplayManager.DisplayListener {
             override fun onDisplayAdded(displayId: Int) = Unit
             override fun onDisplayRemoved(displayId: Int) {
@@ -68,7 +71,7 @@ internal class ProjectionCapture(
         displayListener = listener
         if (settings.audio) startAudio(settings, session, sink)
         attachVideo()
-        worker("projection-video") {
+        worker("projection-video", MediaThreadRole.VIDEO) {
             while (!closed.get()) {
                 pendingSource.getAndSet(null)?.let { source ->
                     val geometry = VideoEncoderPreflight.validate(settings, DisplayInventory(listOf(source)))
@@ -103,7 +106,7 @@ internal class ProjectionCapture(
         android.util.Log.i("ScreenCopySender", "event=PROJECTION_VIDEO_GEOMETRY source_width=${source.width} source_height=${source.height}" +
             " source_rotation=${source.rotation} width=${geometry.output.width} height=${geometry.output.height}")
         renderer = ProjectionRenderer(context, surface, geometry.output, settings, source,
-            onFrame = rotations::offer, fail = ::report)
+            onFrame = rotations::offer, frameTrace = frameTrace, fail = ::report)
     }
 
     private fun attachVideo() {
@@ -180,7 +183,7 @@ internal class ProjectionCapture(
         if (record.recordingState != AudioRecord.RECORDSTATE_RECORDING) throw IOException("AUDIO_FAILED: audio recording did not start")
         owner.mutePlayback(settings)
         val start = System.nanoTime() / 1000
-        worker("projection-audio") {
+        worker("projection-audio", MediaThreadRole.AUDIO) {
             var frames = 0L
             var origin: Long? = null
             var rawPackets: RawPcmPackets? = null
@@ -273,9 +276,12 @@ internal class ProjectionCapture(
 
     }
 
-    private fun worker(name: String, action: () -> Unit) {
+    private fun worker(name: String, role: MediaThreadRole, action: () -> Unit) {
         workers += Thread({
-            try { action() } catch (e: Exception) {
+            try {
+                MediaThreadDiagnostic.report(role)
+                action()
+            } catch (e: Exception) {
                 if (e is InterruptedException) Thread.currentThread().interrupt()
                 if (!closed.get()) report(if (SessionOutcome.errorCode(e) != "INTERNAL" ||
                     e is SessionCancelledException || e is SenderProtocolException) e
@@ -318,7 +324,8 @@ internal class ProjectionCapture(
 
 internal class EncodedOutput(
     val track: Int, private val codec: String, private val session: Long, private val sink: ScrcpyAdapter.Sink,
-    private val rotation: (Long) -> Int = { 0 }
+    private val rotation: (Long) -> Int = { 0 },
+    private val frameTrace: VideoFrameTrace? = null
 ) {
     private var previous: ByteArray? = null
     var generation = 0
@@ -357,6 +364,7 @@ internal class EncodedOutput(
         previous = bytes
     }
     fun packet(bytes: ByteArray, pts: Long, key: Boolean) {
+        if (track == 1) frameTrace?.record(VideoFrameStage.ENCODED, pts, generation)
         if (generation == 0) throw IOException("CAPTURE_FAILED: encoder output preceded initialization")
         if (pts < 0 || bytes.isEmpty() || bytes.size > if (track == 1) Wire.MAX_VIDEO else Wire.MAX_AUDIO)
             throw IOException("CAPTURE_FAILED: invalid encoded packet")

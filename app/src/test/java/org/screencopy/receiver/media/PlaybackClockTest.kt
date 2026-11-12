@@ -324,6 +324,22 @@ class PlaybackClockTest {
         assertEquals(1_600_000L, clock.currentUs())
     }
 
+    @Test fun scheduledVideoPresentationKeepsRecoveryAudioAlignedUntilItsDeadline() {
+        val time = FakeTime()
+        val clock = time.clock().apply { audioExpected = true }
+        time.advanceUs(300_000)
+        clock.anchorVideo(1_000_000)
+        time.advanceUs(300_000)
+        clock.beginAudioRecovery()
+        val deadlineNs = time.ns + 300_000_000
+        clock.videoPresented(1_600_000, deadlineNs)
+        assertEquals(1_300_000L, clock.currentUs())
+        assertEquals(300_000L, clock.audioStartDelayUs(1_600_000))
+        time.advanceUs(300_000)
+        assertEquals(1_600_000L, clock.currentUs())
+        assertEquals(0L, clock.audioStartDelayUs(1_600_000))
+    }
+
     private class FakeTime {
         var ns = 0L
         fun advanceUs(us: Long) { ns += us * 1000 }

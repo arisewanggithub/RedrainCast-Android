@@ -36,6 +36,7 @@ internal class AudioRegulator(private val rate: Int, private val channels: Int) 
     private var source = 0L
     private var silence = 0L
     private var dropped = 0L
+    internal val discardedFrames: Long get() = dropped
     private var recoveries = 0L
     private var speed = 1f
     private var lastCompensation = AudioCompensation(0, 0)

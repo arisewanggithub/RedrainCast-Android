@@ -594,6 +594,7 @@ class ReceiverServer private constructor(
                     pts = message.ptsUs, bytes = message.payload.size.toLong(), reason = DiagnosticReason.STALE)
                 return
             }
+            if (target is AudioPlayer) target.packetReceived(packet.ptsUs, packet.bytes.size)
             // Admission may wait; never hold the other media lane behind a full track.
             try {
                 val pressure = if (!streamRecovery) { target.offer(packet); null } else target.tryOffer(packet)
@@ -1292,7 +1293,8 @@ class ReceiverServer private constructor(
                 onClockCorrection = { android.util.Log.i("ScreenCopyReceiver", it.logMessage()) },
                 onOutputTiming = { android.util.Log.i("ScreenCopyReceiver", "event=AUDIO_OUTPUT_CLOCK stage=PCM_COMPENSATION ${it.logMessage()}") },
                 onUnderrunRecovery = { android.util.Log.w("ScreenCopyReceiver", it.logMessage()) },
-                onRegulation = { android.util.Log.i("ScreenCopyReceiver", it.logMessage()) })).also {
+                onRegulation = { android.util.Log.i("ScreenCopyReceiver", it.logMessage()) },
+                onServiceDiagnostic = { android.util.Log.i("ScreenCopyReceiver", "session=$session audio_epoch=$epoch $it") })).also {
                 it.diagnosticSession = session
                 it.diagnosticGeneration = audioGeneration.toInt()
                 it.statisticsEnabled = request?.receiverOptions?.playbackStats == true
