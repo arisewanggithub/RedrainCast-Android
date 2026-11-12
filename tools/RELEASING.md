@@ -1,179 +1,134 @@
 # Public Android releases
 
-Application source stays in the private RedrainCast-Android repository. Public
-APKs and distribution materials go only to
-[RedrainCast-Releases](https://github.com/arisewanggithub/RedrainCast-Releases).
-The manually triggered `Public Android release candidate` workflow never publishes a
-source archive, debug APK, instrumentation APK, build log or signing keystore.
-GitHub's automatic source links in that public repository contain only its public
-download documentation, not this application.
+Future APKs and distribution materials belong in
+[RedrainCast-Android releases](https://github.com/arisewanggithub/RedrainCast-Android/releases),
+alongside the public Android source. GitHub's automatic source archives contain
+Android source at the release tag. The workflow uploads only the five reviewed
+distribution assets, never debug/test APKs, logs or signing keys.
 
-## Required configuration
+This configuration applies to new versions only; it does not migrate or
+republish historical releases. The product website links to the Android releases
+listing, which works before the first release exists. Windows distribution is
+unchanged.
 
-The release job uses the trusted self-hosted Linux x64 runner labeled
-`arise-local`, matching Android validation. It requires JDK 21, the Android SDK
-and access to install the pinned SDK/NDK/CMake packages, Python 3, Bash and GitHub
-Actions network access. Only trusted maintainers should control this runner,
-which handles production signing secrets; keep its host and runner account
-restricted. Release files use a private per-run/per-attempt directory, with
-keystore removal on signing exit and an always-run cleanup of that precise
-directory after artifact/draft upload. A hard host/process kill can prevent
-cleanup; maintainers must securely remove that attempt's leftover directory
-before reusing the runner. Never delete shared runner directories.
+## Required configuration and permissions
 
-Signing is blocked unless all four signing secrets are configured. Public
-draft upload additionally requires the scoped publisher secret:
+The manually dispatched `Public Android release candidate` workflow runs on
+GitHub-hosted `ubuntu-latest` with JDK 21, the pinned Android SDK/NDK/CMake,
+Python 3 and Bash. Signing requires four existing Actions secrets:
 
 - `ANDROID_RELEASE_KEYSTORE_BASE64`: a dedicated production keystore.
 - `ANDROID_RELEASE_STORE_PASSWORD`, `ANDROID_RELEASE_KEY_PASSWORD`,
-  `ANDROID_RELEASE_KEY_ALIAS`: its credentials. Do not put these in Git or logs.
-- `RELEASE_PUBLISH_TOKEN`: a fine-grained token limited to Contents read/write
-  for the public downloads repository. The private repository's ordinary
-  `GITHUB_TOKEN` cannot publish releases into another repository.
+  `ANDROID_RELEASE_KEY_ALIAS`: credentials. Never put them in Git or logs.
 
-Keep an independently backed-up production key outside the repository. Losing
-it prevents future in-place APK updates. Production signing is different from
-the debug certificate used on the development phones; switching certificates
-requires uninstalling that existing app and loses its local data. Do not
-uninstall or change device signing automatically.
+The signing/build job keeps `contents: read`. Only the separate `publish` job,
+enabled by `publish=true` after signing succeeds, receives `contents: write`.
+It uses the ephemeral same-repository `GITHUB_TOKEN`, downloads the same signed
+candidate, verifies checksums, rechecks exact current main and creates a
+**draft** tag at `reviewed_commit`. It has no signing-secret inputs.
+No cross-repository PAT or `RELEASE_PUBLISH_TOKEN` is needed. Never copy a
+personal login token into Actions. Forks, PRs and non-main dispatches cannot
+reach signing/publication. No repository permission settings need changing.
+
+Release files use a private per-run/per-attempt directory, with keystore removal
+on signing exit and always-run cleanup of that precise directory after artifact
+upload. A hard process kill can prevent cleanup; securely remove only that
+attempt's leftover directory, never shared runner directories.
+
+Keep an independent durable backup of the production key outside Git. Losing
+it prevents future in-place APK updates. Production signing differs from debug
+signing; switching certificates can require uninstalling and losing app data.
+Do not uninstall or change device signing automatically.
 
 On Windows, `tools\release-signing.ps1 -Directory <outside-Git-directory>
--ConfigureSecrets` creates a dedicated RSA-3072 JKS key (CN=RedrainCast,
-10,000-day validity) only if neither key nor credentials exists, or reuses the
-existing matching pair. Set `JAVA_HOME` to JDK 21 first. It protects only its
-new files/staging directory for the current Windows user and SYSTEM, never the
-whole destination folder. Passwords come from the OS CSPRNG; keytool receives
-them through environment variables and `gh secret set` through stdin.
-Never commit, upload as an artifact, or log the key/credential file. A temporary
-Downloads directory is **not** an independent durable backup. Back up both
-files securely before publishing.
+-ConfigureSecrets` creates an RSA-3072 JKS key (CN=RedrainCast, 10,000-day validity)
+only if neither key nor credentials exists, or reuses the existing matching pair.
+Set `JAVA_HOME` to JDK 21 first. It protects only its new files/staging directory
+for the current user and SYSTEM, never the whole destination folder.
+Passwords use the OS CSPRNG; keytool receives environment variables and
+`gh secret set` receives stdin. Never log/upload the key, credential file or
+exports. Temporary Downloads storage is not an independent durable backup.
 
-The configured production certificate SHA-256 is
-`79f906220de117d61c2d15bdfcef179a4e3e48cfa0c76b637c7af986c037fad3`;
-the workflow pins and checks it after signing. Key rotation requires explicit
-review and breaks normal in-place updates without a signing-lineage plan.
+The pinned production certificate SHA-256 is
+`79f906220de117d61c2d15bdfcef179a4e3e48cfa0c76b637c7af986c037fad3`.
+Key rotation requires explicit review and a signing-lineage/update plan.
 
-Create a fine-grained PAT using
-[GitHub token settings](https://github.com/settings/personal-access-tokens/new?name=RedrainCast%20release%20publisher&description=Upload%20reviewed%20Android%20testing%20drafts&target_name=arisewanggithub&expires_in=30&contents=write).
-Select **only RedrainCast-Releases**, Contents read/write, and a short expiry.
-Set it as `RELEASE_PUBLISH_TOKEN` in the private application's Actions secrets
-(for example, `gh secret set RELEASE_PUBLISH_TOKEN --repo
-arisewanggithub/RedrainCast-Android`, entering it interactively). The settings
-link prefills the owner, permission and 30-day expiry, **not repository
-selection**: select only the public downloads repository yourself, then verify
-the permissions before creating it. GitHub's documented
-[template parameters](https://docs.github.com/en/authentication/keeping-your-account-and-data-secure/managing-your-personal-access-tokens#pre-filling-fine-grained-personal-access-token-details-using-url-parameters)
-do not include repository selection.
-Never copy the existing broad `gh` login token into Actions. A properly scoped
-GitHub App installation token is also acceptable, but account consent cannot be
-manufactured by the workflow.
+## Exact-build LGPL relink materials
 
-## Automatic LGPL relink materials
+`release-kit.py` produces `android-lgpl-relink.tar.gz` from the same signed build:
 
-`release-kit.py` now produces `android-lgpl-relink.tar.gz` from the **same**
-release build, after signing; no external artifact run ID is needed. It:
+- SHA-256-pin the public AAR, complete FFmpeg source, configuration/build helpers
+  and compliance materials; never compile FFmpeg or access another checkout.
+- Prove each JNI ELF matches the APK after the same stripping operation.
+- Package matching application-native relocatable objects for all three ABIs,
+  removing debug metadata and rejecting developer paths/credential-shaped data.
+- Preserve exact NDK/API/ABI, link flags, archive order, static C++ runtime,
+  soname and 16 KiB alignment; reject unexpected dependencies.
+- Relink all ABIs, verify ELF machines/alignment and exact JNI exports, and
+  reject unresolved symbols. This is a link/ELF smoke, not a device test.
+- Bind APK/object/source hashes and source commit in the manifest and checksums;
+  include `relink.py` accepting explicit modified FFmpeg archives.
 
-- Pins/downloads the public AAR, corresponding complete FFmpeg source,
-  configuration/build helpers and compliance materials by SHA-256. It does not
-  compile FFmpeg or access the private native-build checkout.
-- Proves each original JNI ELF matches the APK byte-for-byte after the same
-  `llvm-strip --strip-unneeded` operation, refusing ambiguous/missing objects.
-- Packages the three matching relocatable JNI application objects, removing
-  only debug metadata to avoid publishing private source/build paths. It
-  rejects private-path/credential-shaped object or metadata contents.
-- Preserves CMake link flags, static C++ runtime, exact NDK/API/ABI, static
-  archive order, soname and 16 KiB alignment. Unexpected dependencies/flags
-  fail instead of silently falling back.
-- Relinks all three ABIs using the packaged objects/public FFmpeg libraries,
-  checks ELF machines/LOAD alignment and the exact APK's JNI export sets, and
-  refuses unresolved symbols. This is a link/ELF smoke, not a device test.
-- Includes a manifest binding APK/object/source hashes and commit, internal
-  checksums, and `relink.py` accepting explicit **modified** FFmpeg archives.
+The kit excludes raw Ninja/compile-command files, logs, signing material,
+developer paths and application source (available separately in this repository).
+Headers/configuration are included in the public AAR/build materials.
+See [kit instructions](release-kit-README.md). Review licensing/privacy contents
+before publication; mechanical checks are not legal advice.
 
-The archive includes no private application source, raw Ninja/compile-command
-files, logs, signing material or developer paths. Full headers/configuration
-are in the included public AAR and build materials. See
-[kit instructions](release-kit-README.md), including modified-APK signing.
-Maintainers must still review the candidate's licensing/privacy contents before
-publishing; mechanical checks are not legal advice.
+## Version identity for future releases
 
-## Publishing
+Use the full version consistently in embedded `versionName`, tag and asset:
 
-### Version identity for future releases
-
-Use the same full version everywhere:
-
-| Kind | Embedded `versionName` | GitHub tag | APK asset |
+| Kind | Version | Tag | APK |
 |---|---|---|---|
-| Release candidate | `0.5.0-rc.1` | `v0.5.0-rc.1` | `RedrainCast-0.5.0-rc.1.apk` |
+| RC | `0.5.0-rc.1` | `v0.5.0-rc.1` | `RedrainCast-0.5.0-rc.1.apk` |
 | Beta | `0.5.0-beta.2` | `v0.5.0-beta.2` | `RedrainCast-0.5.0-beta.2.apk` |
 | Alpha | `0.5.0-alpha.1` | `v0.5.0-alpha.1` | `RedrainCast-0.5.0-alpha.1.apk` |
 | Stable | `0.5.0` | `v0.5.0` | `RedrainCast-0.5.0.apk` |
 
-Supported versions have three canonical numeric components and an optional
-`-alpha.N`, `-beta.N` or `-rc.N` suffix, where N starts at 1 without leading
-zeroes. Underscore suffixes, build metadata, and bare `-rc` are not accepted.
-Set the embedded version in `app/build.gradle.kts` before reviewing/committing
-the release source; the workflow does not rewrite it from the requested tag.
-Every distributed build must increase Android's numeric `versionCode`, including
-RC-to-stable transitions (for example: RC1 code 21, RC2 code 22, stable code 23).
-Removing a suffix alone does not make an APK installable over a higher code.
+Use three canonical numeric components and optional `-alpha.N`, `-beta.N` or
+`-rc.N` (positive N, no leading zeroes). No underscores, build metadata or bare
+`-rc`. Commit the embedded version before review; the workflow never rewrites it.
+Increase `versionCode` for every distributed build, including RC-to-stable.
+The workflow derives prerelease status from the suffix and always creates a
+draft. Stable publication requires separate explicit owner approval, including
+known limitations. Do not alter the historical plain-version v0.4.6 preview.
 
-The workflow derives GitHub's prerelease flag from the suffix rather than an
-independent toggle. It validates the exact embedded APK/tag identity, preserves
-the suffix in the APK filename and relink manifest, and always uploads a
-**draft**. Only suffixed versions receive `--prerelease`; a bare version creates
-a stable-designated draft requiring separate final review before publication.
-The stable-only app updater accepts installed prerelease versions and considers
-their matching final stable version newer, but never offers another prerelease.
+## Build, review and publish
 
-The already published plain-version `v0.4.6` testing release is a historical
-exception. Do not retag, rename its assets, rebuild it or rewrite its checksums.
+1. Validate changes and select exact committed current Android `main`.
+   Only manual dispatch on `refs/heads/main` in this repository can sign.
+2. Dispatch with matching `tag`, `source_validated=true`, full 40-character
+   `reviewed_commit` and **`publish=false`**. Checkout, dispatch and live main must
+   equal that SHA, rechecked before signing and draft upload. If main moves,
+   review the new revision and restart; never approve stale artifacts.
+3. Review the `signed-testing-candidate` artifact (3-day retention): production
+   APK, checksums, certificate, licenses and exact-build relink kit. On this public
+   repository, artifacts and workflow logs must not be treated as confidential.
+4. Repeat on the same reviewed revision with `publish=true`. The publication job
+   creates a draft in **RedrainCast-Android**, using `GITHUB_TOKEN`. Review the
+   newly built candidate too. Nothing automatically makes the release live.
+5. After explicit publication approval, publish the reviewed draft. Preserve
+   rendering, shutdown, signing-migration and native/runtime acceptance limits
+   in notes; automation is not Windows interoperability or physical-device proof.
 
-1. Finish and validate the application changes first. Select the exact committed
-   revision on private `main`; do not sign an unfinished audio/rendering
-   candidate as ready. Only manual dispatch in the private repository on
-   `refs/heads/main` can start the release job, never PRs, forks or tags.
-2. Run the workflow manually with `tag` matching the APK version,
-   `source_validated=true`, `reviewed_commit` containing the full 40-character
-   SHA of current `main`, and **`publish=false`** (the default).
-   Checkout, dispatch and live remote `main` must all equal that reviewed SHA;
-   this is rechecked before signing and public draft upload. If `main` moves,
-   review the new revision and restart instead of approving stale artifacts.
-   It tests/lints, builds/signs the optimized APK, pins the certificate,
-   alignment-checks it and creates/smokes the relink kit.
-3. Review the private `signed-testing-candidate` artifact (3-day retention):
-   production APK, checksums, certificate, licenses and relink kit.
-4. With the scoped publisher configured, repeat at the same reviewed revision
-   with `publish=true` to create a public-repository **draft** of the inferred kind.
-   Review that newly built candidate too. No release is automatically made live.
-   Manually publish only after final asset/compliance/runtime review.
+Missing signing prerequisites, write permission or tag conflicts fail explicitly.
+Never replace an existing release or tag.
+Updated apps check only this repository's stable metadata; until then a 404 is
+logged without affecting casting. Already-installed v0.4.18 and older apps still
+check the historical repository until manually updated; old binaries/links are
+not rewritten by this configuration change.
 
-Stable publication requires explicit owner approval, including acceptance of
-any documented known limitations. Keep unresolved rendering, shutdown and native
-acceptance limits in the release notes; approval does not establish unverified
-Windows interoperability or prove those issues fixed. Draft upload does not mean
-the candidate is approved. The workflow cannot create a scoped PAT without the
-owner's external authorization. Missing prerequisites fail explicitly.
+## Manual publication fallback
 
-## Initial manual publication with existing local authorization
+An explicitly authorized maintainer may use existing local `gh` authorization;
+never export that login token into Actions. First require a successful
+`publish=false` candidate run at reviewed current main, including tests/lint,
+signing, certificate/alignment and all three ABI relink checks.
+Verify all checksums, APK identity/certificate/ABIs and the manifest's exact
+source/APK/object binding. Never mix builds, objects or source revisions.
 
-A maintainer explicitly authorized to publish may use their existing local
-`gh` login for the initial release without installing that broad login token
-in Actions. This does **not** configure automatic cross-repository publication;
-`RELEASE_PUBLISH_TOKEN` still requires a separately approved scoped credential.
-
-First run the private-candidate workflow with `publish=false` and the exact
-reviewed current-main SHA. Require its successful tests/lint/signing and all
-three ABI relink checks. Download only `signed-testing-candidate`; verify its
-complete checksums, APK version/code/certificate/ABIs and kit manifest binding
-to that exact signed APK, native objects and source revision. Never rebuild a
-dirty newer working tree under an older version or borrow mismatched objects.
-
-For future releases, use these **five explicit asset names** from the verified
-private candidate directory, not a wildcard over local files. The example uses
-an RC; for stable candidates remove the suffix in the committed app version and
-tag, increment versionCode, and complete stable-readiness review first:
+Use these five explicit asset names, not a wildcard over local files:
 
 ```powershell
 $tag = "v0.5.0-rc.1"
@@ -189,22 +144,15 @@ $assets = @(
     "$candidate\licenses.tar.gz",
     "$candidate\android-lgpl-relink.tar.gz"
 )
-gh release create $tag @assets --repo arisewanggithub/RedrainCast-Releases `
-    --target main @options --title "RedrainCast $tag" --notes-file $reviewedNotes
+gh release create $tag @assets --repo arisewanggithub/RedrainCast-Android `
+    --target $reviewedCommit @options --title "RedrainCast $tag" --notes-file $reviewedNotes
 ```
 
-Stop if that release/tag unexpectedly exists; do not overwrite another
-publisher's work. Inspect the draft and download its assets using authorized
-`gh` access, rechecking every hash against the private candidate. Only then
-publish it with that same inferred kind; do not promote an RC to stable merely
-by toggling GitHub's flag or renaming its asset. Draft assets cannot be fetched
-anonymously; after publishing, download all five assets anonymously (for
-example with `curl.exe -q`, without authentication headers), compare their
-hashes again and verify APK signing/version/ABIs and the licensing/relink kit.
-If published bytes fail verification, return the release to draft and report
-the failure rather than advertising a successful download.
-
-Do not upload keystores, credential files, base64/PFX exports, private source,
-build logs or debug/test APKs. Signing exports stay outside Git and release
-asset directories. Preserve the known rendering issue and signing-migration
-warnings in the release notes.
+`$reviewedCommit` must be the exact full SHA used by the successful candidate run.
+Stop if the tag/release exists. Download draft assets with authorized `gh` access
+and recheck every hash against the candidate before publishing.
+After publication, anonymously download all five assets (for example `curl.exe
+-q`, without authentication), compare hashes and verify APK signing/version/ABIs
+and licensing/relink binding again. On mismatch, return the release to draft and
+report failure. Do not upload secrets, keys, credential exports, build logs or
+debug/test APKs. Signing exports stay outside Git and asset directories.

@@ -33,7 +33,7 @@ def validate_revision(environment, checkout, main):
     if (environment.get("GITHUB_EVENT_NAME") != "workflow_dispatch" or
             environment.get("GITHUB_REPOSITORY") != "arisewanggithub/RedrainCast-Android" or
             environment.get("GITHUB_REF") != "refs/heads/main"):
-        raise ValueError("Releases require manual dispatch from private main")
+        raise ValueError("Releases require manual dispatch from the Android repository main branch")
     reviewed = environment.get("REVIEWED_COMMIT", "")
     if not re.fullmatch(r"[0-9a-f]{40}", reviewed):
         raise ValueError("A full reviewed commit SHA is required")
@@ -75,6 +75,6 @@ if __name__ == "__main__":
         remote = subprocess.check_output(
             ["git", "ls-remote", "--exit-code", "origin", "refs/heads/main"], text=True).split()
         if len(remote) != 2 or remote[1] != "refs/heads/main":
-            raise ValueError("Cannot resolve the current private main revision")
+            raise ValueError("Cannot resolve the current Android main revision")
         validate_revision(os.environ, checkout, remote[0])
-        print("Exact reviewed private main revision verified")
+        print("Exact reviewed Android main revision verified")
