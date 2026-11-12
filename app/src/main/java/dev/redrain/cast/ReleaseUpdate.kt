@@ -75,9 +75,9 @@ internal class GitHubUpdateSource(
     }
 
     companion object {
-        const val ENDPOINT = "https://api.github.com/repos/arisewanggithub/RedrainCast-Releases/releases/latest"
+        const val ENDPOINT = "https://api.github.com/repos/arisewanggithub/RedrainCast-Android/releases/latest"
         const val METADATA_LIMIT = 256 * 1024
-        private const val RELEASES = "https://github.com/arisewanggithub/RedrainCast-Releases/releases"
+        private const val RELEASES = "https://github.com/arisewanggithub/RedrainCast-Android/releases"
         private val versionPattern = Regex(
             "(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)(?:-(alpha|beta|rc)\\.([1-9][0-9]*))?")
         private data class Version(val parts: List<BigInteger>, val prerelease: Boolean)

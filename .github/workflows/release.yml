@@ -12,11 +12,11 @@ on:
         type: boolean
         default: false
       reviewed_commit:
-        description: "Full 40-character SHA of the reviewed current private main commit"
+        description: "Full 40-character SHA of the reviewed current main commit"
         required: true
         type: string
       publish:
-        description: "Upload a public DRAFT; prerelease status follows the version suffix (requires scoped token)"
+        description: "Create a DRAFT in this repository; prerelease status follows the version suffix"
         required: true
         type: boolean
         default: false
@@ -31,16 +31,14 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     env:
-      RELEASE_REPOSITORY: arisewanggithub/RedrainCast-Releases
       RELEASE_TAG: ${{ inputs.tag }}
       SOURCE_VALIDATED: ${{ inputs.source_validated }}
       REVIEWED_COMMIT: ${{ inputs.reviewed_commit }}
-      PUBLISH: ${{ inputs.publish }}
       RELEASE_CERT_SHA256: 79f906220de117d61c2d15bdfcef179a4e3e48cfa0c76b637c7af986c037fad3
       PYTHONDONTWRITEBYTECODE: '1'
     steps:
       - uses: actions/checkout@v4
-      - name: Check exact reviewed private main revision
+      - name: Check exact reviewed main revision
         run: python3 -B tools/release-guard.py
       - name: Check required configuration
         env:
@@ -48,7 +46,6 @@ jobs:
           STORE_PASSWORD: ${{ secrets.ANDROID_RELEASE_STORE_PASSWORD }}
           KEY_PASSWORD: ${{ secrets.ANDROID_RELEASE_KEY_PASSWORD }}
           KEY_ALIAS: ${{ secrets.ANDROID_RELEASE_KEY_ALIAS }}
-          PUBLISH_TOKEN: ${{ secrets.RELEASE_PUBLISH_TOKEN }}
         run: |
           set -euo pipefail
           python3 -B tools/release-guard.py --release-tag "$RELEASE_TAG"
@@ -56,10 +53,6 @@ jobs:
           for name in KEYSTORE STORE_PASSWORD KEY_PASSWORD KEY_ALIAS; do
             [[ -n "${!name}" ]] || { echo "::error::Missing required release configuration: $name"; exit 1; }
           done
-          if [[ "$PUBLISH" = true && -z "$PUBLISH_TOKEN" ]]; then
-            echo "::error::Missing required release configuration: scoped RELEASE_PUBLISH_TOKEN"
-            exit 1
-          fi
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
@@ -139,22 +132,6 @@ jobs:
           path: ${{ env.RELEASE_WORK }}/public-assets/
           retention-days: 3
           if-no-files-found: error
-      - name: Upload public draft release
-        if: inputs.publish
-        env:
-          GH_TOKEN: ${{ secrets.RELEASE_PUBLISH_TOKEN }}
-        run: |
-          set -euo pipefail
-          python3 -B tools/release-guard.py
-          kind="$(python3 -B tools/release-guard.py --release-tag "$RELEASE_TAG")"
-          options=(--draft)
-          if [[ "$kind" = prerelease ]]; then
-            options+=(--prerelease)
-          fi
-          gh release create "$RELEASE_TAG" "$RELEASE_WORK/public-assets/"* \
-            --repo "$RELEASE_REPOSITORY" "${options[@]}" \
-            --title "RedrainCast $RELEASE_TAG (candidate)" \
-            --notes "Draft release candidate; version suffix determines prerelease status. One universal APK supports arm64-v8a, armeabi-v7a and x86_64; Android 11/API 30 or newer. The intermittent first-rotation tiny-strip rendering bug remains unresolved; live Windows interoperability is not verified. A production-signed APK cannot update earlier debug-signed installations in place. Checksums, signing certificate, licenses and exact-build LGPL relink materials are attached. Application source remains private. Review all assets, runtime acceptance and stability before manually publishing this draft."
       - name: Remove this attempt's private release files
         if: always() && env.RELEASE_WORK != ''
         run: |
@@ -165,3 +142,42 @@ jobs:
             exit 1
           }
           rm -rf -- "$RELEASE_WORK"
+  publish:
+    if: inputs.publish
+    needs: release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      RELEASE_TAG: ${{ inputs.tag }}
+      REVIEWED_COMMIT: ${{ inputs.reviewed_commit }}
+      PYTHONDONTWRITEBYTECODE: '1'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          name: signed-testing-candidate
+          path: candidate
+      - name: Upload same-repository draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          python3 -B tools/release-guard.py
+          cd candidate
+          sha256sum --check SHA256SUMS
+          cd ..
+          kind="$(python3 -B tools/release-guard.py --release-tag "$RELEASE_TAG")"
+          options=(--draft)
+          if [[ "$kind" = prerelease ]]; then
+            options+=(--prerelease)
+          fi
+          gh release create "$RELEASE_TAG" \
+            "candidate/RedrainCast-${RELEASE_TAG#v}.apk" \
+            candidate/SHA256SUMS candidate/signing-certificate.txt \
+            candidate/licenses.tar.gz candidate/android-lgpl-relink.tar.gz \
+            --repo "$GITHUB_REPOSITORY" --target "$REVIEWED_COMMIT" "${options[@]}" \
+            --title "RedrainCast $RELEASE_TAG (candidate)" \
+            --notes "Draft release candidate; version suffix determines prerelease status. One universal APK supports arm64-v8a, armeabi-v7a and x86_64; Android 11/API 30 or newer. The intermittent first-rotation tiny-strip rendering bug remains unresolved; live Windows interoperability is not verified. A production-signed APK cannot update earlier debug-signed installations in place. Checksums, signing certificate, licenses and exact-build LGPL relink materials are attached. Source archives correspond to this public Android repository. Review all assets, runtime acceptance and stability before manually publishing this draft."

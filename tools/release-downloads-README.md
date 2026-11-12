@@ -1,11 +1,14 @@
 # RedrainCast downloads
 
-Public Android APKs, checksums, signing certificates, notices and LGPL relink
-materials belong in this repository. Application source remains private; the
-automatic GitHub source archives contain only this public download documentation.
+Future Android APKs, checksums, signing certificates, notices and LGPL relink
+materials belong with the public Android source in
+[RedrainCast-Android](https://github.com/arisewanggithub/RedrainCast-Android/releases).
+GitHub source archives there correspond to the tagged Android source.
+This destination applies to new versions; historical assets are not migrated
+or republished.
 
 Testing prereleases, when available, are listed under
-[Releases](https://github.com/arisewanggithub/RedrainCast-Releases/releases).
+[Android releases](https://github.com/arisewanggithub/RedrainCast-Android/releases).
 Every release requires explicit source and asset review, production signing
 and exact-build LGPL relink materials. Drafts are not public downloads;
 nothing automatically publishes a stable release.
@@ -34,8 +37,8 @@ the corresponding FFmpeg source, public build configuration, headers/static
 archives, matching application-native objects for all three ABIs, toolchain
 details and instructions to relink with modified LGPL libraries and sign your
 own APK. Reverse engineering for debugging such modifications is permitted.
-The relink kit does not require the production private signing key or private
-application source.
+The relink kit does not require the production private signing key or a separate
+application-source checkout.
 
 The public native package and corresponding source/build materials are also at
 <https://github.com/arisewanggithub/RedrainCast-Native/releases>.

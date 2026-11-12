@@ -49,7 +49,7 @@ class LaunchUpdateTest {
     private var cancelled = 0
     private var failRequest = false
     private var result: ReleaseUpdate? = ReleaseUpdate("0.5.0",
-        "https://github.com/arisewanggithub/RedrainCast-Releases/releases/tag/v0.5.0")
+        "https://github.com/arisewanggithub/RedrainCast-Android/releases/tag/v0.5.0")
 
     @Before fun configure() {
         MainActivity.updateFactory = { version ->

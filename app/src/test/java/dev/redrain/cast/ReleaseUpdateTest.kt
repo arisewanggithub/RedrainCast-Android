@@ -75,14 +75,16 @@ class ReleaseUpdateTest {
         assertThrows(IllegalArgumentException::class.java) { parse("not-a-version", metadata()) }
     }
 
-    @Test fun releaseAndApkLinksMustExactlyMatchThePublicDownloadsRepository() {
+    @Test fun releaseAndApkLinksMustExactlyMatchTheAndroidRepository() {
         for (page in listOf("https://example.com", "$RELEASES/tag/v0.5.0?x=1",
-            "http://github.com/arisewanggithub/RedrainCast-Releases/releases/tag/v0.5.0")) {
+            "http://github.com/arisewanggithub/RedrainCast-Android/releases/tag/v0.5.0",
+            "https://github.com/arisewanggithub/RedrainCast-Releases/releases/tag/v0.5.0")) {
             assertThrows(IllegalArgumentException::class.java) { parse("0.4.10", metadata().put("html_url", page)) }
         }
         for (url in listOf("https://example.com/RedrainCast-0.5.0.apk",
             "$RELEASES/download/v0.5.0/RedrainCast-0.5.0.apk?redirect=1",
-            "https://github.com/other/repo/releases/download/v0.5.0/RedrainCast-0.5.0.apk")) {
+            "https://github.com/other/repo/releases/download/v0.5.0/RedrainCast-0.5.0.apk",
+            "https://github.com/arisewanggithub/RedrainCast-Releases/releases/download/v0.5.0/RedrainCast-0.5.0.apk")) {
             val release = metadata()
             release.getJSONArray("assets").getJSONObject(0).put("browser_download_url", url)
             assertThrows(IllegalArgumentException::class.java) { parse("0.4.10", release) }
@@ -127,8 +129,8 @@ class ReleaseUpdateTest {
         assertEquals(5000, connection.readTimeout)
         assertEquals("RedrainCast-Update-Check/1", connection.getRequestProperty("User-Agent"))
         assertNull(connection.getRequestProperty("Authorization"))
-        assertTrue(GitHubUpdateSource.ENDPOINT.contains("RedrainCast-Releases/releases/"))
-        assertTrue(GitHubUpdateSource.ENDPOINT.endsWith("/latest"))
+        assertEquals("https://api.github.com/repos/arisewanggithub/RedrainCast-Android/releases/latest",
+            GitHubUpdateSource.ENDPOINT)
     }
 
     @Test fun unauthorizedMissingRedirectAndServerFailuresDoNotBecomeSuccessfulChecks() {
@@ -177,5 +179,5 @@ class ReleaseUpdateTest {
         override fun getContentLengthLong() = length
     }
 
-    companion object { private const val RELEASES = "https://github.com/arisewanggithub/RedrainCast-Releases/releases" }
+    companion object { private const val RELEASES = "https://github.com/arisewanggithub/RedrainCast-Android/releases" }
 }

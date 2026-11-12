@@ -87,7 +87,7 @@ class ReleaseTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             guard.validate_certificate("V2 Signer: certificate SHA-256 digest: " + "a" * 64, "short")
 
-    def test_exact_reviewed_private_main_is_accepted(self):
+    def test_exact_reviewed_android_main_is_accepted(self):
         sha = "a" * 40
         environment = {
             "GITHUB_EVENT_NAME": "workflow_dispatch",
@@ -229,6 +229,43 @@ class ReleaseTests(unittest.TestCase):
                     patch.object(kit.relink, "elf_info", return_value=["Java_example_nativeEntry"]):
                 result = kit.collect_object(root, root, "arm64-v8a", shipped, destination, root)
             self.assertEqual(kit.relink.digest(destination), result["object_sha256"])
+
+
+class PublicationContractTests(unittest.TestCase):
+    def setUp(self):
+        self.root = Path(__file__).resolve().parents[1]
+        self.workflow = (self.root / ".github" / "workflows" / "release.yml").read_text()
+        self.signing, self.publishing = self.workflow.split("\n  publish:\n")
+
+    def test_write_token_is_confined_to_separate_same_repository_publisher(self):
+        self.assertIn("permissions:\n  contents: read\n", self.signing)
+        self.assertNotIn("contents: write", self.signing)
+        self.assertIn("    needs: release\n", self.publishing)
+        self.assertIn("    if: inputs.publish\n", self.publishing)
+        self.assertIn("    permissions:\n      contents: write\n", self.publishing)
+        self.assertIn("GH_TOKEN: ${{ github.token }}", self.publishing)
+        self.assertIn("persist-credentials: false", self.publishing)
+        self.assertNotIn("secrets.", self.publishing)
+        self.assertNotIn("RELEASE_PUBLISH_TOKEN", self.workflow)
+        self.assertNotIn("RedrainCast-Releases", self.workflow)
+
+    def test_publisher_rechecks_revision_and_checksum_before_explicit_draft_upload(self):
+        self.assertIn("uses: actions/download-artifact@v4", self.publishing)
+        self.assertIn("name: signed-testing-candidate", self.publishing)
+        guard_at = self.publishing.index("python3 -B tools/release-guard.py\n")
+        sums_at = self.publishing.index("sha256sum --check SHA256SUMS")
+        upload_at = self.publishing.index('gh release create "$RELEASE_TAG"')
+        self.assertLess(guard_at, sums_at)
+        self.assertLess(sums_at, upload_at)
+        self.assertIn("options=(--draft)", self.publishing)
+        self.assertIn("options+=(--prerelease)", self.publishing)
+        self.assertIn('--repo "$GITHUB_REPOSITORY" --target "$REVIEWED_COMMIT"', self.publishing)
+        upload = self.publishing[upload_at:]
+        for asset in ('"candidate/RedrainCast-${RELEASE_TAG#v}.apk"',
+                      "candidate/SHA256SUMS", "candidate/signing-certificate.txt",
+                      "candidate/licenses.tar.gz", "candidate/android-lgpl-relink.tar.gz"):
+            self.assertEqual(1, upload.count(asset))
+        self.assertNotIn("*", upload)
 
 
 if __name__ == "__main__":

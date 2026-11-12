@@ -420,10 +420,13 @@ Like PartialCast, each new Activity launch checks the public GitHub release
 metadata anonymously on a background worker; configuration recreation retains
 the same check and ordinary resume does not repeat it. Only a **newer stable
 release** with a completed, version-matching universal APK in
-`arisewanggithub/RedrainCast-Releases` can prompt. Drafts and testing prereleases
+`arisewanggithub/RedrainCast-Android` can prompt. Drafts and testing prereleases
 are excluded, including the historical 0.4.6 preview and the 0.4.10 RC builds.
 When no stable release is available, GitHub's `/releases/latest` endpoint returns
 404; this is logged without presenting an update or affecting casting.
+New versions use [this repository](https://github.com/arisewanggithub/RedrainCast-Android/releases).
+This change affects future binaries; it does not modify already-installed apps
+or migrate historical assets.
 Future testing versions use an explicit `-alpha.N`, `-beta.N` or `-rc.N`
 suffix in the embedded app version, GitHub tag and APK filename. An installed
 `0.5.0-rc.1` can recognize stable `0.5.0` as newer, while still ignoring other
@@ -801,4 +804,4 @@ FFmpeg is built with GPL, nonfree and version-3 code disabled. Its LGPL-2.1 text
 upstream notices, pinned source and relinking/build information are included;
 see [FFmpeg distribution obligations](third_party/FFMPEG.md) before distributing
 APK binaries outside this development setup.
-No new license grant for the private application source is implied.
+No new license grant for the application source is implied.

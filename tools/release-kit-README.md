@@ -9,8 +9,9 @@ use; reverse engineering for debugging such modifications is permitted.
 
 `objects/<ABI>/resampler_jni.cpp.o` is the matching application JNI object.
 Only debugging metadata was removed to avoid distributing private build paths;
-all code, data, symbols and relocations needed for relinking remain. Private
-application sources are not included. `manifest.json` binds these objects to
+all code, data, symbols and relocations needed for relinking remain.
+Application sources are available in the public Android repository rather than
+duplicated in this kit. `manifest.json` binds these objects to
 the exact distributed APK hash, version, application commit/source hash, NDK,
 link flags and exported JNI symbols. It contains no local build paths.
 
