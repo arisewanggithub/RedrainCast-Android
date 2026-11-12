@@ -10,13 +10,16 @@ abstract class TrackWorker(
     name: String,
     private val maxBytes: Int,
     private val failure: (String, String) -> Unit,
-    private val track: Int = 0
+    private val track: Int = 0,
+    private val prepareThread: () -> Unit = {}
 ) : AutoCloseable {
     private val queue = ArrayDeque<AccessUnit>()
     private val admittedAt = ArrayDeque<Long>()
     @Volatile internal var statisticsEnabled = false
     @Volatile internal var diagnosticSession = 0L
     @Volatile internal var diagnosticGeneration = 0
+    @Volatile protected var lastAudioAdmissionNs: Long? = null
+        private set
     private fun diagnosticQueue(stage: DiagnosticStage, packet: AccessUnit) {
         val diagnostics = RemoteDiagnostics.recorder
         if (track != 2 || !diagnostics.enabled("receiver", diagnosticSession, DiagnosticKind.AUDIO_QUEUE)) return
@@ -35,6 +38,7 @@ abstract class TrackWorker(
     private val thread = Thread({ runTrack() }, name)
 
     fun start() = thread.start()
+    protected open fun packetEvent(kind: String, packet: AccessUnit, queued: Int) {}
 
     internal fun queuedPackets(): Int = synchronized(monitor) { queue.size }
     private data class QueueObservation(val value: EncodedQueueStatistics, val oldestAtNs: Long?)
@@ -59,6 +63,8 @@ abstract class TrackWorker(
         if (pressure == null) {
             budget.add(packet)
             queue.addLast(packet)
+            if (track == 2) lastAudioAdmissionNs = System.nanoTime()
+            packetEvent("admit", packet, queue.size)
             if (statisticsEnabled) admittedAt.addLast(System.nanoTime())
             publishQueueStatistics()
             monitor.notifyAll()
@@ -77,6 +83,8 @@ abstract class TrackWorker(
                 if (pressure == null) {
                     budget.add(packet)
                     queue.addLast(packet)
+                    if (track == 2) lastAudioAdmissionNs = System.nanoTime()
+                    packetEvent("admit", packet, queue.size)
                     if (statisticsEnabled) admittedAt.addLast(System.nanoTime())
                     publishQueueStatistics()
                     monitor.notifyAll()
@@ -98,12 +106,14 @@ abstract class TrackWorker(
             budget.remove()
             publishQueueStatistics()
             diagnosticQueue(DiagnosticStage.COMPLETE, it)
+            packetEvent("dequeue", it, queue.size)
             monitor.notifyAll()
         }
     }
 
     private fun runTrack() {
         try {
+            prepareThread()
             while (running.get()) step()
         } catch (e: InterruptedException) {
             if (running.get()) failure("DECODER_FAILED", "Playback interrupted unexpectedly")

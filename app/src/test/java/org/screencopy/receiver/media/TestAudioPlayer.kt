@@ -21,6 +21,8 @@ internal fun testAudioPlayer(
     onUnderrunRecovery: (AudioUnderrunDiagnostic) -> Unit = {},
     opusFactory: (AudioFormat) -> OpusPacketDecoder = { OpusDecoder(it.channels, it.outputGainQ8) },
     onRegulation: (AudioRegulationDiagnostic) -> Unit = {},
-    resamplerFactory: (Int, Int) -> PcmResampler = { _, channels -> IdentityPcmResampler(channels) }
+    resamplerFactory: (Int, Int) -> PcmResampler = { _, channels -> IdentityPcmResampler(channels) },
+    onServiceDiagnostic: ((String) -> Unit)? = null,
+    threadCpuNs: () -> Long = { 0 }
 ) = AudioPlayer(format, clock, failure, outputFactory, onClockCorrection, onOutputTiming,
-    onUnderrunRecovery, opusFactory, onRegulation, resamplerFactory)
+    onUnderrunRecovery, opusFactory, onRegulation, resamplerFactory, onServiceDiagnostic, threadCpuNs, {})

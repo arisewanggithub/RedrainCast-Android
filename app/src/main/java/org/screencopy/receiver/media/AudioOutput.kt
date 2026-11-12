@@ -111,6 +111,9 @@ private class AndroidRateAudioTrack(format: AudioFormat, bytes: Int, failure: (S
             .setTransferMode(AudioTrack.MODE_STREAM).setBufferSizeInBytes(bytes).build()
         try {
             check(track.state == AudioTrack.STATE_INITIALIZED) { "Audio output initialization failed" }
+            android.util.Log.i("ScreenCopyReceiver", "event=AUDIO_OUTPUT_PERFORMANCE" +
+                " policy=unchanged actual_mode=${track.performanceMode}" +
+                " sample_rate=${track.sampleRate} buffer_frames=${track.bufferSizeInFrames} capacity_frames=${track.bufferCapacityInFrames}")
             track.addOnRoutingChangedListener(routeListener, Handler(Looper.getMainLooper()))
             position = AudioPosition(format.sampleRate, track.bufferSizeInFrames, System::nanoTime, {
                 val value = AudioTimestamp()

@@ -379,6 +379,150 @@ settings are changed by statistics.
   Other apps' protected windows/DRM content can still appear black by Android
   policy; the app does not bypass those protections.
 
+The playback statistics connection/queue table spans the full overlay width,
+including on landscape phones. Shared content-sized columns keep headers and
+live values aligned instead of squeezing five columns into a narrow sidebar.
+
+### Android media scheduling
+
+Android has no direct application-level MMCSS registration equivalent. Capture
+and playback use dedicated audio and video workers, with a separate GPU capture
+HandlerThread; codec-internal and system mixer/compositor threads remain owned
+by Android. Each actual media worker observes its own native Linux nice priority
+once on entry, including replacement workers. `MEDIA_THREAD_PRIORITY` records
+the role, thread name and actual priority with `policy=unchanged`;
+`MEDIA_THREAD_PRIORITY_UNAVAILABLE` warns if readback is denied or unavailable
+without failing startup. No application priority writes are made: an audio
+boost of -1 has no measured benefit here, and forcing video to 0 could downgrade
+an inherited or framework-assigned priority. Network, control, timer and UI
+priorities are also unchanged.
+
+AudioTrack retains its existing default performance-mode selection and logs the
+actual mode, sample rate, buffer size and capacity as `AUDIO_OUTPUT_PERFORMANCE`
+with `policy=unchanged`. No low-latency request is made. Android's low-latency
+mode requires the sink sample rate and careful buffer tuning; it can change
+the output path and effects support. Mocked readback cannot establish real
+device latency or buffer changes. PCM rate, bounded buffer preparation, FFmpeg
+drift compensation, refill/silence policy and wire timestamps are unchanged. Video
+capture retains the realtime MediaCodec priority hint, no B frames and GPU-only
+delivery; receiver decoding retains hardware preference and Surface delivery.
+
+The public [Process API](https://developer.android.com/reference/android/os/Process)
+documents nice priorities, not realtime reservations, and discourages normal
+application use of AUDIO (-16), URGENT_AUDIO (-19) and VIDEO (-10).
+VIDEO is public since API 28, not a portable reason to select it.
+See also Android's [threading guidance](https://developer.android.com/topic/performance/threads)
+and [AudioTrack performance-mode contract](https://developer.android.com/reference/android/media/AudioTrack.Builder#setPerformanceMode(int)).
+The [low-latency mode requirements](https://developer.android.com/reference/android/media/AudioTrack#PERFORMANCE_MODE_LOW_LATENCY)
+do not establish compatibility with every negotiated source rate or route.
+[ADPF](https://developer.android.com/games/optimize/adpf) provides power/thermal
+and workload hints, not core locking; it is not enabled speculatively here.
+Real-device before/after underrun, refill wall/CPU time and frame-presentation
+measurements under comparable load are required to establish improvement.
+
+### Diagnosing missing video frames
+
+Debug builds can record a metadata-only sender video trace. Before starting a
+new consent-backed cast, run `adb -s <verified-device> shell setprop
+log.tag.RedrainVideoTrace DEBUG`. Tracing remains off in release builds and when
+that log tag is not enabled. Reset the tag to `INFO` after the measurement.
+The first capture callback starts a 30-second window, limited to 16,384 events.
+For a ten-minute measurement, also set `log.tag.RedrainVideoTraceLong` to
+`DEBUG` before starting the cast. This selects 600 seconds and a fixed
+1,440,000-event bound (enough for all nine stages at 240 FPS); storage grows
+only as events arrive. Reset both tags to `INFO` afterward. The long trace
+can use tens of megabytes of memory and is diagnostic-only.
+Capture callbacks, acquired image PTS, intentional FPS filtering, encoder-surface
+submission begin/end, encoded output, sink return and TCP write begin/end
+are recorded in memory without per-frame logging or file I/O. Only successful
+surface submissions and writes receive end events. Sink return is not proof of
+transmission: recovery may retain or discard that packet. Encoder repeats can
+have PTS without a corresponding new captured image.
+
+The watchdog saves one `files/video-frame-<session>.jsonl` in private app storage
+after the window, or a partial trace on orderly session cleanup. Retrieve it
+with `adb -s <verified-device> exec-out run-as dev.redrain.cast.debug cat
+files/video-frame-<session>.jsonl`. `VIDEO_FRAME_TRACE_SAVED` reports its exact
+name; write failures are logged explicitly. Remove the named private trace after
+retrieval. Each line contains timestamp metadata only, never encoded bytes or
+screen content. The summary distinguishes a full window from early Stop or
+capacity overflow; events at either window boundary cannot prove missing frames.
+
+Compare source PTS across successful submissions, encoded pictures, successful
+writes and receiver decode/presentation. Capture PTS gaps alone do not prove
+loss: `updateTexImage()` acquires the latest available image, static content may
+not update, and source video can have a lower or variable cadence. Receiver
+recovery can remap wire generations, so retain session, PTS and generation when
+correlating stages. Monotonic clocks are local to each device and must not be
+subtracted across devices as if synchronized. Tracing does not change capture
+limits, codecs, queue policy, timestamps or playback scheduling.
+
+`tools\Analyze-VideoFrameTrace.ps1 -SenderTrace <sender.jsonl> [-ReceiverTrace
+<receiver.jsonl>]` reports source/observed cadence, GPU-submit/socket-write
+durations and source-PTS multiset discontinuities across stages.
+The report also bins independent stage counts by source-PTS minute; the first
+and last minute can be partial and are not themselves a matched-loss proof.
+It rejects overflowed traces and different sessions and excludes a 500 ms source-PTS margin
+at both ends of each overlapping stage window. Empty or non-overlapping stages
+remain explicitly unmeasured, not zero loss. Sender-only analysis is supported.
+Receiver files use the matching Windows metadata trace schema. Run
+`tools\Test-VideoFrameTrace.ps1` for the analyzer's synthetic continuity checks.
+Instrumentation adds bounded recording overhead; this is a diagnostic sample,
+not proof that timing is identical to an uninstrumented cast.
+
+### Diagnosing receiver audio crackles
+
+The receiver logs `AUDIO_SERVICE_WINDOW` under `ScreenCopyReceiver` every five
+seconds of active audio servicing, plus a final partial window on clean worker
+release. This is independent of the playback statistics checkbox. Each record
+includes the session/audio epoch, actual window duration, native AudioTrack
+underrun delta and lifetime total, explicitly inserted silence frames/episodes,
+discarded PCM frames, zero writes, and maximum worker/input/decode/refill wall
+and thread-CPU durations. Startup waiting before audio starts is excluded.
+Frame counters convert to milliseconds as `frames * 1000 / sample_rate`.
+Underruns per second are `native_underruns * 1000000 / window_us`; these are
+Android counter increments, not a count of perceptually distinct clicks.
+The existing rate-limited `AUDIO_UNDERRUN_RECOVERY` logs remain available.
+
+On native underrun increments, a bounded 512-event history is emitted as
+`AUDIO_UNDERRUN_HISTORY` plus numbered `AUDIO_HISTORY` chunks, at most once per
+second; throttled increments are retained. Data tuples are
+`relative_us,kind,a,b`, relative to the header's monotonic timestamp. Receipt
+means a validated packet reached its worker before admission, not physical
+network arrival. `receive` holds PTS/bytes; `admit` and `dequeue` hold PTS/queue
+count; `decode_begin` and `aac_input` hold PTS/bytes; `decode_end` holds PTS/PCM
+frames; `refill` holds pre-refill padding microseconds/PCM frames; `silence`
+holds accepted frames/PCM frames; `observe` holds native counter/queue count.
+Refill history is sampled at 5 ms while padding exceeds 5 ms; low-padding
+calls are retained individually. Overwritten entries are reported. This
+history distinguishes observed processing order but does not prove scheduler
+state or identify sender versus network delays without sender-side evidence.
+
+Capture logs from the **receiving** device during a reproduction:
+
+```powershell
+adb -s <receiver-serial> logcat -v threadtime ScreenCopyReceiver:I '*:S' > audio-log.txt
+```
+
+`max_refill_gap_us` includes time between output-service calls. Its paired
+`gap_previous_pre_padding_us` is padding measured before the previous refill,
+not the amount left after that refill. `gap_pcm_frames` and
+`gap_last_arrival_age_us` describe the next call before refilling; arrival age
+measures the last packet admitted to the audio worker, not physical network
+arrival. Minimum pre-refill padding is paired with its decoded PCM count.
+Empty/pending-input observations are sampled after output service and cannot
+prove that a packet was available throughout a preceding stall.
+
+Large worker wall time with little thread CPU suggests off-CPU delay, including
+input waits, lock contention, GC or scheduling; high decode CPU suggests work
+cost. These are clues, not automatic root-cause classifications. To establish
+scheduling specifically, capture an Android Studio System Trace/Perfetto trace
+with CPU scheduling and inspect `ScreenCopy-audio`: runnable-but-not-running
+intervals indicate scheduler delay; sleeping/blocked intervals do not. Correlate
+with the logged underrun windows. The logs do not change thread priority, audio
+buffering, resampling, transport, or silence policy, and cannot diagnose an
+audible glitch solely from the A/V skew.
+
 The sender uses MediaProjection, hardware MediaCodec video encoding, an EGL
 natural-coordinate mapping/crop, and a **fixed encoder raster across rotations**.
 Picture-PTS-associated rotation metadata rotates presentation, not the encoder.
