@@ -371,8 +371,8 @@ Ordinary release builds are optimized and **unsigned**. The manually triggered
 production signing, cross-repository access and reviewed LGPL relink materials
 are configured. No production key material or in-app APK installer is included.
 Debug builds use application ID `dev.redrain.cast.debug`, launcher name
-**RedrainCast Debug**, and version name `0.4.17-debug` (the release version plus
-`-debug`). Release remains `dev.redrain.cast`, **RedrainCast**, version `0.4.17`,
+**RedrainCast Debug**, and version name `0.4.18-debug` (the release version plus
+`-debug`). Release remains `dev.redrain.cast`, **RedrainCast**, version `0.4.18`,
 code `30`; both variants retain source namespace `dev.redrain.cast`.
 The distinct IDs allow debug and release to be installed side by side, with
 separate app data, saved settings and permissions; installing debug does not

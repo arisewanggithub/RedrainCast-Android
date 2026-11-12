@@ -373,7 +373,7 @@ class ReceiverServer private constructor(
         private val lastRecoveryReset = LongArray(3)
         private var recoveryFormat: AudioFormat? = null
         private var activeVideoFormat: VideoFormat? = null
-        private var recoveryKeyPts: Long? = null
+        @Volatile private var recoveryKeyPts: Long? = null
         private var audioRecoveryAdmitted = false
         private var audioRecoveryCutoff = 0L
         private var keyProvedGeneration = 0L
@@ -815,68 +815,105 @@ class ReceiverServer private constructor(
                 return
             }
             synchronized(playbackOperations) {
-                if (stopping.get()) return
-                val retired: Pair<VideoPlayer?, AudioPlayer?> = synchronized(playbackLock) {
-                    protocolRequire(accepted && !stopping.get(), "Session has ended")
-                    if (message.track == 1) {
-                        retiredVideoThrough = maxOf(retiredVideoThrough, videoGeneration)
-                        val old = video
-                        video = null
-                        old to null
-                    } else {
-                        retiredAudioThrough = maxOf(retiredAudioThrough, audioEpoch)
-                        val old = audio
-                        audio = null
-                        null to old
-                    }
-                }
-                try { retired.first?.let { videoOutput.release(it) } } finally { retired.second?.close() }
-                synchronized(playbackLock) { configureInitial(message) }
+                configureInitial(message)
             }
         }
 
         private fun configureInitial(message: Message) {
-            if (stopping.get()) return
-            resetStatistics()
-            if (message.track == 1) lastVideoPacketAt = null else lastAudioPacketAt = null
-            protocolRequire(accepted && !stopping.get(), "Session has ended")
-            phase = "Initializing tracks"
-            initializingTrack = message.track
-            phaseAt = now()
-            val trackState = checkNotNull(tracks)
-            val settings = checkNotNull(request)
-            val json = message.json()
-            val codec = if (message.track == 2) settings.audioCodec else settings.videoCodec
-            trackState.configure(message.track, message.generation, codec?.takeIf { json.opt("codec") == it })
-            if (message.track == 1) {
-                if (message.generation > 1) clock.endVideoPreroll()
-                val format = validateHdrOutput(Configuration.video(json, settings))
-                activeVideoFormat = format
-                actualVideo = "Actual video: ${format.mime} ${format.width}x${format.height}, generation ${message.generation}"
-                videoGeneration = message.generation
-                video = createVideoPlayer(format, clock, message.generation)
-                onVideoSize(format.width, format.height)
-            } else {
-                val format = Configuration.audio(json, settings)
-                recoveryFormat = format
-                audioPacketTiming = AudioPacketTiming.from(format)
-                audioGeneration = message.generation
-                audio = createAudioPlayer(format, clock)
-                actualAudio = "Actual audio: ${format.codec} ${format.sampleRate} Hz ${format.channels}ch, pre-skip ${format.preSkip}, generation ${message.generation}\n${checkNotNull(audio).decoderDescription}"
+            val settings: Request
+            val shared: PlaybackClock
+            val videoFormat: VideoFormat?
+            val audioFormat: AudioFormat?
+            val startPresentation: Boolean
+            val retired = synchronized(playbackLock) {
+                if (stopping.get()) return
+                protocolRequire(accepted && active.get() === this, "Session has ended")
+                if (videoOutput.isClosed) {
+                    onDiscoveryDiagnostic("event=RETIRED_TRACK_CONFIGURATION track=${message.track} generation=${message.generation}")
+                    return
+                }
+                resetStatistics()
+                if (message.track == 1) lastVideoPacketAt = null else lastAudioPacketAt = null
+                phase = "Initializing tracks"
+                initializingTrack = message.track
+                phaseAt = now()
+                settings = checkNotNull(request)
+                shared = clock
+                val json = message.json()
+                val codec = if (message.track == 2) settings.audioCodec else settings.videoCodec
+                checkNotNull(tracks).configure(message.track, message.generation, codec?.takeIf { json.opt("codec") == it })
+                videoFormat = if (message.track == 1) validateHdrOutput(Configuration.video(json, settings)) else null
+                audioFormat = if (message.track == 2) Configuration.audio(json, settings) else null
+                startPresentation = presentation == null &&
+                    (if (message.track == 1) settings.audioCodec == null || audio != null else video != null)
+                if (message.track == 1) {
+                    if (message.generation > 1) shared.endVideoPreroll()
+                    retiredVideoThrough = maxOf(retiredVideoThrough, videoGeneration)
+                    videoGeneration = message.generation
+                    (video to null).also { video = null }
+                } else {
+                    retiredAudioThrough = maxOf(retiredAudioThrough, audioEpoch)
+                    audioGeneration = message.generation
+                    (null to audio).also { audio = null }
+                }
             }
-            trackState.ready(message.track)
-            send(Type.STREAM_READY, JSONObject().put("ok", true), message.track, message.generation)
-            if (trackState.allReady()) {
-                if (presentation == null) presentation = onPresentationStart(settings.receiverOrientation)
-                tracksReady = true
-                if (streamRecovery) {
-                    videoRecovering = true
-                    awaitingRecoveryKey = true
-                    clock.recoveryStartup = true
-                    if (videoRecoveryAt == 0L) videoRecoveryAt = now()
-                    phase = "Recovering"
-                } else phase = "Playing"
-                onStatus("Playing: $senderName", "$requestSummary\n$actualVideo\n$decoderDescription\n$actualAudio\nSurface ready; bounded synchronized playback active.")
+            try { retired.first?.let { videoOutput.release(it) } } finally { retired.second?.close() }
+            fun current() = running.get() && accepted && !stopping.get() && active.get() === this &&
+                !videoOutput.isClosed &&
+                (if (message.track == 1) videoGeneration else audioGeneration) == message.generation
+            var createdVideo: VideoPlayer? = null
+            var createdAudio: AudioPlayer? = null
+            var createdPresentation: AutoCloseable? = null
+            var installed = false
+            var playing = false
+            try {
+                if (!current()) return
+                if (videoFormat != null) {
+                    createdVideo = createVideoPlayer(videoFormat, shared, message.generation) ?: return
+                    if (current()) onVideoSize(videoFormat.width, videoFormat.height)
+                } else createdAudio = createAudioPlayer(checkNotNull(audioFormat), shared)
+                if (!current()) return
+                if (startPresentation) createdPresentation = onPresentationStart(settings.receiverOrientation)
+                videoOutput.whileOpen {
+                    synchronized(playbackLock) {
+                        if (!current()) return@synchronized
+                        if (videoFormat != null) {
+                            video = createdVideo
+                            activeVideoFormat = videoFormat
+                            actualVideo = "Actual video: ${videoFormat.mime} ${videoFormat.width}x${videoFormat.height}, generation ${message.generation}"
+                        } else {
+                            audio = createdAudio
+                            recoveryFormat = audioFormat
+                            audioPacketTiming = AudioPacketTiming.from(checkNotNull(audioFormat))
+                            actualAudio = "Actual audio: ${audioFormat.codec} ${audioFormat.sampleRate} Hz ${audioFormat.channels}ch, pre-skip ${audioFormat.preSkip}, generation ${message.generation}\n${checkNotNull(createdAudio).decoderDescription}"
+                        }
+                        if (createdPresentation != null) presentation = createdPresentation
+                        installed = true
+                        val trackState = checkNotNull(tracks)
+                        trackState.ready(message.track)
+                        if (trackState.allReady()) {
+                            tracksReady = true
+                            if (streamRecovery) {
+                                videoRecovering = true
+                                awaitingRecoveryKey = true
+                                shared.recoveryStartup = true
+                                if (videoRecoveryAt == 0L) videoRecoveryAt = now()
+                                phase = "Recovering"
+                            } else phase = "Playing"
+                            playing = true
+                        }
+                        send(Type.STREAM_READY, JSONObject().put("ok", true), message.track, message.generation)
+                    }
+                }
+                if (playing && current())
+                    onStatus("Playing: $senderName", "$requestSummary\n$actualVideo\n$decoderDescription\n$actualAudio\nSurface ready; bounded synchronized playback active.")
+            } finally {
+                if (!installed) {
+                    onDiscoveryDiagnostic("event=RETIRED_TRACK_CONFIGURATION track=${message.track} generation=${message.generation}")
+                    try { createdVideo?.let { videoOutput.release(it) } } finally {
+                        try { createdAudio?.close() } finally { createdPresentation?.close() }
+                    }
+                }
             }
         }
 
@@ -923,7 +960,7 @@ class ReceiverServer private constructor(
             }
             recoveryExecutor.execute {
                 try {
-                    fun current() = accepted && !stopping.get() && active.get() === this &&
+                    fun current() = accepted && !stopping.get() && active.get() === this && !videoOutput.isClosed &&
                         (if (track == 1) videoGeneration else audioGeneration) == message.generation
                     if (!current()) return@execute
                     val cooldown = lastRecoveryReset[track] + 1000 - now()
@@ -944,31 +981,39 @@ class ReceiverServer private constructor(
                         var createdAudio: AudioPlayer? = null
                         var installed = false
                         try {
-                            if (track == 1) createdVideo = createVideoPlayer(checkNotNull(videoFormat), clock, message.generation)
-                            else createdAudio = createAudioPlayer(checkNotNull(audioFormat).copy(preSkip = 0), clock, audioRecoveryCutoff)
-                            synchronized(playbackLock) {
-                                if (!current()) return@synchronized
-                                if (track == 1) {
-                                    video = createdVideo
-                                    activeVideoFormat = videoFormat
-                                    actualVideo = "Actual video: ${checkNotNull(videoFormat).mime} ${videoFormat.width}x${videoFormat.height}, generation ${message.generation}"
-                                    framePresented.set(false)
-                                    awaitingRecoveryKey = true
-                                } else {
-                                    audio = createdAudio
-                                    actualAudio = "Audio playback resynchronized; ${checkNotNull(createdAudio).decoderDescription}"
+                            if (track == 1) {
+                                createdVideo = createVideoPlayer(checkNotNull(videoFormat), clock, message.generation)
+                                if (createdVideo == null) {
+                                    onDiscoveryDiagnostic("event=RETIRED_TRACK_CONFIGURATION track=$track generation=${message.generation}")
+                                    return@operations
                                 }
-                                checkNotNull(tracks).ready(track)
-                                installed = true
+                            }
+                            else createdAudio = createAudioPlayer(checkNotNull(audioFormat).copy(preSkip = 0), clock, audioRecoveryCutoff)
+                            if (!sameRaster && current()) onVideoSize(checkNotNull(videoFormat).width, videoFormat.height)
+                            videoOutput.whileOpen {
+                                synchronized(playbackLock) {
+                                    if (!current()) return@synchronized
+                                    if (track == 1) {
+                                        video = createdVideo
+                                        activeVideoFormat = videoFormat
+                                        actualVideo = "Actual video: ${checkNotNull(videoFormat).mime} ${videoFormat.width}x${videoFormat.height}, generation ${message.generation}"
+                                        framePresented.set(false)
+                                        awaitingRecoveryKey = true
+                                    } else {
+                                        audio = createdAudio
+                                        actualAudio = "Audio playback resynchronized; ${checkNotNull(createdAudio).decoderDescription}"
+                                    }
+                                    checkNotNull(tracks).ready(track)
+                                    installed = true
+                                    send(Type.STREAM_READY, JSONObject().put("ok", true), track, message.generation)
+                                }
                             }
                             if (!installed) {
                                 createdVideo?.let { videoOutput.release(it) }
                                 createdAudio?.close()
                                 return@operations
                             }
-                            if (!sameRaster) onVideoSize(checkNotNull(videoFormat).width, videoFormat.height)
                             if (current()) {
-                                send(Type.STREAM_READY, JSONObject().put("ok", true), track, message.generation)
                                 onDiscoveryDiagnostic("event=STREAM_RECOVERY_READY track=$track generation=${message.generation}")
                             }
                         } catch (e: Exception) {
@@ -994,8 +1039,9 @@ class ReceiverServer private constructor(
             }
         }
 
-        private fun createVideoPlayer(format: VideoFormat, shared: PlaybackClock, generation: Long): VideoPlayer =
-            videoOutput.replace {
+        private fun createVideoPlayer(format: VideoFormat, shared: PlaybackClock, generation: Long): VideoPlayer? {
+            onDiscoveryDiagnostic("event=VIDEO_CONFIGURATION_ADMISSION generation=$generation")
+            return videoOutput.replaceIfOpen {
                 val failed: (String, String) -> Unit = { code, detail ->
                     if (accepted && !stopping.get() && generation == videoGeneration && generation > retiredVideoThrough)
                         playbackFailed(code, detail, FailureOrigin.VIDEO)
@@ -1029,6 +1075,7 @@ class ReceiverServer private constructor(
                     it.start()
                 }
             }
+        }
 
         private fun createAudioPlayer(format: AudioFormat, shared: PlaybackClock, cutoff: Long? = null): AudioPlayer {
             val epoch = ++audioEpoch
@@ -1049,14 +1096,17 @@ class ReceiverServer private constructor(
             }
         }
 
-        private fun proveVideoKey(generation: Long, decodedPts: Long) = synchronized(playbackLock) {
-            val key = recoveryKeyPts ?: return@synchronized
-            if (!streamRecovery || !accepted || stopping.get() || generation != videoGeneration ||
-                generation <= retiredVideoThrough || decodedPts < key || keyProvedGeneration == generation) return@synchronized
-            if (clock.delayUs(decodedPts)?.let { it < -250_000 } == true) return@synchronized
-            send(Type.STATUS, StreamRecoveryProtocol.status(StreamRecoveryProtocol.KEY, 1, generation, key))
-            keyProvedGeneration = generation
-            completeRecovery(1, key)
+        private fun proveVideoKey(generation: Long, decodedPts: Long) {
+            if (!streamRecovery || recoveryKeyPts == null) return
+            synchronized(playbackLock) {
+                val key = recoveryKeyPts ?: return@synchronized
+                if (!accepted || stopping.get() || generation != videoGeneration ||
+                    generation <= retiredVideoThrough || decodedPts < key || keyProvedGeneration == generation) return@synchronized
+                if (clock.delayUs(decodedPts)?.let { it < -250_000 } == true) return@synchronized
+                send(Type.STATUS, StreamRecoveryProtocol.status(StreamRecoveryProtocol.KEY, 1, generation, key))
+                keyProvedGeneration = generation
+                completeRecovery(1, key)
+            }
         }
 
         private fun completeAudio(epoch: Long, pts: Long) = synchronized(playbackLock) {
@@ -1372,11 +1422,14 @@ class ReceiverServer private constructor(
                 org.screencopy.receiver.protocol.ReceiveCapabilities()
             },
             timeMilliseconds: () -> Long = { System.nanoTime() / 1_000_000 },
-            controlWrite: (Socket, Message) -> Unit = { target, message -> Wire.write(target.outputStream, message) }) =
-            ReceiverServer(name, null, onStatus, onVideoSize, onListener, port, ResourceSlot(), validateRequest, onScreenEvent,
+            controlWrite: (Socket, Message) -> Unit = { target, message -> Wire.write(target.outputStream, message) },
+            videoOutput: ResourceSlot<VideoPlayer> = ResourceSlot(),
+            onDiscoveryDiagnostic: (String) -> Unit = {}) =
+            ReceiverServer(name, null, onStatus, onVideoSize, onListener, port, videoOutput, validateRequest, onScreenEvent,
                 onFailure, onPresentationStart, videoFactory, audioFactory, clockFactory, onVideoRotation = onVideoRotation,
                 acquireSession = acquireSession, instanceId = instanceId, supportsPlaybackStatistics = supportsPlaybackStatistics,
-                receiveCapabilities = receiveCapabilities, timeMilliseconds = timeMilliseconds, controlWrite = controlWrite)
+                receiveCapabilities = receiveCapabilities, timeMilliseconds = timeMilliseconds, controlWrite = controlWrite,
+                onDiscoveryDiagnostic = onDiscoveryDiagnostic)
 
         private fun validateCapabilities(settings: Request) {
             val types = MediaCodecList(MediaCodecList.REGULAR_CODECS).codecInfos.filter { !it.isEncoder }.flatMap { it.supportedTypes.toList() }

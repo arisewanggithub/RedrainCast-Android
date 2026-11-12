@@ -386,6 +386,21 @@ Worker replacement is serialized by the playback-operation lock. Detach retired
 workers under the shared lifecycle lock, then close/join them outside it so their
 output callbacks can finish. Recheck session ownership before installing and
 acknowledging the replacement.
+Initial and legacy configuration use the same snapshot/create/install discipline:
+codec construction, presentation startup and UI callbacks run outside the shared
+lifecycle lock. Installation and READY require the current session, generation
+and an open Surface lifetime; rejected workers and presentation leases retire
+outside that lock. The initial all-tracks-READY barrier remains in force.
+Surface closure publishes retirement intent before waiting for in-flight decoder
+construction, preventing that construction from acknowledging a retired Surface.
+The short lifetime lock linearizes closure with installation and READY enqueue,
+separately from the resource lock held during codec construction and retirement.
+Construction admission returns a retired result if closure won that race; codec
+factory failures still propagate through the normal failure channel.
+Initial or legacy configuration arriving after that intent is a diagnosed retired
+operation, not a fatal session error; neither track constructs a worker or sends READY.
+Decoded video callbacks skip the recovery lock when no recovery key is pending;
+pending proofs still revalidate their generation under the lifecycle lock.
 
 ## Framing
 
