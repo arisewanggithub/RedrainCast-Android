@@ -30,6 +30,8 @@ enum class DiagnosticPoint {
     AUDIO_START_WAIT, RECOVERY_RETIRE, RECOVERY_CONSTRUCT
 }
 
+internal data class TransportOperationIds(val audio: Long, val health: Long)
+
 internal data class Observation(
     var seq: Long,
     val ns: Long,
@@ -233,6 +235,12 @@ class DiagnosticRecorder(private val clock: () -> Long = System::nanoTime) {
         val id = operations.incrementAndGet()
         return if (gate === current && current.collecting) id else 0
     }
+
+    internal fun transportOperations(role: String, session: Long, includeAudio: Boolean): TransportOperationIds =
+        TransportOperationIds(
+            if (includeAudio) operation(role, session, DiagnosticKind.AUDIO_TRANSPORT) else 0,
+            operation(role, session, DiagnosticKind.TRANSPORT_HEALTH)
+        )
 
     fun videoConfigured(role: String, session: Long, generation: Int, metadata: DiagnosticVideoConfiguration) {
         val c = gate ?: return

@@ -491,28 +491,28 @@ class ReceiverServer private constructor(
             socket.soTimeout = 0
             phase = "Media"
             while (running.get() && !socket.isClosed && (!owner.stopping.get() || owner.orderlyStop)) {
-                val operation = RemoteDiagnostics.recorder.operation("receiver", owner.session,
-                    if (mediaTrack == 2 && RemoteDiagnostics.recorder.enabled("receiver", owner.session, DiagnosticKind.AUDIO_TRANSPORT))
-                        DiagnosticKind.AUDIO_TRANSPORT else DiagnosticKind.TRANSPORT_HEALTH)
+                val operations = RemoteDiagnostics.recorder.transportOperations(
+                    "receiver", owner.session, mediaTrack == 2)
                 if (mediaTrack == 2) RemoteDiagnostics.recorder.observe("receiver", owner.session,
-                    DiagnosticKind.AUDIO_TRANSPORT, DiagnosticStage.BEGIN, mediaTrack, operation = operation,
+                    DiagnosticKind.AUDIO_TRANSPORT, DiagnosticStage.BEGIN, mediaTrack, operation = operations.audio,
                     point = DiagnosticPoint.READ)
                 RemoteDiagnostics.recorder.observe("receiver", owner.session, DiagnosticKind.TRANSPORT_HEALTH,
-                    DiagnosticStage.BEGIN, mediaTrack, operation = operation, point = DiagnosticPoint.READ)
+                    DiagnosticStage.BEGIN, mediaTrack, operation = operations.health, point = DiagnosticPoint.READ)
                 val message = try { read() } catch (e: Exception) {
                     if (mediaTrack == 2) RemoteDiagnostics.recorder.observe("receiver", owner.session,
-                        DiagnosticKind.AUDIO_TRANSPORT, DiagnosticStage.FAILED, mediaTrack, operation = operation,
+                        DiagnosticKind.AUDIO_TRANSPORT, DiagnosticStage.FAILED, mediaTrack,
+                        operation = operations.audio,
                         reason = DiagnosticReason.FAILURE, point = DiagnosticPoint.READ)
                     RemoteDiagnostics.recorder.observe("receiver", owner.session, DiagnosticKind.TRANSPORT_HEALTH,
-                        DiagnosticStage.FAILED, mediaTrack, operation = operation,
+                        DiagnosticStage.FAILED, mediaTrack, operation = operations.health,
                         reason = DiagnosticReason.FAILURE, point = DiagnosticPoint.READ)
                     throw e
                 }
                 if (mediaTrack == 2) RemoteDiagnostics.recorder.observe("receiver", owner.session,
                     DiagnosticKind.AUDIO_TRANSPORT, DiagnosticStage.COMPLETE, mediaTrack, message.generation.toInt(),
-                    operation, message.ptsUs, bytes = message.payload.size.toLong(), point = DiagnosticPoint.READ)
+                    operations.audio, message.ptsUs, bytes = message.payload.size.toLong(), point = DiagnosticPoint.READ)
                 RemoteDiagnostics.recorder.observe("receiver", owner.session, DiagnosticKind.TRANSPORT_HEALTH,
-                    DiagnosticStage.COMPLETE, mediaTrack, message.generation.toInt(), operation, message.ptsUs,
+                    DiagnosticStage.COMPLETE, mediaTrack, message.generation.toInt(), operations.health, message.ptsUs,
                     bytes = message.payload.size.toLong(), point = DiagnosticPoint.READ)
                 if (owner.stopping.get()) {
                     if (owner.orderlyStop) continue

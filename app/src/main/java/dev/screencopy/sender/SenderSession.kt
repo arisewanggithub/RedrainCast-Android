@@ -532,14 +532,12 @@ class SenderSession internal constructor(
                         if (message.type == Wire.VIDEO_FRAME) RemoteDiagnostics.recorder.video(
                             "sender", session, message.generation, DiagnosticVideoStage.WRITE_STARTED, message.pts,
                             message.payload.size.toLong(), keyFrame = message.flags and 1 != 0)
-                        val operation = RemoteDiagnostics.recorder.operation("sender", session,
-                            if (lane == 2 && RemoteDiagnostics.recorder.enabled("sender", session, DiagnosticKind.AUDIO_TRANSPORT))
-                                DiagnosticKind.AUDIO_TRANSPORT else DiagnosticKind.TRANSPORT_HEALTH)
+                        val operations = RemoteDiagnostics.recorder.transportOperations("sender", session, lane == 2)
                         if (lane == 2) RemoteDiagnostics.recorder.observe("sender", session, DiagnosticKind.AUDIO_TRANSPORT,
-                            DiagnosticStage.BEGIN, lane, message.generation, operation, message.pts,
+                            DiagnosticStage.BEGIN, lane, message.generation, operations.audio, message.pts,
                             bytes = message.payload.size.toLong(), point = DiagnosticPoint.WRITE)
                         RemoteDiagnostics.recorder.observe("sender", session, DiagnosticKind.TRANSPORT_HEALTH,
-                            DiagnosticStage.BEGIN, lane, message.generation, operation, message.pts,
+                            DiagnosticStage.BEGIN, lane, message.generation, operations.health, message.pts,
                             bytes = message.payload.size.toLong(), point = DiagnosticPoint.WRITE)
                         try {
                             connected.send(message)
@@ -548,10 +546,10 @@ class SenderSession internal constructor(
                                 "sender", session, message.generation, DiagnosticVideoStage.WRITE_FAILED, message.pts,
                                 message.payload.size.toLong(), reason = DiagnosticReason.FAILURE)
                             if (lane == 2) RemoteDiagnostics.recorder.observe("sender", session, DiagnosticKind.AUDIO_TRANSPORT,
-                                DiagnosticStage.FAILED, lane, message.generation, operation, message.pts,
+                                DiagnosticStage.FAILED, lane, message.generation, operations.audio, message.pts,
                                 bytes = message.payload.size.toLong(), reason = DiagnosticReason.FAILURE, point = DiagnosticPoint.WRITE)
                             RemoteDiagnostics.recorder.observe("sender", session, DiagnosticKind.TRANSPORT_HEALTH,
-                                DiagnosticStage.FAILED, lane, message.generation, operation, message.pts,
+                                DiagnosticStage.FAILED, lane, message.generation, operations.health, message.pts,
                                 reason = DiagnosticReason.FAILURE, point = DiagnosticPoint.WRITE)
                             throw error
                         }
@@ -559,10 +557,10 @@ class SenderSession internal constructor(
                             "sender", session, message.generation, DiagnosticVideoStage.WRITTEN, message.pts,
                             message.payload.size.toLong(), keyFrame = message.flags and 1 != 0)
                         if (lane == 2) RemoteDiagnostics.recorder.observe("sender", session, DiagnosticKind.AUDIO_TRANSPORT,
-                            DiagnosticStage.COMPLETE, lane, message.generation, operation, message.pts,
+                            DiagnosticStage.COMPLETE, lane, message.generation, operations.audio, message.pts,
                             bytes = message.payload.size.toLong(), point = DiagnosticPoint.WRITE)
                         RemoteDiagnostics.recorder.observe("sender", session, DiagnosticKind.TRANSPORT_HEALTH,
-                            DiagnosticStage.COMPLETE, lane, message.generation, operation, message.pts,
+                            DiagnosticStage.COMPLETE, lane, message.generation, operations.health, message.pts,
                             bytes = message.payload.size.toLong(), point = DiagnosticPoint.WRITE)
                         writeCompleted(message)
                     } catch (error: Exception) {

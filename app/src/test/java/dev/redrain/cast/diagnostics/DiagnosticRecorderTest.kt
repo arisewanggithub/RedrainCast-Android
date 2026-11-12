@@ -260,6 +260,39 @@ class DiagnosticRecorderTest {
         })
     }
 
+    @Test fun pairedAudioAndTransportMetricsUseIndependentOperations() {
+        val id = start(setOf("audio.transport", "transport.health"))
+        val operations = recorder.transportOperations("receiver", 73, includeAudio = true)
+        assertTrue(operations.audio > 0)
+        assertTrue(operations.health > 0)
+        assertNotEquals(operations.audio, operations.health)
+
+        for ((kind, operation) in listOf(
+            DiagnosticKind.AUDIO_TRANSPORT to operations.audio,
+            DiagnosticKind.TRANSPORT_HEALTH to operations.health
+        )) {
+            recorder.observe("receiver", 73, kind, DiagnosticStage.BEGIN, track = 2,
+                operation = operation, point = DiagnosticPoint.READ)
+            now += 1_000_000
+            recorder.observe("receiver", 73, kind, DiagnosticStage.COMPLETE, track = 2,
+                operation = operation, point = DiagnosticPoint.READ)
+        }
+        recorder.end(id)
+
+        val records = allRecords(id)
+        val ended = records.single { it.getString("kind") == "CAPTURE_ENDED" }.getJSONObject("data")
+        assertEquals("0", ended.getString("inFlightNotTracked"))
+        assertEquals(0, ended.getInt("inFlightCount"))
+        for (kind in listOf("AUDIO_TRANSPORT", "TRANSPORT_HEALTH")) {
+            val summary = records.single {
+                it.getString("kind") == kind &&
+                    it.getJSONObject("data").optJSONObject("metrics")?.optString("schema") == "operation_summary"
+            }.getJSONObject("data").getJSONObject("metrics")
+            assertEquals("1", summary.getString("started"))
+            assertEquals("1", summary.getString("completed"))
+        }
+    }
+
     @Test fun routineFloodCannotEvictRecoverySessionOrLifecycleEvidence() {
         val id = start(setOf("audio.output", "recovery", "session"))
         recorder.tick()
