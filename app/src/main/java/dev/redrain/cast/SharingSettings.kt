@@ -276,6 +276,48 @@ object SharingSettings {
             advanced.addView(this, spacing(16))
         }
         label(advanced, R.string.rc_playback_statistics_hint).tag = "playbackStatisticsHint"
+        val remoteDiagnostics = CheckBox(activity).apply {
+            tag = "allowRemoteDiagnostics"
+            text = "Allow unpaired LAN diagnostics (this process only)"
+            isChecked = dev.redrain.cast.diagnostics.DiagnosticAccess.enabled
+            isEnabled = playbackStatistics.isChecked
+            minimumHeight = dp(48)
+            advanced.addView(this, spacing(8))
+        }
+        TextView(activity).apply {
+            tag = "remoteDiagnosticsWarning"
+            text = dev.redrain.cast.diagnostics.DiagnosticAccess.warning
+            advanced.addView(this, spacing(8))
+        }
+        remoteDiagnostics.setOnCheckedChangeListener { _, checked ->
+            if (!checked) dev.redrain.cast.diagnostics.DiagnosticAccess.setEnabled(activity, false, playbackStatistics.isChecked)
+        }
+        playbackStatistics.setOnCheckedChangeListener { _, checked ->
+            remoteDiagnostics.isEnabled = checked
+            if (!checked) {
+                remoteDiagnostics.isChecked = false
+                dev.redrain.cast.diagnostics.DiagnosticAccess.setEnabled(activity, false, false)
+            }
+        }
+        Button(activity).apply {
+            tag = "remoteDiagnosticsStatus"
+            text = "LAN diagnostics endpoint / status"
+            minimumHeight = dp(48)
+            setOnClickListener {
+                val info = TextView(activity).apply {
+                    text = dev.redrain.cast.diagnostics.DiagnosticAccess.status +
+                        "\n\nRefresh by reopening. Save settings to apply consent. " +
+                        dev.redrain.cast.diagnostics.DiagnosticAccess.warning
+                    setTextIsSelectable(true)
+                    setPadding(dp(16), dp(12), dp(16), dp(12))
+                }
+                val status = AlertDialog.Builder(activity).setTitle("LAN diagnostics").setView(info)
+                    .setPositiveButton(android.R.string.ok, null).create()
+                status.window?.addFlags(android.view.WindowManager.LayoutParams.FLAG_SECURE)
+                status.show()
+            }
+            advanced.addView(this, spacing(8))
+        }
         button(body, R.string.rc_notices, "notices", onNotices)
         dialog = AlertDialog.Builder(activity)
             .setTitle(R.string.rc_settings)
@@ -336,6 +378,8 @@ object SharingSettings {
                     return@setOnClickListener
                 }
                 onSave(next)
+                dev.redrain.cast.diagnostics.DiagnosticAccess.setEnabled(activity,
+                    remoteDiagnostics.isChecked, next.showPlaybackStatistics)
                 dialog.dismiss()
             }
         }

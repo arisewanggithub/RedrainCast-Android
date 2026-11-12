@@ -1,6 +1,7 @@
 package dev.screencopy.sender
 
 import android.content.Context
+import dev.redrain.cast.diagnostics.*
 import org.json.JSONObject
 import java.io.IOException
 import java.security.SecureRandom
@@ -58,6 +59,8 @@ class SenderSession internal constructor(
     private val stopping get() = outcome.stopping
     @Volatile private var requestSent = false
     @Volatile private var acceptedSession = false
+    private var diagnosticRevocation: AutoCloseable? = null
+    private val diagnosticRevoked = AtomicBoolean()
     @Volatile private var remoteStop = false
     @Volatile private var closing = false
     @Volatile private var mediaRetiring = false
@@ -176,6 +179,9 @@ class SenderSession internal constructor(
     }
 
     override fun run() {
+        DiagnosticAccess.connections.begin(session, receiver.host, requested = false, supported = false)
+        RemoteDiagnostics.recorder.sessionStarted("sender", session)
+        mux.diagnosticSession = session
         try {
             trace.sessionStarted(session)
             settings.validate()
@@ -206,15 +212,51 @@ class SenderSession internal constructor(
             if (statisticsUnavailable)
                 diagnostic("event=RECEIVER_OPTION_UNAVAILABLE option=playbackStats nonfatal=true")
             val request = org.screencopy.receiver.protocol.ReceiverOptionProtocol.apply(settings.request(), options)
+            val diagnosticConsentGeneration = DiagnosticAccess.consentGeneration
+            val delegateDiagnostics = DiagnosticAccess.enabled && requestedStatistics
+            DiagnosticAccess.connections.begin(session, connected.connectedHost,
+                delegateDiagnostics, connected.delegatedDiagnostics)
+            DiagnosticAccess.receiverSession(if (delegateDiagnostics) session else null)
+            DiagnosticAccess.receiverStatus(if (!delegateDiagnostics) "Not requested" else
+                if (connected.delegatedDiagnostics) "starting" else "unsupported")
+            if (delegateDiagnostics && connected.delegatedDiagnostics)
+                request.put("diagnostic", org.screencopy.receiver.protocol.DiagnosticDelegation.request(true))
             connected.send(Wire.control(Wire.SESSION_REQUEST, session, request))
             worker("receiver-control-write") { writeLoop(0) }
             requestSent = true
+            if (delegateDiagnostics && connected.delegatedDiagnostics) {
+                diagnosticRevocation = DiagnosticAccess.onDisabled(diagnosticConsentGeneration) {
+                    DiagnosticAccess.connections.revoke(session)
+                    if (diagnosticRevoked.compareAndSet(false, true) && !stopping && !closing) {
+                        try {
+                            DiagnosticAccess.receiverStatus("revocation requested")
+                            timer.execute {
+                                try {
+                                    mux.offer(Wire.control(Wire.STATUS, session, Wire.obj("state" to "diagnostics",
+                                        "message" to "disabled", "diagnostic" to
+                                            org.screencopy.receiver.protocol.DiagnosticDelegation.request(false))))
+                                } catch (_: IOException) {
+                                    DiagnosticAccess.receiverStatus("Revocation delivery failed; closing cast transport")
+                                    link?.close()
+                                }
+                            }
+                        } catch (_: java.util.concurrent.RejectedExecutionException) {
+                            DiagnosticAccess.receiverStatus("Session teardown in progress")
+                        }
+                    }
+                }
+            }
             if (stopping) queueTerminal()
             val accepted = connected.receive()
             lastIncoming = now()
             if (accepted.session != session) throw IOException("PROTOCOL: negotiation session mismatch")
             if (accepted.type == Wire.REJECT || accepted.type == Wire.ERROR)
                 throw IOException("${Json.string(accepted.json(), "code")}: ${Json.string(accepted.json(), "message")}")
+            if (delegateDiagnostics && connected.delegatedDiagnostics) {
+                DiagnosticAccess.connections.update(session,
+                    org.screencopy.receiver.protocol.StrictJson.decode(accepted.payload))
+                DiagnosticAccess.receiverStatus(DiagnosticAccess.connections.snapshot().getString("state"))
+            }
             check()
             acceptedSession = true
             worker("receiver-read", ::readLoop)
@@ -253,11 +295,21 @@ class SenderSession internal constructor(
             status(outcome.failure?.let { "Error: ${SessionOutcome.safeMessage(it)}" } ?: "Idle")
             trace.mark(SessionStopTrace.Stage.FINISHED)
             cleanupComplete = true
+            RemoteDiagnostics.recorder.observe("sender", session, DiagnosticKind.SESSION,
+                if (outcome.failure == null) DiagnosticStage.ENDED else DiagnosticStage.FAILED,
+                reason = if (outcome.failure == null) DiagnosticReason.STOPPED else DiagnosticReason.FAILURE)
+            RemoteDiagnostics.recorder.sessionEnded("sender", session)
+            diagnosticRevocation?.close()
+            DiagnosticAccess.connections.ended(session)
+            if (DiagnosticAccess.receiverSession == session &&
+                DiagnosticAccess.receiverStatus !in setOf("unsupported", "unavailable", "local", "Not requested"))
+                DiagnosticAccess.receiverStatus("Cast ended; receiver frozen retrieval only, at most 120 seconds")
             finished()
         }
     }
 
     internal fun retireTransport() {
+        DiagnosticAccess.connections.ended(session)
         synchronized(this) { closing = true }
         trace.phase(SessionStopTrace.Phase.CLEANUP)
         val orderly = orderlyTeardown
@@ -385,6 +437,11 @@ class SenderSession internal constructor(
                         val detail = Json.string(json, "message")
                         if (state.length > 80 || detail.length > 2048)
                             throw IOException("PROTOCOL: oversized STATUS fields")
+                        if (json.has("diagnostic") && state == "diagnostics") {
+                            DiagnosticAccess.connections.update(session,
+                                org.screencopy.receiver.protocol.StrictJson.decode(message.payload))
+                            DiagnosticAccess.receiverStatus(DiagnosticAccess.connections.snapshot().getString("state"))
+                        }
                         if (state in setOf(StreamRecoveryProtocol.REQUEST, StreamRecoveryProtocol.KEY, StreamRecoveryProtocol.COMPLETE)) {
                             val current = recovery ?: throw IOException("PROTOCOL: stream recovery was not negotiated")
                             val track = StreamRecoveryProtocol.track(json)
@@ -472,7 +529,41 @@ class SenderSession internal constructor(
                     mux.beginWrite(message)
                     if (message.type in setOf(Wire.STOP, Wire.SESSION_END, Wire.ERROR)) terminalWriting = true
                     try {
-                        connected.send(message)
+                        if (message.type == Wire.VIDEO_FRAME) RemoteDiagnostics.recorder.video(
+                            "sender", session, message.generation, DiagnosticVideoStage.WRITE_STARTED, message.pts,
+                            message.payload.size.toLong(), keyFrame = message.flags and 1 != 0)
+                        val operation = RemoteDiagnostics.recorder.operation("sender", session,
+                            if (lane == 2 && RemoteDiagnostics.recorder.enabled("sender", session, DiagnosticKind.AUDIO_TRANSPORT))
+                                DiagnosticKind.AUDIO_TRANSPORT else DiagnosticKind.TRANSPORT_HEALTH)
+                        if (lane == 2) RemoteDiagnostics.recorder.observe("sender", session, DiagnosticKind.AUDIO_TRANSPORT,
+                            DiagnosticStage.BEGIN, lane, message.generation, operation, message.pts,
+                            bytes = message.payload.size.toLong(), point = DiagnosticPoint.WRITE)
+                        RemoteDiagnostics.recorder.observe("sender", session, DiagnosticKind.TRANSPORT_HEALTH,
+                            DiagnosticStage.BEGIN, lane, message.generation, operation, message.pts,
+                            bytes = message.payload.size.toLong(), point = DiagnosticPoint.WRITE)
+                        try {
+                            connected.send(message)
+                        } catch (error: Exception) {
+                            if (message.type == Wire.VIDEO_FRAME) RemoteDiagnostics.recorder.video(
+                                "sender", session, message.generation, DiagnosticVideoStage.WRITE_FAILED, message.pts,
+                                message.payload.size.toLong(), reason = DiagnosticReason.FAILURE)
+                            if (lane == 2) RemoteDiagnostics.recorder.observe("sender", session, DiagnosticKind.AUDIO_TRANSPORT,
+                                DiagnosticStage.FAILED, lane, message.generation, operation, message.pts,
+                                bytes = message.payload.size.toLong(), reason = DiagnosticReason.FAILURE, point = DiagnosticPoint.WRITE)
+                            RemoteDiagnostics.recorder.observe("sender", session, DiagnosticKind.TRANSPORT_HEALTH,
+                                DiagnosticStage.FAILED, lane, message.generation, operation, message.pts,
+                                reason = DiagnosticReason.FAILURE, point = DiagnosticPoint.WRITE)
+                            throw error
+                        }
+                        if (message.type == Wire.VIDEO_FRAME) RemoteDiagnostics.recorder.video(
+                            "sender", session, message.generation, DiagnosticVideoStage.WRITTEN, message.pts,
+                            message.payload.size.toLong(), keyFrame = message.flags and 1 != 0)
+                        if (lane == 2) RemoteDiagnostics.recorder.observe("sender", session, DiagnosticKind.AUDIO_TRANSPORT,
+                            DiagnosticStage.COMPLETE, lane, message.generation, operation, message.pts,
+                            bytes = message.payload.size.toLong(), point = DiagnosticPoint.WRITE)
+                        RemoteDiagnostics.recorder.observe("sender", session, DiagnosticKind.TRANSPORT_HEALTH,
+                            DiagnosticStage.COMPLETE, lane, message.generation, operation, message.pts,
+                            bytes = message.payload.size.toLong(), point = DiagnosticPoint.WRITE)
                         writeCompleted(message)
                     } catch (error: Exception) {
                         writeFailed(lane, error)
@@ -498,6 +589,12 @@ class SenderSession internal constructor(
     }
     override fun config(track: Int, generation: Int, config: JSONObject) {
         check()
+        RemoteDiagnostics.recorder.observe("sender", session, DiagnosticKind.SESSION, DiagnosticStage.CONFIG,
+            track, generation, metadata = if (track == 2 && RemoteDiagnostics.recorder.enabled("sender", session, DiagnosticKind.SESSION))
+                DiagnosticConfiguration(DiagnosticCodec.from(config.optString("codec")), config.optInt("sampleRate"),
+                    config.optInt("channels"), when (config.optString("codec")) {
+                        "raw", "pcm" -> 0; "opus" -> 80_000; else -> null
+                    }) else null)
         val current = recovery
         if (current == null) mux.offer(Wire.config(session, track, generation, config))
         else current.config(track, generation, config)

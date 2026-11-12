@@ -2,8 +2,121 @@ package org.screencopy.receiver.media
 
 import org.junit.Assert.*
 import org.junit.Test
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicInteger
 
 class PlaybackClockTest {
+    @Test fun publishedAudioKeepsItsSourceMappingAndObservationTimeWithoutExtrapolation() {
+        val time = FakeTime()
+        val clock = time.clock()
+        val source = clock.anchorObservedAudio(1_000_000, 48000)
+        assertFalse("An unobserved audio clock cannot prove video freshness", clock.canProveVideo(1_000_000, null))
+        clock.audioPacket(0, 1_000_000)
+        clock.audioWritten(100_000)
+        clock.observeAudio(source, 20_000, time.ns)
+        assertEquals(1_020_000L, clock.currentUs())
+        clock.audioPacket(50_000, 1_051_000)
+        time.advanceUs(60_000)
+        clock.observeAudio(source, 80_000, time.ns)
+        assertEquals(1_080_600L, clock.currentUs())
+        val observed = checkNotNull(clock.cachedPlayedAudioObservation())
+        clock.beginAudioRecovery()
+        time.advanceUs(250_001)
+        clock.videoPresented(2_000_000)
+        repeat(10) {
+            assertEquals("Attached audio remains sample-master even when its observation is stale",
+                1_080_600L, clock.currentUs())
+            assertSame(observed, clock.cachedPlayedAudioObservation())
+            assertFalse("Unchanged audio observations must not prove a recovery key fresh",
+                clock.canProveVideo(1_080_600, observed))
+        }
+        clock.observeAudio(source, 90_000, observed.observedAtNs - 1)
+        assertSame("Out-of-order observations cannot refresh or rewind the clock",
+            observed, clock.cachedPlayedAudioObservation())
+        clock.observeAudio(source, 90_000, time.ns)
+        assertEquals(1_090_800L, clock.currentUs())
+        assertTrue(clock.canProveVideo(1_090_800, observed))
+        clock.detachObservedAudio(source)
+        time.advanceUs(20_000)
+        assertEquals(1_110_800L, clock.currentUs())
+        val replacement = clock.anchorObservedAudio(1_110_800, 48000)
+        clock.audioWritten(20_000)
+        clock.observeAudio(replacement, 10_000, time.ns)
+        val replacementObservation = clock.cachedPlayedAudioObservation()
+        clock.observeAudio(source, 100_000, time.ns + 1)
+        clock.detachObservedAudio(source)
+        assertSame(replacementObservation, clock.cachedPlayedAudioObservation())
+        assertEquals(1_120_800L, clock.currentUs())
+    }
+
+    @Test(timeout = 5000) fun blockedCallbackDoesNotOwnClockMonitorOrPublishIntoReplacement() {
+        val time = FakeTime()
+        val clock = time.clock()
+        val entered = CountDownLatch(1)
+        val release = CountDownLatch(1)
+        val calls = AtomicInteger()
+        clock.anchorAudio(1_000_000) {
+            if (calls.incrementAndGet() == 1) {
+                entered.countDown()
+                check(release.await(3, TimeUnit.SECONDS))
+                50_000
+            } else 10_000
+        }
+        clock.audioWritten(100_000)
+        val workers = Executors.newFixedThreadPool(2)
+        val reading = workers.submit<Long?> { clock.currentUs() }
+        try {
+            assertTrue(entered.await(1, TimeUnit.SECONDS))
+            workers.submit {
+                clock.beginAudioRecovery()
+                clock.anchorVideo(1_000_000)
+                clock.detachAudio()
+            }.get(1, TimeUnit.SECONDS)
+            val replacement = clock.anchorObservedAudio(1_010_000, 48000)
+            clock.audioWritten(20_000)
+            clock.observeAudio(replacement, 5000, time.ns)
+            val observed = clock.cachedPlayedAudioObservation()
+            release.countDown()
+            assertEquals(1_015_000L, reading.get(1, TimeUnit.SECONDS))
+            assertSame("The blocked retired callback cannot publish into the replacement",
+                observed, clock.cachedPlayedAudioObservation())
+        } finally {
+            release.countDown()
+            workers.shutdownNow()
+            assertTrue(workers.awaitTermination(1, TimeUnit.SECONDS))
+        }
+    }
+
+    @Test fun previouslyAnchoredAudioFollowsPresentedVideoOnlyWhileActuallyDetached() {
+        val time = FakeTime()
+        val clock = time.clock().apply { audioExpected = true }
+        clock.anchorVideo(1_000_000)
+        clock.prepareAudio(TrimmedAudio(0, 960, 1_000_000), 48000)
+        assertTrue(clock.awaitAudioStart(1_000_000) { true })
+        clock.anchorAudio(1_000_000) { 20_000 }
+        clock.audioWritten(40_000)
+        clock.beginAudioRecovery()
+        clock.videoPresented(2_000_000)
+        assertEquals("Attached audio remains master even during recovery", 1_020_000L, clock.currentUs())
+        clock.detachAudio()
+        val before = time.ns
+        clock.videoPresented(2_000_000)
+        assertEquals(2_000_000L, clock.currentUs())
+        clock.videoPresented(1_500_000)
+        assertEquals("Older video cannot rewind the detached clock", 2_000_000L, clock.currentUs())
+        val slice = TrimmedAudio(0, 960, 2_000_000)
+        assertEquals(slice, clock.prepareAudio(slice, 48000))
+        assertTrue(clock.awaitAudioStart(slice.audiblePtsUs) { true })
+        assertEquals("Fresh source audio must not wait behind the retired audio clock", before, time.ns)
+        clock.anchorAudio(slice.audiblePtsUs) { 0 }
+        clock.videoPresented(3_000_000)
+        assertEquals("New audio is master before completion too", 2_000_000L, clock.currentUs())
+        clock.endAudioRecovery()
+        clock.checkStartup()
+    }
+
     @Test fun videoFirstPlaysBeforeAudioWithThreeHundredMillisecondSourceOffset() {
         val time = FakeTime()
         val clock = time.clock()

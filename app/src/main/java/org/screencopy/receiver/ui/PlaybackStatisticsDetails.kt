@@ -11,6 +11,13 @@ import org.screencopy.receiver.media.PlaybackDisplayMeasurements
 
 class PlaybackStatisticsDetails(context: Context) : ScrollView(context) {
     internal val panel = PlaybackStatisticsOverlay(context, detailed = true)
+    private val independentPanel = PlaybackStatisticsSurface(context, detailed = true).apply {
+        onContentHeight = { contentHeight ->
+            if (layoutParams.height != contentHeight && contentHeight > 0) {
+                layoutParams = layoutParams.apply { height = contentHeight }
+            }
+        }
+    }
     private val unavailable = TextView(context).apply {
         setText(R.string.rc_playback_diagnostics_unavailable)
         textSize = 16f
@@ -25,7 +32,26 @@ class PlaybackStatisticsDetails(context: Context) : ScrollView(context) {
             orientation = LinearLayout.VERTICAL
             addView(unavailable, LinearLayout.LayoutParams(-1, -2))
             addView(panel, LinearLayout.LayoutParams(-1, -2))
+            addView(independentPanel, LinearLayout.LayoutParams(-1,
+                (1400 * resources.displayMetrics.density).toInt()))
         })
+    }
+
+    fun start(source: () -> PlaybackStatisticsSnapshot?, canvasWidth: Int, canvasHeight: Int,
+        measurements: PlaybackDisplayMeasurements, selected: () -> Boolean = { true }) {
+        unavailable.visibility = View.GONE
+        panel.visibility = View.GONE
+        independentPanel.measurements(canvasWidth, canvasHeight, measurements)
+        independentPanel.start(selected, source)
+    }
+
+    fun stop() = independentPanel.stop()
+
+    fun bindWindow(protection: StatisticsWindowProtection) = independentPanel.bindWindow(protection)
+
+    override fun onDetachedFromWindow() {
+        stop()
+        super.onDetachedFromWindow()
     }
 
     fun show(snapshot: PlaybackStatisticsSnapshot?, canvasWidth: Int, canvasHeight: Int,

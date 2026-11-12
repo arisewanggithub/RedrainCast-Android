@@ -65,6 +65,181 @@ class MainActivityTest {
         holderSurfaces.forEach { (surface, image) -> surface.release(); image.release() }
     }
 
+    @Test fun sendingKeepsAStatisticsWindowSecureAndExplainsTheCaptureRestriction() {
+        val controller = Robolectric.buildActivity(MainActivity::class.java).setup()
+        val activity = controller.get()
+        try {
+            val protection = org.screencopy.receiver.ui.StatisticsWindowProtection.forWindow(activity.window)
+            assertNotNull(protection.retainForStatistics(activity.window.decorView))
+            org.robolectric.util.ReflectionHelpers.callInstanceMethod<Unit>(activity, "clearSecureWindowForSending")
+            assertEquals(WindowManager.LayoutParams.FLAG_SECURE,
+                activity.window.attributes.flags and WindowManager.LayoutParams.FLAG_SECURE)
+            assertEquals(activity.getString(R.string.rc_statistics_window_stays_secure),
+                org.robolectric.shadows.ShadowToast.getTextOfLatestToast())
+            org.robolectric.util.ReflectionHelpers.callInstanceMethod<Unit>(activity, "clearSecureWindowForSending")
+            assertEquals(WindowManager.LayoutParams.FLAG_SECURE,
+                activity.window.attributes.flags and WindowManager.LayoutParams.FLAG_SECURE)
+        } finally { controller.pause().stop().destroy() }
+        await { activity.resourcesRetired }
+    }
+
+    @Test fun receiverRegistersProtectionBeforeItsFirstWindowAttachment() {
+        val controller = Robolectric.buildActivity(MainActivity::class.java).create()
+        val activity = controller.get()
+        val decor = activity.window.decorView
+        val protection = org.screencopy.receiver.ui.StatisticsWindowProtection.forWindow(activity.window)
+        val attachedProtection = mutableListOf<Boolean>()
+        decor.addOnAttachStateChangeListener(object : View.OnAttachStateChangeListener {
+            override fun onViewAttachedToWindow(view: View) {
+                attachedProtection.add(protection.canHostStatistics(view))
+            }
+            override fun onViewDetachedFromWindow(view: View) {}
+        })
+        try {
+            assertFalse(decor.isAttachedToWindow)
+            assertEquals(WindowManager.LayoutParams.FLAG_SECURE,
+                activity.window.attributes.flags and WindowManager.LayoutParams.FLAG_SECURE)
+            controller.start().resume().visible()
+            assertEquals(listOf(true), attachedProtection)
+            assertTrue(protection.canHostStatistics(decor))
+        } finally { controller.pause().stop().destroy() }
+        await { activity.resourcesRetired }
+    }
+
+    @Test @Config(sdk = [33])
+    fun cancelledProjectionCancelsDeferredClearBeforeReceiverListenerRestarts() {
+        val controller = Robolectric.buildActivity(MainActivity::class.java).setup()
+        val activity = controller.get()
+        val protection = org.screencopy.receiver.ui.StatisticsWindowProtection.forWindow(activity.window)
+        val acknowledgeDetach = checkNotNull(protection.retainForStatistics(activity.window.decorView))
+        val request = CastState.requests.reserve(Settings().request().toString(), ReceiverTarget("192.0.2.1", 50000))
+        org.robolectric.util.ReflectionHelpers.setField(activity, "pendingRequestId", request.id)
+        try {
+            org.robolectric.util.ReflectionHelpers.callInstanceMethod<Unit>(activity, "clearSecureWindowForSending")
+            org.robolectric.util.ReflectionHelpers.callInstanceMethod<Unit>(activity, "requestProjection")
+            assertTrue(checkNotNull(CastState.requests.snapshot()).consentStarted)
+            assertFalse(protection.canHostStatistics(activity.window.decorView))
+            surfaceReady(activity)
+            assertNull(org.robolectric.util.ReflectionHelpers.getField<Any?>(activity, "listenerRun"))
+
+            org.robolectric.util.ReflectionHelpers.callInstanceMethod<Unit>(activity, "onActivityResult",
+                org.robolectric.util.ReflectionHelpers.ClassParameter.from(Int::class.javaPrimitiveType, 11),
+                org.robolectric.util.ReflectionHelpers.ClassParameter.from(Int::class.javaPrimitiveType, Activity.RESULT_CANCELED),
+                org.robolectric.util.ReflectionHelpers.ClassParameter.from(Intent::class.java, null))
+            assertNull(CastState.requests.snapshot())
+            assertNull(CastState.roles.role())
+            assertNotNull(org.robolectric.util.ReflectionHelpers.getField<Any?>(activity, "listenerRun"))
+            assertTrue(protection.canHostStatistics(activity.window.decorView))
+            acknowledgeDetach()
+            acknowledgeDetach()
+            assertEquals(WindowManager.LayoutParams.FLAG_SECURE,
+                activity.window.attributes.flags and WindowManager.LayoutParams.FLAG_SECURE)
+            assertTrue(protection.canHostStatistics(activity.window.decorView))
+
+            val nextDetach = checkNotNull(protection.retainForStatistics(activity.window.decorView))
+            assertFalse(protection.clearSecureFlag())
+            nextDetach()
+            assertEquals(0, activity.window.attributes.flags and WindowManager.LayoutParams.FLAG_SECURE)
+            protection.secureForReceiving()
+            assertEquals(WindowManager.LayoutParams.FLAG_SECURE,
+                activity.window.attributes.flags and WindowManager.LayoutParams.FLAG_SECURE)
+            assertFalse("Actual declassification remains irreversible",
+                protection.canHostStatistics(activity.window.decorView))
+        } finally {
+            CastState.requests.finish(request.id)
+            controller.pause().stop().destroy()
+        }
+        await { activity.resourcesRetired }
+    }
+
+    @Test @Config(sdk = [33])
+    fun cancelledProjectionRestoresProtectionWithoutWaitingForDecoderSurfaces() {
+        val controller = Robolectric.buildActivity(MainActivity::class.java).setup()
+        val activity = controller.get()
+        val protection = org.screencopy.receiver.ui.StatisticsWindowProtection.forWindow(activity.window)
+        val acknowledgeDetach = checkNotNull(protection.retainForStatistics(activity.window.decorView))
+        val request = CastState.requests.reserve(Settings().request().toString(), ReceiverTarget("192.0.2.1", 50000))
+        org.robolectric.util.ReflectionHelpers.setField(activity, "pendingRequestId", request.id)
+        try {
+            assertFalse(protection.clearSecureFlag())
+            org.robolectric.util.ReflectionHelpers.callInstanceMethod<Unit>(activity, "requestProjection")
+            org.robolectric.util.ReflectionHelpers.callInstanceMethod<Unit>(activity, "onActivityResult",
+                org.robolectric.util.ReflectionHelpers.ClassParameter.from(Int::class.javaPrimitiveType, 11),
+                org.robolectric.util.ReflectionHelpers.ClassParameter.from(Int::class.javaPrimitiveType, Activity.RESULT_CANCELED),
+                org.robolectric.util.ReflectionHelpers.ClassParameter.from(Intent::class.java, null))
+            assertNull(CastState.roles.role())
+            assertNull(org.robolectric.util.ReflectionHelpers.getField<Any?>(activity, "listenerRun"))
+            assertTrue(protection.canHostStatistics(activity.window.decorView))
+            acknowledgeDetach()
+            assertEquals(WindowManager.LayoutParams.FLAG_SECURE,
+                activity.window.attributes.flags and WindowManager.LayoutParams.FLAG_SECURE)
+            assertTrue(protection.clearSecureFlag())
+            assertFalse(protection.canHostStatistics(activity.window.decorView))
+        } finally {
+            CastState.requests.finish(request.id)
+            controller.pause().stop().destroy()
+        }
+        await { activity.resourcesRetired }
+    }
+
+    @Test @Config(sdk = [33])
+    fun foregroundReceiverCancelsDeferredClearEvenBeforeDecoderSurfacesReturn() {
+        val controller = Robolectric.buildActivity(MainActivity::class.java).setup()
+        val activity = controller.get()
+        val protection = org.screencopy.receiver.ui.StatisticsWindowProtection.forWindow(activity.window)
+        val acknowledgeDetach = checkNotNull(protection.retainForStatistics(activity.window.decorView))
+        try {
+            assertFalse(protection.clearSecureFlag())
+            controller.pause().stop().start().resume().visible()
+            assertTrue(protection.canHostStatistics(activity.window.decorView))
+            acknowledgeDetach()
+            assertEquals(WindowManager.LayoutParams.FLAG_SECURE,
+                activity.window.attributes.flags and WindowManager.LayoutParams.FLAG_SECURE)
+            assertTrue(protection.canHostStatistics(activity.window.decorView))
+            assertTrue(protection.clearSecureFlag())
+            assertEquals(0, activity.window.attributes.flags and WindowManager.LayoutParams.FLAG_SECURE)
+        } finally { controller.pause().stop().destroy() }
+        await { activity.resourcesRetired }
+    }
+
+    @Test @Config(sdk = [31])
+    fun recreationCannotRequalifyAPreservedDeclassifiedWindow() {
+        val controller = Robolectric.buildActivity(MainActivity::class.java).setup()
+        val original = controller.get()
+        val oldWindow = original.window
+        val oldProtection = org.screencopy.receiver.ui.StatisticsWindowProtection.forWindow(oldWindow)
+        var current = original
+        try {
+            assertTrue(oldProtection.canHostStatistics(oldWindow.decorView))
+            assertTrue(oldProtection.clearSecureFlag())
+            controller.recreate()
+            current = controller.get()
+            val newProtection = org.screencopy.receiver.ui.StatisticsWindowProtection.forWindow(current.window)
+            if (current.window === oldWindow) {
+                assertSame(oldProtection, newProtection)
+                assertFalse(newProtection.canHostStatistics(current.window.decorView))
+            } else {
+                assertNotSame(oldProtection, newProtection)
+                assertTrue(newProtection.canHostStatistics(current.window.decorView))
+            }
+            assertFalse(oldProtection.canHostStatistics(oldWindow.decorView))
+            val host = org.robolectric.util.ReflectionHelpers.getField<org.screencopy.receiver.ui.InlineStatisticsHost>(
+                current, "inlineStatisticsHost")
+            val inline = current.findViewById<ViewGroup>(android.R.id.content)
+                .findViewWithTag<org.screencopy.receiver.ui.PlaybackStatisticsSurface>("playbackStatistics")
+            (inline.parent as View).layout(23, 41, 623, 441)
+            host.start(600, 400, org.screencopy.receiver.media.PlaybackDisplayMeasurements(), { true }) { null }
+            if (newProtection.canHostStatistics(inline)) {
+                assertNull(host.dialog)
+            } else {
+                assertTrue(checkNotNull(host.dialog).isShowing)
+                assertTrue(org.screencopy.receiver.ui.StatisticsWindowProtection.forWindow(host.dialog!!.window!!)
+                    .canHostStatistics(checkNotNull(host.panel)))
+            }
+        } finally { controller.pause().stop().destroy() }
+        await { original.resourcesRetired && current.resourcesRetired }
+    }
+
     @Test fun activeDisplayModeIsCachedSeparatelyAndObserverRetiresOnBackground() {
         val controller = Robolectric.buildActivity(MainActivity::class.java).setup()
         val activity = controller.get()
@@ -254,6 +429,13 @@ class MainActivityTest {
             assertTrue(dialog.isShowing)
             val details = dialog.window!!.decorView.findViewWithTag<org.screencopy.receiver.ui.PlaybackStatisticsDetails>(
                 "playbackStatisticsDetails")
+            val independent = org.robolectric.util.ReflectionHelpers.getField<
+                org.screencopy.receiver.ui.PlaybackStatisticsSurface>(details, "independentPanel")
+            val dialogProtection = org.screencopy.receiver.ui.StatisticsWindowProtection.forWindow(dialog.window!!)
+            assertTrue(dialog.window!!.decorView.isAttachedToWindow)
+            assertTrue("The actual dialog caller must register before show, not after attachment",
+                dialogProtection.canHostStatistics(independent))
+            assertFalse(dialogProtection.canHostStatistics(activity.window.decorView))
             assertEquals(View.GONE, details.panel.visibility)
             assertNull(shadowOf(activity).nextStartedActivityForResult)
             assertNull(shadowOf(activity).nextStartedService)
@@ -270,7 +452,7 @@ class MainActivityTest {
         val handler = org.robolectric.util.ReflectionHelpers.getField<android.os.Handler>(activity, "main")
         val refresh = org.robolectric.util.ReflectionHelpers.getField<Runnable>(activity, "statisticsRefresh")
         val overlay = activity.findViewById<ViewGroup>(android.R.id.content)
-            .findViewWithTag<org.screencopy.receiver.ui.PlaybackStatisticsOverlay>("playbackStatistics")
+            .findViewWithTag<org.screencopy.receiver.ui.PlaybackStatisticsSurface>("playbackStatistics")
         try {
             assertFalse(handler.hasCallbacks(refresh))
             refresh.run()
@@ -278,8 +460,24 @@ class MainActivityTest {
             assertEquals(View.GONE, overlay.visibility)
             controller.pause()
             assertFalse(handler.hasCallbacks(refresh))
-            assertEquals("", overlay.text)
+            assertFalse(overlay.refreshing)
         } finally { controller.stop().destroy() }
+        await { activity.resourcesRetired }
+    }
+
+    @Test fun foregroundPauseDoesNotHideIndependentStatisticsButStopRetiresIt() {
+        val controller = Robolectric.buildActivity(MainActivity::class.java).setup()
+        val activity = controller.get()
+        val overlay = activity.findViewById<ViewGroup>(android.R.id.content)
+            .findViewWithTag<org.screencopy.receiver.ui.PlaybackStatisticsSurface>("playbackStatistics")
+        try {
+            overlay.start { null }
+            controller.pause()
+            assertEquals(View.VISIBLE, overlay.visibility)
+            controller.stop()
+            assertEquals(View.GONE, overlay.visibility)
+            assertFalse(overlay.refreshing)
+        } finally { controller.destroy() }
         await { activity.resourcesRetired }
     }
 
@@ -702,6 +900,51 @@ class MainActivityTest {
         await { activity.resourcesRetired }
     }
 
+    @Test @Config(sdk = [31])
+    fun sendToReceiverUsesProductionInlineHostWithoutRestartOrInputCapture() {
+        val request = CastState.requests.reserve(Settings().request().toString(), ReceiverTarget("192.0.2.1", 50000))
+        CastState.requests.adopt(request.id)
+        val controller = Robolectric.buildActivity(MainActivity::class.java).setup()
+        val activity = controller.get()
+        val host = org.robolectric.util.ReflectionHelpers.getField<org.screencopy.receiver.ui.InlineStatisticsHost>(
+            activity, "inlineStatisticsHost")
+        try {
+            surfaceReady(activity)
+            assertEquals(RoleOwner.Role.SEND, CastState.roles.role())
+            CastState.requests.finish(request.id)
+            shadowOf(Looper.getMainLooper()).idleFor(java.time.Duration.ofMillis(500))
+            await { activity.currentListeningPort != null }
+            val inline = activity.findViewById<ViewGroup>(android.R.id.content)
+                .findViewWithTag<org.screencopy.receiver.ui.PlaybackStatisticsSurface>("playbackStatistics")
+            (inline.parent as View).layout(19, 31, 619, 431)
+            host.start(600, 400, org.screencopy.receiver.media.PlaybackDisplayMeasurements(), { true }) { null }
+            val panelWindow = checkNotNull(host.dialog?.window)
+            assertTrue(org.screencopy.receiver.ui.StatisticsWindowProtection.forWindow(panelWindow)
+                .canHostStatistics(checkNotNull(host.panel)))
+            assertFalse(org.screencopy.receiver.ui.StatisticsWindowProtection.forWindow(activity.window)
+                .canHostStatistics(inline))
+            assertTrue(host.dialog!!.isShowing)
+            assertEquals(WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE,
+                panelWindow.attributes.flags and WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE)
+            org.robolectric.util.ReflectionHelpers.callInstanceMethod<Unit>(activity, "showPlaybackDiagnostics")
+            val details = org.robolectric.shadows.ShadowAlertDialog.getLatestAlertDialog()
+            assertTrue(details.isShowing)
+            assertEquals(WindowManager.LayoutParams.TYPE_APPLICATION, details.window!!.attributes.type)
+            assertEquals(WindowManager.LayoutParams.TYPE_APPLICATION_PANEL, panelWindow.attributes.type)
+            assertNull(shadowOf(activity).lastRequestedPermission)
+            assertNull(shadowOf(activity).nextStartedActivityForResult)
+            controller.pause()
+            assertTrue(host.dialog!!.isShowing)
+            controller.stop()
+            assertNull(host.dialog)
+            assertEquals(View.GONE, inline.visibility)
+        } finally {
+            CastState.requests.finish(request.id)
+            controller.destroy()
+        }
+        await { activity.resourcesRetired }
+    }
+
     @Test fun serviceStartupFailureReleasesReservationAndKeepsErrorVisible() {
         val request = CastState.requests.reserve(Settings().request().toString(), ReceiverTarget("192.0.2.1", 50000))
         val service = Robolectric.buildService(CastService::class.java).create()
@@ -759,8 +1002,8 @@ class MainActivityTest {
         assertEquals(if (BuildConfig.DEBUG) "RedrainCast Debug" else "RedrainCast",
             context.applicationInfo.loadLabel(context.packageManager).toString())
         val info = context.packageManager.getPackageInfo(packageName, 0)
-        assertEquals(if (BuildConfig.DEBUG) "0.4.19-debug" else "0.4.19", info.versionName)
-        assertEquals(32L, info.longVersionCode)
+        assertEquals(if (BuildConfig.DEBUG) "0.5.0-debug" else "0.5.0", info.versionName)
+        assertEquals(33L, info.longVersionCode)
         val activity = context.packageManager.getActivityInfo(
             android.content.ComponentName(context, MainActivity::class.java), 0)
         assertEquals("dev.redrain.cast.MainActivity", activity.name)

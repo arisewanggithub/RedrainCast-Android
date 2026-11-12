@@ -4,6 +4,58 @@ import org.junit.Assert.*
 import org.junit.Test
 
 class PlaybackStatisticsTest {
+    @Test fun cachedAudioObservationExpiresWhileNativeWriteIsBlockedWithoutQueryingIt() {
+        val now = java.util.concurrent.atomic.AtomicLong(1_000_000_000)
+        val entered = java.util.concurrent.CountDownLatch(1)
+        val release = java.util.concurrent.CountDownLatch(1)
+        val native = Output()
+        val output = object : AudioOutput by native {
+            override fun write(samples: ShortArray, offset: Int, count: Int): Int {
+                entered.countDown()
+                check(release.await(3, java.util.concurrent.TimeUnit.SECONDS))
+                return 0
+            }
+        }
+        val clock = PlaybackClock(now::get) { now.addAndGet(it * 1_000_000) }
+            .apply { audioExpected = true; anchorVideo(1_000_000) }
+        val failures = java.util.concurrent.ConcurrentLinkedQueue<String>()
+        val player = testAudioPlayer(AudioFormat("pcm", 48000, 2, byteArrayOf()), clock,
+            { code, detail -> failures.add("$code $detail") }, { output }).apply { statisticsEnabled = true }
+        try {
+            player.offer(AccessUnit(1_000_000, ByteArray(3840)))
+            player.start()
+            assertTrue(entered.await(2, java.util.concurrent.TimeUnit.SECONDS))
+            val observedAt = now.get() / 1_000_000
+            val queries = native.queries
+            val cached = checkNotNull(player.freshAudioStatistics(observedAt))
+            assertSame(cached, player.freshAudioStatistics(observedAt + 1000))
+            assertNull(player.freshAudioStatistics(observedAt + 1001))
+            assertEquals(queries, native.queries)
+            assertTrue(failures.toString(), failures.isEmpty())
+        } finally {
+            release.countDown()
+            player.close()
+        }
+    }
+
+    @Test fun staleSnapshotRetainsHistoricalTotalsButNeverInventsLiveRatesOrNativeHealth() {
+        val sampler = PlaybackStatisticsSampler()
+        sampler.sample(1000, input(count = 1))
+        val sampled = sampler.sample(2000, input(count = 61, observedMs = 2000))
+        assertSame(sampled, sampled.forDisplay(4500))
+        val stale = sampled.forDisplay(4501)
+        assertEquals(61L, stale.input.video?.decoded)
+        assertEquals("Statistics stale (2501 ms)", stale.input.state)
+        assertEquals(2511L, stale.input.controlAgeMs)
+        assertNull(stale.input.audio)
+        assertNull(stale.input.videoQueue)
+        assertNull(stale.input.rttMs)
+        assertNull(stale.rxFps)
+        assertNull(stale.decodedFps)
+        assertNull(stale.presentedFps)
+        assertNull(stale.syncMs)
+    }
+
     @Test fun enablingStatisticsPreservesAllSourceSamplesAndDoesNotAddNativeTimingQueries() {
         fun run(enabled: Boolean): Triple<ShortArray, Long, Int> {
             val now = java.util.concurrent.atomic.AtomicLong(1_000_000_000)

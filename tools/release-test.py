@@ -348,9 +348,13 @@ class PublicationContractTests(unittest.TestCase):
         self.assertIn("name: signed-testing-candidate", self.publishing)
         guard_at = self.publishing.index("python3 -B tools/release-guard.py\n")
         sums_at = self.publishing.index("sha256sum --check SHA256SUMS")
+        notes_at = self.publishing.index('[[ -s "$notes" ]]')
         upload_at = self.publishing.index('gh release create "$RELEASE_TAG"')
         self.assertLess(guard_at, sums_at)
         self.assertLess(sums_at, upload_at)
+        self.assertIn('notes="tools/release-notes-${RELEASE_TAG}.md"', self.publishing)
+        self.assertIn('--notes-file "$notes"', self.publishing)
+        self.assertLess(sums_at, notes_at)
         self.assertIn("options=(--draft)", self.publishing)
         self.assertIn("options+=(--prerelease)", self.publishing)
         reserve_at = self.publishing.index(
@@ -358,6 +362,7 @@ class PublicationContractTests(unittest.TestCase):
         verify_at = self.publishing.index(
             'python3 -B tools/release-guard.py --release-tag "$RELEASE_TAG" --verify-tag')
         self.assertLess(sums_at, reserve_at)
+        self.assertLess(notes_at, reserve_at)
         self.assertLess(reserve_at, upload_at)
         self.assertLess(upload_at, verify_at)
         self.assertIn('--repo "$GITHUB_REPOSITORY" --verify-tag', self.publishing)

@@ -12,19 +12,27 @@ import java.net.InetAddress
 import java.net.Socket
 import java.nio.ByteBuffer
 import java.util.concurrent.ConcurrentLinkedQueue
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicReference
 
 class PlaybackStatisticsPipelineTest {
     @Test(timeout = 15_000) fun typedSnapshotsFollowRealMediaLanesGenerationHideAndStopWithoutNativeQueries() = stream(false)
     @Test(timeout = 15_000) fun negotiatedStatisticsSurviveRecoveryKeyCompletionAndNativeEpochReplacement() = stream(true)
+    @Test(timeout = 15_000) fun samplingAndPublicationContinueWhileDecoderAndPlaybackQueueLocksAreBlocked() =
+        stream(false, blocked = true)
 
-    private fun stream(recovery: Boolean) {
+    private fun stream(recovery: Boolean, blocked: Boolean = false) {
         val failures = ConcurrentLinkedQueue<String>()
         val clocks = ConcurrentLinkedQueue<PlaybackClock>()
+        val nativeEntered = CountDownLatch(1)
+        val nativeRelease = CountDownLatch(if (blocked) 1 else 0)
         ReceiverServer.forProtocolTests("Receiver", supportsPlaybackStatistics = true,
             onFailure = { failures.add(it.logMessage()) },
             videoFactory = { format, clock, failed, generation ->
                 clocks.add(clock)
-                VideoPlayer(format, clock, failed, Decoder(), generation)
+                VideoPlayer(format, clock, failed, Decoder(nativeEntered, nativeRelease), generation)
             }).use { server ->
             server.start()
             Socket(InetAddress.getLoopbackAddress(), server.listeningPort).use { peer ->
@@ -81,6 +89,11 @@ class PlaybackStatisticsPipelineTest {
                     assertNull(first.input.videoQueue?.oldestAgeMs)
                     assertNull(first.input.audio)
                     assertNull(first.presentedFps)
+                    if (blocked) {
+                        assertTrue(nativeEntered.await(2, TimeUnit.SECONDS))
+                        assertSamplingWithoutProducerLocks(server, first)
+                        nativeRelease.countDown()
+                    }
                     server.showPlaybackStatistics(false)
                     assertNull(server.playbackStatistics)
                     server.showPlaybackStatistics(true)
@@ -109,7 +122,56 @@ class PlaybackStatisticsPipelineTest {
         assertTrue("Statistics snapshot not ready", ready())
     }
 
-    private class Decoder : VideoDecoder {
+    private fun assertSamplingWithoutProducerLocks(server: ReceiverServer, first: PlaybackStatisticsSnapshot) {
+        fun field(owner: Any, name: String): Any = owner.javaClass.getDeclaredField(name).let {
+            it.isAccessible = true
+            checkNotNull(it.get(owner))
+        }
+        val active = field(server, "active") as AtomicReference<*>
+        val connection = checkNotNull(active.get())
+        val video = field(connection, "video")
+        val monitor = TrackWorker::class.java.getDeclaredField("monitor").let {
+            it.isAccessible = true
+            checkNotNull(it.get(video))
+        }
+        val locks = listOf(field(connection, "playbackLock"), monitor,
+            field(video, "pathStatistics"), field(connection, "controlStatistics"))
+        val held = CountDownLatch(1)
+        val release = CountDownLatch(1)
+        fun hold(index: Int) {
+            if (index == locks.size) {
+                held.countDown()
+                check(release.await(5, TimeUnit.SECONDS))
+            } else synchronized(locks[index]) { hold(index + 1) }
+        }
+        val blocker = Thread({ hold(0) }, "stats-test-blocked-media-locks")
+        val executor = Executors.newSingleThreadExecutor()
+        try {
+            blocker.start()
+            assertTrue(held.await(2, TimeUnit.SECONDS))
+            val sampledAt = checkNotNull(first.sampledAtMs) + 1000
+            val sampled = executor.submit<PlaybackStatisticsSnapshot?> {
+                val method = connection.javaClass.getDeclaredMethod("sampleStatistics", Long::class.javaPrimitiveType)
+                method.isAccessible = true
+                method.invoke(connection, sampledAt)
+                server.playbackStatistics
+            }.get(500, TimeUnit.MILLISECONDS)
+            assertNotNull(sampled)
+            assertEquals(sampledAt, sampled?.sampledAtMs)
+            assertEquals(0.0, sampled?.presentedFps)
+            assertTrue(checkNotNull(sampled?.input?.videoLastPacketAgeMs) >= 1000)
+            assertTrue(checkNotNull(sampled?.input?.controlAgeMs) >= 1000)
+        } finally {
+            release.countDown()
+            executor.shutdownNow()
+            assertTrue(executor.awaitTermination(2, TimeUnit.SECONDS))
+        }
+    }
+
+    private class Decoder(
+        private val nativeEntered: CountDownLatch,
+        private val nativeRelease: CountDownLatch
+    ) : VideoDecoder {
         override val description = "fake rendered-callback fixture"
         override val supportsRenderedStatistics = true
         private var callback: (Long, Long) -> Unit = { _, _ -> }
@@ -123,7 +185,13 @@ class PlaybackStatisticsPipelineTest {
             output = VideoOutput(0, ptsUs, size, 0)
         }
         override fun dequeueOutput(): VideoOutput? = output.also { output = null }
-        override fun releaseOutput(index: Int, renderAtNs: Long?) { if (renderAtNs != null) callback(pts, renderAtNs) }
+        override fun releaseOutput(index: Int, renderAtNs: Long?) {
+            if (renderAtNs != null) {
+                callback(pts, renderAtNs)
+                nativeEntered.countDown()
+                check(nativeRelease.await(5, TimeUnit.SECONDS))
+            }
+        }
         override fun close() {}
     }
 }

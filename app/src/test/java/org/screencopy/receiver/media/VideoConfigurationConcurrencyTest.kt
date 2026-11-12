@@ -15,10 +15,138 @@ import java.util.concurrent.ConcurrentLinkedQueue
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
 
 class VideoConfigurationConcurrencyTest {
+    @Test(timeout = 15_000) fun blockedAudioTimingLeavesVideoControlAndStopWriteIndependent() =
+        blockedAudioTiming(stopWhileBlocked = true)
+
+    @Test(timeout = 15_000) fun resumedAudioObservationRetriesTheDecodedProofWithoutAnotherVideoPicture() =
+        blockedAudioTiming(stopWhileBlocked = false)
+
+    private fun blockedAudioTiming(stopWhileBlocked: Boolean) {
+        val entered = CountDownLatch(1)
+        val release = CountDownLatch(1)
+        val submitted = CountDownLatch(1)
+        val rendered = CountDownLatch(1)
+        val block = AtomicBoolean()
+        val errors = ConcurrentLinkedQueue<String>()
+        val decoders = ConcurrentLinkedQueue<Decoder>()
+        val output = Output().apply {
+            onSourceWrite = { submitted.countDown() }
+            onTiming = {
+                if (block.get()) {
+                    entered.countDown()
+                    check(release.await(5, TimeUnit.SECONDS))
+                }
+            }
+        }
+        val now = AtomicLong(1_000_000_000)
+        val stopper = Executors.newSingleThreadExecutor()
+        ReceiverServer.forProtocolTests("Receiver", onFailure = { errors.add(it.logMessage()) },
+            clockFactory = { PlaybackClock(now::get) { now.addAndGet(it * 1_000_000) } },
+            videoFactory = { format, clock, failed, generation ->
+                VideoPlayer(format, clock, failed, Decoder().apply {
+                    if (generation == 2L) onRender = { rendered.countDown() }
+                    decoders.add(this)
+                }, generation)
+            },
+            audioFactory = { format, clock, failed -> testAudioPlayer(format, clock, failed, { output }) }
+        ).use { server ->
+            try {
+                session(server, audio = true, recovery = true) { peer, media ->
+                    configure(peer, media, 1)
+                    configure(peer, media, 2)
+                    Wire.write(media.video.outputStream, frame(1_000_000))
+                    assertEquals(StreamRecoveryProtocol.KEY, expect(peer, Type.STATUS).json().getString("state"))
+                    assertEquals(StreamRecoveryProtocol.COMPLETE, expect(peer, Type.STATUS).json().getString("state"))
+                    sendAudio(media, 1_000_000)
+                    assertTrue(submitted.await(2, TimeUnit.SECONDS))
+                    block.set(true)
+                    assertTrue(entered.await(2, TimeUnit.SECONDS))
+                    Wire.write(media.video.outputStream, config(1, 2))
+                    assertEquals(2L, expect(peer, Type.STREAM_READY).generation)
+                    Wire.write(media.video.outputStream,
+                        Message(Type.VIDEO_FRAME, 41, 1, 2, 1_020_000, 1, byteArrayOf(0, 0, 0, 1, 0x26, 1)))
+                    assertTrue("Real video decoded/render callbacks must not poll blocked native audio",
+                        rendered.await(2, TimeUnit.SECONDS))
+                    // A queued stale KEY/COMPLETE instead of PONG would fail this assertion.
+                    ping(peer)
+                    if (!stopWhileBlocked) {
+                        block.set(false)
+                        release.countDown()
+                        val key = expect(peer, Type.STATUS)
+                        assertEquals(StreamRecoveryProtocol.KEY, key.json().getString("state"))
+                        assertEquals(2L, key.json().getLong("generation"))
+                        assertEquals(StreamRecoveryProtocol.COMPLETE, expect(peer, Type.STATUS).json().getString("state"))
+                    }
+                    val stopping = stopper.submit { server.disconnect("blocked audio timing") }
+                    expect(peer, Type.STOP)
+                    if (stopWhileBlocked)
+                        assertFalse("STOP write is not proof of completed native worker cleanup", output.closed)
+                    block.set(false)
+                    release.countDown()
+                    stopping.get(3, TimeUnit.SECONDS)
+                    Wire.write(peer.outputStream,
+                        Message.json(Type.SESSION_END, JSONObject().put("reason", "acknowledged"), 41))
+                }
+            } finally {
+                block.set(false)
+                release.countDown()
+                stopper.shutdownNow()
+                assertTrue(stopper.awaitTermination(3, TimeUnit.SECONDS))
+            }
+        }
+        assertTrue(errors.toString(), errors.isEmpty())
+        assertTrue(output.closed)
+        assertTrue(decoders.all { it.closes.get() == 1 })
+    }
+
+    @Test(timeout = 15_000) fun blockedRecoveryDiagnosticDoesNotHoldPlaybackTransactions() {
+        val diagnostic = CountDownLatch(1)
+        val release = CountDownLatch(1)
+        val audioSubmitted = CountDownLatch(1)
+        val errors = ConcurrentLinkedQueue<String>()
+        val now = AtomicLong(1_000_000_000)
+        ReceiverServer.forProtocolTests("Receiver", onFailure = { errors.add(it.logMessage()) },
+            clockFactory = { PlaybackClock(now::get) { now.addAndGet(it * 1_000_000) } },
+            onDiscoveryDiagnostic = {
+                if (it.startsWith("event=STREAM_RECOVERY_KEY ")) {
+                    diagnostic.countDown()
+                    check(release.await(5, TimeUnit.SECONDS))
+                }
+            },
+            videoFactory = { format, clock, failed, generation ->
+                VideoPlayer(format, clock, failed, Decoder(), generation)
+            },
+            audioFactory = { format, clock, failed ->
+                testAudioPlayer(format, clock, failed, { Output().apply {
+                    onSourceWrite = { audioSubmitted.countDown() }
+                } })
+            }
+        ).use { server ->
+            try {
+                session(server, audio = true, recovery = true) { peer, media ->
+                    configure(peer, media, 1)
+                    configure(peer, media, 2)
+                    Wire.write(media.video.outputStream, frame(1_000_000))
+                    assertTrue(diagnostic.await(2, TimeUnit.SECONDS))
+                    sendAudio(media, 1_000_000)
+                    assertTrue("A diagnostic callback cannot gate the other media lane",
+                        audioSubmitted.await(2, TimeUnit.SECONDS))
+                    ping(peer)
+                    release.countDown()
+                    expect(peer, Type.STATUS)
+                    expect(peer, Type.STATUS)
+                    stop(peer)
+                }
+            } finally { release.countDown() }
+        }
+        assertTrue(errors.toString(), errors.isEmpty())
+    }
+
     @Test(timeout = 20_000) fun closureBetweenCurrentCheckAndConstructionAdmissionRetiresInitialLegacyAndRecovery() {
         for (mode in 0..2) {
             val slot = ResourceSlot<VideoPlayer>()
@@ -51,8 +179,8 @@ class VideoConfigurationConcurrencyTest {
         }
     }
 
-    @Test(timeout = 15_000) fun alreadyClosingSurfaceRetiresInitialAndLegacyVideoAndAudioConfigurationWithoutError() {
-        for (legacy in listOf(false, true)) for (track in listOf(1, 2)) {
+    @Test(timeout = 15_000) fun alreadyClosingSurfaceRetiresInitialAndLegacyVideoConfigurationWithoutError() {
+        for (legacy in listOf(false, true)) {
             val slot = ResourceSlot<VideoPlayer>()
             val retired = CountDownLatch(1)
             val errors = ConcurrentLinkedQueue<String>()
@@ -86,8 +214,8 @@ class VideoConfigurationConcurrencyTest {
                         configure(peer, media, 2)
                     }
                     slot.close()
-                    Wire.write(media.output(track), config(track, if (legacy) 2 else 1))
-                    assertTrue("Closed Surface configuration must retire: legacy=$legacy track=$track",
+                    Wire.write(media.video.outputStream, config(1, if (legacy) 2 else 1))
+                    assertTrue("Closed Surface configuration must retire: legacy=$legacy",
                         retired.await(2, TimeUnit.SECONDS))
                     ping(peer)
                     assertEquals(if (legacy) 2 else 0, creations.get())
@@ -99,6 +227,87 @@ class VideoConfigurationConcurrencyTest {
             assertEquals(if (legacy) 1 else 0, decoder.closes.get())
             assertEquals(legacy, output.closed)
         }
+    }
+
+    @Test(timeout = 15_000) fun closedVideoSurfaceDoesNotGateInitialAudioReady() {
+        val slot = ResourceSlot<VideoPlayer>()
+        val errors = ConcurrentLinkedQueue<String>()
+        val creations = AtomicInteger()
+        val ready = AtomicInteger()
+        val output = Output()
+        ReceiverServer.forProtocolTests("Receiver", videoOutput = slot,
+            onFailure = { errors.add(it.logMessage()) },
+            controlWrite = { socket, message ->
+                if (message.type == Type.STREAM_READY) ready.incrementAndGet()
+                Wire.write(socket.outputStream, message)
+            },
+            audioFactory = { format, clock, failed ->
+                creations.incrementAndGet()
+                testAudioPlayer(format, clock, failed, { output })
+            }).use { server ->
+            session(server, audio = true) { peer, media ->
+                slot.close()
+                Wire.write(media.audio.outputStream, config(2))
+                assertEquals(2, expect(peer, Type.STREAM_READY).track)
+                assertEquals(1, creations.get())
+                assertEquals(1, ready.get())
+                assertFalse(output.closed)
+                stop(peer)
+            }
+        }
+        assertTrue(errors.toString(), errors.isEmpty())
+        assertTrue(output.closed)
+    }
+
+    @Test(timeout = 15_000) fun closedVideoSurfaceDoesNotGateAudioRecovery() {
+        val slot = ResourceSlot<VideoPlayer>()
+        val errors = ConcurrentLinkedQueue<String>()
+        val audioCreations = AtomicInteger()
+        val decoder = Decoder()
+        val submitted = CountDownLatch(1)
+        val outputs = ConcurrentLinkedQueue<Output>()
+        val now = AtomicLong(1_000_000_000)
+        ReceiverServer.forProtocolTests("Receiver", videoOutput = slot,
+            onFailure = { errors.add(it.logMessage()) },
+            clockFactory = { PlaybackClock(now::get) { now.addAndGet(it * 1_000_000) } },
+            videoFactory = { format, clock, failed, generation ->
+                VideoPlayer(format, clock, failed, decoder, generation)
+            },
+            audioFactory = { format, clock, failed ->
+                audioCreations.incrementAndGet()
+                testAudioPlayer(format, clock, failed, {
+                    Output().apply { onSourceWrite = { submitted.countDown() } }.also(outputs::add)
+                })
+            }).use { server ->
+            session(server, audio = true, recovery = true) { peer, media ->
+                configure(peer, media, 1)
+                configure(peer, media, 2)
+                slot.close()
+                val recovery = JSONObject().put("codec", "raw").put("sampleRate", 48000)
+                    .put("channels", 2).put("sampleFormat", "s16le").put("csd", JSONArray())
+                    .put("recoveryPtsUs", "1000000")
+                Wire.write(media.audio.outputStream, Message.json(Type.STREAM_CONFIG, recovery, 41, 2, 2))
+                val ready = expect(peer, Type.STREAM_READY)
+                assertEquals(2, ready.track)
+                assertEquals(2L, ready.generation)
+                assertEquals(2, audioCreations.get())
+                Wire.write(media.audio.outputStream, Message(Type.AUDIO_PACKET, 41, 2, 2,
+                    1_000_000, payload = ByteArray(3840) { 1 }))
+                assertTrue("Recovered audio must reach output without a live Surface or first video packet",
+                    submitted.await(2, TimeUnit.SECONDS))
+                val complete = expect(peer, Type.STATUS).json()
+                assertEquals(StreamRecoveryProtocol.COMPLETE, complete.getString("state"))
+                assertEquals(2, complete.getInt("track"))
+                assertEquals(2, complete.getInt("generation"))
+                assertTrue(StreamRecoveryProtocol.timestamp(complete, "audioPtsUs") >= 1_000_000)
+                assertTrue(outputs.first().closed)
+                assertTrue(outputs.last().sourceFrames.get() > 0)
+                assertFalse(outputs.last().closed)
+                stop(peer)
+            }
+        }
+        assertTrue(errors.toString(), errors.isEmpty())
+        assertEquals(1, decoder.closes.get())
     }
 
     @Test(timeout = 10_000) fun openSurfaceCodecSetupFailureRemainsFatal() {
@@ -211,6 +420,46 @@ class VideoConfigurationConcurrencyTest {
         assertEquals(1, decoder.closes.get())
     }
 
+    @Test(timeout = 15_000) fun blockedVideoPresentationStartupDoesNotBlockAudioConfiguration() {
+        val starting = CountDownLatch(1)
+        val finishPresentation = CountDownLatch(1)
+        val readyTracks = ConcurrentLinkedQueue<Int>()
+        val errors = ConcurrentLinkedQueue<String>()
+        val decoder = Decoder()
+        ReceiverServer.forProtocolTests("Receiver", onFailure = { errors.add(it.logMessage()) },
+            onPresentationStart = {
+                starting.countDown()
+                check(finishPresentation.await(5, TimeUnit.SECONDS))
+                AutoCloseable {}
+            },
+            controlWrite = { socket, message ->
+                if (message.type == Type.STREAM_READY) readyTracks.add(message.track)
+                Wire.write(socket.outputStream, message)
+            },
+            videoFactory = { format, clock, failed, generation ->
+                VideoPlayer(format, clock, failed, decoder, generation)
+            },
+            audioFactory = { format, clock, failed -> testAudioPlayer(format, clock, failed, { Output() }) }
+        ).use { server ->
+            try {
+                session(server, audio = true) { peer, media ->
+                    Wire.write(media.video.outputStream, config(1))
+                    assertTrue(starting.await(2, TimeUnit.SECONDS))
+                    Wire.write(media.audio.outputStream, config(2))
+                    assertEquals(2, expect(peer, Type.STREAM_READY).track)
+                    assertEquals(listOf(2), readyTracks.toList())
+                    ping(peer)
+                    finishPresentation.countDown()
+                    assertEquals(1, expect(peer, Type.STREAM_READY).track)
+                    assertEquals(listOf(2, 1), readyTracks.toList())
+                    stop(peer)
+                }
+            } finally { finishPresentation.countDown() }
+        }
+        assertTrue(errors.toString(), errors.isEmpty())
+        assertEquals(1, decoder.closes.get())
+    }
+
     @Test(timeout = 15_000) fun stopDuringConstructionRejectsTheUninstalledDecoderAndReady() {
         val constructing = CountDownLatch(1)
         val finishConstruction = CountDownLatch(1)
@@ -304,10 +553,11 @@ class VideoConfigurationConcurrencyTest {
         ).use { server ->
             try {
                 session(server, audio = true) { peer, media ->
-                    configure(peer, media, 1)
-                    Wire.write(media.audio.outputStream, config(2))
+                    Wire.write(media.video.outputStream, config(1))
                     assertTrue(starting.await(2, TimeUnit.SECONDS))
-                    Wire.write(media.video.outputStream, frame(1_000_000))
+                    Wire.write(media.audio.outputStream, config(2))
+                    assertEquals(2, expect(peer, Type.STREAM_READY).track)
+                    sendAudio(media, 1_000_000)
                     assertEquals("PROTOCOL", expect(peer, Type.ERROR).json().getString("code"))
                     finishPresentation.countDown()
                     assertTrue(presentationClosed.await(2, TimeUnit.SECONDS))
@@ -386,6 +636,7 @@ class VideoConfigurationConcurrencyTest {
         private val submitted = AtomicLong()
         val sourceFrames = AtomicLong()
         @Volatile var onSourceWrite: (Short) -> Unit = {}
+        @Volatile var onTiming: () -> Unit = {}
         @Volatile var closed = false
         override val underrunCount = 0
         override fun play() {}
@@ -399,7 +650,10 @@ class VideoConfigurationConcurrencyTest {
             }
             return count
         }
-        override fun timing() = AudioOutputTiming(48000, 6240, submitted.get(), 0, 0, 0, AudioClockSource.TIMESTAMP)
+        override fun timing(): AudioOutputTiming {
+            onTiming()
+            return AudioOutputTiming(48000, 6240, submitted.get(), 0, 0, 0, AudioClockSource.TIMESTAMP)
+        }
         override fun close() { closed = true }
     }
 }

@@ -17,6 +17,7 @@ import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicLong
 import dev.screencopy.sender.MediaBudget
 import dev.screencopy.sender.ReceiverLink
 import dev.screencopy.sender.ReceiverTarget
@@ -24,6 +25,195 @@ import dev.screencopy.sender.StreamRecoverySender
 import dev.screencopy.sender.Wire as SenderWire
 
 class StreamRecoveryPipelineTest {
+    @Test(timeout = 10_000) fun realReceiverAcceptsFreshRawSuffixAfterNineHundredEightyMillisecondReadyDelay() {
+        val now = AtomicLong(1_000_000_000)
+        val constructing = CountDownLatch(1)
+        val release = CountDownLatch(1)
+        val audioCreations = AtomicInteger()
+        val videoCreations = AtomicInteger()
+        val failures = ConcurrentLinkedQueue<String>()
+        ReceiverServer.forProtocolTests("Receiver", onFailure = { failures.add(it.logMessage()) },
+            clockFactory = { PlaybackClock(now::get) { now.addAndGet(it * 1_000_000) } },
+            videoFactory = { format, clock, failed, generation ->
+                videoCreations.incrementAndGet()
+                VideoPlayer(format, clock, failed, Decoder(false), generation)
+            },
+            audioFactory = { format, clock, failed ->
+                if (audioCreations.incrementAndGet() == 2) {
+                    constructing.countDown()
+                    check(release.await(3, TimeUnit.SECONDS))
+                }
+                testAudioPlayer(format, clock, failed, { Output() })
+            }).use { server ->
+            try {
+                server.start()
+                Socket(InetAddress.getLoopbackAddress(), server.listeningPort).use { peer ->
+                    peer.soTimeout = 3000
+                    sendControl(peer, Type.HELLO, JSONObject().put("role", "sender").put("name", "Phone")
+                        .put("versions", JSONArray().put(3)).put("streamRecovery", true).put("streamRecoveryVersion", 2), 0)
+                    expect(peer, Type.HELLO)
+                    sendControl(peer, Type.SESSION_REQUEST, request().apply { getJSONObject("audio").put("codec", "raw") })
+                    MediaSockets.attach(server, expect(peer, Type.SESSION_ACCEPT)).use { media ->
+                        val budget = MediaBudget(true, now::get, 1)
+                        val sender = StreamRecoverySender(41, budget, now::get)
+                        fun write(track: Int): SenderWire.Message {
+                            val packet = checkNotNull(budget.pollLane(track, 1))
+                            budget.beginWrite(packet)
+                            try {
+                                SenderWire.write((if (track == 1) media.video else media.audio).outputStream, packet)
+                                sender.written(packet)
+                            } finally { budget.endWrite(packet) }
+                            return packet
+                        }
+                        sender.config(1, 1, videoConfig(1).json())
+                        sender.config(2, 1, JSONObject().put("codec", "raw").put("sampleRate", 48000)
+                            .put("channels", 2).put("sampleFormat", "s16le").put("csd", JSONArray()))
+                        for (track in 1..2) {
+                            write(track)
+                            val ready = expect(peer, Type.STREAM_READY)
+                            budget.ready(ready.track, ready.generation.toInt())
+                        }
+                        sender.ready()
+                        sender.packet(SenderWire.Message(SenderWire.VIDEO_FRAME, 1, 41, 1, 1, 1_000_000,
+                            frame(1_000_000, key = true).payload))
+                        write(1)
+                        assertEquals(StreamRecoveryProtocol.KEY, expect(peer, Type.STATUS).json().getString("state"))
+                        sender.keyProved(1, 1_000_000)
+                        assertEquals(StreamRecoveryProtocol.COMPLETE, expect(peer, Type.STATUS).json().getString("state"))
+                        sender.completed(1, 1, 1_000_000)
+                        sender.request(2, 1)
+                        val config = write(2)
+                        assertEquals("1000000", config.json().getString("recoveryPtsUs"))
+                        assertTrue(constructing.await(2, TimeUnit.SECONDS))
+                        repeat(50) { index ->
+                            now.set(1_000_000_000 + index * 20_000_000L)
+                            sender.packet(SenderWire.Message(SenderWire.AUDIO_PACKET, 0, 41, 2, 1,
+                                1_000_000 + index * 20_000L, ByteArray(3840)))
+                        }
+                        release.countDown()
+                        val ready = expect(peer, Type.STREAM_READY)
+                        assertEquals(2L, ready.generation)
+                        budget.ready(2, 2)
+                        sender.ready()
+                        val submitted = write(2)
+                        assertEquals(SenderWire.AUDIO_PACKET, submitted.type)
+                        assertEquals(1_980_000L, submitted.pts)
+                        val complete = expect(peer, Type.STATUS).json()
+                        assertEquals(StreamRecoveryProtocol.COMPLETE, complete.getString("state"))
+                        assertEquals(2, complete.getInt("track"))
+                        val pts = StreamRecoveryProtocol.timestamp(complete, "audioPtsUs")
+                        assertTrue(pts in submitted.pts until submitted.pts + 20_000)
+                        sender.completed(2, 2, pts)
+                        assertEquals(1, videoCreations.get())
+                        assertEquals(2, audioCreations.get())
+                        assertTrue(failures.toString(), failures.isEmpty())
+                        sender.checkDeadline()
+                        sendControl(peer, Type.STOP, JSONObject().put("reason", "raw suffix verified"))
+                        expect(peer, Type.SESSION_END)
+                    }
+                }
+            } finally { release.countDown() }
+        }
+    }
+
+    @Test(timeout = 15_000) fun cooldownDoesNotQueueTheOtherTracksResetBehindATimer() {
+        for (coolingTrack in 1..2) {
+            ReceiverServer.forProtocolTests("Receiver",
+                videoFactory = { format, clock, failed, generation ->
+                    VideoPlayer(format, clock, failed, Decoder(false), generation)
+                },
+                audioFactory = { format, clock, failed ->
+                    testAudioPlayer(format, clock, failed, { Output() }, opusFactory = {
+                        object : OpusPacketDecoder {
+                            override fun decode(packet: ByteArray) = ShortArray(1920)
+                            override fun close() {}
+                        }
+                    })
+                }).use { server ->
+                session(server) { peer, media ->
+                    val lane = if (coolingTrack == 1) media.video else media.audio
+                    val other = if (coolingTrack == 1) media.audio else media.video
+                    fun config(generation: Long) =
+                        if (coolingTrack == 1) videoConfig(generation) else audioConfig(generation, 1_080_000)
+                    Wire.write(lane.outputStream, config(2))
+                    assertEquals(coolingTrack, expect(peer, Type.STREAM_READY).track)
+                    val active = ReceiverServer::class.java.getDeclaredField("active").apply { isAccessible = true }
+                        .get(server) as java.util.concurrent.atomic.AtomicReference<*>
+                    val connection = checkNotNull(active.get())
+                    val generation = connection.javaClass.getDeclaredField(
+                        if (coolingTrack == 1) "videoGeneration" else "audioGeneration").apply { isAccessible = true }
+                    val recoveryAt = connection.javaClass.getDeclaredField(
+                        if (coolingTrack == 1) "videoRecoveryAt" else "audioRecoveryAt").apply { isAccessible = true }
+                    val originalDeadline = recoveryAt.getLong(connection)
+                    Wire.write(lane.outputStream, config(3))
+                    await { generation.getLong(connection) == 3L }
+                    Wire.write(other.outputStream, if (coolingTrack == 1) audioConfig(2, 1_080_000) else videoConfig(2))
+                    assertEquals("The other reset must finish before the cooling track", 3 - coolingTrack,
+                        expect(peer, Type.STREAM_READY).track)
+                    val ready = expect(peer, Type.STREAM_READY)
+                    assertEquals(coolingTrack, ready.track)
+                    assertEquals(3L, ready.generation)
+                    assertEquals(originalDeadline, recoveryAt.getLong(connection))
+                    sendControl(peer, Type.STOP, JSONObject().put("reason", "cooldown verified"))
+                    expect(peer, Type.SESSION_END)
+                }
+            }
+        }
+    }
+
+    @Test(timeout = 15_000) fun slowVideoRecoveryDoesNotBlockAudioRecovery() = independentRecovery(1)
+
+    @Test(timeout = 15_000) fun slowAudioRecoveryDoesNotBlockVideoRecovery() = independentRecovery(2)
+
+    private fun independentRecovery(slowTrack: Int) {
+        val entered = CountDownLatch(1)
+        val release = CountDownLatch(1)
+        val audioCreations = AtomicInteger()
+        val failures = ConcurrentLinkedQueue<String>()
+        ReceiverServer.forProtocolTests("Receiver", onFailure = { failures.add(it.logMessage()) },
+            videoFactory = { format, clock, failed, generation ->
+                if (slowTrack == 1 && generation == 2L) {
+                    entered.countDown()
+                    check(release.await(4, TimeUnit.SECONDS))
+                }
+                VideoPlayer(format, clock, failed, Decoder(false), generation)
+            },
+            audioFactory = { format, clock, failed ->
+                if (slowTrack == 2 && audioCreations.incrementAndGet() == 2) {
+                    entered.countDown()
+                    check(release.await(4, TimeUnit.SECONDS))
+                }
+                testAudioPlayer(format, clock, failed, { Output() }, opusFactory = {
+                    object : OpusPacketDecoder {
+                        override fun decode(packet: ByteArray) = ShortArray(1920)
+                        override fun close() {}
+                    }
+                })
+            }).use { server ->
+            try {
+                session(server) { peer, media ->
+                    val slowLane = if (slowTrack == 1) media.video else media.audio
+                    val otherLane = if (slowTrack == 1) media.audio else media.video
+                    Wire.write(slowLane.outputStream, if (slowTrack == 1) videoConfig(2) else audioConfig(2, 1_080_000))
+                    assertTrue(entered.await(2, TimeUnit.SECONDS))
+                    Wire.write(otherLane.outputStream, if (slowTrack == 1) audioConfig(2, 1_080_000) else videoConfig(2))
+                    peer.soTimeout = 1500
+                    val ready = expect(peer, Type.STREAM_READY)
+                    assertEquals(3 - slowTrack, ready.track)
+                    assertEquals(2L, ready.generation)
+                    assertEquals(1L, release.count)
+                    sendControl(peer, Type.PING, JSONObject().put("nonce", 717))
+                    assertEquals(717, expect(peer, Type.PONG).json().getInt("nonce"))
+                    release.countDown()
+                    assertEquals(slowTrack, expect(peer, Type.STREAM_READY).track)
+                    assertTrue(failures.toString(), failures.isEmpty())
+                    sendControl(peer, Type.STOP, JSONObject().put("reason", "independent recovery verified"))
+                    expect(peer, Type.SESSION_END)
+                }
+            } finally { release.countDown() }
+        }
+    }
+
     @Test(timeout = 15_000) fun recoveryAfterLongPlaybackUsesItsTrackDeadlineNotTheSetupTimestamp() {
         for (track in 1..2) recoveryDeadline(track, expireControl = false)
     }

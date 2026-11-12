@@ -35,6 +35,49 @@ import org.robolectric.shadows.ShadowAlertDialog
 @GraphicsMode(GraphicsMode.Mode.LEGACY)
 @ConscryptMode(ConscryptMode.Mode.OFF)
 class SharingSettingsTest {
+    @Test fun remoteConsentCannotBeGrantedByAnUnsavedOrStatisticsDisabledDraft() {
+        val controller = activity()
+        val dialog = show(controller.get(), Settings(), {}, {})
+        latestDialog()
+        val statistics = field<CheckBox>(dialog, "showPlaybackStatistics")
+        val remote = field<CheckBox>(dialog, "allowRemoteDiagnostics")
+        val warning = field<android.widget.TextView>(dialog, "remoteDiagnosticsWarning")
+        assertTrue(warning.text.contains("Anyone on this LAN"))
+        assertTrue(warning.text.contains("unencrypted and unauthenticated"))
+        assertTrue(warning.text.contains("without a receiver settings change"))
+        assertTrue(remote.text.contains("unpaired LAN"))
+        assertFalse(remote.isEnabled)
+        statistics.isChecked = true
+        remote.isChecked = true
+        click(dialog, AlertDialog.BUTTON_NEGATIVE)
+        assertFalse(dev.redrain.cast.diagnostics.DiagnosticAccess.enabled)
+        assertFalse(dev.redrain.cast.diagnostics.RemoteDiagnostics.recorder.collecting)
+        val second = show(controller.get(), Settings().apply { showPlaybackStatistics = true }, {}, {})
+        latestDialog()
+        val newRemote = field<CheckBox>(second, "allowRemoteDiagnostics")
+        assertFalse(newRemote.isChecked)
+        newRemote.isChecked = true
+        field<CheckBox>(second, "showPlaybackStatistics").isChecked = false
+        assertFalse(newRemote.isChecked)
+        assertFalse(newRemote.isEnabled)
+        second.dismiss()
+        controller.pause().stop().destroy()
+    }
+
+    @Test fun remoteEndpointDialogIsScreenshotProtectedAndDoesNotSaveSettings() {
+        val controller = activity()
+        var saved = false
+        val dialog = show(controller.get(), Settings(), { saved = true }, {})
+        latestDialog()
+        field<Button>(dialog, "remoteDiagnosticsStatus").performClick()
+        val pairing = ShadowAlertDialog.getLatestAlertDialog()
+        assertTrue(checkNotNull(pairing.window).attributes.flags and android.view.WindowManager.LayoutParams.FLAG_SECURE != 0)
+        assertFalse(saved)
+        assertFalse(dev.redrain.cast.diagnostics.DiagnosticAccess.enabled)
+        pairing.dismiss()
+        dialog.dismiss()
+        controller.pause().stop().destroy()
+    }
     @Test fun advancedFullDiagnosticsActionDoesNotSaveOrMutateDraftSettings() {
         val controller = activity()
         val current = Settings()
@@ -65,14 +108,17 @@ class SharingSettingsTest {
         assertFalse(checkbox.isChecked)
         assertFalse("Diagnostic option must start inside collapsed Advanced", checkbox.isShown)
         val advanced = checkbox.parent as LinearLayout
-        assertEquals(advanced.childCount - 2, advanced.indexOfChild(checkbox))
-        assertEquals("playbackStatisticsHint", advanced.getChildAt(advanced.childCount - 1).tag)
+        assertEquals("playbackStatisticsHint", advanced.getChildAt(advanced.indexOfChild(checkbox) + 1).tag)
+        val remote = field<CheckBox>(dialog, "allowRemoteDiagnostics")
+        assertFalse(remote.isChecked)
+        assertFalse(remote.isEnabled)
         field<Button>(dialog, "advancedToggle").performClick()
         shadowOf(Looper.getMainLooper()).idle()
         assertTrue(checkbox.isShown)
         assertEquals(controller.get().getString(R.string.rc_playback_statistics_hint),
             field<TextView>(dialog, "playbackStatisticsHint").text.toString())
         checkbox.isChecked = true
+        assertTrue(remote.isEnabled)
         click(dialog, AlertDialog.BUTTON_POSITIVE)
         assertNotNull(field<TextView>(dialog, "settingsError").text.toString(), saved)
         assertFalse(current.showPlaybackStatistics)

@@ -9,6 +9,7 @@ import android.media.AudioAttributes
 import android.media.AudioFormat
 import android.media.AudioPlaybackCaptureConfiguration
 import android.media.AudioRecord
+import dev.redrain.cast.diagnostics.*
 import android.media.AudioTimestamp
 import android.media.MediaCodec
 import android.media.MediaCodecInfo
@@ -183,9 +184,35 @@ internal class ProjectionCapture(
             var frames = 0L
             var origin: Long? = null
             var rawPackets: RawPcmPackets? = null
+            var diagnosticTimestampAt = 0L
+            var diagnosticCaptureId: String? = null
             val bytes = ByteArray(3840)
             while (!closed.get()) {
+                val operation = RemoteDiagnostics.recorder.operation("sender", session, DiagnosticKind.AUDIO_CAPTURE)
+                RemoteDiagnostics.recorder.observe("sender", session, DiagnosticKind.AUDIO_CAPTURE,
+                    DiagnosticStage.BEGIN, 2, output.generation, operation = operation, count = frames, point = DiagnosticPoint.READ)
                 val count = record.read(bytes, 0, bytes.size, AudioRecord.READ_NON_BLOCKING)
+                RemoteDiagnostics.recorder.observe("sender", session, DiagnosticKind.AUDIO_CAPTURE,
+                    if (count < 0) DiagnosticStage.FAILED else DiagnosticStage.COMPLETE,
+                    2, output.generation, operation = operation, pts = origin?.let { it + frames * 1_000_000L / 48000 } ?: -1,
+                    count = if (count >= 0) count.toLong() / 4 else -1, bytes = count.toLong(), point = DiagnosticPoint.READ)
+                if (RemoteDiagnostics.recorder.enabled("sender", session, DiagnosticKind.AUDIO_CAPTURE)) {
+                    if (diagnosticCaptureId != RemoteDiagnostics.recorder.captureIdentity) {
+                        diagnosticCaptureId = RemoteDiagnostics.recorder.captureIdentity
+                        diagnosticTimestampAt = 0
+                    }
+                    val diagnosticNow = System.nanoTime()
+                    if (diagnosticNow >= diagnosticTimestampAt) {
+                        diagnosticTimestampAt = diagnosticNow + RemoteDiagnostics.recorder.samplePeriodNs
+                        val time = AudioTimestamp()
+                        val available = try {
+                            record.getTimestamp(time, AudioTimestamp.TIMEBASE_MONOTONIC) == AudioRecord.SUCCESS
+                        } catch (_: IllegalStateException) { false }
+                        RemoteDiagnostics.recorder.observe("sender", session, DiagnosticKind.AUDIO_CAPTURE,
+                            DiagnosticStage.SAMPLE, 2, output.generation,
+                            metadata = DiagnosticCaptureTimestamp(available, time.framePosition, time.nanoTime))
+                    }
+                }
                 if (count < 0) throw IOException("AUDIO_FAILED: AudioRecord read failed ($count)")
                 if (count == 0) {
                     if (codec != null) output.drain(codec, 0)
@@ -194,8 +221,13 @@ internal class ProjectionCapture(
                 if (count % 4 != 0) throw IOException("AUDIO_FAILED: unaligned stereo PCM")
                 if (origin == null) {
                     val time = AudioTimestamp()
-                    origin = if (record.getTimestamp(time, AudioTimestamp.TIMEBASE_MONOTONIC) == AudioRecord.SUCCESS)
+                    val available = record.getTimestamp(time, AudioTimestamp.TIMEBASE_MONOTONIC) == AudioRecord.SUCCESS
+                    origin = if (available)
                         time.nanoTime / 1000 - time.framePosition * 1_000_000L / 48000 else start
+                    if (RemoteDiagnostics.recorder.enabled("sender", session, DiagnosticKind.AUDIO_CAPTURE))
+                        RemoteDiagnostics.recorder.observe("sender", session, DiagnosticKind.AUDIO_CAPTURE,
+                            DiagnosticStage.CONFIG, 2, pts = checkNotNull(origin),
+                            metadata = DiagnosticCaptureTimestamp(available, time.framePosition, time.nanoTime))
                 }
                 if (codec == null) {
                     if (rawPackets == null) rawPackets = RawPcmPackets(checkNotNull(origin)) { data, pts -> output.packet(data, pts, false) }
@@ -289,7 +321,8 @@ internal class EncodedOutput(
     private val rotation: (Long) -> Int = { 0 }
 ) {
     private var previous: ByteArray? = null
-    private var generation = 0
+    var generation = 0
+        private set
     fun restart() { previous = null }
     fun drain(encoder: MediaCodec, timeout: Long) {
         val info = MediaCodec.BufferInfo()
@@ -336,6 +369,8 @@ internal class EncodedOutput(
         val degrees = if (track == 1) rotation(pts) else 0
         if (degrees !in listOf(0, 90, 180, 270)) throw IOException("CAPTURE_FAILED: invalid video rotation")
         val flags = (if (track == 1 && key) 1 else 0) or (degrees / 90 shl 1)
+        if (track == 1) RemoteDiagnostics.recorder.video("sender", session, generation,
+            DiagnosticVideoStage.ENCODED, pts, bytes.size.toLong(), keyFrame = key)
         sink.packet(Wire.Message(if (track == 1) Wire.VIDEO_FRAME else Wire.AUDIO_PACKET,
             flags, session, track, generation, pts, bytes))
     }

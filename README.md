@@ -7,6 +7,44 @@ policy; there is no migration from the retired applications.
 
 ## Use
 
+**Remote diagnostics (default off, process-local):** enable playback statistics
+in Settings → Advanced, read the warning, select **Allow unpaired LAN diagnostics**,
+then Save. The separate TCP endpoint appears in **LAN diagnostics endpoint / status**
+and the controlled `DIAGNOSTIC_LISTENER_STARTED` local log event.
+**Anyone on the LAN can read bounded metadata and control diagnostic captures
+while enabled. Traffic is unencrypted and unauthenticated; use a trusted LAN.**
+There is no pairing, certificate, or secret; the collector requires explicit
+`--lan` and sends HELLO. Only an explicit bounded START enables instrumentation.
+When this device sends a cast, consent also requests session-scoped diagnostics
+on compatible receivers **without requiring projector settings or receiver
+statistics**. Normal cast admission is required; unsupported/unavailable access
+is reported instead of failing the cast. Use the exact receiver session shown
+in diagnostics status (also returned in receiver HELLO `scope`); delegated mode
+rejects `nextSession`. Flag-off/cast end freezes collection; retrieval remains
+available for at most 120 seconds. New owners revoke the previous scope/history.
+The PC collector's `--discover` finds consenting receiver endpoints from existing
+UDP discovery advertisements without ADB. Discovery never connects automatically.
+Settings are unavailable during an active cast. To find the sender after its
+startup log is gone, use `--discover-sender PHONE_PRIVATE_IPV4`: one read-only
+unicast query to UDP 27184 returns the live consent-gated TCP endpoint without
+restarting/toggling consent or scanning ports. This requires the updated build;
+it cannot recover an unknown endpoint in an already-running older process.
+For an active cast, `--lan --sender PHONE_HOST:PHONE_PORT --follow-receiver`
+instead reads the owning receiver endpoint/session from sender process memory
+over diagnostic TCP and captures both devices, without receiver UDP discovery,
+a manual projector endpoint or opening settings during the cast.
+Disabling either setting closes local access and clears local capture history;
+delegated receiver collection freezes with bounded retrieval. Sender
+backgrounding does not revoke local consent.
+See the [protocol and supported schemas](protocol/REMOTE_DIAGNOSTICS.md) and
+[paired PC collector](tools/REMOTE_DIAGNOSTICS.md). Select supported role flags
+explicitly: `video.progress` and kernel TCP metrics are not implemented.
+No media contents or unrestricted logs are collected. A 180-second paired LAN
+capture with the latest debug build completed without disconnect, recovery or a
+sustained freeze. This single run is not broad LAN/lifetime acceptance or a
+physical display/overhead measurement; do not treat a diagnostic capture as a
+fix for audio failure.
+
 **Playback statistics (default off):** Settings on the sending Android device
 has **Show playback statistics on receiver (next cast)** at the bottom of
 **Advanced**, with a diagnostic-use hint. Save it before starting
@@ -15,7 +53,114 @@ feature; an older receiver continues casting without the overlay and the sender
 retains a nonfatal unavailable notice. Old senders never activate it.
 The display-only translucent overlay stays above receiver video/fullscreen,
 uses 16sp text on larger windows and dense 10sp diagnostic text on phones,
-refreshing cached typed counters once per second. Phone mode retains the full
+refreshing cached typed counters once per second.
+The receiver samples on a dedicated statistics executor, reading published
+immutable queue/control/decoder observations rather than playback or native-output
+locks. The overlay and full diagnostic grid draw into their own secure translucent
+surfaces on dedicated rendering loopers, independently of video callbacks and the
+player's main UI looper. A stalled decoder, audio output, video surface, or foreground
+activity pause does not stop their refresh. Missing observations show N/A; audio
+observations older than one second are unavailable, and a snapshot older than
+2.5 seconds is explicitly stale with live rates suppressed. Stopping/backgrounding
+the activity or ending/disabling statistics retires rendering and sampling. Android
+still controls surface lifetime, scrolling/dialog controls and window changes;
+no panel can render while the OS suspends the process or removes its surface.
+Each renderer owns a new SurfaceControl child and its own producer, using public
+Android APIs rather than a parcel alias of the holder's producer. The secure
+SurfaceView is only a placement/clipping anchor: rendering never accesses its
+holder Surface. On stop, resize or destruction, the UI queues an atomic child
+hide/detach transaction before the callback returns, without taking the drawing
+Surface's lock or waiting for compositor presentation. The worker
+releases its producer and control after its active draw returns. A late submission
+can only reach the detached child, not a recreated anchor or a new renderer.
+An indefinitely hung native call still retains its retired worker and resources;
+there is no claim of forcibly cancelling it. Setup failures release unused handles.
+Detached table Views belong exclusively to the rendering looper; attached layout
+remains on the main UI thread.
+Independent secure rendering requires Android 12/API 31 or later and an actual
+`FLAG_SECURE` host window, where secure ancestor protection applies to child layers.
+`SurfaceView.setSecure` alone does not secure children of its public container.
+The panel binds the actual owning Window through a `StatisticsWindowProtection`,
+not merely an Activity obtained from its Context. Its constructor is private and
+its shared factory is app-internal. The owner must register while the Window is
+initially secure and not yet attached. The Activity registers during creation;
+the dialog registers before showing. Registering after attachment, starting with
+an insecure Window, or previously clearing its secure flag cannot grant a
+statistics capability. Re-adding `FLAG_SECURE` later is not proof that WMS has
+already secured the compositor ancestor.
+
+Before any producer allocation, the owner retains protection with a separate
+retirement token for each child, including every resize/recreated generation.
+Both receiver Activity flag-clear paths use the owner's veto; the diagnostics
+dialog never requests removal of its secure flag. On API 33+, an actual public
+transaction committed listener acknowledges the atomic hide/detach. An explicit
+owner request to clear the flag is deferred until every token is acknowledged,
+without waiting on the UI or drawing thread. A detached, hidden child's hung
+producer cannot reparent or show itself. On API 31/32 there is no public Java
+commit listener, so protection lasts until Window destruction. Missing commit
+acknowledgements or uncertain allocation failures also retain protection; there
+is no timeout that declassifies a potentially visible layer.
+
+Switching to sending while protection is retained shows a resource-backed notice
+that this app's own window remains excluded from capture until safe retirement,
+or for the entire Window lifetime where confirmation is unavailable. Sharing
+other applications remains available. After a clear request, no new producer can
+start until receiving resumes and the owner cancels the deferred clear. Late
+retirement acknowledgements cannot clear that restored receiver protection.
+Cancellation never reverses an actual declassification: the same Window cannot
+regain statistics eligibility after its secure flag was cleared.
+New Window instances have their own ownership state.
+If recreation preserves a Window, its existing protection owner and declassification
+history remain authoritative; recreating an Activity cannot requalify that Window.
+An Activity window declassified for sending cannot itself host statistics when
+switching back to receiving. A new
+PhoneWindow wrapping already attached preserved decor is likewise rejected,
+because its initial secure ancestry cannot be established. On API 31+, these
+cases use a fresh, initially secure `TYPE_APPLICATION_PANEL` Dialog instead.
+This transparent, non-modal window is neither focusable nor touchable, needs no
+overlay permission, and uses the same independent child-surface renderer. Its
+position and size follow the inline anchor in the parent window's coordinates,
+including content insets, rotation and multiwindow relayout. It remains below
+separate modal diagnostics windows. Stopping, disabling or destroying the host
+retires its producer and dismisses the panel; temporary player UI pause does not.
+Missing parent tokens and failed attachment explicitly report unavailability
+and log failures, never allocate into an untrusted Activity window.
+
+This is an explicit app-only ownership invariant: all host flag-removal requests
+must use the protection owner, including future direct WindowManager updates.
+Arbitrary raw Window mutations outside that contract are not intercepted or
+claimed safe. Hosts unable to maintain this lifetime contract must not bind an
+owner and show the explicit unavailable state. There is no Window.Callback
+wrapper, flag restoration, or claim that queuing hide/detach commits before WMS
+removes a flag. `Window.setFlags` dispatches its callback before the normal WMS
+update, but that is not cross-client compositor commit ordering. Public Java
+transaction committed listeners require API 33 and do not prevent bypassed host
+updates. They supply a real acknowledgement for retirement, not protection
+against arbitrary host mutations. The API 31/32 policy does not depend on
+asynchronous transaction ordering at all.
+A newly allocated child stays hidden until host security is revalidated.
+A dialog or future Presentation must bind its own lifetime-secure Window; a secure
+Activity does not authorize another window. On Android 11/API 30, statistics show
+the explicit unavailable state and log the compatibility reason instead of using
+an insecure child or a main-looper-dependent fallback. Casting remains available.
+API 29 is below the application's minimum SDK and cannot install it.
+Child placement, crop, transform and relative Z-order inherit from the anchor;
+the anchor is above receiver video, and resize/orientation changes create a fresh
+correctly sized producer rather than modifying one that may still be drawing.
+This follows the public SurfaceControl hierarchy contract and Android 12's
+recursive secure-ancestor handling, not a private API or a secure SurfaceView's
+otherwise unrelated buffer flag.
+Host tests exercise the production lifecycle with injected owned targets, native
+bitmap rendering, blocked teardown, resize/recreation, actual window binding,
+owner-vetoed/deferred policy removal, every-token acknowledgement, initial secure
+capability checks, callback non-interference, startup failures and late callback fencing.
+`StatisticsSurfaceOwnershipTest` in `androidTest` retains the real Binder parcel
+round-trip regression and tests owned SurfaceControl drawing across actual anchor
+destruction/replacement and API 33+ compositor retirement acknowledgement. These
+instrumentation tests are compiled and packaged,
+not executed during host-only validation; host bitmaps do not prove compositor
+placement or capture protection on a device.
+Phone mode retains the full
 metrics rather than replacing them with a six-row summary. It uses measured,
 content-sized short labels, shared units and tighter spacing; the landscape
 panel is bounded to 65% of the player width. At the Galaxy-sized test viewport

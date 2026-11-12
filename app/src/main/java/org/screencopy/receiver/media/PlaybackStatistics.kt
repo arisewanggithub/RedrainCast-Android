@@ -31,7 +31,22 @@ data class PlaybackStatisticsInput(
 data class PlaybackStatisticsSnapshot(val input: PlaybackStatisticsInput, val rxFps: Double?,
     val decodedFps: Double?, val presentedFps: Double?, val videoMbps: Double?, val audioMbps: Double?,
     val recentSkippedPercent: Double?, val recentSilenceMs: Double?, val recentDiscardedMs: Double?,
-    val syncMs: Double?, val recentSyncPeakMs: Double?, val generationSyncPeakMs: Double?)
+    val syncMs: Double?, val recentSyncPeakMs: Double?, val generationSyncPeakMs: Double?,
+    val sampledAtMs: Long? = null) {
+    fun forDisplay(nowMs: Long): PlaybackStatisticsSnapshot {
+        val sampled = sampledAtMs ?: return this
+        val age = (nowMs - sampled).coerceAtLeast(0)
+        if (age <= 2500) return this
+        return copy(input = input.copy(state = "Statistics stale (${age} ms)",
+            audio = null, videoQueue = null, audioQueue = null, rttMs = null,
+            controlAgeMs = input.controlAgeMs + age,
+            videoLastPacketAgeMs = input.videoLastPacketAgeMs?.plus(age),
+            audioLastPacketAgeMs = input.audioLastPacketAgeMs?.plus(age)),
+            rxFps = null, decodedFps = null, presentedFps = null, videoMbps = null, audioMbps = null,
+            recentSkippedPercent = null, recentSilenceMs = null, recentDiscardedMs = null,
+            syncMs = null, recentSyncPeakMs = null)
+    }
+}
 
 /** One consumer samples typed counters at 1 Hz; native output is never queried by the UI. */
 class PlaybackStatisticsSampler {
@@ -77,7 +92,7 @@ class PlaybackStatisticsSampler {
             if (input.audioCodec == null) null else rate(input.audioBytes, prior?.audioBytes)?.times(8.0 / 1_000_000),
             skipped, input.audio?.let { a -> prior?.audio?.let { (a.silenceMs - it.silenceMs).coerceAtLeast(0.0) } },
             input.audio?.let { a -> prior?.audio?.let { (a.discardedMs - it.discardedMs).coerceAtLeast(0.0) } },
-            sync, recentPeak, peak)
+            sync, recentPeak, peak, nowMs)
     }
 
     private fun comparableSkew(nowMs: Long, video: VideoStatistics?, audio: AudioStatistics?): Double? {

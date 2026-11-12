@@ -7,11 +7,13 @@ import org.junit.Test
 import org.screencopy.receiver.net.ReceiverServer
 import org.screencopy.receiver.net.MediaSockets
 import org.screencopy.receiver.protocol.*
+import java.io.IOException
 import java.net.InetAddress
 import java.net.Socket
 import java.nio.ByteBuffer
 import java.util.Base64
 import java.util.concurrent.ConcurrentLinkedQueue
+import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
@@ -259,12 +261,46 @@ class VideoAdmissionPipelineTest {
         assertTrue(now - start >= 1_000_000_000L / 60)
     }
 
+    @Test fun transportDiagnosticsPreserveCauseAndObserveTheFailureQueueAtFailureTime() {
+        val cause = IOException("original transport failure")
+        val errors = ConcurrentLinkedQueue<String>()
+        val failure = assertThrows(AssertionError::class.java) {
+            withTransportDiagnostics({ "capture_index=330 generation=2 receiver_errors=$errors" }) {
+                errors.add("DECODER_FAILED original receiver diagnostic")
+                throw cause
+            }
+        }
+        assertSame(cause, failure.cause)
+        assertTrue(failure.message.orEmpty().contains("capture_index=330 generation=2"))
+        assertTrue(failure.message.orEmpty().contains("DECODER_FAILED original receiver diagnostic"))
+    }
+
+    @Test fun transportDiagnosticsDoNotCatchAssertionsOrEvaluateContextOnSuccess() {
+        var evaluated = false
+        val context = { evaluated = true; "unused" }
+        withTransportDiagnostics(context) {}
+        assertFalse(evaluated)
+        val original = AssertionError("original playback assertion")
+        assertSame(original, assertThrows(AssertionError::class.java) {
+            withTransportDiagnostics(context) { throw original }
+        })
+        assertFalse(evaluated)
+    }
+
+    private inline fun withTransportDiagnostics(context: () -> String, action: () -> Unit) {
+        try {
+            action()
+        } catch (failure: IOException) {
+            throw AssertionError("Transport failure: ${context()}", failure)
+        }
+    }
+
     private fun stream(fps: Int, transitUs: Long) {
         val now = System::nanoTime
         val base = 8_000_000_000L
         val clock = PlaybackClock(now)
         val output = TransitOutput(now, transitUs)
-        val decoders = mutableListOf<BoundedDecoder>()
+        val decoders = CopyOnWriteArrayList<BoundedDecoder>()
         val errors = ConcurrentLinkedQueue<String>()
         val corrections = ConcurrentLinkedQueue<AudioClockCorrection>()
         val expectedPts = mutableListOf<Long>()
@@ -322,44 +358,53 @@ class VideoAdmissionPipelineTest {
                 val scenarioStart = now()
                 var previousClock = Long.MIN_VALUE
                 repeat(fps * 14) { index ->
-                    assertTrue("Real-time stream scenario exceeded its 30-second budget",
-                        now() - scenarioStart < TimeUnit.SECONDS.toNanos(30))
-                    if (index > 0) {
-                        paceCapture(start, index, fps, now) { TimeUnit.NANOSECONDS.sleep(it) }
+                    withTransportDiagnostics({
+                        "fps=$fps transit_us=$transitUs capture_index=$index generation=$generation" +
+                            " elapsed_ns=${now() - scenarioStart} capture_elapsed_ns=${if (start == 0L) null else now() - start}" +
+                            " source_frames=$sourceFrames written_frames=${output.written.get()}" +
+                            " decoder_inputs=${decoders.map { it.inputs.get() }}" +
+                            " decoder_rendered=${decoders.map { it.rendered.get() }}" +
+                            " decoder_closed=${decoders.map { it.closed }} receiver_errors=$errors"
+                    }) {
+                        assertTrue("Real-time stream scenario exceeded its 30-second budget",
+                            now() - scenarioStart < TimeUnit.SECONDS.toNanos(30))
+                        if (index > 0) {
+                            paceCapture(start, index, fps, now) { TimeUnit.NANOSECONDS.sleep(it) }
+                        }
+                        if (index == fps * 11) {
+                            assertTrue("Must already be presenting before generation change", decoders.sumOf { it.rendered.get() } > fps)
+                            val before = clock.currentUs()
+                            generation++
+                            configureVideo()
+                            assertTrue(checkNotNull(clock.currentUs()) >= checkNotNull(before))
+                        }
+                        val pts = base + index * 1_000_000L / fps
+                        // A finite codec-output pause after playback has started, not a slow decoder.
+                        if (index == fps * 2) {
+                            assertTrue(output.written.get() > 48000)
+                            assertTrue("Failure must not be a startup-only scenario", decoders.single().rendered.get() > fps / 2)
+                            decoders.single().outputReadyAt.set(now() + 100_000_000)
+                        }
+                        val payload = ByteArray(20_000_000 / 8 / fps).apply { this[3] = 1 }
+                        // A static screen before rotation lets the prior generation finish naturally.
+                        if (index < fps * 10 || index in fps * 11 until fps * 13) {
+                            Wire.write(checkNotNull(media).video.outputStream, Message(Type.VIDEO_FRAME, 41, 1, generation, pts,
+                                flags = if (index == 0 || index == fps * 11) 1 else 0, payload = payload))
+                            expectedPts.add(pts)
+                        }
+                        // Opus refreshes source phase independently of the continuous decoded sample timeline.
+                        val phase = if (index < fps * 3) 0 else -149_651
+                        Wire.write(checkNotNull(media).audio.outputStream, Message(Type.AUDIO_PACKET, 41, 2, 1, pts + phase, payload = byteArrayOf(1)))
+                        control(Type.PING, JSONObject().put("nonce", index))
+                        expect(Type.PONG)
+                        sourceFrames += pcmFrames
+                        await { output.written.get() >= sourceFrames || errors.isNotEmpty() }
+                        assertTrue(errors.toString(), errors.isEmpty())
+                        if (index == 0) start = now()
+                        val current = checkNotNull(clock.currentUs())
+                        assertTrue("Presentation clock must not rewind", current >= previousClock)
+                        previousClock = current
                     }
-                    if (index == fps * 11) {
-                        assertTrue("Must already be presenting before generation change", decoders.sumOf { it.rendered.get() } > fps)
-                        val before = clock.currentUs()
-                        generation++
-                        configureVideo()
-                        assertTrue(checkNotNull(clock.currentUs()) >= checkNotNull(before))
-                    }
-                    val pts = base + index * 1_000_000L / fps
-                    // A finite codec-output pause after playback has started, not a slow decoder.
-                    if (index == fps * 2) {
-                        assertTrue(output.written.get() > 48000)
-                        assertTrue("Failure must not be a startup-only scenario", decoders.single().rendered.get() > fps / 2)
-                        decoders.single().outputReadyAt.set(now() + 100_000_000)
-                    }
-                    val payload = ByteArray(20_000_000 / 8 / fps).apply { this[3] = 1 }
-                    // A static screen before rotation lets the prior generation finish naturally.
-                    if (index < fps * 10 || index in fps * 11 until fps * 13) {
-                        Wire.write(checkNotNull(media).video.outputStream, Message(Type.VIDEO_FRAME, 41, 1, generation, pts,
-                            flags = if (index == 0 || index == fps * 11) 1 else 0, payload = payload))
-                        expectedPts.add(pts)
-                    }
-                    // Opus refreshes source phase independently of the continuous decoded sample timeline.
-                    val phase = if (index < fps * 3) 0 else -149_651
-                    Wire.write(checkNotNull(media).audio.outputStream, Message(Type.AUDIO_PACKET, 41, 2, 1, pts + phase, payload = byteArrayOf(1)))
-                    control(Type.PING, JSONObject().put("nonce", index))
-                    expect(Type.PONG)
-                    sourceFrames += pcmFrames
-                    await { output.written.get() >= sourceFrames || errors.isNotEmpty() }
-                    assertTrue(errors.toString(), errors.isEmpty())
-                    if (index == 0) start = now()
-                    val current = checkNotNull(clock.currentUs())
-                    assertTrue("Presentation clock must not rewind", current >= previousClock)
-                    previousClock = current
                 }
                 assertTrue(corrections.any { it.afterOffsetUs == -149_651L })
                 assertTrue(errors.toString(), errors.isEmpty())

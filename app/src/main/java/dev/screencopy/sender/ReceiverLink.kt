@@ -33,6 +33,9 @@ class ReceiverLink(private val target: ReceiverTarget) : Closeable {
         private set
     var receiverOptions = ReceiverOptionCapabilities()
         private set
+    var delegatedDiagnostics = false
+        private set
+    val connectedHost: String get() = checkNotNull(sockets[0].inetAddress?.hostAddress)
 
     private fun connectSocket(socket: Socket) {
         if (closed.get()) throw SessionCancelledException()
@@ -66,13 +69,16 @@ class ReceiverLink(private val target: ReceiverTarget) : Closeable {
                     "role" to "sender", "versions" to JSONArray().put(3),
                     "name" to "RedrainCast", "videoRotation" to true, "streamRecovery" to true, "uncappedFps" to true,
                     "streamRecoveryVersion" to StreamRecoveryProtocol.VERSION,
-                    "receiverOptions" to ReceiverOptionProtocol.IMPLEMENTED.wireValue()
+                    "receiverOptions" to ReceiverOptionProtocol.IMPLEMENTED.wireValue(),
+                    "diagnostics" to org.screencopy.receiver.protocol.DiagnosticDelegation.capability()
                 )))
                 val hello = receive()
                 reject(hello)
                 if (hello.type != Wire.HELLO || hello.session != 0L)
                     throw IOException("PROTOCOL: receiver HELLO session zero required")
                 val json = hello.json()
+                delegatedDiagnostics = org.screencopy.receiver.protocol.DiagnosticDelegation.supported(
+                    org.screencopy.receiver.protocol.StrictJson.decode(hello.payload))
                 receiverOptions = try {
                     ReceiverOptionProtocol.capabilities(org.screencopy.receiver.protocol.StrictJson.decode(hello.payload))
                         .intersect(ReceiverOptionProtocol.IMPLEMENTED)

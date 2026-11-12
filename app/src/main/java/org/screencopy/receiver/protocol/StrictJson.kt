@@ -16,17 +16,17 @@ object StrictJson {
     fun encodedSize(value: JSONObject): Int = synchronized(sizes) {
         sizes[value] ?: value.toString().toByteArray(Charsets.UTF_8).size
     }
-    fun decode(bytes: ByteArray): JSONObject {
+    fun decode(bytes: ByteArray, maxDepth: Int = 16, trackSizes: Boolean = true): JSONObject {
         val text = try {
             Charsets.UTF_8.newDecoder().onMalformedInput(CodingErrorAction.REPORT)
                 .onUnmappableCharacter(CodingErrorAction.REPORT).decode(ByteBuffer.wrap(bytes)).toString()
         } catch (_: java.nio.charset.CharacterCodingException) {
             throw ProtocolException("PROTOCOL", "Malformed UTF-8")
         }
-        return Parser(text).parse()
+        return Parser(text, maxDepth, trackSizes).parse()
     }
 
-    private class Parser(private val text: String) {
+    private class Parser(private val text: String, private val maxDepth: Int, private val trackSizes: Boolean) {
         private var position = 0
         fun parse(): JSONObject {
             val result = value(0)
@@ -36,7 +36,7 @@ object StrictJson {
         }
 
         private fun value(depth: Int): Any {
-            protocolRequire(depth <= 16, "JSON nesting exceeds 16 levels")
+            protocolRequire(depth <= maxDepth, "JSON nesting exceeds limit")
             whitespace()
             protocolRequire(position < text.length, "Truncated JSON")
             return when (text[position]) {
@@ -59,7 +59,7 @@ object StrictJson {
                         } while (consume(','))
                         protocolRequire(consume('}'), "Unterminated JSON object")
                     }
-                    synchronized(sizes) { sizes[obj] = text.substring(start, position).toByteArray(Charsets.UTF_8).size }
+                    if (trackSizes) synchronized(sizes) { sizes[obj] = text.substring(start, position).toByteArray(Charsets.UTF_8).size }
                     obj
                 }
                 '[' -> {

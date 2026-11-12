@@ -5,6 +5,7 @@ import org.screencopy.receiver.protocol.AudioPacketTiming
 import org.screencopy.receiver.protocol.RandomAccessPoint
 import java.io.IOException
 import java.util.Base64
+import dev.redrain.cast.diagnostics.*
 
 /** Each track owns its recovery generation; the other TCP lane keeps its original timeline. */
 internal class StreamRecoverySender(
@@ -55,6 +56,8 @@ internal class StreamRecoverySender(
         }
         for (track in 1..if (withAudio) 2 else 1) {
             if (state[track] != State.WAIT_READY || !budget.trackReady(track)) continue
+            RemoteDiagnostics.recorder.observe("sender", session, DiagnosticKind.RECOVERY, DiagnosticStage.READY,
+                track, wireGeneration[track], cutoff = minimumPts[track])
             if (track == 2 && wireGeneration[track] == 1) {
                 val first = budget.firstQueuedAudioPts()
                 initialAudioCutoffPending = first == null
@@ -115,6 +118,8 @@ internal class StreamRecoverySender(
         unresolvedAt[track] = null
         state[track] = State.ACTIVE
         diagnostic("event=STREAM_RECOVERY_COMPLETE track=$track generation=$generation pts_us=$pts")
+        RemoteDiagnostics.recorder.observe("sender", session, DiagnosticKind.RECOVERY, DiagnosticStage.COMPLETE,
+            track, generation, pts = pts, cutoff = minimumPts[track])
     }
 
     @Synchronized fun written(packet: Wire.Message) {
@@ -175,9 +180,15 @@ internal class StreamRecoverySender(
             releaseAudioIfReady()
             return
         }
-        if (state[track] == State.WAIT_READY) return
+        if (state[track] == State.WAIT_READY) {
+            if (track == 1) videoDropped(mapped, DiagnosticReason.SOURCE_PENDING)
+            return
+        }
         if (track == 1 && state[1] == State.WAIT_SOURCE) {
-            if (packet.flags and 1 == 0 || packet.pts < minimumPts[1] || now() / 1000 - packet.pts > 250_000) return
+            if (packet.flags and 1 == 0 || packet.pts < minimumPts[1] || now() / 1000 - packet.pts > 250_000) {
+                videoDropped(mapped, DiagnosticReason.STALE)
+                return
+            }
             val config = checkNotNull(configs[1])
             val csd = config.optJSONArray("csd")
             RandomAccessPoint.verify(config.getString("codec"), packet.payload,
@@ -185,15 +196,22 @@ internal class StreamRecoverySender(
         }
         val pressure = budget.tryOfferMedia(mapped)
         if (pressure != null) {
+            if (track == 1) videoDropped(mapped, DiagnosticReason.CAPACITY)
             diagnostic("event=STREAM_RECOVERY_PRESSURE ${pressure.fields()}")
             begin(track, "sender")
             return
         }
+
         if (track == 1 && state[1] == State.WAIT_SOURCE) {
             state[1] = State.WAIT_PROOF
             sentKeyPts[1] = packet.pts
             diagnostic("event=STREAM_RECOVERY_KEY track=1 generation=${wireGeneration[1]} pts_us=${packet.pts}")
         }
+    }
+
+    private fun videoDropped(packet: Wire.Message, reason: DiagnosticReason) {
+        RemoteDiagnostics.recorder.video("sender", session, packet.generation, DiagnosticVideoStage.SOURCE_DROPPED,
+            packet.pts, packet.payload.size.toLong(), keyFrame = packet.flags and 1 != 0, reason = reason)
     }
 
     private fun releaseAudioIfReady() {
@@ -207,7 +225,7 @@ internal class StreamRecoverySender(
             }
             minimumPts[2] = maxOf(minimumPts[2], primed)
         }
-        when (budget.releaseRecoveryAudio(minimumPts[2], checkNotNull(audioTiming))) {
+        when (budget.releaseRecoveryAudio(minimumPts[2], checkNotNull(audioTiming), freshRawWindow = wireGeneration[2] > 1)) {
             RecoveryAudioCoverage.READY -> state[2] = if (wireGeneration[2] == 1) State.ACTIVE else State.WAIT_PROOF
             RecoveryAudioCoverage.LOST -> begin(2, "audio-source-window-lost")
             RecoveryAudioCoverage.WAITING -> Unit
@@ -235,6 +253,16 @@ internal class StreamRecoverySender(
     }
 
     private fun begin(track: Int, reason: String, initial: Boolean = false) {
+        RemoteDiagnostics.recorder.observe("sender", session, DiagnosticKind.RECOVERY, DiagnosticStage.RESET,
+            track, wireGeneration[track], cutoff = minimumPts[track],
+            reason = when (reason) {
+                "capture" -> DiagnosticReason.CAPTURE
+                "receiver" -> DiagnosticReason.RECEIVER
+                "audio-source-window-lost" -> DiagnosticReason.SOURCE_WINDOW_LOST
+                "initial-audio-preroll-retired" -> DiagnosticReason.PREROLL_MISSING
+                "audio-proof-window-capacity" -> DiagnosticReason.PROOF_CAPACITY
+                else -> DiagnosticReason.PRESSURE
+            })
         if (unresolvedAt[track] == null) unresolvedAt[track] = now()
         if (!initial || track == 2) budget.discardMediaForRecovery(track)
         state[track] = State.WAIT_READY
@@ -249,6 +277,8 @@ internal class StreamRecoverySender(
             pendingAudioCompletion = null
         }
         wireGeneration[track] = next(wireGeneration[track])
+        RemoteDiagnostics.recorder.observe("sender", session, DiagnosticKind.RECOVERY, DiagnosticStage.BEGIN,
+            track, wireGeneration[track], cutoff = minimumPts[track])
         val config = JSONObject(checkNotNull(configs[track]).toString())
         if (track == 2 && !initial) config.put("recoveryPtsUs", minimumPts[2].toString())
         budget.offer(Wire.config(session, track, wireGeneration[track], config))

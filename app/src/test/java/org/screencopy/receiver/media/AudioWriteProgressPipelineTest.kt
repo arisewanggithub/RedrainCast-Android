@@ -8,8 +8,110 @@ import java.util.concurrent.ConcurrentLinkedQueue
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicLong
+import dev.redrain.cast.diagnostics.*
 
 class AudioWriteProgressPipelineTest {
+    @Test fun audioStartWaitHasItsOwnTypedOperationSummaries() {
+        val diagnostics = RemoteDiagnostics.recorder
+        diagnostics.grantConsent()
+        diagnostics.sessionStarted("receiver", 73)
+        val id = diagnostics.start("receiver", 73, setOf("audio.output"), 10000, 1000).getString("captureId")
+        try {
+            Fixture { _, count, _ -> count }.use { fixture ->
+                fixture.player.diagnosticSession = 73
+                fixture.player.diagnosticGeneration = 2
+                fixture.start()
+                await { fixture.player.sourceSubmittedFrames > 0 || fixture.errors.isNotEmpty() }
+                assertTrue(fixture.errors.toString(), fixture.errors.isEmpty())
+                diagnostics.end(id)
+                val wait = capturedRecords(id).filter {
+                    it.getString("kind") == "AUDIO_OUTPUT" &&
+                        it.getJSONObject("data").optString("point") == "audio_start_wait" &&
+                        it.getJSONObject("data").optString("stage") == "sample"
+                }
+                assertTrue(wait.isNotEmpty())
+                val metrics = wait.map { it.getJSONObject("data").getJSONObject("metrics") }
+                assertTrue(metrics.all { it.getString("schema") == "operation_summary" })
+                assertEquals(1L, metrics.sumOf { it.getString("started").toLong() })
+                assertEquals(1L, metrics.sumOf { it.getString("completed").toLong() })
+                assertEquals(1L, metrics.sumOf { summary ->
+                    val durations = summary.getJSONObject("durationBuckets")
+                    listOf("under1Ms", "1To5Ms", "5To20Ms", "over20Ms").sumOf { durations.getString(it).toLong() }
+                })
+            }
+        } finally {
+            diagnostics.revoke()
+            diagnostics.sessionEnded("receiver", 73)
+        }
+    }
+
+    @Test fun resumedRawOutputTrimsToPresentedVideoWithoutWaitingOrRetimingSamples() {
+        Fixture { _, count, _ -> count }.use { fixture ->
+            val clock = fixture.clock
+            clock.prepareAudio(TrimmedAudio(0, 960, 1_000_000), 48000)
+            assertTrue(clock.awaitAudioStart(1_000_000) { true })
+            clock.anchorAudio(1_000_000) { 20_000 }
+            clock.audioWritten(40_000)
+            clock.beginAudioRecovery()
+            clock.detachAudio()
+            clock.videoPresented(1_990_000)
+            fixture.player.recoveryCutoffUs = 1_000_000
+            val submitted = AtomicLong(-1)
+            fixture.player.onFirstSubmitted = submitted::set
+            val before = fixture.now.get()
+            val bytes = ByteBuffer.allocate(1920 * 2).order(ByteOrder.LITTLE_ENDIAN)
+            repeat(1920) { bytes.putShort(it.toShort()) }
+            fixture.player.start()
+            fixture.player.offer(AccessUnit(1_980_000, bytes.array()))
+            await { fixture.player.sourceSubmittedFrames == 480L || fixture.errors.isNotEmpty() }
+            assertTrue(fixture.errors.toString(), fixture.errors.isEmpty())
+            assertEquals(1_990_000L, submitted.get())
+            assertEquals(before, fixture.now.get())
+            assertEquals((960 until 1920).map(Int::toShort), fixture.track.accepted.toList().take(960))
+            assertEquals(48000, fixture.track.sampleRate)
+            assertEquals(1f, fixture.track.speed)
+            assertTrue(clock.currentUs()!! >= 1_990_000)
+            clock.endAudioRecovery()
+            clock.checkStartup()
+        }
+    }
+
+    @Test fun remoteEndCannotWaitForBlockedNativeOutputAndPreservesUnfinishedOperation() {
+        val entered = CountDownLatch(1)
+        val release = CountDownLatch(1)
+        val fixture = Fixture { _, _, _ -> entered.countDown(); release.await(); 0 }
+        val diagnostics = RemoteDiagnostics.recorder
+        diagnostics.grantConsent()
+        diagnostics.sessionStarted("receiver", 73)
+        val id = diagnostics.start("receiver", 73, setOf("audio.output", "audio.queue"), 10000, 100).getString("captureId")
+        fixture.player.diagnosticSession = 73
+        fixture.player.diagnosticGeneration = 1
+        try {
+            fixture.start()
+            assertTrue(entered.await(2, TimeUnit.SECONDS))
+            val started = System.nanoTime()
+            diagnostics.end(id)
+            assertTrue(TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - started) < 500)
+            val terminal = capturedRecords(id).single { it.getString("kind") == "CAPTURE_ENDED" }.getJSONObject("data")
+            assertTrue(terminal.getInt("inFlightCount") > 0)
+            val inFlight = terminal.getJSONArray("inFlight")
+            val write = (0 until inFlight.length()).map { inFlight.getJSONObject(it) }.single {
+                it.getString("kind") == "AUDIO_OUTPUT" && it.getString("point") == "write"
+            }
+            assertTrue(write.getString("operationId").toLong() > 0)
+            assertTrue(write.getString("ageNs").toLong() >= 0)
+            assertEquals(2, write.getInt("track"))
+            assertEquals(1, write.getInt("generation"))
+            assertEquals("1000000", write.getString("ptsUs"))
+            assertTrue(write.getString("count").toLong() > 0)
+            assertFalse(diagnostics.collecting)
+        } finally {
+            release.countDown()
+            fixture.close()
+            diagnostics.revoke()
+            diagnostics.sessionEnded("receiver", 73)
+        }
+    }
     @Test fun partialProgressAcrossLongPacketDoesNotBecomeAWriteStall() {
         val fixture = Fixture { track, count, call ->
             if (call % 2 == 0) {
@@ -210,6 +312,20 @@ class AudioWriteProgressPipelineTest {
     }
 
     companion object {
+        private fun capturedRecords(id: String): List<org.json.JSONObject> {
+            val records = ArrayList<org.json.JSONObject>()
+            var cursor = 0L
+            repeat(32) {
+                val page = RemoteDiagnostics.recorder.fetch(id, cursor, 32)
+                val batch = page.getJSONArray("records")
+                if (batch.length() == 0) return records
+                for (i in 0 until batch.length()) records.add(batch.getJSONObject(i))
+                cursor = page.getString("nextAfterSeq").toLong()
+            }
+            fail("Capture pagination did not terminate")
+            return records
+        }
+
         private fun await(condition: () -> Boolean) {
             val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(3)
             while (!condition() && System.nanoTime() < deadline) Thread.sleep(1)
