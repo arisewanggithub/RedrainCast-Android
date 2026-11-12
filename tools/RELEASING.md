@@ -24,8 +24,11 @@ Python 3 and Bash. Signing requires four existing Actions secrets:
 The signing/build job keeps `contents: read`. Only the separate `publish` job,
 enabled by `publish=true` after signing succeeds, receives `contents: write`.
 It uses the ephemeral same-repository `GITHUB_TOKEN`, downloads the same signed
-candidate, verifies checksums, rechecks exact current main and creates a
-**draft** tag at `reviewed_commit`. It has no signing-secret inputs.
+candidate, verifies checksums and rechecks exact current main. It atomically
+creates a new tag at `reviewed_commit` (GitHub's create-ref operation, never an
+update/force), verifies the remote tag's peeled commit, then creates a **draft**
+using `gh release create --verify-tag`. It verifies the tag again after upload.
+It has no signing-secret inputs.
 No cross-repository PAT or `RELEASE_PUBLISH_TOKEN` is needed. Never copy a
 personal login token into Actions. Forks, PRs and non-main dispatches cannot
 reach signing/publication. No repository permission settings need changing.
@@ -113,7 +116,13 @@ known limitations. Do not alter the historical plain-version v0.4.6 preview.
    in notes; automation is not Windows interoperability or physical-device proof.
 
 Missing signing prerequisites, write permission or tag conflicts fail explicitly.
-Never replace an existing release or tag.
+Never replace or reuse an existing release or tag, even one at the correct SHA
+without a release. Atomic ref creation rejects a concurrent creator too.
+Lookup/network errors fail closed. A failure after tag creation may leave that
+new tag or a draft behind; stop and report it, never automatically delete,
+overwrite or retry publication with that tag. A post-upload mismatch fails the
+job and leaves the release a draft, not an approved/public release.
+Before manually publishing any draft, recheck its tag binding as well.
 Updated apps check only this repository's stable metadata; until then a 404 is
 logged without affecting casting. Already-installed v0.4.18 and older apps still
 check the historical repository until manually updated; old binaries/links are
@@ -137,6 +146,10 @@ $kind = python3 -B .\tools\release-guard.py --release-tag $tag --apk-version $ve
 if ($LASTEXITCODE -ne 0) { throw "Invalid release version identity" }
 $options = @("--draft")
 if ($kind -eq "prerelease") { $options += "--prerelease" }
+$env:GITHUB_REPOSITORY = "arisewanggithub/RedrainCast-Android"
+$env:REVIEWED_COMMIT = $reviewedCommit
+python3 -B .\tools\release-guard.py --release-tag $tag --create-tag
+if ($LASTEXITCODE -ne 0) { throw "Tag reservation or source binding failed" }
 $assets = @(
     "$candidate\RedrainCast-$version.apk",
     "$candidate\SHA256SUMS",
@@ -145,7 +158,10 @@ $assets = @(
     "$candidate\android-lgpl-relink.tar.gz"
 )
 gh release create $tag @assets --repo arisewanggithub/RedrainCast-Android `
-    --target $reviewedCommit @options --title "RedrainCast $tag" --notes-file $reviewedNotes
+    --verify-tag @options --title "RedrainCast $tag" --notes-file $reviewedNotes
+if ($LASTEXITCODE -ne 0) { throw "Draft creation failed; do not reuse the reserved tag" }
+python3 -B .\tools\release-guard.py --release-tag $tag --verify-tag
+if ($LASTEXITCODE -ne 0) { throw "Draft tag source binding failed; do not publish" }
 ```
 
 `$reviewedCommit` must be the exact full SHA used by the successful candidate run.

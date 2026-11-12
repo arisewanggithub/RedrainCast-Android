@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Require the exact approved source revision and signing certificate."""
 import argparse
+import json
 import os
 from pathlib import Path
 import re
@@ -11,6 +12,51 @@ VERSION = re.compile(
     r"(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)"
     r"(?:-(alpha|beta|rc)\.([1-9][0-9]*))?"
 )
+
+REPOSITORY = "arisewanggithub/RedrainCast-Android"
+
+
+def github_api(repository, endpoint, *arguments):
+    return json.loads(subprocess.check_output(
+        ["gh", "api", f"repos/{repository}/{endpoint}", *arguments], text=True))
+
+
+def verify_release_tag(repository, tag, reviewed):
+    validate_release_tag(tag)
+    if repository != REPOSITORY or not re.fullmatch(r"[0-9a-f]{40}", reviewed):
+        raise ValueError("Tag binding requires the Android repository and full reviewed SHA")
+    ref = github_api(repository, f"git/ref/tags/{tag}")
+    if not isinstance(ref, dict) or ref.get("ref") != f"refs/tags/{tag}":
+        raise ValueError("GitHub did not return the exact release tag")
+    target = ref.get("object")
+    visited = set()
+    while isinstance(target, dict):
+        sha = target.get("sha", "")
+        kind = target.get("type")
+        if not isinstance(sha, str) or not re.fullmatch(r"[0-9a-f]{40}", sha):
+            break
+        if kind == "commit":
+            if sha != reviewed:
+                raise ValueError("Release tag does not resolve to the reviewed commit")
+            return
+        if kind != "tag" or sha in visited or len(visited) >= 16:
+            break
+        visited.add(sha)
+        annotated = github_api(repository, f"git/tags/{sha}")
+        if not isinstance(annotated, dict):
+            break
+        target = annotated.get("object")
+    raise ValueError("Cannot resolve release tag to a commit")
+
+
+def create_release_tag(repository, tag, reviewed):
+    validate_release_tag(tag)
+    if repository != REPOSITORY or not re.fullmatch(r"[0-9a-f]{40}", reviewed):
+        raise ValueError("Tag creation requires the Android repository and full reviewed SHA")
+    # Creating a ref is atomic: an existing tag, including a concurrent creator, fails.
+    github_api(repository, "git/refs", "--method", "POST",
+               "-f", f"ref=refs/tags/{tag}", "-f", f"sha={reviewed}")
+    verify_release_tag(repository, tag, reviewed)
 
 
 def is_prerelease(version):
@@ -59,10 +105,20 @@ if __name__ == "__main__":
     parser.add_argument("--certificate-report", type=Path)
     parser.add_argument("--release-tag")
     parser.add_argument("--apk-version")
+    tag_action = parser.add_mutually_exclusive_group()
+    tag_action.add_argument("--create-tag", action="store_true")
+    tag_action.add_argument("--verify-tag", action="store_true")
     args = parser.parse_args()
+    if (args.create_tag or args.verify_tag) and (
+            args.release_tag is None or args.certificate_report or args.apk_version):
+        parser.error("Tag operations require --release-tag only")
     if args.apk_version is not None and args.release_tag is None:
         parser.error("--apk-version requires --release-tag")
-    if args.release_tag is not None:
+    if args.create_tag or args.verify_tag:
+        action = create_release_tag if args.create_tag else verify_release_tag
+        action(os.environ["GITHUB_REPOSITORY"], args.release_tag, os.environ["REVIEWED_COMMIT"])
+        print("Release tag resolves to the exact reviewed commit")
+    elif args.release_tag is not None:
         if args.certificate_report:
             parser.error("Release version and certificate checks must be invoked separately")
         print("prerelease" if validate_release_tag(args.release_tag, args.apk_version) else "stable")

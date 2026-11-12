@@ -2,6 +2,7 @@
 """Focused release tooling tests; no Gradle, device or private credentials."""
 import importlib.util
 from pathlib import Path
+import subprocess
 import tempfile
 from types import SimpleNamespace
 import unittest
@@ -231,6 +232,99 @@ class ReleaseTests(unittest.TestCase):
             self.assertEqual(kit.relink.digest(destination), result["object_sha256"])
 
 
+class ReleaseTagTests(unittest.TestCase):
+    repository = "arisewanggithub/RedrainCast-Android"
+    tag = "v0.5.0"
+    reviewed = "a" * 40
+
+    def ref(self, sha=None, kind="commit"):
+        return {"ref": "refs/tags/" + self.tag,
+                "object": {"type": kind, "sha": sha or self.reviewed}}
+
+    def test_new_tag_is_atomically_created_at_reviewed_commit_and_read_back(self):
+        with patch.object(guard, "github_api", side_effect=[self.ref(), self.ref()]) as api:
+            guard.create_release_tag(self.repository, self.tag, self.reviewed)
+        self.assertEqual([
+            unittest.mock.call(self.repository, "git/refs", "--method", "POST",
+                               "-f", "ref=refs/tags/" + self.tag, "-f", "sha=" + self.reviewed),
+            unittest.mock.call(self.repository, "git/ref/tags/" + self.tag),
+        ], api.call_args_list)
+
+    def test_any_existing_tag_without_a_release_is_rejected_without_overwrite(self):
+        for existing in (self.ref(), self.ref("b" * 40), self.ref("c" * 40, "tag")):
+            with self.subTest(existing=existing):
+                calls = []
+
+                def api(repository, endpoint, *arguments):
+                    calls.append((endpoint, arguments))
+                    if endpoint == "git/refs":
+                        raise subprocess.CalledProcessError(1, ["gh", "api"], stderr="Reference already exists")
+                    return existing
+
+                with patch.object(guard, "github_api", side_effect=api), \
+                        self.assertRaises(subprocess.CalledProcessError):
+                    guard.create_release_tag(self.repository, self.tag, self.reviewed)
+                self.assertEqual([("git/refs", ("--method", "POST", "-f",
+                    "ref=refs/tags/" + self.tag, "-f", "sha=" + self.reviewed))], calls)
+
+    def test_concurrent_new_tag_creator_fails_instead_of_reusing_winner(self):
+        conflict = subprocess.CalledProcessError(1, ["gh", "api"], stderr="Reference already exists")
+        with patch.object(guard, "github_api", side_effect=conflict) as api, \
+                self.assertRaises(subprocess.CalledProcessError):
+            guard.create_release_tag(self.repository, self.tag, self.reviewed)
+        self.assertEqual(1, api.call_count)
+        self.assertEqual("git/refs", api.call_args.args[1])
+
+    def test_failed_tag_lookup_after_creation_fails_closed(self):
+        failure = subprocess.CalledProcessError(1, ["gh", "api"], stderr="Service unavailable")
+        with patch.object(guard, "github_api", side_effect=[self.ref(), failure]), \
+                self.assertRaises(subprocess.CalledProcessError):
+            guard.create_release_tag(self.repository, self.tag, self.reviewed)
+
+    def test_tag_changed_after_creation_or_draft_upload_is_rejected(self):
+        with patch.object(guard, "github_api", side_effect=[self.ref(), self.ref("b" * 40)]), \
+                self.assertRaisesRegex(ValueError, "reviewed commit"):
+            guard.create_release_tag(self.repository, self.tag, self.reviewed)
+        with patch.object(guard, "github_api", return_value=self.ref("b" * 40)), \
+                self.assertRaisesRegex(ValueError, "reviewed commit"):
+            guard.verify_release_tag(self.repository, self.tag, self.reviewed)
+
+    def test_annotated_tags_are_peeled_to_commit_not_compared_as_tag_object_shas(self):
+        for commit in (self.reviewed, "b" * 40):
+            with self.subTest(commit=commit):
+                responses = [self.ref("c" * 40, "tag"),
+                    {"object": {"type": "tag", "sha": "d" * 40}},
+                    {"object": {"type": "commit", "sha": commit}}]
+                with patch.object(guard, "github_api", side_effect=responses) as api:
+                    if commit == self.reviewed:
+                        guard.verify_release_tag(self.repository, self.tag, self.reviewed)
+                    else:
+                        with self.assertRaisesRegex(ValueError, "reviewed commit"):
+                            guard.verify_release_tag(self.repository, self.tag, self.reviewed)
+                self.assertEqual("git/tags/" + "d" * 40, api.call_args.args[1])
+
+    def test_missing_ambiguous_malformed_or_cyclic_tag_lookup_fails_closed(self):
+        for response in (None, [], {}, {"ref": "refs/tags/other"},
+                         self.ref("invalid"), self.ref(kind="tree")):
+            with self.subTest(response=response), \
+                    patch.object(guard, "github_api", return_value=response), \
+                    self.assertRaises(ValueError):
+                guard.verify_release_tag(self.repository, self.tag, self.reviewed)
+        cyclic = {"object": {"type": "tag", "sha": "c" * 40}}
+        with patch.object(guard, "github_api", side_effect=[self.ref("c" * 40, "tag"), cyclic]), \
+                self.assertRaisesRegex(ValueError, "Cannot resolve"):
+            guard.verify_release_tag(self.repository, self.tag, self.reviewed)
+
+    def test_invalid_tag_repository_or_reviewed_sha_cannot_create_refs(self):
+        for repo, tag, sha in (("other/repo", self.tag, self.reviewed),
+                              (self.repository, "../bad", self.reviewed),
+                              (self.repository, self.tag, "short")):
+            with self.subTest(repo=repo, tag=tag, sha=sha), \
+                    patch.object(guard, "github_api") as api, self.assertRaises(ValueError):
+                guard.create_release_tag(repo, tag, sha)
+            api.assert_not_called()
+
+
 class PublicationContractTests(unittest.TestCase):
     def setUp(self):
         self.root = Path(__file__).resolve().parents[1]
@@ -259,7 +353,15 @@ class PublicationContractTests(unittest.TestCase):
         self.assertLess(sums_at, upload_at)
         self.assertIn("options=(--draft)", self.publishing)
         self.assertIn("options+=(--prerelease)", self.publishing)
-        self.assertIn('--repo "$GITHUB_REPOSITORY" --target "$REVIEWED_COMMIT"', self.publishing)
+        reserve_at = self.publishing.index(
+            'python3 -B tools/release-guard.py --release-tag "$RELEASE_TAG" --create-tag')
+        verify_at = self.publishing.index(
+            'python3 -B tools/release-guard.py --release-tag "$RELEASE_TAG" --verify-tag')
+        self.assertLess(sums_at, reserve_at)
+        self.assertLess(reserve_at, upload_at)
+        self.assertLess(upload_at, verify_at)
+        self.assertIn('--repo "$GITHUB_REPOSITORY" --verify-tag', self.publishing)
+        self.assertNotIn("--target", self.publishing)
         upload = self.publishing[upload_at:]
         for asset in ('"candidate/RedrainCast-${RELEASE_TAG#v}.apk"',
                       "candidate/SHA256SUMS", "candidate/signing-certificate.txt",
