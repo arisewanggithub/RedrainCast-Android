@@ -13,8 +13,8 @@ android {
         applicationId = "dev.redrain.cast"
         minSdk = 30
         targetSdk = 37
-        versionCode = 35
-        versionName = "0.5.1"
+        versionCode = 36
+        versionName = "0.5.2"
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         externalNativeBuild {
             cmake { arguments += "-DANDROID_STL=c++_static" }
