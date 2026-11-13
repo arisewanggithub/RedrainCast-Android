@@ -25,6 +25,9 @@ class VideoRemoteDiagnosticsTest {
         player.diagnosticSession = 975
         player.diagnosticGeneration = 3
         player.discardOutputBeforePts = 750_000
+        player.onDecoded = { pts ->
+            if (pts == 800_000L) now.addAndGet(10_000_000)
+        }
         player.onPlaybackStep = {
             if (decoder.released) {
                 completed.countDown()
