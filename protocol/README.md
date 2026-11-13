@@ -668,6 +668,11 @@ visible raster, including alignment crop, must match that configuration.
 Picture PTS and rotation remain associated unchanged through decode/presentation.
 Future decoded pictures are released with their PTS-derived deadline mapped onto
 the receiver's monotonic clock; pictures already due remain immediate.
+Catch-up replaces a held decoded picture only while its deadline is strictly
+past, checking the clock again for each replacement. Future and exactly-due
+pictures are scheduled rather than replaced. Each worker step replaces at most
+eight pictures; timed Surface release does not wait for presentation or enlarge
+the existing compressed queue or decoded-picture ownership bounds.
 
 Allow dependent video after the verified key so the decoder can produce output.
 KEY acknowledges usable decoded output at/after that key, not merely admission.

@@ -134,13 +134,19 @@ class VideoPlayer private constructor(
             clock.checkStartup()
             // Only decoded pictures are replaceable; keep admitting every compressed dependency.
             for (index in 0 until 8) {
+                if (!running.get()) return
+                stage = VideoStage.CLOCK
+                delayUs = clock.delayUs(heldPtsUs)
+                if (delayUs?.let { it < 0 } != true) break
                 val newer = dequeuePicture() ?: break
+                if (!running.get()) return
                 stage = VideoStage.OUTPUT_RELEASE
                 decoder.releaseOutput(heldOutput, null)
                 diagnosticVideo(DiagnosticVideoStage.SKIPPED, heldPtsUs, reason = DiagnosticReason.REPLACED)
                 decodedSkipped++
                 hold(newer)
             }
+            if (!running.get()) return
             stage = VideoStage.CLOCK
             delayUs = clock.delayUs(heldPtsUs)
             if (dropStaleOutput && delayUs?.let { it < -250_000 } == true) {
