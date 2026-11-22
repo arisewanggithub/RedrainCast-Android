@@ -18,12 +18,13 @@ import time
 
 
 MAX_LINE = 16384
+MAX_JSON_DEPTH = 10
 MAX_INT64 = (1 << 63) - 1
 FETCH_WINDOW_SECONDS = 1.01
 FETCH_RESERVED_RECORDS = 32
 FETCH_RESERVED_BYTES = 15360
 MAX_FROZEN_RECORDS = 4096 + 1024
-MAX_FROZEN_BYTES = 2 * 1024 * 1024 + 1024 * 2048
+MAX_FROZEN_BYTES = 2 * 1024 * 1024 + 1024 * 12000
 FROZEN_RETENTION_SECONDS = 120
 PENDING_RETRY_SECONDS = 0.25
 ENDPOINT_QUERY_PORT = 27184
@@ -33,7 +34,7 @@ FLAGS = {
     "sender": ["session", "recovery", "audio.capture", "audio.transport",
                "audio.queue", "video.progress", "transport.health"],
     "receiver": ["session", "recovery", "audio.transport", "audio.queue",
-                 "audio.output", "video.progress", "transport.health"],
+                 "audio.output", "video.progress", "video.timing", "transport.health"],
 }
 
 
@@ -81,12 +82,16 @@ def select_flags(role, requested, supported):
         raise DiagnosticError("Missing role capabilities")
     if requested is None:
         selected = [flag for flag in FLAGS[role] if flag in supported]
+        if "video.progress" not in selected and "video.timing" in selected:
+            selected.remove("video.timing")
         if not selected:
             raise DiagnosticError("No supported default flags")
         return selected
     unsupported = [flag for flag in requested if flag not in supported]
     if unsupported:
         raise DiagnosticError("Unsupported requested flags: " + ",".join(unsupported))
+    if "video.timing" in requested and "video.progress" not in requested:
+        raise DiagnosticError("video.timing requires video.progress")
     return requested
 
 
@@ -109,7 +114,7 @@ def strict_json(data):
         raise DiagnosticError("Malformed diagnostic JSON") from error
 
     def check_depth(item, depth):
-        if depth > 8:
+        if depth > MAX_JSON_DEPTH:
             raise DiagnosticError("Diagnostic nesting exceeds limit")
         if isinstance(item, dict):
             for child in item.values():

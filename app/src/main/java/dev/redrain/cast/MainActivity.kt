@@ -153,8 +153,6 @@ class MainActivity : Activity(), SurfaceHolder.Callback, TextureView.SurfaceText
             requestedOrientation = it.getInt("previousOrientation")
         }
         settings = SharingSettings.load(this, ::showError)
-        if (!settings.showPlaybackStatistics)
-            dev.redrain.cast.diagnostics.DiagnosticAccess.setEnabled(this, false, false)
         val pending = CastState.requests.snapshot()
         if (savedInstanceState?.getLong("pendingRequest", -1) == pending?.id && pending?.adopted == false) {
             pendingRequestId = pending.id
@@ -257,7 +255,7 @@ class MainActivity : Activity(), SurfaceHolder.Callback, TextureView.SurfaceText
         if (!foreground || isDestroyed) return
         if (CastState.roles.role() != RoleOwner.Role.SEND) statisticsWindowProtection.secureForReceiving()
         if (!LocalNetworkPermission.granted(this)) {
-            dev.redrain.cast.diagnostics.DiagnosticAccess.setEnabled(this, false, false)
+            dev.redrain.cast.diagnostics.DiagnosticAccess.setEnabled(this, false)
             if (listenerRun != null) retireListener()
             closeDiscovery()
             readiness = "PERMISSION REQUIRED"

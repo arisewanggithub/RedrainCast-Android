@@ -234,19 +234,19 @@ object DiagnosticAccess {
     @Volatile private var epoch = 0L
     val consentGeneration: Long get() = epoch
 
-    fun setEnabled(context: Context, allow: Boolean, statistics: Boolean) {
-        setEnabled(context, allow, statistics) { DiagnosticIdentity.android(context.applicationContext) }
+    fun setEnabled(context: Context, allow: Boolean) {
+        setEnabled(context, allow) { DiagnosticIdentity.android(context.applicationContext) }
     }
 
-    internal fun setEnabled(context: Context, allow: Boolean, statistics: Boolean,
+    internal fun setEnabled(context: Context, allow: Boolean,
         expectedGeneration: Long? = null,
         identity: () -> DiagnosticIdentity) {
         val granted = LocalNetworkPermission.granted(context)
-        val next = allow && statistics && granted
+        val next = allow && granted
         val generation = synchronized(this) {
             if (expectedGeneration != null && expectedGeneration != epoch) return
             if (next == enabled) {
-                if (allow && statistics && !granted) state = "Unavailable: local network permission required"
+                if (allow && !granted) state = "Unavailable: local network permission required"
                 return
             }
             ++epoch
@@ -269,7 +269,7 @@ object DiagnosticAccess {
             if (enabled && next && generation == epoch) {
                 try {
                     val created = DiagnosticListener(application, RemoteDiagnostics.recorder, identity(), accessRevoked = {
-                        setEnabled(application, false, false, generation) { DiagnosticIdentity.android(application) }
+                        setEnabled(application, false, generation) { DiagnosticIdentity.android(application) }
                     })
                     val published = synchronized(this) {
                         if (enabled && generation == epoch) {

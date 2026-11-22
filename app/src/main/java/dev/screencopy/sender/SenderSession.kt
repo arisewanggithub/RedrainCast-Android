@@ -222,7 +222,7 @@ class SenderSession internal constructor(
                 diagnostic("event=RECEIVER_OPTION_UNAVAILABLE option=playbackStats nonfatal=true")
             val request = org.screencopy.receiver.protocol.ReceiverOptionProtocol.apply(settings.request(), options)
             val diagnosticConsentGeneration = DiagnosticAccess.consentGeneration
-            val delegateDiagnostics = DiagnosticAccess.enabled && requestedStatistics
+            val delegateDiagnostics = DiagnosticAccess.enabled
             DiagnosticAccess.connections.begin(session, connected.connectedHost,
                 delegateDiagnostics, connected.delegatedDiagnostics)
             DiagnosticAccess.receiverSession(if (delegateDiagnostics) session else null)

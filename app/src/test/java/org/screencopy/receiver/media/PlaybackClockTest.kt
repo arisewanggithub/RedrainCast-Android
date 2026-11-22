@@ -8,6 +8,269 @@ import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
 
 class PlaybackClockTest {
+    @Test fun qualifiedTimestampBehindFallbackFloorDoesNotProjectTheFloorWhileCatchingUp() {
+        val time = FakeTime()
+        val clock = time.clock()
+        val source = clock.anchorObservedAudio(1_000_000, 48000)
+        val timeline = AudioPresentationTimeline(48000)
+        timeline.submitted(9600, true)
+        clock.audioWritten(200_000)
+        var head = 5280
+        var stamp: FrameTimestamp? = null
+        val position = AudioPosition(48000, 9600, { time.ns }, { stamp }, { head })
+        position.written(9600)
+        fun publish(): AudioOutputTiming = position.current().also {
+            clock.observeAudio(source, timeline.presentedUs(it.presentedFrames), time.ns, it,
+                timeline.projection())
+        }
+        assertEquals(AudioClockSource.HEAD_UNAVAILABLE, publish().clockSource)
+        assertEquals(1_110_000L, clock.currentUs())
+        stamp = FrameTimestamp(480, time.ns)
+        assertEquals(AudioClockSource.HEAD_WARMUP, publish().clockSource)
+        time.advanceUs(10_000)
+        head = 5760
+        stamp = FrameTimestamp(960, time.ns)
+        val qualified = publish()
+        assertEquals(AudioClockSource.TIMESTAMP, qualified.clockSource)
+        assertEquals(5280L, qualified.presentedFrames)
+        val observed = clock.cachedPlayedAudioObservation()
+        time.advanceUs(5000)
+        val early = clock.videoSchedulingClock(1_200_000)
+        assertEquals("The 960-frame DAC estimate must catch the 5280-frame floor before video advances",
+            1_110_000L, early.positionUs)
+        assertSame(observed, clock.cachedPlayedAudioObservation())
+        assertEquals(5280L, publish().presentedFrames)
+        time.advanceUs(85_000)
+        assertEquals("At 90 ms the DAC estimate reaches, but cannot advance, the floor",
+            1_110_000L, clock.videoSchedulingClock(1_200_000).positionUs)
+        time.advanceUs(5000)
+        assertEquals("After catch-up, project the DAC estimate, not floor plus elapsed",
+            1_115_000L, clock.videoSchedulingClock(1_200_000).positionUs)
+        assertEquals(1_110_000L, clock.currentUs())
+        time.advanceUs(5000)
+        assertEquals("Projection stops at the observed 5760 consumed frames",
+            1_120_000L, clock.videoSchedulingClock(1_200_000).positionUs)
+        time.advanceUs(1)
+        assertEquals("Expiry cannot advance beyond previously guarded progress",
+            1_120_000L, clock.videoSchedulingClock(1_200_000).positionUs)
+        assertEquals("Video prediction never publishes actual audible progress", 1_110_000L,
+            clock.cachedPlayedAudioSource())
+        stamp = FrameTimestamp(5760, time.ns)
+        assertEquals(5760L, publish().presentedFrames)
+        assertEquals(1_120_000L, clock.currentUs())
+    }
+
+    @Test fun variableObservationAgeDoesNotBecomeVideoDeadlineCadenceJitter() {
+        for ((firstAge, secondAge) in listOf(10_681_666L to 280_083L, 388_333L to 11_329_333L)) {
+            val time = FakeTime()
+            val clock = time.clock()
+            val source = clock.anchorObservedAudio(1_000_000, 48000)
+            clock.audioWritten(500_000)
+            val deadlines = ArrayList<Long>()
+            val frozenDeadlines = ArrayList<Long>()
+            for ((index, age) in listOf(firstAge, secondAge).withIndex()) {
+                val scheduleNs = 100_000_000L + index * 20_000_000L
+                val observationNs = scheduleNs - age
+                val frames = observationNs * 48000 / 1_000_000_000
+                val sampleUs = frames * 1_000_000 / 48000
+                val timing = AudioOutputTiming(48000, 4800, frames + 4800, frames + 2400,
+                    frames, 10_000, AudioClockSource.TIMESTAMP, observationNs,
+                    timestampAtNs = observationNs - 10_000_000, timestampEstimateFrames = frames)
+                clock.observeAudio(source, sampleUs, observationNs, timing) { it * 1_000_000 / 48000 }
+                time.ns = scheduleNs
+                val pts = 1_300_000L + index * 20_000
+                val decision = clock.videoSchedulingClock(pts)
+                deadlines.add(decision.readAtNs + checkNotNull(decision.delayUs) * 1000)
+                frozenDeadlines.add(scheduleNs + (pts - checkNotNull(clock.currentUs())) * 1000)
+                assertEquals("Prediction cannot publish fake audible progress", 1_000_000 + sampleUs,
+                    clock.cachedPlayedAudioSource())
+                assertEquals(scheduleNs, decision.readAtNs)
+            }
+            val residual = deadlines[1] - deadlines[0] - 20_000_000
+            assertTrue("One output-frame rounding bound, not observation-age jitter: $residual",
+                kotlin.math.abs(residual) <= (1_000_000_000L + 47999) / 48000)
+            assertTrue("Frozen-clock baseline reproduces >10 ms cadence error",
+                kotlin.math.abs(frozenDeadlines[1] - frozenDeadlines[0] - 20_000_000) > 10_000_000)
+        }
+    }
+
+    @Test fun predictionMapsActualResampledSpansSilenceAndSlewWithoutConsumingAudioHistory() {
+        val time = FakeTime()
+        val clock = time.clock()
+        val source = clock.anchorObservedAudio(1_000_000, 48000)
+        val timeline = AudioPresentationTimeline(48000)
+        timeline.write(true, 1, 960, sourceUnits = { it * 1_040_000L }) { 960 }
+        timeline.submitted(480, false)
+        timeline.submitted(960, true)
+        clock.audioPacket(0, 1_000_000)
+        clock.audioPacket(10_000, 1_011_000)
+        clock.audioWritten(40_800)
+        clock.observeAudio(source, timeline.presentedUs(0), time.ns,
+            AudioOutputTiming(48000, 2400, 2400, 2400, 0, 0, AudioClockSource.TIMESTAMP, time.ns,
+                timestampAtNs = time.ns, timestampEstimateFrames = 0),
+            timeline.projection())
+        val anchors = source.pendingAnchors()
+        time.advanceUs(20_000)
+        assertEquals(1_021_016L, clock.videoSchedulingClock(1_100_000).sourcePositionUs)
+        time.advanceUs(5_000)
+        assertEquals("Underrun silence does not count as source audio", 1_021_016L,
+            clock.videoSchedulingClock(1_100_000).sourcePositionUs)
+        assertEquals("Only actual audio may apply phase slew", 0L, source.appliedOffsetUs())
+        assertEquals(anchors, source.pendingAnchors())
+        assertEquals(1_000_000L, clock.currentUs())
+        time.advanceUs(15_000)
+        assertEquals(1_031_216L, clock.videoSchedulingClock(1_100_000).sourcePositionUs)
+        clock.observeAudio(source, timeline.presentedUs(1920), time.ns)
+        assertEquals("Actual presentation agrees with the earlier prediction", 1_031_216L, clock.currentUs())
+    }
+
+    @Test fun predictionStopsAtKnownConsumptionTimestampValidityAndRecoveryBoundaries() {
+        val time = FakeTime()
+        val clock = time.clock()
+        val source = clock.anchorObservedAudio(1_000_000, 48000)
+        clock.audioWritten(500_000)
+        fun observe(frames: Long, consumed: Long, ageUs: Long = 0,
+                    kind: AudioClockSource = AudioClockSource.TIMESTAMP) {
+            clock.observeAudio(source, frames * 1_000_000 / 48000, time.ns,
+                AudioOutputTiming(48000, 4800, consumed + 4800, consumed, frames, ageUs, kind, time.ns,
+                    timestampAtNs = time.ns - ageUs * 1000, timestampEstimateFrames = frames)
+            ) { it * 1_000_000 / 48000 }
+        }
+        observe(0, 960)
+        time.advanceUs(30_000)
+        assertEquals("Never predict queued but not yet consumed frames", 1_020_000L,
+            clock.videoSchedulingClock(1_200_000).positionUs)
+        observe(960, 9600, 90_000)
+        time.advanceUs(10_000)
+        assertEquals("Remaining native timestamp validity is ten ms", 1_030_000L,
+            clock.videoSchedulingClock(1_200_000).positionUs)
+        time.advanceUs(10_000)
+        assertEquals("Expiry retains only previously guarded progress", 1_030_000L,
+            clock.videoSchedulingClock(1_200_000).positionUs)
+        time.advanceUs(250_000)
+        assertEquals(1_030_000L, clock.videoSchedulingClock(1_200_000).positionUs)
+        observe(960, 9600, kind = AudioClockSource.HEAD_STALE)
+        assertEquals("An unqualified new observation cannot rewind guarded video", 1_030_000L,
+            clock.videoSchedulingClock(1_200_000).positionUs)
+        observe(2400, 4800)
+        clock.beginAudioRecovery()
+        time.advanceUs(10_000)
+        assertEquals("Recovery invalidates the old projection", 1_050_000L,
+            clock.videoSchedulingClock(1_200_000).positionUs)
+        clock.detachObservedAudio(source)
+        val replacement = clock.anchorObservedAudio(1_050_000, 48000)
+        clock.audioWritten(100_000)
+        clock.endAudioRecovery()
+        clock.observeAudio(source, 400_000, time.ns + 1)
+        time.advanceUs(10_000)
+        assertEquals("Retired epochs cannot qualify a new output", 1_050_000L,
+            clock.videoSchedulingClock(1_200_000).positionUs)
+        clock.observeAudio(replacement, 20_000, time.ns)
+        assertEquals(1_070_000L, clock.videoSchedulingClock(1_200_000).positionUs)
+    }
+
+    @Test fun unqualifiedOrFutureEvidenceCannotStartOrRefreshPrediction() {
+        for (kind in AudioClockSource.entries) {
+            val time = FakeTime()
+            val clock = time.clock()
+            val source = clock.anchorObservedAudio(1_000_000, 48000)
+            clock.audioWritten(100_000)
+            val timing = AudioOutputTiming(48000, 4800, 4800, 4800, 0, 0, kind,
+                positionAtNs = time.ns, timestampAtNs = time.ns, timestampEstimateFrames = 0)
+            clock.observeAudio(source, 0, time.ns,
+                if (kind == AudioClockSource.TIMESTAMP) timing.copy(timestampAtNs = null) else timing
+            ) { it * 1_000_000 / 48000 }
+            time.advanceUs(20_000)
+            assertEquals("Missing native evidence and fallback heads do not establish a source rate",
+                1_000_000L, clock.videoSchedulingClock(1_200_000).positionUs)
+            clock.observeAudio(source, 0, time.ns, timing.copy(positionAtNs = time.ns,
+                clockSource = AudioClockSource.TIMESTAMP, timestampAtNs = time.ns + 1)
+            ) { it * 1_000_000 / 48000 }
+            time.advanceUs(20_000)
+            assertEquals(1_000_000L, clock.videoSchedulingClock(1_200_000).positionUs)
+            val observation = clock.cachedPlayedAudioObservation()
+            clock.observeAudio(source, 50_000, time.ns, timing.copy(positionAtNs = 0,
+                clockSource = AudioClockSource.TIMESTAMP, timestampAtNs = 0)
+            ) { it * 1_000_000 / 48000 }
+            assertSame("Old native observation times cannot refresh the prediction",
+                observation, clock.cachedPlayedAudioObservation())
+        }
+        val time = FakeTime()
+        val clock = time.clock()
+        val source = clock.anchorObservedAudio(1_000_000, 48000)
+        clock.audioWritten(100_000)
+        clock.observeAudio(source, 0, time.ns,
+            AudioOutputTiming(48000, 4800, 4800, 4800, 0, 0, AudioClockSource.TIMESTAMP,
+                positionAtNs = time.ns, timestampAtNs = time.ns, timestampEstimateFrames = 0)
+        ) { it * 1_000_000 / 48000 }
+        time.advanceUs(100_001)
+        assertEquals("A first read after expiry must not invent past progress up to the validity boundary",
+            1_000_000L, clock.videoSchedulingClock(1_200_000).positionUs)
+    }
+
+    @Test fun schedulingContextUsesCachedObservationAndKeepsPacketCorrectionSeparateFromAppliedSlew() {
+        val time = FakeTime()
+        val clock = time.clock()
+        val source = clock.anchorObservedAudio(1_000_000, 48000)
+        val initial = clock.videoSchedulingClock(1_010_000)
+        assertEquals("AUDIO_INITIAL", initial.mode)
+        assertNull(initial.audioObservationSequence)
+        clock.audioPacket(0, 1_000_000)
+        clock.audioWritten(100_000)
+        val output = AudioOutputTiming(48000, 4800, 4800, 1000, 960, 12, AudioClockSource.TIMESTAMP)
+        clock.observeAudio(source, 20_000, time.ns, output)
+        val fresh = clock.videoSchedulingClock(1_030_000)
+        assertEquals("CACHED_AUDIO", fresh.mode)
+        assertEquals(10_000L, fresh.delayUs)
+        assertEquals(AudioClockSource.TIMESTAMP, fresh.audioOutputSource)
+        assertEquals(12L, fresh.audioTimestampAgeUs)
+        clock.audioPacket(50_000, 1_051_000)
+        time.advanceUs(250_000)
+        val stale = clock.videoSchedulingClock(1_030_000)
+        assertEquals(fresh.audioObservationSequence, stale.audioObservationSequence)
+        assertEquals(fresh.audioObservationAtNs, stale.audioObservationAtNs)
+        assertEquals(fresh.positionUs, stale.positionUs)
+        assertEquals(250_000_000L, stale.readAtNs - checkNotNull(stale.audioObservationAtNs))
+        assertEquals(0L, stale.observedAppliedOffsetUs)
+        assertEquals(1000L, stale.lastPacketCorrection?.deltaUs)
+        assertTrue(stale.mappingRevision > fresh.mappingRevision)
+        clock.observeAudio(source, 80_000, time.ns, output.copy(clockSource = AudioClockSource.HEAD_STALE))
+        val next = clock.videoSchedulingClock(1_090_000)
+        assertEquals(600L, next.observedAppliedOffsetUs)
+        assertEquals(AudioClockSource.HEAD_STALE, next.audioOutputSource)
+        assertNotEquals(stale.audioObservationSequence, next.audioObservationSequence)
+        clock.observeAudio(source, 90_000, time.ns - 1)
+        assertEquals(next, clock.videoSchedulingClock(1_090_000))
+    }
+
+    @Test fun schedulingContextLabelsUnavailableFallbackAndMonotonicGuardWithoutInventingAudio() {
+        val time = FakeTime()
+        val clock = time.clock()
+        assertEquals("UNAVAILABLE", clock.videoSchedulingClock(1).mode)
+        assertNull(clock.videoSchedulingClock(1).positionUs)
+        clock.anchorVideo(1_000_000)
+        val monotonic = clock.videoSchedulingClock(1_000_000)
+        assertEquals("MONOTONIC", monotonic.mode)
+        assertNull(monotonic.audioOutputSource)
+        time.advanceUs(20_000)
+        clock.currentUs()
+        val source = clock.anchorObservedAudio(1_019_000, 48000)
+        val guarded = clock.videoSchedulingClock(1_030_000)
+        assertEquals(1_019_000L, guarded.sourcePositionUs)
+        assertEquals(1_020_000L, guarded.positionUs)
+        clock.beginAudioRecovery()
+        clock.detachObservedAudio(source)
+        val detached = clock.videoSchedulingClock(1_030_000)
+        assertEquals("MONOTONIC", detached.mode)
+        assertTrue(detached.recoveringAudio)
+        assertNull(detached.audioObservationSequence)
+        assertNull(detached.observedAppliedOffsetUs)
+        assertTrue(detached.mappingRevision > guarded.mappingRevision)
+        clock.anchorAudio(1_020_000) { 0 }
+        assertEquals("CALLBACK_AUDIO", clock.videoSchedulingClock(1_030_000).mode)
+        assertNull(clock.videoSchedulingClock(1_030_000).audioOutputSource)
+    }
+
     @Test fun publishedAudioKeepsItsSourceMappingAndObservationTimeWithoutExtrapolation() {
         val time = FakeTime()
         val clock = time.clock()

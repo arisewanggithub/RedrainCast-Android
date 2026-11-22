@@ -30,3 +30,7 @@ jobs:
         env:
           JAVA_TOOL_OPTIONS: -Djava.util.concurrent.ForkJoinPool.common.parallelism=3
         run: bash ./gradlew :app:testDebugUnitTest :app:lintDebug :app:assembleDebug :app:assembleRelease --console=plain
+      - name: Test generated receiver collector contract
+        env:
+          DIAGNOSTICS_REQUIRE_FIXTURE: '1'
+        run: python3 -B tools/diagnostics-test.py ProtocolTests.test_generated_receiver_timing_fetch_passes_actual_collector_exchange ProtocolTests.test_generated_legacy_receiver_capture_drains

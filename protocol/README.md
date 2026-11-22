@@ -437,8 +437,29 @@ Native audio timing is sampled only by the audio worker and its joined cleanup,
 not by video, admission, recovery proofs or shared-clock readers. Each output
 service publishes the actually presented source-sample mapping and its original
 monotonic observation time, including during encoded-input gaps. Attached audio
-remains sample-master without extrapolation; reads do not refresh stalled
-observations. Video recovery requires a new attached-audio observation after its
+remains sample-master; reads do not refresh stalled observations or advance
+actually presented source positions. For video deadlines only, a qualified DAC
+timestamp projects device presentation from its original `System.nanoTime`
+observation to the single scheduling-clock read. Projection uses the output's
+actual playback speed and sample rate, not a guessed source rate or an
+observation-to-observation slope. It stops at the already-consumed device-frame
+count. The timestamp-derived estimate is projected before applying the existing
+monotonic presentation floor: after head fallback, a returning DAC estimate
+behind that floor must catch up before scheduling positions advance.
+Projection also requires the native timestamp to remain within its existing
+100 ms validity; it never assumes queued but unconsumed PCM will play.
+An immutable copy of the existing bounded presentation-span history maps these
+frames through actual resampler source/output ratios and underrun silence.
+A non-mutating preview of the source clock applies the existing packet anchors
+and 1/50 phase-slew bound. Neither history, slew credit nor actual audio/statistics
+observations are advanced by video. Unavailable/warming/stale/invalid timestamps,
+missing native time/mapping evidence and recovery use the observed position;
+a separate video monotonic guard prevents rewinds when prediction stops.
+Recovery transitions, detach and replacement invalidate prediction, and retired
+outputs cannot publish into a new epoch. The absolute deadline and diagnostic
+snapshot always use the same scheduling read/time, with recording on or off.
+This removes observation-age-induced app deadlines, not proof of physical-display
+smoothness. Video recovery requires a new attached-audio observation after its
 decoded proof candidate; the video worker retries that candidate during idle
 steps, without requiring another compressed picture or blocking the audio worker.
 The existing 250 ms picture lateness check and recovery deadline still apply.

@@ -31,14 +31,15 @@ class DiagnosticVideoTest {
         } while (page.getBoolean("hasMore"))
         return result
     }
-    private fun video(id: String) = records(id).filter { it.getString("kind") == "VIDEO_PROGRESS" }
+    private fun video(id: String) = records(id).filter { it.getString("kind") == "VIDEO_PROGRESS" &&
+        it.getJSONObject("data").optJSONObject("metrics")?.optString("schema") == "video_progress" }
     private fun metric(event: JSONObject) = event.getJSONObject("data").getJSONObject("metrics")
 
     @Test fun disabledWrongRoleSessionAndUnselectedFlagNeverReadClock() {
         var clocks = 0
         val gated = DiagnosticRecorder { clocks++; now }
         fun update(role: String = "receiver", session: Long = 73) =
-            gated.video(role, session, 1, DiagnosticVideoStage.DECODED, 100)
+            gated.video(role, session, 1, DiagnosticVideoStage.SKIPPED, 100, reason = DiagnosticReason.STALE)
         repeat(1000) { update() }
         assertEquals(0, clocks)
         gated.sessionStarted("receiver", 73)
@@ -167,5 +168,72 @@ class DiagnosticVideoTest {
         val page = recorder.fetch(id, 0, 32)
         assertTrue(page.getString("droppedBeforeRetention").toLong() > 0)
         assertEquals("CAPTURE_ENDED", records(id).last().getString("kind"))
+    }
+
+    @Test fun receiverTimingAndAnomalyTraceAreBoundedAndReportSuppression() {
+        val id = start()
+        recorder.video("receiver", 73, 1, DiagnosticVideoStage.RELEASED, 100, sourceAtNs = now + 10_000_000, delayUs = 10_000)
+        repeat(70) {
+            now += 60_000_000
+            recorder.video("receiver", 73, 1, DiagnosticVideoStage.RELEASED, 100L + it,
+                sourceAtNs = now, delayUs = -25_000, heldNs = 75_000_000, releaseCallNs = 30_000_000)
+        }
+        recorder.video("receiver", 73, 1, DiagnosticVideoStage.RENDERED, 1, sourceAtNs = 900)
+        recorder.video("receiver", 73, 1, DiagnosticVideoStage.RENDERED, 2, sourceAtNs = 950)
+        recorder.video("receiver", 73, 1, DiagnosticVideoStage.RENDERED, 3, sourceAtNs = 800)
+        recorder.end(id)
+        val all = records(id)
+        val traces = all.filter { it.optJSONObject("data")?.optJSONObject("metrics")?.optString("schema") == "video_anomaly" }
+        assertEquals(64, traces.size)
+        assertEquals("1060000000", metric(traces.first()).getString("occurrenceAtNs"))
+        assertEquals("1000000000", metric(traces.first()).getString("previousAtNs"))
+        assertEquals("-25000", metric(traces.first()).getString("delayUs"))
+        val release = video(id).last { metric(it).getString("videoStage") == "released" }.let(::metric)
+        assertEquals("70", release.getString("longIntervals"))
+        assertEquals("71", release.getString("scheduledCount"))
+        assertEquals("70", release.getString("lateSchedules"))
+        assertEquals("-25000", release.getString("minDelayUs"))
+        assertEquals("10000", release.getString("maxDelayUs"))
+        assertEquals("70", release.getString("holdSamples"))
+        assertEquals("75000000", release.getString("maxHoldNs"))
+        assertEquals("30000000", release.getString("maxReleaseCallNs"))
+        assertEquals("71", release.getString("traceCandidates"))
+        assertEquals("7", release.getString("traceSuppressed"))
+        val callback = video(id).last { metric(it).getString("videoStage") == "rendered" }.let(::metric)
+        assertEquals("1", callback.getString("sourceIntervalCount"))
+        assertEquals("50", callback.getString("maxSourceIntervalNs"))
+        assertEquals("1", callback.getString("sourceRegressions"))
+    }
+
+    @Test fun generationAndClockRegressionsDoNotInventIntervalsOrMatchCallbacks() {
+        val id = start()
+        recorder.video("receiver", 73, 1, DiagnosticVideoStage.RENDERED, 10, sourceAtNs = Long.MIN_VALUE)
+        now -= 1
+        recorder.video("receiver", 73, 1, DiagnosticVideoStage.RENDERED, 10, sourceAtNs = Long.MAX_VALUE)
+        recorder.videoConfigured("receiver", 73, 2, DiagnosticVideoConfiguration(DiagnosticCodec.H264, 1, 1, 60, true))
+        recorder.video("receiver", 73, 1, DiagnosticVideoStage.RENDERED, 10, sourceAtNs = 5)
+        recorder.end(id)
+        val rendered = video(id).last { metric(it).getString("videoStage") == "rendered" }.let(::metric)
+        assertEquals("0", rendered.getString("intervalCount"))
+        assertEquals(Long.MAX_VALUE.toString(), rendered.getString("maxSourceIntervalNs"))
+        assertEquals("2", rendered.getString("count"))
+    }
+
+    @Test fun callbackSourceGapsAndRegressionsAreTracedWithoutMatchingDuplicatePts() {
+        val id = start()
+        recorder.video("receiver", 73, 1, DiagnosticVideoStage.RENDERED, 10, sourceAtNs = 10)
+        recorder.video("receiver", 73, 1, DiagnosticVideoStage.RENDERED, 10, sourceAtNs = 50_000_010)
+        recorder.video("receiver", 73, 1, DiagnosticVideoStage.RENDERED, 10, sourceAtNs = 5)
+        recorder.end(id)
+        val traces = records(id).filter {
+            it.optJSONObject("data")?.optJSONObject("metrics")?.optString("schema") == "video_anomaly"
+        }
+        assertEquals(2, traces.size)
+        assertEquals("10", metric(traces[0]).getString("previousSourceAtNs"))
+        assertEquals("50000010", metric(traces[0]).getString("sourceAtNs"))
+        assertEquals("50000010", metric(traces[1]).getString("previousSourceAtNs"))
+        assertEquals("5", metric(traces[1]).getString("sourceAtNs"))
+        assertEquals(1, traces[1].getInt("generation"))
+        assertEquals("10", traces[1].getJSONObject("data").getString("ptsUs"))
     }
 }

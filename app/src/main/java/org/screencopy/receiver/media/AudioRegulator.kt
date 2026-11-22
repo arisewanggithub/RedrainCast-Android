@@ -180,6 +180,25 @@ internal class AudioPresentationTimeline(private val rate: Int) {
         }
         return sourcePresented / rate
     }
+    @Synchronized fun projection(): (Long) -> Long {
+        val history = spans.toList()
+        val floor = sourcePresented
+        val limit = deviceWritten
+        return { deviceFrames ->
+            require(deviceFrames in 0..limit)
+            var units = floor
+            for (span in history) {
+                if (deviceFrames >= span.deviceEnd) units = maxOf(units, span.sourceEnd)
+                else {
+                    if (deviceFrames >= span.deviceStart)
+                        units = maxOf(units, span.sourceStart + (deviceFrames - span.deviceStart) *
+                            (span.sourceEnd - span.sourceStart) / (span.deviceEnd - span.deviceStart))
+                    break
+                }
+            }
+            units / rate
+        }
+    }
     @Synchronized fun clear() {
         spans.clear()
         deviceWritten = 0

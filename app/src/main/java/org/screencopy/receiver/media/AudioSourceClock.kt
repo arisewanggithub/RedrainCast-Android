@@ -13,7 +13,7 @@ data class AudioClockCorrection(
 }
 
 /** Source anchors follow presented samples, never the newest packet still buffered at the output. */
-internal class AudioSourceClock(private val firstPtsUs: Long, sampleRate: Int) {
+internal class AudioSourceClock(private val firstPtsUs: Long, private val sampleRate: Int) {
     init { require(firstPtsUs >= 0 && sampleRate > 0) { "Invalid audio source clock format" } }
     private data class Anchor(val sampleUs: Long, val offsetUs: Long)
     private val anchors = ArrayDeque<Anchor>().apply { add(Anchor(0, 0)) }
@@ -60,6 +60,17 @@ internal class AudioSourceClock(private val firstPtsUs: Long, sampleRate: Int) {
 
     fun bufferedUs(): Long = (submittedUs - playedUs).coerceAtLeast(0)
     internal fun pendingAnchors(): Int = anchors.size
+    internal fun appliedOffsetUs(): Long = appliedOffsetUs
+
+    // Video prediction must not consume source anchors or slew credit owned by actual audio.
+    internal fun projected(positionUs: Long): Long = AudioSourceClock(firstPtsUs, sampleRate).also {
+        it.anchors.clear()
+        it.anchors.addAll(anchors)
+        it.submittedUs = submittedUs
+        it.playedUs = playedUs
+        it.appliedOffsetUs = appliedOffsetUs
+        it.slewRemainder = slewRemainder
+    }.current(positionUs)
 
     private fun advance(positionUs: Long) {
         check(positionUs >= playedUs) { "Audio source mapping attempted to rewind presented samples" }

@@ -21,8 +21,8 @@ explicit access remains available independently. No media or casting control is 
 
 ## Local consent and lifetime
 
-- The local playback-statistics setting exposes an additional **Allow unpaired LAN
-  diagnostics** switch beside an explicit risk warning, off by default. Both must be enabled to open the
+- Settings expose an independent **Allow unpaired LAN
+  diagnostics** switch beside an explicit risk warning, off by default. It alone authorizes the
   local diagnostic listener. Delegated receiver access is described below.
   LAN permission remains required where applicable.
 - Enabling access starts only the listener and HELLO machinery. It does
@@ -30,14 +30,13 @@ explicit access remains available independently. No media or casting control is 
   Existing ordinary application logging/statistics are unaffected.
 - The UI displays the endpoint, unauthenticated LAN access warning and whether
   a collector/capture is active. No certificate, pairing secret or fingerprint exists.
-- Local access is process-local, not persisted across app restarts. Turning either
-  local setting off stops local collection, closes its sockets and clears its history.
+- Local access is process-local, not persisted across app restarts. Turning diagnostic
+  access off stops local collection, closes its sockets and clears its history.
   On a sender it also sends delegated revocation to the admitted receiver; that
   receiver freezes same-cast evidence for up to 120 seconds rather than continuing sampling.
   UI recreation must not accidentally enable access or duplicate the listener.
-- A sender may be backgrounded while casting. Backgrounding or hiding the
-  overlay alone does not revoke consent; disabling the underlying statistics
-  setting does. A receiver must remain diagnosable after casting fails.
+- A sender may be backgrounded while casting. Backgrounding or changing the
+  statistics setting or overlay does not revoke consent. A receiver must remain diagnosable after casting fails.
 - A compatible receiver honors the admitted sender's negotiated diagnostic flag
   for that single cast without requiring local receiver statistics/remote opt-in.
   Accepting a cast with this flag intentionally opens bounded LAN metadata
@@ -74,8 +73,12 @@ explicit access remains available independently. No media or casting control is 
 
 Each message is one UTF-8 JSON object terminated by LF. Limit every original
 line to 16,384 bytes, excluding LF, before JSON parsing. Reject malformed UTF-8,
-duplicate keys, non-object roots, excessive nesting (more than 8 levels), and
+duplicate keys, non-object roots, excessive nesting, and
 noncanonical typed values; do not coerce strings, Booleans or fractional numbers.
+Requests and legacy responses retain the 8-level bound. Only captures explicitly
+selecting `video.timing` may return responses through depth 10 (root depth zero,
+counting descent into values), for fully populated clock corrections. Depth 11
+is rejected by the current collector.
 Maximum command rate is 20/second, with a burst allowance of 20.
 
 Requests have `v:1`, `id` (ASCII identifier, 1..64 characters from
@@ -145,7 +148,8 @@ nonempty array of unique names, not an ambiguous numeric bitmask:
 | `audio.transport` | Sender write begin/end/failure; receiver read begin/end and admission outcome; bytes/counts and generation/PTS only. |
 | `audio.queue` | Queue occupancy, oldest age, PTS range, eviction/hold/release and writer-in-flight age. |
 | `audio.output` | Receiver decode/resample/refill/AudioTrack call begin/end, frame counts, playback progress and underrun observations where available. |
-| `video.progress` | Low-rate received/decoded/presented/dropped counters and recovery progress, not per-frame video traces. |
+| `video.progress` | Low-rate video stage counters and bounded receiver anomaly examples. |
+| `video.timing` | Receiver-only extended timing snapshots; requires `video.progress` and a collector supporting depth 10 and 12,000-byte records. |
 | `transport.health` | Per-lane application progress and supported TCP statistics, with metric provenance and availability. |
 
 No automatic enabling of omitted groups. A minimal capture lifecycle, sequence
@@ -158,7 +162,7 @@ Example:
 
 ```json
 {"v":1,"id":"capture1","op":"START","args":{"target":{"role":"sender","nextSession":true},"flags":["session","recovery","audio.capture","audio.transport","audio.queue"],"durationMs":180000,"samplePeriodMs":1000}}
-{"v":1,"id":"capture1","op":"START","ok":true,"result":{"captureId":"c1","startedNs":"613130000000000","expiresNs":"613310000000000","maxRecords":4096,"maxBytes":2097152,"maxRecordBytes":2048}}
+{"v":1,"id":"capture1","op":"START","ok":true,"result":{"captureId":"c1","startedNs":"613130000000000","expiresNs":"613310000000000","maxRecords":4096,"maxBytes":2097152,"maxRecordBytes":2048,"maxDefaultRecordBytes":2048}}
 {"v":1,"id":"end1","op":"END","args":{"captureId":"c1"}}
 ```
 
@@ -205,7 +209,8 @@ the implementation, not accept arbitrary string maps or free-form log messages.
   Do not assume PTS is unique or infer packet loss from sequence numbers on
   different devices. No media protocol header change is required for v1.
 - Keep at most 4,096 records AND 2 MiB of serialized retained data per device;
-  individual records are at most 2,048 bytes. Retention reserves 512 records /
+  individual records are at most 2,048 bytes except receiver video timing
+  aggregates, capped at 12,000 bytes. Retention reserves 512 records /
   512 KiB for lifecycle, session, recovery and failure evidence; routine records
   use the remaining 3,584 records / 1.5 MiB. Use fixed, bounded typed counters
   and serialize off media threads. Event hooks do not do socket I/O, disk I/O,
@@ -218,6 +223,10 @@ the implementation, not accept arbitrary string maps or free-form log messages.
   closes the queue, so no late producer can publish after `CAPTURE_ENDED`.
   The control lane drains in ticket order and never lets a later record pass an
   earlier producer that has reserved but not yet published its slot.
+  Video timing generation replacement reserves a routine ticket before retiring
+  the old tracker; if admission fails, the old tracker remains available for
+  final capture sampling. A replacement that loses its compare-and-set publishes
+  a stale contention observation in its reserved slot.
 - Routine retention cannot evict critical retention. Counters distinguish
   routine/critical queue saturation, expired observations, closed-capture
   races, oversized records and routine/critical retention eviction. Admission
@@ -314,7 +323,7 @@ remaining ambiguity rather than invent a network diagnosis.
 
 This unreleased draft intentionally supports sender-controlled receiver
 diagnostics: the sender warning explicitly states that enabling local
-statistics plus remote diagnostics also opens compatible receiver diagnostics
+remote diagnostics also opens compatible receiver diagnostics
 for an admitted cast. Projector settings need not be accessed. Local
 receiver statistics/diagnostic preferences are not prerequisites and are never
 mutated by delegation. Any reachable LAN client can use the bounded endpoint;
@@ -375,8 +384,8 @@ cast does not request diagnostics. Old async startups/callbacks cannot grant a
 replacement session. The regular 180-second capture lease and all byte/record/
 rate/deadline limits remain unchanged.
 
-Explicit local receiver mode takes precedence, has its original process-local
-statistics gate and unrestricted local profile, and is not closed by delegated
+Explicit local receiver mode takes precedence, has a process-local
+consent gate and unrestricted local profile, and is not closed by delegated
 cast teardown. Enabling local mode revokes a delegated listener/history first;
 turning local mode off does not silently rearm an earlier delegation. No receiver
 preference is changed. Each new cast needs a fresh negotiated request.
@@ -495,7 +504,7 @@ The existing receiver discovery advertisement on UDP **27183** may include the
 optional root field `"diagnostic":{"version":1,"port":43210,"access":"lan"}`. `port` is an exact
 JSON integer in 1..65535, taken directly from the bound diagnostic server socket,
 not the casting TCP port or a parsed display string. It is included only when
-local statistics/remote consent or admitted session delegation remains valid and the diagnostic listener
+local remote consent or admitted session delegation remains valid and the diagnostic listener
 is successfully bound/live with LAN permission. Disabled, revoked, failed,
 starting and closed listeners omit the entire field. Closing the receiver also
 prevents the field from appearing in its advertisement. Existing advertisement
@@ -531,7 +540,7 @@ connection. The collector requires explicit `--lan` to acknowledge plaintext,
 unauthenticated access. Network policy, NAT and stale packets can still prevent
 reachability; the exact locally displayed bound endpoint remains authoritative.
 
-Local access: **Settings → Advanced → Show playback statistics → Allow unpaired LAN
+Local access: **Settings → Advanced → Allow unpaired LAN
 diagnostics (this process only)**, read the warning, then **Save**. Reopen **LAN diagnostics
 endpoint / status** after listener startup, before casting, to read the actual TCP endpoint and
 unauthenticated-access status/warning. Settings cannot be opened during an active
@@ -563,9 +572,13 @@ The supported flags are:
 | Role | Supported flags |
 |---|---|
 | sender | `session`, `recovery`, `audio.capture`, `audio.transport`, `audio.queue`, `video.progress`, `transport.health` |
-| receiver | `session`, `recovery`, `audio.transport`, `audio.queue`, `audio.output`, `video.progress`, `transport.health` |
+| receiver | `session`, `recovery`, `audio.transport`, `audio.queue`, `audio.output`, `video.progress`, `video.timing`, `transport.health` |
 
-`video.progress` supplies bounded cumulative stage snapshots, described below.
+`video.progress` supplies bounded cumulative stage snapshots and bounded receiver anomaly examples, described below.
+The optional `video.timing` capability requires `video.progress` in START and
+negotiates the extended timing schema and record size. Without it, timing records
+are not produced, all records remain at most 2,048 bytes, and legacy collectors
+can parse and drain the capture including delayed staging publications.
 Collector defaults intersect their known flags with each peer's advertised
 capabilities, including when following the receiver. Explicit flag lists stay
 strict: unsupported requests fail before START; `capture_metadata.flags` always
@@ -583,13 +596,16 @@ FETCH pages obey both strict rolling one-second budgets (256 records/128 KiB,
 including response framing); a budget-exhausted request returns `RATE_LIMITED`
 without advancing the client cursor or discarding retained evidence.
 `START` returns `captureId`, `startedNs`, `expiresNs`, `maxRecords`, `maxBytes`,
-`maxRecordBytes`, `maxDurationMs`. `STATUS` returns `state` (`idle`, `collecting`,
+`maxRecordBytes`, `maxDefaultRecordBytes`, `maxDurationMs`. `STATUS` returns `state` (`idle`, `collecting`,
 `frozen`), nullable `captureId`, `target`, `flags`, `expiresNs`, `endedNs`,
 `endReason`, `sessions` and the retained range/drop counters. The frozen timer
 never renews on STATUS, PING or FETCH. END is idempotent while its capture remains.
 STATUS also returns integer `pendingRecords` (zero when idle). Frozen retrieval
 is bounded by the initial 4,096-record/2 MiB retention plus at most 1,024 staging
-records of at most 2,048 bytes each; pages may be byte-limited, not just
+records of at most 12,000 bytes each (a conservative bound including video timing
+aggregates): at most 5,120 records and 14,385,152 record bytes across the drain.
+This is a total transfer bound, not an increase to simultaneous retention.
+Pages may be byte-limited, not just
 32-record-limited. The collector enforces both evidence bounds, cursor progress
 and the original 120-second deadline rather than a 129-page assumption.
 
@@ -655,10 +671,179 @@ Optional `data.metrics` is exactly one enumerated typed schema:
 | `capture_timestamp` | Boolean `available`; decimal `framePosition`, `monoNs` when available, otherwise both null |
 | `video_configuration` | controlled `codec`; integer `width`, `height`, `frameRate` (0 means unspecified); nullable Boolean `renderedCallback`; constant `presentationEvidence:"codec_release_or_render_callback_not_physical_display"` |
 | `video_progress` | controlled `videoStage`; decimal cumulative `count`, `firstAtNs`, `lastAtNs`, `maxPtsGapUs`, `maxObservationGapNs`; nullable decimal `bytes`, `keyFrames`, `firstPtsUs`, `lastPtsUs`, `sourceAtNs`; controlled `lastReason`; Boolean `retired`; `reasons` with decimal `stale`, `capacity`, `pressure`, `sourcePending`, `stopped`, `replaced` |
+| `video_frame_timing` | receiver-only bounded correlation counters and signed nanosecond ranges, described below |
+| `video_anomaly` | controlled `videoStage`, `reason`; decimal `occurrenceAtNs`; nullable decimal `previousAtNs`, `sourceAtNs`, `previousSourceAtNs`, `delayUs`, `heldNs`, `releaseCallNs`; event supplies PTS and generation |
 | `video_failure` | controlled lowercase decoder `VideoStage` in `videoStage` and `VideoFault` in `fault`; enclosing `failed` event supplies track/generation, waiting/last input PTS and reason `failure`, without exception messages |
 | `operation_summary` | lowercase `point`; decimal `windowStartNs`, `windowEndNs`, `started`, `completed`, `zeroOperationEvents`, `bytes`, `units`, `slow`, `maxDurationNs`; `durationBuckets` with decimal `under1Ms`, `1To5Ms`, `5To20Ms`, `over20Ms`; nullable decimal `slowExampleOperationId`, `slowExampleDurationNs`, `slowExamplePtsUs`, `slowExampleEndPtsUs`, `slowExampleCount`, `slowExampleBytes`; nullable integer slow-exemplar track/generation |
 
 ### Video progress evidence
+
+Receiver `video.progress` also reports cumulative `intervalCount`, `longIntervals`
+(observation gaps at least 50 ms), `sourceIntervalCount`, `maxSourceIntervalNs`,
+`sourceRegressions`, `scheduledCount`, `lateSchedules`, and nullable signed
+`minDelayUs`/`maxDelayUs`, plus `holdSamples`, `maxHoldNs`, `releaseCallSamples`
+and `maxReleaseCallNs`. Hold time runs from holding a decoded output to codec
+release invocation; release-call time is wall-clock time in that API call, not
+time to presentation. Invalid/regressing clock samples are omitted. Source intervals are computed only between successive
+render callbacks in one generation; regressions are counted, not converted to
+positive intervals. Release delay is the playback clock's signed delay before
+clamping to zero, not measured display lateness. A null delay means the clock
+was unavailable. Release `sourceAtNs` is the requested codec deadline, whereas
+render callback `sourceAtNs` is the codec-provided render timestamp. Observation
+times use the recorder monotonic clock and release observation happens after the
+codec call returns; callbacks can precede that observation.
+
+`video_frame_timing` requires an active receiver capture selecting both
+`video.progress` and `video.timing`, not the statistics panel. It summarizes a capture
+and video generation, retaining provisional correlation contributions for the
+most recent 128 PTS groups. Every range has decimal `count` and nullable
+signed decimal `minNs`/`maxNs`; snapshots are not additive:
+
+* `decodedMinusDeadline` is minus the signed playback-clock delay sampled at
+  decoded output availability. Negative means available before that estimate.
+  `suppliedMinusDeadline` compares the actual codec release timestamp with the
+  **unclamped** deadline estimated from the existing schedule delay and
+  schedule-time monotonic sample. Positive values include late-delay clamping.
+  These are clock estimates, not measured display times; a null clock or
+  overflow omits the corresponding sample.
+* For safely correlated callbacks, `callbackMinusDeadline` compares the
+  codec-supplied timestamp to the intended deadline. `observedMinusCallback`
+  compares local callback observation to the supplied timestamp; it is signed,
+  so a future supplied timestamp remains negative. `futureCallbacks` counts
+  all observed callbacks whose supplied time is in the future, including
+  unmatched callbacks. `worstCallbackErrorExample` is null until a match,
+  then contains the matched `ptsUs`, `deadlineNs`, `releaseNs`, `callbackNs`,
+  `observedNs`, and nullable `decodedMinusDeadlineNs` of the greatest absolute
+  callback error; the decode value uses its earlier clock estimate and is
+  omitted if its clock revision differs from the release.
+* `ptsCadence`, `deadlineCadence`, and `callbackCadence` are intervals between
+  consecutive safely matched callbacks in callback-observation order with the
+  same clock mapping and increasing PTS. `callbackCadenceMinusPts` and
+  `callbackCadenceMinusDeadline` are signed differences of those intervals.
+  Legitimate variable source cadence is not itself a pacing fault.
+* `deadlineCadenceMinusPts` independently compares consecutive successful
+  unique-PTS scheduling decisions, after sealing by a later decoded PTS, with
+  increasing PTS, adjacent release order and the same stable mapping. It does
+  not require callbacks. Its minimum/maximum are accompanied by
+  `minimumDeadlineCadenceExample`/`maximumDeadlineCadenceExample`, each containing
+  the signed difference and both PTS-keyed scheduling snapshots. Duplicate outputs
+  or releases, failures and mapping transitions break this continuity.
+  `latestSchedulingExample` retains the latest eligible decision even without
+  a deadline. The worst callback example also contains its `scheduling` snapshot.
+* Scheduling snapshots contain `scheduleAtNs`, unclamped `deadlineNs`,
+  `releaseNs`, `mappingRevision`, `mappingStable`, and a nullable `clock`.
+  The clock snapshot is taken atomically at the **delay read actually used**,
+  not from a later stats-panel query. `readAtNs` is the local monotonic time
+  used for that read **and** the actual absolute deadline; `scheduleAtNs` is
+  this same time, not a later timing read. `positionUs` includes the monotonic guard,
+  while `sourcePositionUs` is its unguarded input (including bounded DAC/source-map
+  prediction for qualified cached audio, not necessarily the cached observed PTS).
+  `delayUs` is the original
+  signed delay. Modes are `CACHED_AUDIO`, `CALLBACK_AUDIO` (legacy callback
+  observation), `AUDIO_INITIAL` (attached audio without an observation),
+  `MONOTONIC` (no attached audio), and `UNAVAILABLE` (no anchor).
+* `audioObservationSequence` identifies an accepted cached observation within
+  the playback clock; unchanged values across decisions mean the same cached
+  observation, not a repeated hardware sample read or an unchanged predicted
+  scheduling position. For native audio `audioObservationAtNs` is the exact
+  `AudioPosition` presentation-read time, not the later publication time. It and
+  signed `audioObservationAgeNs` use receiver-local `System.nanoTime`, with age
+  measured at `scheduleAtNs`. `audioObservationAge` and `clockReadToSchedule`
+  summarize these signed nanosecond ages and read-to-schedule intervals over
+  eligible decisions. Null means unknown, not zero.
+* `audioOutputSource` and `audioTimestampAgeAtObservationUs` come from the
+  exact `AudioOutputTiming` used to publish that cached observation. The
+  source is AudioPosition's qualified timestamp/head fallback classification,
+  not a claimed native effective clock source. Hardware timestamp age is at
+  the audio read, **not** at video scheduling; it is distinct from cached
+  observation age. Legacy callbacks have no output classification. Android
+  AudioTrack supplies timestamps in the monotonic domain; no wall clock or
+  sender timestamp is subtracted to obtain observation age.
+* `observedAppliedOffsetUs` is the source-map slew offset at the cached audio
+  observation. Nullable `lastPacketCorrection` retains the latest packet-map
+  change since audio attachment, with sequence, before/after offsets, delta,
+  and `appliedOffsetAtPacketUs`. A packet correction is not proof that its whole
+  delta was applied to the audible clock: buffered anchors and bounded slew
+  intervene. `recoveringAudio` is the actual recovery flag. A changed mapping
+  between delay read and schedule invalidates the intended deadline, but the
+  snapshot retains both revisions and `mappingStable=false`.
+
+Only 128 PTS groups, constant-size cumulative ranges and four retained
+scheduling exemplars (latest, minimum pair, maximum pair, worst callback)
+are kept. At most two lightweight occurrence tokens per group and 512 pending
+adjacency edges cover callback and release order across retirement. Each token
+has at most one incoming and one outgoing edge in its stream; edges have no
+chains or references to retired groups. Fully retired edges are accumulated
+and discarded. Retired endpoint tokens survive only while referenced by these
+bounded edges or the two stream tails, so they cannot form unbounded history. There is
+no additional per-frame stream. Capture/generation resets
+discard this context with the existing tracker. Audio publication retains
+constant-size context without another output query; video snapshots are only
+created under both active receiver video gates. These fields can
+associate deadline variation with reused observations, source-map changes,
+monotonic guarding or read-to-schedule time, but cannot establish causation,
+thread wakeup latency, native PLL corrections, compositor latch or scanout.
+The existing periodic aggregate remains one record, rather than introducing
+a per-frame stream. Only receiver `video_frame_timing` records have a
+12,000-byte UTF-8 ceiling when `video.timing` is selected (below the existing 15,000-byte read-page budget);
+all other records retain the 2,048-byte ceiling. HELLO advertises the 12,000-byte
+maximum; START advertises 12,000 only when `video.timing` is selected, otherwise
+2,048. `maxDefaultRecordBytes` is 2,048. Capture byte/record quotas,
+retention reserves and oversized-record loss accounting are unchanged.
+
+`matched`, `unmatched`, `ambiguous`, `evicted`, `missing`, `pending`,
+`incomplete`, `releaseFailed`, `clockUnavailable`, `mappingChanged`, and
+`outsideWindowCallbacks` are
+decimal counters; `capacity` is 128 PTS groups. A callback group is eligible only
+after a later decoded PTS seals it, and only with one observed output, one
+successful release and one callback. The first observed PTS is deliberately
+ambiguous because a pre-capture callback can arrive late. Eligible groups stay
+in the bounded window after their first callback. A later duplicate output,
+release or callback within that window retracts the corresponding provisional
+match, cadence contributions and exemplars in subsequent snapshots. Callback
+contributions follow callback-observation order, independently of PTS-order
+retirement. Each adjacency is observed in callback/release order and remains
+provisional until **both** endpoints retire. A pair crossing the window boundary
+therefore survives PTS-order retirement without prematurely freezing a still-live
+endpoint's eligibility. Scheduling contributions follow release order and do not depend on
+callback uniqueness. Pre-release callbacks and recreated evicted PTS are never
+guessed into matches. A callback during a release is held until success or failure.
+`missing` counts successful releases without callbacks at eviction/end;
+`pending` counts outstanding releases in live snapshots; `incomplete` counts
+unsealed or in-flight groups at finalization. Ambiguity and eviction are
+conservative group counts, not a reconstruction of every missing callback.
+Eviction commits that group's eligible per-frame contributions and retires its duplicate
+detection state; `evicted` now counts every such bounded-window retirement,
+including successfully correlated groups. `outsideWindowCallbacks` counts
+unmatched callbacks at/below the eviction watermark. Such callbacks cannot
+retract that retired endpoint's eligibility: lifetime uniqueness beyond the 128-group window is
+not asserted. Finalization includes eligible sealed retained groups, while
+the last unsealed PTS remains incomplete. Correlation totals and ranges can
+decrease or change when retained evidence becomes ambiguous; snapshots must
+not be subtracted or summed as monotonic deltas. Earlier exported snapshots
+remain historical observations of then-provisional evidence.
+Generation replacement closes the prior tracker; capture end freezes it.
+Clock source attachment/detachment, recovery and mapping corrections advance
+a revision; callbacks crossing a revision are excluded, as are unstable
+schedule samples. Regular audio-position observations can refine the clock
+estimate without changing that revision. Late callbacks and unmatched PTS
+break future cadence continuity. Bounds, recorder staging drops and retention loss
+can all reduce evidence. No codec callback proves compositor latch or scanout.
+Recorder lifecycle samples and the terminal record expose
+`videoTimingContention` for failed bounded tracker-admission attempts.
+
+At most 64 receiver `video_anomaly` examples per capture are attempted for
+decoded/released/rendered observation gaps of at least 50 ms, callback timestamp
+gaps of at least 50 ms or regressions, release delays at or below -20 ms, or
+held output at least 50 ms, release calls at least 20 ms, or skipped pictures.
+Examples include the occurrence timestamp,
+previous same-stage observation if available, generation, PTS and the applicable
+deadline/callback timestamp or signed delay. They are not a complete frame trace.
+Each progress summary reports cumulative `traceCandidates`, `traceLimit` and
+`traceSuppressed` (candidates beyond the cap); staging drops and retention evictions
+remain separately reported by the normal capture loss watermarks. Repeated summaries
+are snapshots, not additive. This instrumentation runs only for an explicitly
+started receiver capture selecting `video.progress`; it never logs every frame.
 
 Every video observation has `track:1`, session and generation. Fixed stage slots
 hold immutable cumulative counters **since this capture first observed that
@@ -720,10 +905,11 @@ The `video_failure.videoStage` vocabulary is `select`, `create`, `configure`,
 
 The disabled hook does no clock read, JSON work or snapshot allocation.
 Enabled hooks use bounded four-attempt atomic updates and never
-acquire a media lock or perform I/O/native timing reads. Contention exhaustion
-uses the existing admission-loss counters. No per-frame staging event is
-created; periodic snapshots and rare generation/configuration/failure records
-use existing bounded staging and retention. Final per-stage samples have
+acquire a media lock or perform I/O. Receiver release timing adds two monotonic
+clock reads only while the video flag is active. Contention exhaustion uses the
+existing admission-loss counters. Only capped anomaly examples, periodic snapshots
+and generation/configuration/failure records use bounded staging and retention.
+Final per-stage samples have
 reserved staging capacity before the terminal record. Always inspect loss
 watermarks: diagnostic loss and snapshots spanning concurrent stages prevent
 proof of exact cross-stage conservation or absence of stalls.

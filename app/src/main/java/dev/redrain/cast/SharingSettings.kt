@@ -280,7 +280,6 @@ object SharingSettings {
             tag = "allowRemoteDiagnostics"
             text = "Allow unpaired LAN diagnostics (this process only)"
             isChecked = dev.redrain.cast.diagnostics.DiagnosticAccess.enabled
-            isEnabled = playbackStatistics.isChecked
             minimumHeight = dp(48)
             advanced.addView(this, spacing(8))
         }
@@ -290,14 +289,7 @@ object SharingSettings {
             advanced.addView(this, spacing(8))
         }
         remoteDiagnostics.setOnCheckedChangeListener { _, checked ->
-            if (!checked) dev.redrain.cast.diagnostics.DiagnosticAccess.setEnabled(activity, false, playbackStatistics.isChecked)
-        }
-        playbackStatistics.setOnCheckedChangeListener { _, checked ->
-            remoteDiagnostics.isEnabled = checked
-            if (!checked) {
-                remoteDiagnostics.isChecked = false
-                dev.redrain.cast.diagnostics.DiagnosticAccess.setEnabled(activity, false, false)
-            }
+            if (!checked) dev.redrain.cast.diagnostics.DiagnosticAccess.setEnabled(activity, false)
         }
         Button(activity).apply {
             tag = "remoteDiagnosticsStatus"
@@ -379,7 +371,7 @@ object SharingSettings {
                 }
                 onSave(next)
                 dev.redrain.cast.diagnostics.DiagnosticAccess.setEnabled(activity,
-                    remoteDiagnostics.isChecked, next.showPlaybackStatistics)
+                    remoteDiagnostics.isChecked)
                 dialog.dismiss()
             }
         }

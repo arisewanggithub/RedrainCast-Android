@@ -471,7 +471,9 @@ class AudioPlayer(
     private fun observePresentation(timing: AudioOutputTiming, observedAtNs: Long) {
         val sampleUs = presentation.presentedUs(timing.presentedFrames)
         presentedSourceUs = sampleUs
-        sourceClock?.let { clock.observeAudio(it, sampleUs, observedAtNs) }
+        sourceClock?.let { clock.observeAudio(it, sampleUs, observedAtNs, timing,
+            if (output.playbackActive == true && timing.clockSource == AudioClockSource.TIMESTAMP)
+                presentation.projection() else null) }
     }
 
     private fun pcm16(bytes: ByteArray): ShortArray {

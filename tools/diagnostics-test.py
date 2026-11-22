@@ -5,6 +5,7 @@ import hashlib
 import importlib.util
 import json
 import io
+import os
 from contextlib import contextmanager
 from pathlib import Path
 import shutil
@@ -25,6 +26,26 @@ TEST_ROOT = TEST_FILES / "diagnostics-contract"
 TEST_ROOT.mkdir(exist_ok=True)
 
 
+def fixture_path(name):
+    fixture = TEST_FILES.parent / "app" / "build" / "diagnostics-contract" / name
+    if not fixture.is_file():
+        message = "Run DiagnosticVideoTimingTest to generate " + name
+        if os.environ.get("DIAGNOSTICS_REQUIRE_FIXTURE") == "1":
+            raise AssertionError(message)
+        raise unittest.SkipTest(message)
+    return fixture
+
+
+def legacy_collector():
+    path = os.environ.get("DIAGNOSTICS_LEGACY_COLLECTOR")
+    if not path:
+        return None
+    legacy_spec = importlib.util.spec_from_file_location("legacy_collector", path)
+    module = importlib.util.module_from_spec(legacy_spec)
+    legacy_spec.loader.exec_module(module)
+    return module
+
+
 @contextmanager
 def test_workspace(name):
     directory = TEST_ROOT / name
@@ -42,7 +63,7 @@ class VideoFlagTests(unittest.TestCase):
         for role in collector.FLAGS:
             supported = collector.FLAGS[role]
             self.assertIn("video.progress", collector.select_flags(role, None, supported))
-            legacy = [flag for flag in supported if flag != "video.progress"]
+            legacy = [flag for flag in supported if flag not in ("video.progress", "video.timing")]
             self.assertEqual(legacy, collector.select_flags(role, None, legacy))
 
     def test_explicit_video_is_strict_and_parser_accepts_it(self):
@@ -51,6 +72,12 @@ class VideoFlagTests(unittest.TestCase):
             collector.select_flags("receiver", ["video.progress"], ["session"])
         self.assertEqual(["video.progress"], collector.select_flags(
             "receiver", ["video.progress"], ["session", "video.progress"]))
+        with self.assertRaisesRegex(collector.DiagnosticError, "requires video.progress"):
+            collector.select_flags("receiver", ["video.timing"], ["video.progress", "video.timing"])
+        self.assertEqual(["video.progress", "video.timing"], collector.select_flags(
+            "receiver", None, ["video.progress", "video.timing"]))
+        self.assertEqual(["video.progress"], collector.select_flags(
+            "receiver", None, ["video.progress"]))
 
     def test_default_does_not_invent_flags_or_accept_empty_capabilities(self):
         self.assertEqual(["session"], collector.select_flags("sender", None, ["session", "future.flag"]))
@@ -210,8 +237,49 @@ def page(records=None, cursor="0", more=False, pending=0):
 def event(seq="1", capture="c1"):
     return dict(captureId=capture, seq=seq, monoNs="1000", kind="SAMPLE", data={})
 
+def timing_event(seq="1"):
+    number = str(collector.MAX_INT64)
+    correction = dict(sequence=number, beforeOffsetUs="0", afterOffsetUs="100",
+                      deltaUs="100", appliedOffsetAtPacketUs="50")
+    clock = dict(mode="CACHED_AUDIO", readAtNs=number, mappingRevision=number,
+                 delayUs="100", positionUs=number, sourcePositionUs=number,
+                 audioObservationSequence=number, audioObservationAtNs=number,
+                 audioObservationAgeNs="0", audioOutputSource="TIMESTAMP",
+                 audioTimestampAgeAtObservationUs="10", observedAppliedOffsetUs="50",
+                 recoveringAudio=False, lastPacketCorrection=correction)
+    scheduling = dict(mappingStable=True, ptsUs=number, deadlineNs=number,
+                      releaseNs=number, scheduleAtNs=number, mappingRevision=number, clock=clock)
+    pair = dict(deadlineCadenceMinusPtsNs="-10000", previous=scheduling, current=scheduling)
+    metrics = dict(schema="video_frame_timing", capacity=128,
+                   latestSchedulingExample=scheduling,
+                   minimumDeadlineCadenceExample=pair, maximumDeadlineCadenceExample=pair,
+                   worstCallbackErrorExample=dict(ptsUs=number, deadlineNs=number,
+                       releaseNs=number, callbackNs=number, observedNs=number,
+                       decodedMinusDeadlineNs="-1000", scheduling=scheduling))
+    for name in ("matched", "missing", "pending", "unmatched", "ambiguous", "evicted",
+                 "incomplete", "releaseFailed", "clockUnavailable", "mappingChanged",
+                 "futureCallbacks", "outsideWindowCallbacks"):
+        metrics[name] = number
+    for name in ("decodedMinusDeadline", "suppliedMinusDeadline", "callbackMinusDeadline",
+                 "observedMinusCallback", "ptsCadence", "deadlineCadence", "callbackCadence",
+                 "callbackCadenceMinusPts", "callbackCadenceMinusDeadline",
+                 "deadlineCadenceMinusPts", "audioObservationAge", "clockReadToSchedule"):
+        metrics[name] = dict(count=number, minNs="-10000", maxNs=number)
+    record = event(seq)
+    record.update(kind="VIDEO_PROGRESS", role="receiver", session=number, track=1, generation=1)
+    record["data"] = dict(stage="sample", reason="none", point="unspecified", metrics=metrics)
+    return record
+
 
 class ParsingTests(unittest.TestCase):
+    def test_missing_generated_fixture_fails_in_required_ci_phase(self):
+        with patch.dict(os.environ, {"DIAGNOSTICS_REQUIRE_FIXTURE": "1"}), \
+                self.assertRaisesRegex(AssertionError, "Run DiagnosticVideoTimingTest"):
+            fixture_path("missing-fixture.json")
+        with patch.dict(os.environ, {"DIAGNOSTICS_REQUIRE_FIXTURE": "0"}), \
+                self.assertRaises(unittest.SkipTest):
+            fixture_path("missing-fixture.json")
+
     def test_sender_connections_validate_types_owner_state_and_exact_endpoint(self):
         receiver = dict(available=True, host="192.0.2.10", port=34567, version=1,
                         access="lan", session=str(2**63-1), state="enabled")
@@ -284,7 +352,7 @@ class ParsingTests(unittest.TestCase):
 
     def test_json_depth_is_bounded(self):
         value = {}
-        for _ in range(10):
+        for _ in range(collector.MAX_JSON_DEPTH + 1):
             value = {"nested": value}
         with self.assertRaises(collector.DiagnosticError):
             collector.strict_json(json.dumps(value).encode())
@@ -358,6 +426,146 @@ class ParsingTests(unittest.TestCase):
 
 
 class ProtocolTests(unittest.IsolatedAsyncioTestCase):
+    async def test_fully_populated_timing_fetch_passes_client_and_page_validation(self):
+        record = timing_event()
+        response = reply("FETCH", page([record], "1"))
+        encoded = json.dumps(response).encode()
+        self.assertLessEqual(len(encoded), collector.MAX_LINE)
+        self.assertEqual(response, collector.strict_json(encoded))
+        old = legacy_collector()
+        if old is not None:
+            with self.assertRaisesRegex(old.DiagnosticError, "nesting exceeds"):
+                old.strict_json(encoded)
+        client = collector.Client(stream(response), Writer())
+        result = await client.request("FETCH", {"captureId": "c1", "afterSeq": "0", "limit": 32})
+        records, cursor = collector.validate_page(result, "c1", 0)
+        self.assertEqual([record], records)
+        self.assertEqual(1, cursor)
+        correction = result["records"][0]["data"]["metrics"]["minimumDeadlineCadenceExample"][
+            "previous"]["clock"]["lastPacketCorrection"]
+        correction["sequence"] = {"tooDeep": "1"}
+        response["result"] = result
+        with self.assertRaisesRegex(collector.DiagnosticError, "nesting exceeds"):
+            collector.strict_json(json.dumps(response).encode())
+
+    async def test_generated_receiver_timing_fetch_passes_actual_collector_exchange(self):
+        fixture = fixture_path("receiver-timing-fetch.json")
+        response = collector.strict_json(fixture.read_bytes())
+        response["id"] = "r1"
+        client = collector.Client(stream(response), Writer())
+        capture_id = response["result"]["records"][0]["captureId"]
+        result = await client.request("FETCH", {"captureId": capture_id, "afterSeq": "0", "limit": 32})
+        records, _ = collector.validate_page(result, capture_id, 0)
+        metrics = next(record["data"]["metrics"] for record in records
+                       if record["data"].get("metrics", {}).get("schema") == "video_frame_timing")
+        for pair in ("minimumDeadlineCadenceExample", "maximumDeadlineCadenceExample"):
+            for side in ("previous", "current"):
+                self.assertEqual("2", metrics[pair][side]["clock"]["lastPacketCorrection"]["sequence"])
+
+    async def test_generated_legacy_receiver_capture_drains(self):
+        fixture = json.loads(fixture_path("receiver-legacy-capture.json").read_bytes())
+        hello, start, end, fetch = (fixture[key] for key in ("hello", "start", "end", "fetch"))
+        for index, response in enumerate((hello, start, end, fetch), 1):
+            response["id"] = "r" + str(index)
+        capture_id = fetch["result"]["records"][0]["captureId"]
+        for implementation in filter(None, (collector, legacy_collector())):
+            with self.subTest(implementation=implementation.__name__):
+                for response in (hello, start, end, fetch):
+                    encoded = json.dumps(response, separators=(",", ":")).encode()
+                    self.assertLessEqual(len(encoded), implementation.MAX_LINE)
+                    implementation.strict_json(encoded)
+                    def depth(value):
+                        if isinstance(value, dict):
+                            return 1 + max((depth(v) for v in value.values()), default=-1)
+                        if isinstance(value, list):
+                            return 1 + max((depth(v) for v in value), default=-1)
+                        return 0
+                    self.assertLessEqual(depth(response), 8)
+                records = fetch["result"]["records"]
+                self.assertTrue(any(r["data"].get("metrics", {}).get("schema") == "video_progress"
+                                    for r in records))
+                self.assertTrue(all(len(json.dumps(r, separators=(",", ":")).encode()) <= 2048
+                                    for r in records))
+                self.assertFalse(any(r["data"].get("metrics", {}).get("schema") == "video_frame_timing"
+                                     for r in records))
+                client = implementation.Client(stream(hello, start, end, fetch), Writer())
+                capabilities = await client.request("HELLO")
+                flags = implementation.select_flags("receiver", None, capabilities["capabilities"]["receiver"])
+                if implementation is not collector:
+                    self.assertEqual(fixture["flags"], flags)
+                else:
+                    flags = fixture["flags"]
+                started = await client.request("START", {"target": {"role": "receiver", "session": "91"},
+                    "flags": flags, "durationMs": 1000, "samplePeriodMs": 100})
+                self.assertEqual(capture_id, started["captureId"])
+                await client.request("END", {"captureId": capture_id})
+                output = io.StringIO()
+                await implementation.drain_frozen(client, capture_id, 0, implementation.FetchBudget(),
+                    asyncio.get_running_loop().time() + 120, output)
+                self.assertEqual(len(records), sum('"type":"event"' in line
+                    for line in output.getvalue().splitlines()))
+
+    async def test_legacy_sized_delayed_tail_stays_within_old_frozen_limit(self):
+        pages = []
+        total = 0
+        retained = 2 * 1024 * 1024 // 2048
+        for start in range(0, retained + 1024, 32):
+            records = []
+            for index in range(start, start + 32):
+                record = event(str(index + 1))
+                record["data"]["padding"] = ""
+                size = len(json.dumps(record, separators=(",", ":")).encode())
+                record["data"]["padding"] = "x" * (2048 - size)
+                total += 2048
+                records.append(record)
+            pending = 1024 if start + 32 == retained else 0
+            pages.append(page(records, str(start + 32),
+                              start + 32 < retained or start + 32 < retained + 1024 and not pending,
+                              pending))
+        self.assertEqual(2 * 1024 * 1024 + 1024 * 2048, total)
+        for implementation in filter(None, (collector, legacy_collector())):
+            with self.subTest(implementation=implementation.__name__), \
+                    patch.object(implementation, "fetch_page", AsyncMock(side_effect=pages)), \
+                    patch.object(implementation.asyncio, "sleep", AsyncMock()):
+                output = io.StringIO()
+                await implementation.drain_frozen(None, "c1", 0, None,
+                    asyncio.get_running_loop().time() + 120, output)
+                self.assertEqual(retained + 1024, sum('"type":"event"' in line
+                    for line in output.getvalue().splitlines()))
+
+    async def test_delayed_full_size_timing_staging_tail_respects_new_frozen_bound(self):
+        self.assertEqual(2 * 1024 * 1024 + 1024 * 12000, collector.MAX_FROZEN_BYTES)
+        pages = []
+        record_bytes = 0
+        retained = (2 * 1024 * 1024) // 12000
+        for index in range(retained + 1024):
+            record = timing_event(str(index + 1))
+            record["data"]["padding"] = ""
+            size = len(json.dumps(record, separators=(",", ":")).encode())
+            record["data"]["padding"] = "x" * (12000 - size)
+            self.assertEqual(12000, len(json.dumps(record, separators=(",", ":")).encode()))
+            record_bytes += 12000
+            pages.append(page([record], str(index + 1), index + 1 < retained + 1024))
+            if index + 1 == retained:
+                pages[-1]["hasMore"] = False
+                pages[-1]["pendingRecords"] = 1024
+                pages.append(page(cursor=str(index + 1), pending=1024))
+        self.assertGreater(record_bytes, 2 * 1024 * 1024 + 1024 * 2048)
+        self.assertLessEqual(record_bytes, collector.MAX_FROZEN_BYTES)
+        output = io.StringIO()
+        with patch.object(collector, "fetch_page", AsyncMock(side_effect=pages)), \
+                patch.object(collector.asyncio, "sleep", AsyncMock()) as sleeping:
+            await collector.drain_frozen(None, "c1", 0, None,
+                                         asyncio.get_running_loop().time() + 120, output)
+        self.assertEqual(2, sleeping.await_count)
+        self.assertEqual(retained + 1024, sum('"type":"event"' in line for line in output.getvalue().splitlines()))
+        with patch.object(collector, "MAX_FROZEN_BYTES", record_bytes - 1), \
+                patch.object(collector, "fetch_page", AsyncMock(side_effect=pages)), \
+                patch.object(collector.asyncio, "sleep", AsyncMock()):
+            with self.assertRaisesRegex(collector.DiagnosticError, "exceeds bounded retention"):
+                await collector.drain_frozen(None, "c1", 0, None,
+                                             asyncio.get_running_loop().time() + 120, io.StringIO())
+
     async def test_byte_limited_frozen_backlog_exceeds_old_page_bound(self):
         backlog = []
         for kind, count, size in (("AUDIO_QUEUE", 3389, 464), ("RECORDER_SAMPLE", 179, 697)):

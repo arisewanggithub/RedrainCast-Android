@@ -10,7 +10,11 @@ data class AudioOutputTiming(
     val consumedFrames: Long,
     val presentedFrames: Long,
     val timestampAgeUs: Long?,
-    val clockSource: AudioClockSource
+    val clockSource: AudioClockSource,
+    internal val positionAtNs: Long? = null,
+    internal val playbackSpeed: Float = 1f,
+    internal val timestampAtNs: Long? = null,
+    internal val timestampEstimateFrames: Long? = null
 ) {
     val bufferedUs: Long get() = framesToUs((submittedFrames - consumedFrames).coerceAtLeast(0))
     val presentedUs: Long get() = framesToUs(presentedFrames)
@@ -58,6 +62,9 @@ internal class AudioPosition(
     private val timestamp: () -> FrameTimestamp?,
     private val playbackHead: () -> Int
 ) {
+    internal companion object {
+        const val TIMESTAMP_VALID_NS = 100_000_000L
+    }
     private var submitted = 0L
     private var consumed = 0L
     private var previousHead = 0L
@@ -109,7 +116,7 @@ internal class AudioPosition(
             val previous = previousTimestamp
             source = when {
                 frames < 0 || frames > consumed || stamp.nanoTime > now -> AudioClockSource.HEAD_INVALID
-                now - stamp.nanoTime > 100_000_000L -> AudioClockSource.HEAD_STALE
+                now - stamp.nanoTime > TIMESTAMP_VALID_NS -> AudioClockSource.HEAD_STALE
                 previous != null && (frames < previous.frames || stamp.nanoTime < previous.nanoTime) -> AudioClockSource.HEAD_INVALID
                 candidate == trustedTimestamp ||
                     previous != null && frames > previous.frames && stamp.nanoTime > previous.nanoTime -> AudioClockSource.TIMESTAMP
@@ -125,7 +132,8 @@ internal class AudioPosition(
         }
         // On timestamp loss/staleness, keep the learned hardware transit instead of jumping to head.
         presented = maxOf(presented, estimate).coerceAtMost(consumed)
-        return timing()
+        return timing().copy(positionAtNs = now, playbackSpeed = speed, timestampAtNs = stamp?.nanoTime,
+            timestampEstimateFrames = if (source == AudioClockSource.TIMESTAMP) estimate else null)
     }
 
     private fun timing(head: Long = consumed) =
