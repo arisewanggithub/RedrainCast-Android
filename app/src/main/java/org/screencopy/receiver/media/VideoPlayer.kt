@@ -73,10 +73,12 @@ class VideoPlayer private constructor(
     private var diagnosticConfigurationCapture: String? = null
     private fun diagnosticVideo(stage: DiagnosticVideoStage, pts: Long, bytes: Long = -1,
                                 reason: DiagnosticReason = DiagnosticReason.NONE, sourceAtNs: Long? = null,
-                                keyFrame: Boolean? = null) {
+                                keyFrame: Boolean? = null, delayUs: Long? = null,
+                                heldNs: Long? = null, releaseCallNs: Long? = null) {
         if (!running.get()) return
         RemoteDiagnostics.recorder.video("receiver", diagnosticSession, diagnosticGeneration,
-            stage, pts, bytes, keyFrame = keyFrame, reason = reason, sourceAtNs = sourceAtNs)
+            stage, pts, bytes, keyFrame = keyFrame, reason = reason, sourceAtNs = sourceAtNs, delayUs = delayUs,
+            heldNs = heldNs, releaseCallNs = releaseCallNs)
     }
     @Volatile private var renderedObservation: SourceTimestampObservation? = null
     internal fun videoStatistics(): VideoStatistics {
@@ -103,6 +105,11 @@ class VideoPlayer private constructor(
         } catch (e: Exception) { throw failure(e) }
         supportsRenderedStatistics = decoder.supportsRenderedStatistics
         decoder.renderedStatistics { pts, atNs ->
+            if (running.get()) {
+                RemoteDiagnostics.recorder.videoTiming(diagnosticSession, diagnosticGeneration)?.let {
+                    it.callback(pts, atNs, clock.monotonicNs(), clock.mappingRevision())
+                }
+            }
             diagnosticVideo(DiagnosticVideoStage.RENDERED, pts, sourceAtNs = atNs)
             if (running.get() && statisticsEnabled) {
                 pathStatistics.rendered(pts, atNs)
@@ -136,7 +143,7 @@ class VideoPlayer private constructor(
             for (index in 0 until 8) {
                 if (!running.get()) return
                 stage = VideoStage.CLOCK
-                delayUs = clock.delayUs(heldPtsUs)
+                delayUs = clock.videoSchedulingClock(heldPtsUs).delayUs
                 if (delayUs?.let { it < 0 } != true) break
                 val newer = dequeuePicture() ?: break
                 if (!running.get()) return
@@ -148,7 +155,10 @@ class VideoPlayer private constructor(
             }
             if (!running.get()) return
             stage = VideoStage.CLOCK
-            delayUs = clock.delayUs(heldPtsUs)
+            val timing = diagnostics.videoTiming(diagnosticSession, diagnosticGeneration)
+            val schedulingClock = clock.videoSchedulingClock(heldPtsUs)
+            val mappingBefore = schedulingClock.mappingRevision
+            delayUs = schedulingClock.delayUs
             if (dropStaleOutput && delayUs?.let { it < -250_000 } == true) {
                 decoder.releaseOutput(heldOutput, null)
                 diagnosticVideo(DiagnosticVideoStage.SKIPPED, heldPtsUs, reason = DiagnosticReason.STALE)
@@ -167,14 +177,34 @@ class VideoPlayer private constructor(
                 throw PlaybackException("HDR output became unavailable; restart casting with SDR", "UNSUPPORTED_CONFIG")
             if (statisticsEnabled) pathStatistics.scheduled(heldPtsUs, heldPath)
             val renderDelayUs = delayUs?.coerceAtLeast(0) ?: 0
-            val renderAtNs = Math.addExact(clock.monotonicNs(), Math.multiplyExact(renderDelayUs, 1_000L))
-            decoder.releaseOutput(heldOutput, renderAtNs)
-            diagnosticVideo(DiagnosticVideoStage.RELEASED, heldPtsUs, sourceAtNs = renderAtNs)
+            val scheduleAtNs = schedulingClock.readAtNs
+            val renderAtNs = Math.addExact(scheduleAtNs, Math.multiplyExact(renderDelayUs, 1_000L))
+            val mappingAfter = if (timing != null) clock.mappingRevision() else 0L
+            val intendedNs = if (timing != null) delayUs?.let {
+                try { Math.addExact(scheduleAtNs, Math.multiplyExact(it, 1_000L)) }
+                catch (_: ArithmeticException) { null }
+            } else null
+            val token = timing?.begin(heldPtsUs, intendedNs, renderAtNs, mappingAfter,
+                mappingBefore == mappingAfter, schedulingClock, scheduleAtNs)
+            val timingEnabled = diagnostics.enabled("receiver", diagnosticSession, DiagnosticKind.VIDEO_PROGRESS)
+            val callAtNs = if (timingEnabled) clock.monotonicNs() else null
+            var releaseSucceeded = false
+            try {
+                decoder.releaseOutput(heldOutput, renderAtNs)
+                releaseSucceeded = true
+            } finally {
+                timing?.finish(token, releaseSucceeded)
+            }
+            val returnedAtNs = if (timingEnabled) clock.monotonicNs() else null
+            diagnosticVideo(DiagnosticVideoStage.RELEASED, heldPtsUs, sourceAtNs = renderAtNs, delayUs = delayUs,
+                heldNs = callAtNs?.let { elapsedNs(it, heldAtNs) },
+                releaseCallNs = if (returnedAtNs != null && callAtNs != null) elapsedNs(returnedAtNs, callAtNs) else null)
             clock.videoPresented(heldPtsUs, renderAtNs)
             renderSubmitted++
             heldOutput = -1
             reportPresentation()
         }
+
         if (waiting == null) {
             waiting = next()
             waitingAtNs = clock.monotonicNs()
@@ -222,6 +252,11 @@ class VideoPlayer private constructor(
             fail(VideoFault.OUTPUT_STALL)
     }
 
+    private fun elapsedNs(end: Long, start: Long): Long? {
+        if (end < start) return null
+        return try { Math.subtractExact(end, start) } catch (_: ArithmeticException) { Long.MAX_VALUE }
+    }
+
     private fun dequeuePicture(): VideoOutput? {
         stage = VideoStage.OUTPUT_DEQUEUE
         val output = decoder.dequeueOutput()
@@ -237,15 +272,22 @@ class VideoPlayer private constructor(
             } else {
                 diagnosticVideo(DiagnosticVideoStage.DECODED, output.ptsUs, output.size.toLong())
                 if (discardOutputBeforePts?.let { output.ptsUs < it } == true) {
+                    if (output.ptsUs >= 0 && lastOutputPtsUs?.let { output.ptsUs < it } != true)
+                        RemoteDiagnostics.recorder.videoTiming(diagnosticSession, diagnosticGeneration)
+                            ?.decoded(output.ptsUs, null, hasAvailability = false)
                     decoder.releaseOutput(output.index, null)
                     diagnosticVideo(DiagnosticVideoStage.SKIPPED, output.ptsUs, reason = DiagnosticReason.STALE)
                     decodedSkipped++
                     return null
                 }
                 stage = VideoStage.CLOCK
-                delayUs = if (output.ptsUs >= 0) clock.delayUs(output.ptsUs) else null
+                val timing = RemoteDiagnostics.recorder.videoTiming(diagnosticSession, diagnosticGeneration)
+                val schedulingClock = if (output.ptsUs >= 0) clock.videoSchedulingClock(output.ptsUs) else null
+                val mappingBefore = schedulingClock?.mappingRevision ?: 0L
+                delayUs = schedulingClock?.delayUs
                 stage = VideoStage.OUTPUT_VALIDATE
                 if (output.ptsUs < 0 || lastOutputPtsUs?.let { output.ptsUs < it } == true) fail(VideoFault.OUTPUT_PTS)
+                timing?.decoded(output.ptsUs, delayUs, mappingBefore == clock.mappingRevision(), mapping = mappingBefore)
                 lastOutputPtsUs = output.ptsUs
                 if (statisticsEnabled) pathStatistics.decoded(output.path)
                 decodedFrames++

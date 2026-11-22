@@ -7,8 +7,8 @@ policy; there is no migration from the retired applications.
 
 ## Use
 
-**Remote diagnostics (default off, process-local):** enable playback statistics
-in Settings → Advanced, read the warning, select **Allow unpaired LAN diagnostics**,
+**Remote diagnostics (default off, process-local):** in Settings → Advanced,
+read the warning, select **Allow unpaired LAN diagnostics** independently of playback statistics,
 then Save. The separate TCP endpoint appears in **LAN diagnostics endpoint / status**
 and the controlled `DIAGNOSTIC_LISTENER_STARTED` local log event.
 **Anyone on the LAN can read bounded metadata and control diagnostic captures
@@ -38,7 +38,10 @@ delegated receiver collection freezes with bounded retrieval. Sender
 backgrounding does not revoke local consent.
 See the [protocol and supported schemas](protocol/REMOTE_DIAGNOSTICS.md) and
 [paired PC collector](tools/REMOTE_DIAGNOSTICS.md). Select supported role flags
-explicitly: `video.progress` and kernel TCP metrics are not implemented.
+explicitly: receiver `video.progress,video.timing` includes bounded PTS-keyed scheduling
+and callback evidence, with cached audio observation age and clock-map context,
+independently of the statistics panel. Sender `video.progress` and kernel TCP
+metrics are not implemented. These clock estimates do not prove physical scanout.
 No media contents or unrestricted logs are collected. A 180-second paired LAN
 capture with the latest debug build completed without disconnect, recovery or a
 sustained freeze. This single run is not broad LAN/lifetime acceptance or a
@@ -560,6 +563,11 @@ Healthy video continues decoding without another keyframe or decoder reset.
 Both tracks retain the same playback clock. While audio is detached, that clock
 continues monotonically; fresh audio resumes against it instead of rebasing the
 video timeline. Staleness is determined by source timestamps, not queue size.
+Video deadlines project qualified DAC observations to their scheduling time,
+bounded by already-consumed output frames and the existing 100 ms timestamp
+validity. Actual resampler/silence spans and source-clock slew are previewed
+without advancing audio observations. Diagnostics use the same deadline snapshot;
+this fixes cached-observation-age deadline jitter, not proven physical judder.
 Only decoded video pictures and decoded PCM may be trimmed within a retained
 compressed chain. Initial audio does not wait for a video decode proof.
 Video completion proves usable decoded output; audio completion proves actual

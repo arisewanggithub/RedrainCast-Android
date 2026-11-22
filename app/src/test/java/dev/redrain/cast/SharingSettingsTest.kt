@@ -35,7 +35,7 @@ import org.robolectric.shadows.ShadowAlertDialog
 @GraphicsMode(GraphicsMode.Mode.LEGACY)
 @ConscryptMode(ConscryptMode.Mode.OFF)
 class SharingSettingsTest {
-    @Test fun remoteConsentCannotBeGrantedByAnUnsavedOrStatisticsDisabledDraft() {
+    @Test fun remoteConsentIsIndependentButCannotBeGrantedByAnUnsavedDraft() {
         val controller = activity()
         val dialog = show(controller.get(), Settings(), {}, {})
         latestDialog()
@@ -46,9 +46,9 @@ class SharingSettingsTest {
         assertTrue(warning.text.contains("unencrypted and unauthenticated"))
         assertTrue(warning.text.contains("without a receiver settings change"))
         assertTrue(remote.text.contains("unpaired LAN"))
-        assertFalse(remote.isEnabled)
-        statistics.isChecked = true
+        assertTrue(remote.isEnabled)
         remote.isChecked = true
+        statistics.isChecked = true
         click(dialog, AlertDialog.BUTTON_NEGATIVE)
         assertFalse(dev.redrain.cast.diagnostics.DiagnosticAccess.enabled)
         assertFalse(dev.redrain.cast.diagnostics.RemoteDiagnostics.recorder.collecting)
@@ -58,8 +58,8 @@ class SharingSettingsTest {
         assertFalse(newRemote.isChecked)
         newRemote.isChecked = true
         field<CheckBox>(second, "showPlaybackStatistics").isChecked = false
-        assertFalse(newRemote.isChecked)
-        assertFalse(newRemote.isEnabled)
+        assertTrue(newRemote.isChecked)
+        assertTrue(newRemote.isEnabled)
         second.dismiss()
         controller.pause().stop().destroy()
     }
@@ -111,7 +111,7 @@ class SharingSettingsTest {
         assertEquals("playbackStatisticsHint", advanced.getChildAt(advanced.indexOfChild(checkbox) + 1).tag)
         val remote = field<CheckBox>(dialog, "allowRemoteDiagnostics")
         assertFalse(remote.isChecked)
-        assertFalse(remote.isEnabled)
+        assertTrue(remote.isEnabled)
         field<Button>(dialog, "advancedToggle").performClick()
         shadowOf(Looper.getMainLooper()).idle()
         assertTrue(checkbox.isShown)

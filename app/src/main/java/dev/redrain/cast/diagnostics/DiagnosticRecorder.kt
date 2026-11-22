@@ -7,6 +7,7 @@ import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.atomic.AtomicLongArray
+import java.util.concurrent.atomic.AtomicReference
 import java.util.concurrent.atomic.AtomicReferenceArray
 
 /** Fixed vocabulary: no media, arbitrary log text, addresses or exception messages. */
@@ -66,17 +67,21 @@ class DiagnosticRecorder(private val clock: () -> Long = System::nanoTime) {
         const val MAX_RECORDS = 4096
         const val MAX_BYTES = 2 * 1024 * 1024
         const val MAX_RECORD_BYTES = 2048
+        const val MAX_VIDEO_TIMING_RECORD_BYTES = 12000
         const val PENDING = 1024
         const val CRITICAL_RESERVED = 128
         const val CRITICAL_RECORDS = 512
         const val CRITICAL_BYTES = 512 * 1024
         const val SLOW_OPERATION_NS = 20_000_000L
+        const val VIDEO_TRACE_LIMIT = 64
+        const val VIDEO_LONG_INTERVAL_NS = 50_000_000L
+        const val VIDEO_LATE_DELAY_US = -20_000L
 
         private const val ROUTINE_RECORDS = MAX_RECORDS - CRITICAL_RECORDS
         private const val ROUTINE_BYTES = MAX_BYTES - CRITICAL_BYTES
         private val KIND_COUNT = DiagnosticKind.values().size
         private val POINT_COUNT = DiagnosticPoint.values().size
-        private val FINAL_SUMMARY_RESERVED = KIND_COUNT * POINT_COUNT + DiagnosticVideoStage.values().size
+        private val FINAL_SUMMARY_RESERVED = KIND_COUNT * POINT_COUNT + DiagnosticVideoStage.values().size + 1
         private val NONTERMINAL_PRIORITY_LIMIT = PENDING - FINAL_SUMMARY_RESERVED - 1
         private const val METRIC_FIELDS = 11
         private const val DROPPED_REASONS = 5
@@ -86,11 +91,12 @@ class DiagnosticRecorder(private val clock: () -> Long = System::nanoTime) {
 
         val capabilities = mapOf(
             "sender" to setOf("session", "recovery", "audio.capture", "audio.transport", "audio.queue", "video.progress", "transport.health"),
-            "receiver" to setOf("session", "recovery", "audio.transport", "audio.queue", "audio.output", "video.progress", "transport.health")
+            "receiver" to setOf("session", "recovery", "audio.transport", "audio.queue", "audio.output", "video.progress", "video.timing", "transport.health")
         )
 
         fun limits() = JSONObject().put("maxRecords", MAX_RECORDS).put("maxBytes", MAX_BYTES)
-            .put("maxRecordBytes", MAX_RECORD_BYTES).put("maxDurationMs", 180000)
+            .put("maxRecordBytes", MAX_VIDEO_TIMING_RECORD_BYTES)
+            .put("maxDefaultRecordBytes", MAX_RECORD_BYTES).put("maxDurationMs", 180000)
             .put("maxLineBytes", 16384).put("maxFetchRecords", 32).put("stagingRecords", PENDING)
             .put("reservedCriticalQueueRecords", CRITICAL_RESERVED)
             .put("reservedFinalSummaryRecords", FINAL_SUMMARY_RESERVED)
@@ -168,6 +174,9 @@ class DiagnosticRecorder(private val clock: () -> Long = System::nanoTime) {
         val video = AtomicReferenceArray<DiagnosticVideoProgress?>(DiagnosticVideoStage.values().size)
         val staleVideoUpdates = AtomicLong()
         val videoGeneration = AtomicLong()
+        val videoTraceCandidates = AtomicLong()
+        val videoTiming = AtomicReference<DiagnosticVideoTiming?>()
+        val videoTimingContention = AtomicLong()
 
         // Per-kind/point fixed counters: starts, completions, unnumbered calls,
         // bytes, units, four duration buckets, slow count and maximum duration.
@@ -187,6 +196,8 @@ class DiagnosticRecorder(private val clock: () -> Long = System::nanoTime) {
     @Volatile private var gate: Capture? = null
     @Volatile internal var afterResponseSnapshot: (() -> Unit)? = null
     @Volatile internal var afterSequenceReservation: (() -> Unit)? = null
+    @Volatile internal var beforeVideoTimingSwap: (() -> Unit)? = null
+    @Volatile internal var afterVideoTimingReplacement: (() -> Unit)? = null
     private var consent = true
     private var delegatedSession: Long? = null
     private var delegatedActive = false
@@ -249,6 +260,56 @@ class DiagnosticRecorder(private val clock: () -> Long = System::nanoTime) {
         observe(role, session, DiagnosticKind.VIDEO_PROGRESS, DiagnosticStage.CONFIG, 1, generation, metadata = metadata)
     }
 
+    internal fun videoTiming(session: Long, generation: Int): DiagnosticVideoTiming? {
+        val c = gate ?: return null
+        if ("video.timing" !in c.flags || !enabled("receiver", session, DiagnosticKind.VIDEO_PROGRESS) || generation <= 0 ||
+            clock() >= c.expires || !advanceVideoGeneration(c, generation, clock())) return null
+        repeat(4) {
+            if (gate !== c || c.videoGeneration.get() != generation.toLong()) return null
+            val old = c.videoTiming.get()
+            if (old?.generation == generation) return old
+            if (old != null && old.generation > generation) return null
+            val next = DiagnosticVideoTiming(generation)
+            // Reserve before retiring the old tracker so END cannot pass its final snapshot.
+            val ticket = old?.let { reserve(c, clock(), false, maxAttempts = 4) ?: return null }
+            beforeVideoTimingSwap?.invoke()
+            val replaced = c.videoTiming.compareAndSet(old, next)
+            if (replaced) {
+                afterVideoTimingReplacement?.invoke()
+            }
+            if (old != null) {
+                val ns = clock()
+                val event = if (replaced) videoTimingObservation(c, old, ns, true, DiagnosticStage.RESET)
+                else observation(ns, DiagnosticKind.VIDEO_PROGRESS, DiagnosticStage.SAMPLE, c.role, c.session ?: 0,
+                    1, old.generation, 0, -1, -1, -1, -1, -1, DiagnosticReason.STALE,
+                    DiagnosticPoint.UNSPECIFIED, null)
+                publish(c, checkNotNull(ticket), event)
+            }
+            if (replaced) {
+                if (gate !== c || !c.collecting || c.videoGeneration.get() != generation.toLong()) {
+                    next.snapshot(true)
+                    c.videoTiming.compareAndSet(next, null)
+                    return null
+                }
+                return next
+            }
+        }
+        c.videoTimingContention.incrementAndGet()
+        return null
+    }
+
+    private fun submitVideoTiming(c: Capture, timing: DiagnosticVideoTiming, ns: Long,
+                                  final: Boolean, stage: DiagnosticStage = DiagnosticStage.SAMPLE,
+                                  priority: Boolean = false) {
+        submit(c, videoTimingObservation(c, timing, ns, final, stage), priority, finalSummary = priority)
+    }
+
+    private fun videoTimingObservation(c: Capture, timing: DiagnosticVideoTiming, ns: Long,
+                                       final: Boolean, stage: DiagnosticStage) =
+        observation(ns, DiagnosticKind.VIDEO_PROGRESS, stage, c.role, c.session ?: 0,
+            1, timing.generation, 0, -1, -1, -1, -1, -1, DiagnosticReason.NONE,
+            DiagnosticPoint.UNSPECIFIED, timing.snapshot(final))
+
     private fun advanceVideoGeneration(c: Capture, generation: Int, ns: Long): Boolean {
         repeat(4) {
             val latest = c.videoGeneration.get()
@@ -262,7 +323,8 @@ class DiagnosticRecorder(private val clock: () -> Long = System::nanoTime) {
     fun video(
         role: String, session: Long, generation: Int, stage: DiagnosticVideoStage, pts: Long,
         bytes: Long = -1, count: Long = 1, keyFrame: Boolean? = null,
-        reason: DiagnosticReason = DiagnosticReason.NONE, sourceAtNs: Long? = null
+        reason: DiagnosticReason = DiagnosticReason.NONE, sourceAtNs: Long? = null,
+        delayUs: Long? = null, heldNs: Long? = null, releaseCallNs: Long? = null
     ) {
         val c = gate ?: return
         if (!enabled(role, session, DiagnosticKind.VIDEO_PROGRESS) || generation <= 0 || count <= 0) return
@@ -278,6 +340,9 @@ class DiagnosticRecorder(private val clock: () -> Long = System::nanoTime) {
                 return
             }
             val previous = old?.takeIf { it.generation == generation }
+            val interval = previous?.let { nonNegativeDifference(ns, it.lastAtNs) }
+            val sourceInterval = if (stage == DiagnosticVideoStage.RENDERED && sourceAtNs != null &&
+                previous?.sourceAtNs != null) nonNegativeDifference(sourceAtNs, previous.sourceAtNs) else null
             val next = DiagnosticVideoProgress(generation, stage,
                 (previous?.count ?: 0) + count,
                 if (bytes >= 0) (previous?.bytes ?: 0).coerceAtLeast(0) + bytes else previous?.bytes ?: -1,
@@ -285,27 +350,76 @@ class DiagnosticRecorder(private val clock: () -> Long = System::nanoTime) {
                     else previous?.keyFrames ?: -1,
                 previous?.firstPtsUs ?: pts, pts, previous?.firstAtNs ?: ns, ns, sourceAtNs,
                 maxOf(previous?.maxPtsGapUs ?: 0, if (previous != null && pts >= 0 && previous.lastPtsUs >= 0)
-                    (pts - previous.lastPtsUs).coerceAtLeast(0) else 0),
-                maxOf(previous?.maxObservationGapNs ?: 0, previous?.let { (ns - it.lastAtNs).coerceAtLeast(0) } ?: 0),
+                    nonNegativeDifference(pts, previous.lastPtsUs) ?: 0 else 0),
+                maxOf(previous?.maxObservationGapNs ?: 0, interval ?: 0),
                 reason,
                 (previous?.stale ?: 0) + if (reason == DiagnosticReason.STALE) count else 0,
                 (previous?.capacity ?: 0) + if (reason == DiagnosticReason.CAPACITY) count else 0,
                 (previous?.pressure ?: 0) + if (reason == DiagnosticReason.PRESSURE) count else 0,
                 (previous?.sourcePending ?: 0) + if (reason == DiagnosticReason.SOURCE_PENDING) count else 0,
                 (previous?.stopped ?: 0) + if (reason == DiagnosticReason.STOPPED) count else 0,
-                (previous?.replaced ?: 0) + if (reason == DiagnosticReason.REPLACED) count else 0)
+                (previous?.replaced ?: 0) + if (reason == DiagnosticReason.REPLACED) count else 0,
+                (previous?.intervalCount ?: 0) + if (interval != null) 1 else 0,
+                (previous?.longIntervals ?: 0) + if (interval != null && interval >= VIDEO_LONG_INTERVAL_NS) 1 else 0,
+                (previous?.sourceIntervalCount ?: 0) + if (sourceInterval != null) 1 else 0,
+                maxOf(previous?.maxSourceIntervalNs ?: 0, sourceInterval ?: 0),
+                (previous?.sourceRegressions ?: 0) + if (stage == DiagnosticVideoStage.RENDERED &&
+                    sourceAtNs != null && previous?.sourceAtNs != null && sourceAtNs < previous.sourceAtNs) 1 else 0,
+                (previous?.scheduledCount ?: 0) + if (delayUs != null) 1 else 0,
+                (previous?.lateSchedules ?: 0) + if (delayUs != null && delayUs < 0) 1 else 0,
+                if (delayUs == null) previous?.minDelayUs else minOf(previous?.minDelayUs ?: delayUs, delayUs),
+                if (delayUs == null) previous?.maxDelayUs else maxOf(previous?.maxDelayUs ?: delayUs, delayUs),
+                (previous?.holdSamples ?: 0) + if (heldNs != null && heldNs >= 0) 1 else 0,
+                maxOf(previous?.maxHoldNs ?: 0, heldNs?.coerceAtLeast(0) ?: 0),
+                (previous?.releaseCallSamples ?: 0) + if (releaseCallNs != null && releaseCallNs >= 0) 1 else 0,
+                maxOf(previous?.maxReleaseCallNs ?: 0, releaseCallNs?.coerceAtLeast(0) ?: 0))
             if (c.video.compareAndSet(slot, old, next)) {
                 if (old != null && previous == null) submitVideo(c, old, ns, DiagnosticStage.RESET)
+                if (role == "receiver" && (stage == DiagnosticVideoStage.DECODED ||
+                        stage == DiagnosticVideoStage.RELEASED || stage == DiagnosticVideoStage.RENDERED ||
+                        stage == DiagnosticVideoStage.SKIPPED) &&
+                    (interval != null && interval >= VIDEO_LONG_INTERVAL_NS ||
+                        sourceInterval != null && sourceInterval >= VIDEO_LONG_INTERVAL_NS ||
+                        stage == DiagnosticVideoStage.RENDERED && sourceAtNs != null &&
+                            previous?.sourceAtNs != null && sourceAtNs < previous.sourceAtNs ||
+                        delayUs != null && delayUs <= VIDEO_LATE_DELAY_US ||
+                        heldNs != null && heldNs >= VIDEO_LONG_INTERVAL_NS ||
+                        releaseCallNs != null && releaseCallNs >= SLOW_OPERATION_NS ||
+                        stage == DiagnosticVideoStage.SKIPPED)) {
+                    val candidate = reserveVideoTrace(c, ns)
+                    if (candidate != null && candidate < VIDEO_TRACE_LIMIT) {
+                        val metadata = DiagnosticVideoAnomaly(stage, previous?.lastAtNs, ns, sourceAtNs,
+                            if (stage == DiagnosticVideoStage.RENDERED) previous?.sourceAtNs else null,
+                            delayUs, heldNs, releaseCallNs, reason)
+                        submit(c, observation(ns, DiagnosticKind.VIDEO_PROGRESS, DiagnosticStage.SAMPLE, role, session,
+                            1, generation, 0, pts, -1, 1, bytes, -1, reason, DiagnosticPoint.UNSPECIFIED, metadata), false)
+                    }
+                }
                 return
             }
         }
         drop(c, Drop.ROUTINE_CAPACITY, ns)
     }
 
+    private fun nonNegativeDifference(now: Long, before: Long): Long? {
+        if (now < before) return null
+        return try { Math.subtractExact(now, before) } catch (_: ArithmeticException) { Long.MAX_VALUE }
+    }
+
+    private fun reserveVideoTrace(c: Capture, ns: Long): Long? {
+        repeat(4) {
+            val count = c.videoTraceCandidates.get()
+            if (count == Long.MAX_VALUE || c.videoTraceCandidates.compareAndSet(count, count + 1)) return count
+        }
+        drop(c, Drop.ROUTINE_CAPACITY, ns)
+        return null
+    }
+
     private fun submitVideo(c: Capture, value: DiagnosticVideoProgress, ns: Long,
                             stage: DiagnosticStage = DiagnosticStage.SAMPLE, priority: Boolean = false) {
-        val metadata = if (value.videoStage != DiagnosticVideoStage.ENCODED &&
-            value.generation < c.videoGeneration.get()) value.copy(retired = true) else value
+        val metadata = value.copy(traceCandidates = c.videoTraceCandidates.get(),
+            retired = value.videoStage != DiagnosticVideoStage.ENCODED &&
+                value.generation < c.videoGeneration.get())
         val event = observation(ns, DiagnosticKind.VIDEO_PROGRESS, stage, c.role, c.session ?: 0,
             1, value.generation, 0, value.lastPtsUs, -1, value.count, value.bytes, -1,
             value.reason, DiagnosticPoint.UNSPECIFIED, metadata)
@@ -314,6 +428,7 @@ class DiagnosticRecorder(private val clock: () -> Long = System::nanoTime) {
 
     private fun sampleVideo(c: Capture, now: Long, priority: Boolean = false) {
         for (i in 0 until c.video.length()) c.video.get(i)?.let { submitVideo(c, it, now, priority = priority) }
+        c.videoTiming.get()?.let { submitVideoTiming(c, it, now, priority, priority = priority) }
     }
 
     fun observe(
@@ -496,12 +611,20 @@ class DiagnosticRecorder(private val clock: () -> Long = System::nanoTime) {
         c: Capture, event: Observation, priority: Boolean,
         countDrop: Boolean = true, finalSummary: Boolean = false
     ): Boolean {
-        while (true) {
+        val ticket = reserve(c, event.ns, priority, countDrop, finalSummary) ?: return false
+        publish(c, ticket, event)
+        return true
+    }
+
+    private fun reserve(
+        c: Capture, ns: Long, priority: Boolean, countDrop: Boolean = true,
+        finalSummary: Boolean = false, maxAttempts: Int = Int.MAX_VALUE
+    ): Long? {
+        repeat(maxAttempts) {
             val state = c.queueState.get()
-            val ns = event.ns
             if (state < 0) {
                 if (countDrop) drop(c, Drop.CLOSED_CAPTURE, ns)
-                return false
+                return null
             }
             val next = state
             val outstanding = next - c.queueHead.get()
@@ -512,14 +635,19 @@ class DiagnosticRecorder(private val clock: () -> Long = System::nanoTime) {
             }
             if (outstanding >= limit || next >= Long.MAX_VALUE - 1) {
                 if (countDrop) drop(c, if (priority) Drop.CRITICAL_CAPACITY else Drop.ROUTINE_CAPACITY, ns)
-                return false
+                return null
             }
-            if (!c.queueState.compareAndSet(state, state + 1)) continue
-            event.seq = next + 1
+            if (!c.queueState.compareAndSet(state, state + 1)) return@repeat
             afterSequenceReservation?.invoke()
-            c.queue.set((next % PENDING).toInt(), event)
-            return true
+            return next + 1
         }
+        if (countDrop) drop(c, if (priority) Drop.CRITICAL_CAPACITY else Drop.ROUTINE_CAPACITY, ns)
+        return null
+    }
+
+    private fun publish(c: Capture, ticket: Long, event: Observation) {
+        event.seq = ticket
+        c.queue.set(((ticket - 1) % PENDING).toInt(), event)
     }
 
     private fun submitFinal(c: Capture, event: Observation): Boolean {
@@ -576,6 +704,7 @@ class DiagnosticRecorder(private val clock: () -> Long = System::nanoTime) {
         capture?.let { throw DiagnosticError(if (it.collecting) "CAPTURE_ACTIVE" else "RETAINED_CAPTURE_EXISTS") }
         if (role !in capabilities || flags.isEmpty() || flags.any { it !in capabilities.getValue(role) })
             throw DiagnosticError("UNSUPPORTED_FLAG")
+        if ("video.timing" in flags && "video.progress" !in flags) throw DiagnosticError("INVALID_ARGUMENT")
         if (durationMs !in 1000..180000 || periodMs !in 100..5000) throw DiagnosticError("INVALID_ARGUMENT")
         if (session != null && sessions[role] != session) throw DiagnosticError("SESSION_NOT_FOUND")
         val now = clock()
@@ -585,7 +714,8 @@ class DiagnosticRecorder(private val clock: () -> Long = System::nanoTime) {
         lifecycle(c, "CAPTURE_STARTED", JSONObject())
         if (session != null) lifecycle(c, "SESSION_BOUND", JSONObject())
         gate = c
-        return limits().put("captureId", c.id).put("startedNs", "$now").put("expiresNs", "${c.expires}")
+        return limits().put("maxRecordBytes", if ("video.timing" in flags) MAX_VIDEO_TIMING_RECORD_BYTES else MAX_RECORD_BYTES)
+            .put("captureId", c.id).put("startedNs", "$now").put("expiresNs", "${c.expires}")
     }
 
     @Synchronized fun tick() {
@@ -608,6 +738,7 @@ class DiagnosticRecorder(private val clock: () -> Long = System::nanoTime) {
                 .put("evictedAfterRetention", "${c.evicted}")
                 .put("inFlightNotTracked", "${c.untrackedOperations.get()}")
                 .put("staleVideoUpdates", "${c.staleVideoUpdates.get()}")
+                .put("videoTimingContention", "${c.videoTimingContention.get()}")
                 .put("inFlightCount", countInFlight(c))
                 .put("dropReasons", drops)
                 .put("inFlight", inFlight(c, now)))
@@ -700,6 +831,7 @@ class DiagnosticRecorder(private val clock: () -> Long = System::nanoTime) {
             lifecycle(c, "CAPTURE_ENDED", JSONObject().put("reason", effective)
                 .put("inFlightCount", countInFlight(c))
                 .put("inFlightNotTracked", "${c.untrackedOperations.get()}")
+                .put("videoTimingContention", "${c.videoTimingContention.get()}")
                 .put("inFlight", inFlight(c, now)), terminal = true)
             drain(c)
         }
@@ -866,7 +998,10 @@ class DiagnosticRecorder(private val clock: () -> Long = System::nanoTime) {
 
     private fun retain(c: Capture, seq: Long, event: JSONObject, priority: Boolean) {
         val size = event.toString().toByteArray(Charsets.UTF_8).size
-        if (size > MAX_RECORD_BYTES) {
+        val recordLimit = if ("video.timing" in c.flags && event.optString("kind") == DiagnosticKind.VIDEO_PROGRESS.name &&
+            event.optJSONObject("data")?.optJSONObject("metrics")?.optString("schema") == "video_frame_timing")
+            MAX_VIDEO_TIMING_RECORD_BYTES else MAX_RECORD_BYTES
+        if (size > recordLimit) {
             c.oversizedRecords.record(seq)
             drop(c, Drop.OVERSIZED_RECORD, clock())
             return

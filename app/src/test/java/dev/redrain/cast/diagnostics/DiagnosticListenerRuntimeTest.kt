@@ -33,7 +33,7 @@ class DiagnosticListenerRuntimeTest {
     }
 
     private fun enable(): Int {
-        DiagnosticAccess.setEnabled(context, true, true) {
+        DiagnosticAccess.setEnabled(context, true) {
             DiagnosticIdentity(InetAddress.getLoopbackAddress())
         }
         drainControlWorker()
@@ -61,7 +61,7 @@ class DiagnosticListenerRuntimeTest {
     }
 
     private fun disable() {
-        DiagnosticAccess.setEnabled(context, false, false)
+        DiagnosticAccess.setEnabled(context, false)
         drainControlWorker()
     }
 
@@ -84,7 +84,7 @@ class DiagnosticListenerRuntimeTest {
             client(port).use {
                 command(it, "HELLO")
                 assertEquals("idle", command(it, "STATUS").getString("state"))
-                DiagnosticAccess.setEnabled(context, false, false)
+                DiagnosticAccess.setEnabled(context, false)
                 assertEquals(-1, it.inputStream.read())
             }
             assertFalse(DiagnosticAccess.enabled)
@@ -99,7 +99,7 @@ class DiagnosticListenerRuntimeTest {
     @Test fun networkChangeRevokesListenerAndClosesCollectorWithoutRebinding() {
         val valid = AtomicBoolean(true)
         val disabled = CountDownLatch(1)
-        DiagnosticAccess.setEnabled(context, true, true) {
+        DiagnosticAccess.setEnabled(context, true) {
             DiagnosticIdentity(InetAddress.getLoopbackAddress(), isValid = valid::get)
         }
         drainControlWorker()
@@ -148,7 +148,7 @@ class DiagnosticListenerRuntimeTest {
                     .put("afterSeq", "0").put("limit", 32)).getJSONArray("records")
                 assertTrue(records.length() >= 2)
                 assertFalse(RemoteDiagnostics.recorder.collecting)
-                DiagnosticAccess.setEnabled(context, false, false)
+                DiagnosticAccess.setEnabled(context, false)
                 assertEquals(-1, it.inputStream.read())
             }
             drainControlWorker()
@@ -167,7 +167,7 @@ class DiagnosticListenerRuntimeTest {
             val reports = mutableListOf<String>()
             val access = DiagnosticAccess.sessionAccess(context)
             try {
-                DiagnosticAccess.setEnabled(context, true, true) {
+                DiagnosticAccess.setEnabled(context, true) {
                     binding.countDown()
                     check(release.await(5, TimeUnit.SECONDS)) { "Binding was not released" }
                     if (race == "failed") throw java.io.IOException("Synthetic bind failure")
@@ -184,7 +184,7 @@ class DiagnosticListenerRuntimeTest {
                 }
                 assertTrue(reports.isEmpty())
                 when (race) {
-                    "disabled" -> DiagnosticAccess.setEnabled(context, false, false)
+                    "disabled" -> DiagnosticAccess.setEnabled(context, false)
                     "retired" -> access.ended(77)
                 }
                 release.countDown()

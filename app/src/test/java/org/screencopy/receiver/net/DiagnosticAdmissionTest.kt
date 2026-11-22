@@ -73,12 +73,14 @@ class DiagnosticAdmissionTest {
 
     private class Access : DiagnosticSessionAccess {
         val admissions = mutableListOf<Pair<Long, Boolean>>()
+        val admitted = CountDownLatch(1)
         val revoked = CountDownLatch(1)
         val ended = CountDownLatch(1)
         var fail = false
         override fun admitted(session: Long, requested: Boolean, ownerActive: () -> Boolean, report: (String) -> Unit) {
             assertTrue(ownerActive())
             admissions.add(session to requested)
+            admitted.countDown()
             if (fail) throw java.io.IOException("synthetic diagnostics unavailable")
             if (requested) report("enabled")
         }
@@ -123,6 +125,34 @@ class DiagnosticAdmissionTest {
                 send(peer, Type.STOP, JSONObject().put("reason", "done"), 77)
                 assertEquals(Type.SESSION_END, read(peer).type)
                 assertTrue(access.ended.await(2, TimeUnit.SECONDS))
+            }
+
+        }
+    }
+
+    @Test fun statisticsAndDiagnosticRequestsAreIndependent() {
+        for (stats in listOf(false, true)) for (diagnostics in listOf(false, true)) {
+            val access = Access()
+            ReceiverServer.forProtocolTests("Receiver", supportsPlaybackStatistics = true,
+                diagnosticSessionAccess = access, diagnosticDiscovery = { DiagnosticDiscovery(43210) }).use { server ->
+                server.start()
+                connect(server).use { peer ->
+                    val offer = JSONObject().put("role", "sender").put("versions", JSONArray().put(3))
+                        .put("name", "Phone").put("diagnostics", DiagnosticDelegation.capability())
+                        .put("receiverOptions", ReceiverOptionProtocol.IMPLEMENTED.wireValue())
+                    send(peer, Type.HELLO, offer)
+                    assertEquals(Type.HELLO, read(peer).type)
+                    val request = settings(if (diagnostics) true else null)
+                    if (stats) request.put("receiverOptions", JSONObject().put("version", 1).put("playbackStats", true))
+                    send(peer, Type.SESSION_REQUEST, request, 77)
+                    assertEquals(Type.SESSION_ACCEPT, read(peer).type)
+                    if (diagnostics) assertEquals(Type.STATUS, read(peer).type)
+                    assertTrue(access.admitted.await(2, TimeUnit.SECONDS))
+                    assertEquals(listOf(77L to diagnostics), access.admissions)
+                    assertEquals(stats, server.playbackStatisticsRequested)
+                    send(peer, Type.STOP, JSONObject().put("reason", "done"), 77)
+                    assertEquals(Type.SESSION_END, read(peer).type)
+                }
             }
         }
     }

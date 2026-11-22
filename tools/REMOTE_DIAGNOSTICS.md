@@ -46,13 +46,14 @@ does not share the Activity-owned receiver-advertisement socket on UDP 27183.
 There is no debug/run-as dependency; the same path is compiled into optimized
 release builds and tested by the existing collector/JVM/assembly CI workflow.
 
-1. Enable playback statistics and remote diagnostics on the sender before
+1. Enable remote diagnostics on the sender before
    starting the cast. Accept its LAN-access warning. On a compatible receiver,
    the admitted cast automatically opens session-scoped diagnostics without
    changing projector settings. Both devices need the updated build.
    The receiver endpoint may become discoverable after cast admission when
    the advertisement's source address matches its diagnostic bind address.
    Alternatively, standalone receiver-local diagnostics can still be enabled.
+   The playback statistics panel is optional and independent.
 2. Run the collector with Python 3.10 or newer, following the session selection
    instructions in step 4:
 
@@ -111,7 +112,8 @@ broadcast discovery alone still does not discover senders. Connection hints
 remain process-only and no tokens/secrets are logged.
 
 The default flags negotiate the advertised audio investigation surfaces,
-`video.progress` and application transport health separately for each peer.
+`video.progress`, the optional receiver `video.timing` extension, and application
+transport health separately for each peer.
 Older builds without video support still collect their supported defaults; the
 `capture_metadata.flags` record is the authoritative selected set. Explicit
 `--sender-flags` / `--receiver-flags` remain strict: a build lacking a requested
@@ -139,7 +141,7 @@ producer is an explicit collection error, not a successful truncated capture.
 
 For a focused paired video capture, explicitly request
 `--sender-flags session,recovery,video.progress,transport.health` and
-`--receiver-flags session,recovery,video.progress,transport.health` with the
+`--receiver-flags session,recovery,video.progress,video.timing,transport.health` with the
 existing `--follow-receiver` flow. This fails on older peers lacking video;
 omit the explicit flag lists to negotiate backward-compatible defaults.
 
@@ -158,6 +160,46 @@ legitimate encoded gaps. Inspect recorder loss watermarks and recovery records.
 configuration). Neither is physical display/scanout proof. Missing stages
 are unavailable observations, not fabricated zeroes. See
 `protocol\REMOTE_DIAGNOSTICS.md` for exact schemas and generation semantics.
+
+Receiver `video_frame_timing` requires both `video.progress` and `video.timing`;
+the latter explicitly negotiates deeper responses and larger records. Legacy
+collectors do not select it and receive only legacy-sized, depth-8 records.
+Receiver `video_frame_timing` adds bounded signed timing ranges for decoded
+availability, unclamped intended deadline versus codec release timestamp,
+and safely matched callback timestamps and cadence. Check its missing,
+ambiguous, evicted, mapping-change and future-callback counters before drawing
+conclusions. Compare callback cadence to the actual PTS cadence rather than
+assuming a fixed frame rate; callback evidence still does not establish scanout.
+For deadline variation, inspect `deadlineCadenceMinusPts` and its bounded
+minimum/maximum paired scheduling examples. Each includes the clock position
+actually used, mapping revision, cached audio observation sequence/monotonic
+age, output timestamp/head classification when known, source slew offset at
+observation, latest packet-map correction, and delay-read-to-schedule times.
+Unchanged observation identity with increasing age exposes reuse. Video deadlines
+now project qualified native presentation only to already-consumed frames and
+the existing 100 ms DAC timestamp validity boundary, using the real resampler/
+silence mapping and source phase slew without advancing actual audio observations.
+`sourcePositionUs` is that unguarded scheduling input, not necessarily cached PTS.
+`scheduleAtNs` and clock `readAtNs` are the same deadline-calculation time whether
+recording is on or off. Packet corrections are not instantaneous audible-clock changes,
+and hardware timestamp age is not cached observation age. Null is unknown.
+Scheduling pairs do not require callbacks and never span mapping revisions;
+these are correlations, not proof of scheduling jitter or native clock drift.
+Correlation contributions remain provisional while their PTS groups occupy the
+128-group duplicate-detection window. Later duplicates within that window retract
+matches, affected cadence ranges and exemplars. Retirement commits eligible
+per-frame history; adjacency pairs commit only after both endpoints retire,
+so callback-order pairs survive out-of-order callbacks and PTS-order retirement.
+At most 512 pending edges bridge the bounded window; there are no endpoint chains.
+`outsideWindowCallbacks` exposes unmatched callbacks too old to revise
+that history. No lifetime uniqueness beyond the window is claimed, and snapshots
+must not be treated as monotonic deltas.
+The collector keeps the 16,384-byte line limit but accepts response depth 10,
+including fully populated clock corrections inside paired FETCH exemplars.
+Frozen draining is capped at 5,120 records / 14,385,152 record bytes, covering
+2 MiB initial retention plus 1,024 delayed publications of up to 12,000 bytes.
+The CI collector integration runs after the JVM fixture generator with
+`DIAGNOSTICS_REQUIRE_FIXTURE=1`; standalone Python tests may skip absent fixtures.
 
 Each device writes its own JSONL file with selected flags, process clock ID,
 start/end clock samples, capture identity, events and retention/drop counters.
