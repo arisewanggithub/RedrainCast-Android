@@ -33,4 +33,4 @@ jobs:
       - name: Test generated receiver collector contract
         env:
           DIAGNOSTICS_REQUIRE_FIXTURE: '1'
-        run: python3 -B tools/diagnostics-test.py ProtocolTests.test_generated_receiver_timing_fetch_passes_actual_collector_exchange ProtocolTests.test_generated_legacy_receiver_capture_drains
+        run: python3 -B tools/diagnostics-test.py ProtocolTests.test_generated_receiver_timing_fetch_passes_actual_collector_exchange ProtocolTests.test_generated_legacy_receiver_capture_is_explicitly_rejected
