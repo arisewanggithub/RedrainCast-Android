@@ -60,7 +60,13 @@ object Wire {
         if (if (media) pts < 0 else pts != -1L) throw IOException("PROTOCOL: invalid PTS")
     }
 
-    fun read(source: InputStream, started: () -> Unit = {}): Message {
+    fun read(source: InputStream, started: () -> Unit = {}): Message =
+        read(source, started, null, MAX_VIDEO)
+
+    internal fun readBounded(source: InputStream, expectedType: Int, maxPayload: Int): Message =
+        read(source, {}, expectedType, maxPayload)
+
+    private fun read(source: InputStream, started: () -> Unit, expectedType: Int?, maxPayload: Int): Message {
         val first = source.read()
         if (first < 0) throw EOFException()
         started()
@@ -77,6 +83,8 @@ object Wire {
         val generation = input.readInt()
         val pts = input.readLong()
         validate(type, flags, session, track, generation, pts, size)
+        if (expectedType != null && (type != expectedType || size > maxPayload))
+            throw IOException("PROTOCOL: unexpected bounded response")
         val payload = ByteArray(size).also(input::readFully)
         return Message(type, flags, session, track, generation, pts, payload).also {
             if (type != VIDEO_FRAME && type != AUDIO_PACKET) it.json()

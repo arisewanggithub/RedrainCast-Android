@@ -21,6 +21,7 @@ internal class SessionStopTrace(private val log: (String) -> Unit, private val c
         val safe = SenderFailureDiagnostics.sanitize(original)
         val chain = SenderFailureDiagnostics.chain(original)
         val root = chain.last()
+        val recoveryDeadline = chain.filterIsInstance<RecoveryDeadlineException>().firstOrNull()
         val causes = SenderFailureDiagnostics.causes(chain)
         val stack = SenderFailureDiagnostics.stack(chain)
         fun codec(value: String) = value.takeIf { it in setOf("h264", "h265", "av1", "opus", "aac", "raw") } ?: "UNKNOWN"
@@ -35,7 +36,16 @@ internal class SessionStopTrace(private val log: (String) -> Unit, private val c
             "audio_enabled" to settings.audio, "max_size" to settings.maxSize, "max_fps" to settings.maxFps,
             "crop_width" to settings.cropWidth, "crop_height" to settings.cropHeight,
             "track" to (error as? SenderProtocolException)?.evidence?.track?.name,
-            "generation" to (error as? SenderProtocolException)?.evidence?.generation
+            "generation" to (error as? SenderProtocolException)?.evidence?.generation,
+            "recovery_deadline" to recoveryDeadline?.let { deadline -> Wire.obj(
+                "track" to deadline.track, "generation" to deadline.generation,
+                "phase" to deadline.phase, "last_trigger" to deadline.trigger,
+                "elapsed_ns" to deadline.elapsedNs.toString(), "deadline_ns" to "10000000000",
+                "cutoff_us" to deadline.cutoffUs.toString(), "last_source_pts_us" to deadline.sourcePtsUs.toString(),
+                "sent_key_pts_us" to deadline.sentKeyPtsUs?.toString(), "key_proved" to deadline.keyProved,
+                "pending_audio_completion_us" to deadline.pendingAudioCompletionUs?.toString(),
+                "written_audio_intervals" to deadline.writtenAudioIntervals
+            ) }
         )}")
     }
     fun congestion(snapshot: SenderQueueFailure, atFailure: Phase) { log("sender_queue_failure phase=$atFailure ${snapshot.fields()}") }

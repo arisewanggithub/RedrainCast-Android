@@ -89,6 +89,7 @@ class MediaBudget internal constructor(private val withAudio: Boolean, private v
                 }
             }
         }
+        updateIncidentQueue(track)
         monitor.notifyAll()
     }
 
@@ -107,6 +108,7 @@ class MediaBudget internal constructor(private val withAudio: Boolean, private v
             diagnosticQueue(DiagnosticStage.EVICTED, recoveryCutoffUs ?: -1, DiagnosticReason.CAPACITY, timing)
             if (oldest.message.generation == 1) initialAudioPrefixRetired = true
             mediaBytes -= oldest.message.payload.size
+            updateIncidentQueue(2)
             pressure = tryOfferMedia(message)
         }
         pressure
@@ -144,6 +146,7 @@ class MediaBudget internal constructor(private val withAudio: Boolean, private v
             if (oldest.message.generation == 1) initialAudioPrefixRetired = true
             mediaBytes -= oldest.message.payload.size
         }
+        updateIncidentQueue(2)
         val packets = audio.filter { it.message.type == Wire.AUDIO_PACKET }
         if (packets.isEmpty()) {
             diagnosticQueue(DiagnosticStage.HOLD, cutoff, DiagnosticReason.SOURCE_PENDING, timing)
@@ -200,26 +203,65 @@ class MediaBudget internal constructor(private val withAudio: Boolean, private v
                 {
                     if (track == 2) diagnosticQueue(DiagnosticStage.PRESSURE, reason = DiagnosticReason.CAPACITY)
                     if (track == 1) diagnosticVideo(message, DiagnosticVideoStage.REJECTED, DiagnosticReason.CAPACITY)
-                    throw SenderCongestionException(snapshot(message, limit, (System.nanoTime() - begin) / 1_000_000))
+                    val pressure = snapshot(message, limit, (System.nanoTime() - begin) / 1_000_000)
+                    TelemetryRegistry.event("sender", diagnosticSession,
+                        DiagnosticKind.RECOVERY.ordinal + 1, DiagnosticStage.PRESSURE.ordinal,
+                        message.track, message.generation, pressure.attemptedSpanUs,
+                        listOf(limit.ordinal.toLong(), message.pts, pressure.count.toLong(),
+                            pressure.countCap.toLong(), pressure.bytes.toLong(), pressure.byteCap.toLong(),
+                            pressure.incomingBytes.toLong(), pressure.trackCount.toLong(), pressure.trackBytes.toLong(),
+                            pressure.queuedSpanUs, pressure.sourceStepUs, pressure.ageMs, pressure.waitMs,
+                            if (pressure.ready) 1L else 0L, (pressure.writerQueue?.ordinal ?: -1).toLong(),
+                            pressure.writerBytes.toLong(), pressure.writerMs, pressure.writerAdmittedAgeMs,
+                            pressure.lastWriteMs), pressure = true)
+                    throw SenderCongestionException(pressure)
                 }
             monitor.wait(remaining / 1_000_000, (remaining % 1_000_000).toInt())
         }
         val entry = Entry(message, clock())
         if (message.type == Wire.STREAM_CONFIG) {
+            TelemetryRegistry.evidence("sender", diagnosticSession, track, message.generation,
+                IncidentEvidence.Stage.CONFIG_ENQUEUED)
             generation[track] = message.generation; lastPts[track] = -1
             opusSourcePts[track] = opusConfig
             val queue = if (track == 1) video else audio
             queue.add(entry); configCount++; controlBytes += message.payload.size
+            updateIncidentQueue(track, entry.admitted)
         } else if (message.type != Wire.VIDEO_FRAME && message.type != Wire.AUDIO_PACKET) {
             controls.add(entry); controlBytes += message.payload.size
         } else {
             lastPts[track] = message.pts
             val queue = if (track == 1) video else audio
             queue.add(entry); mediaBytes += message.payload.size
+            updateIncidentQueue(track, entry.admitted)
             if (track == 2) diagnosticQueue(DiagnosticStage.ADMITTED)
             if (track == 1) diagnosticVideo(message, DiagnosticVideoStage.QUEUED)
         }
         monitor.notifyAll()
+    }
+
+    private fun updateIncidentQueue(track: Int, at: Long? = null) {
+        if (!TelemetryRegistry.has("sender", diagnosticSession)) return
+        val now = at ?: clock()
+        val queue = if (track == 1) video else audio
+        val lane = if (track == 1) SenderQueue.VIDEO.ordinal else SenderQueue.AUDIO.ordinal
+        val first = queue.firstOrNull { it.message.type == Wire.VIDEO_FRAME || it.message.type == Wire.AUDIO_PACKET }
+        val bytes = queuedMediaBytes(queue)
+        val span = sourceSpan(queue)
+        val isReady = generation[track] > 0 && ready[track] == generation[track]
+        TelemetryRegistry.evidence("sender", diagnosticSession, track, generation[track], IncidentEvidence.Stage.QUEUE_STATE,
+            queue.size.toLong(), bytes.toLong(), span,
+            first?.admitted ?: -1, if (isReady) 1 else 0,
+            if (writing[lane]) writeBegin[lane] else -1, lastWriteMs[lane])
+        TelemetryRegistry.state("sender", diagnosticSession, 60 + track,
+            DiagnosticKind.entries.size + 1, DiagnosticStage.SAMPLE.ordinal,
+            track, generation[track], span,
+            detail = listOf(queue.size.toLong(), 1024, bytes.toLong(),
+                mediaByteLimit(track).toLong(), first?.let { ((now - it.admitted) / 1_000_000).coerceAtLeast(0) } ?: -1,
+                if (isReady) 1L else 0L,
+                if (writing[lane]) 1L else 0L, writerBytes[lane].toLong(),
+                if (writing[lane]) ((now - writeBegin[lane]) / 1_000_000).coerceAtLeast(0) else -1,
+                lastWriteMs[lane]))
     }
     private fun protocol(message: Wire.Message, reason: CaptureProtocolReason): SenderProtocolException {
         val track = message.track
@@ -305,14 +347,18 @@ class MediaBudget internal constructor(private val withAudio: Boolean, private v
         writerBytes[lane] = message.payload.size
         writeBegin[lane] = clock()
         writeAdmitted[lane] = pendingWrites[lane]?.takeIf { it.message === message }?.admitted ?: writeBegin[lane]
+        if (lane in 1..2) updateIncidentQueue(lane, writeBegin[lane])
     }
     fun endWrite(message: Wire.Message? = null) = synchronized(monitor) {
         val lanes = if (message == null) 0..2 else kind(message).ordinal..kind(message).ordinal
         for (lane in lanes) {
-            if (writing[lane]) lastWriteMs[lane] = ((clock() - writeBegin[lane]) / 1_000_000).coerceAtLeast(0)
+            val wasWriting = writing[lane]
+            val at = if (wasWriting) clock() else 0
+            if (wasWriting) lastWriteMs[lane] = ((at - writeBegin[lane]) / 1_000_000).coerceAtLeast(0)
             writing[lane] = false
             writerBytes[lane] = 0
             pendingWrites[lane] = null
+            if (wasWriting && lane in 1..2) updateIncidentQueue(lane, at)
         }
         monitor.notifyAll()
     }
@@ -336,6 +382,7 @@ class MediaBudget internal constructor(private val withAudio: Boolean, private v
         ready[track] = gen
         readinessDeadline[track] = 0
         if (ready[1] > 0 && (!withAudio || ready[2] > 0)) started = true
+        updateIncidentQueue(track)
         monitor.notifyAll()
     }
     fun poll(waitMs: Long): Wire.Message? = synchronized(monitor) {
@@ -358,6 +405,8 @@ class MediaBudget internal constructor(private val withAudio: Boolean, private v
         controls.clear(); video.clear(); audio.clear()
         mediaBytes = 0; controlBytes = message.payload.size; configCount = 0
         controls.add(Entry(message, clock()))
+        updateIncidentQueue(1)
+        if (withAudio) updateIncidentQueue(2)
         monitor.notifyAll()
     }
     private fun take(lane: Int? = null): Wire.Message? {
@@ -380,12 +429,14 @@ class MediaBudget internal constructor(private val withAudio: Boolean, private v
                         queue.remove(); announced[track] = message.generation
                         readinessDeadline[track] = clock() + 10_000_000_000L
                         configCount--; controlBytes -= message.payload.size
+                        updateIncidentQueue(track)
                         pendingWrites[track] = entry; monitor.notifyAll()
                         return message
                     }
                 } else if (started && ready[track] == message.generation && (track != 2 || !recoveryAudioHeld)) {
                     queue.remove(); mediaBytes -= message.payload.size
                     if (track == 1) diagnosticVideo(message, DiagnosticVideoStage.QUEUE_REMOVED)
+                    updateIncidentQueue(track)
                     pendingWrites[track] = entry; monitor.notifyAll()
                     return message
                 }

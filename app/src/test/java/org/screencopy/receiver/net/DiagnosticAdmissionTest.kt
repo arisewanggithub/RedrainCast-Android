@@ -14,6 +14,81 @@ import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
 
 class DiagnosticAdmissionTest {
+    @Test(timeout = 15_000) fun ordinaryControlReadsDoNotCountDuplicateOperationsWithLiveRecorderOnOrOff() {
+        val recorder = dev.redrain.cast.diagnostics.RemoteDiagnostics.recorder
+        recorder.unrestricted()
+        try {
+            for (live in listOf(false, true)) {
+                recorder.revoke()
+                ReceiverServer.forProtocolTests("Receiver").use { server ->
+                    server.start()
+                    connect(server).use { peer ->
+                        val hello = hello(peer, null, telemetry = true)
+                        assertTrue(dev.redrain.cast.diagnostics.SessionTelemetryProtocol.supported(hello.json()))
+                        send(peer, Type.SESSION_REQUEST, settings(null).put("sessionTelemetry",
+                            dev.redrain.cast.diagnostics.SessionTelemetryProtocol.capability()), 77)
+                        val accepted = read(peer)
+                        assertEquals(Type.SESSION_ACCEPT, accepted.type)
+                        assertTrue(dev.redrain.cast.diagnostics.SessionTelemetryProtocol.supported(accepted.json()))
+                        var final: dev.redrain.cast.diagnostics.SessionTelemetryProtocol.Batch? = null
+                        fun expect(type: Type): Message {
+                            while (true) {
+                                val message = read(peer)
+                                if (message.type == Type.STATUS &&
+                                    message.json().optString("state") == "session-telemetry") {
+                                    val batch = dev.redrain.cast.diagnostics.SessionTelemetryProtocol.parse(message.payload)
+                                    if (batch.final) final = batch
+                                } else {
+                                    assertEquals(type, message.type)
+                                    return message
+                                }
+                            }
+                        }
+                        var captureId: String? = null
+                        if (live) {
+                            recorder.grantConsent()
+                            captureId = recorder.start("receiver", 77, setOf("transport.health"), 10_000, 100)
+                                .getString("captureId")
+                        }
+                        assertEquals(live, recorder.collecting)
+                        repeat(7) { nonce ->
+                            send(peer, Type.PING, JSONObject().put("nonce", nonce), 77)
+                            expect(Type.PONG)
+                        }
+                        if (live) {
+                            recorder.end(checkNotNull(captureId))
+                            val records = recorder.fetch(checkNotNull(captureId), 0, 32).getJSONArray("records")
+                            val summaries = (0 until records.length()).map { records.getJSONObject(it) }.filter {
+                                it.optString("kind") == "TRANSPORT_HEALTH" &&
+                                    it.optJSONObject("data")?.optString("point") == "read" &&
+                                    it.optJSONObject("data")?.optJSONObject("metrics")
+                                        ?.optString("schema") == "operation_summary"
+                            }.map { it.getJSONObject("data").getJSONObject("metrics") }
+                            assertTrue(summaries.isNotEmpty())
+                            val started = summaries.sumOf { it.getString("started").toLong() }
+                            val completed = summaries.sumOf { it.getString("completed").toLong() }
+                            assertTrue("Unexpected read completions: $completed", completed in 6L..7L)
+                            assertTrue("Unexpected read starts: $started, completed: $completed",
+                                started in (completed - 1)..(completed + 1))
+                            assertEquals(0L, summaries.sumOf { it.getString("zeroOperationEvents").toLong() })
+                        }
+                        send(peer, Type.STOP, JSONObject().put("reason", "done"), 77)
+                        val terminal = expect(Type.SESSION_END)
+                        val batch = checkNotNull(final)
+                        assertEquals(batch.sequence.toString(), terminal.json().getString("finalSeq"))
+                        val reads = batch.state.filter {
+                            it.kind == dev.redrain.cast.diagnostics.DiagnosticKind.TRANSPORT_HEALTH.ordinal + 1 &&
+                                it.track == 0 &&
+                                it.detail[3] == dev.redrain.cast.diagnostics.DiagnosticPoint.READ.ordinal.toLong()
+                        }
+                        assertEquals(1, reads.size)
+                        assertTrue(reads.single().detail[4] > 0)
+                    }
+                }
+            }
+        } finally { recorder.revoke() }
+    }
+
     @Test fun admittedStatusCarriesOnlyActualBoundDiagnosticPortAndExactOwner() {
         val recorder = dev.redrain.cast.diagnostics.DiagnosticRecorder()
         dev.redrain.cast.diagnostics.DiagnosticListener(recorder,
@@ -92,9 +167,11 @@ class DiagnosticAdmissionTest {
     private fun send(peer: Socket, type: Type, json: JSONObject, session: Long = 0) =
         Wire.write(peer.outputStream, Message.json(type, json, session))
     private fun read(peer: Socket) = Wire.read(peer.inputStream)
-    private fun hello(peer: Socket, diagnostics: Any? = DiagnosticDelegation.capability()): Message {
+    private fun hello(peer: Socket, diagnostics: Any? = DiagnosticDelegation.capability(),
+                      telemetry: Boolean = false): Message {
         val hello = JSONObject().put("role", "sender").put("versions", JSONArray().put(3)).put("name", "Phone")
         if (diagnostics != null) hello.put("diagnostics", diagnostics)
+        if (telemetry) hello.put("sessionTelemetry", dev.redrain.cast.diagnostics.SessionTelemetryProtocol.capability())
         send(peer, Type.HELLO, hello)
         return read(peer)
     }
@@ -291,6 +368,7 @@ class DiagnosticAdmissionTest {
                 hello(peer)
                 send(peer, Type.SESSION_REQUEST, settings(false), 77)
                 assertEquals(Type.SESSION_ACCEPT, read(peer).type)
+                assertTrue(access.admitted.await(3, TimeUnit.SECONDS))
                 assertEquals(listOf(77L to false), access.admissions)
                 send(peer, Type.STATUS, JSONObject().put("state", "diagnostics").put("message", "enable")
                     .put("diagnostic", DiagnosticDelegation.request(true)), 77)

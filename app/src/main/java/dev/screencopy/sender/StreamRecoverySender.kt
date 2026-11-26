@@ -7,6 +7,20 @@ import java.io.IOException
 import java.util.Base64
 import dev.redrain.cast.diagnostics.*
 
+internal class RecoveryDeadlineException(
+    val track: Int,
+    val generation: Int,
+    val phase: String,
+    val trigger: String,
+    val elapsedNs: Long,
+    val cutoffUs: Long,
+    val sourcePtsUs: Long,
+    val sentKeyPtsUs: Long?,
+    val keyProved: Boolean,
+    val pendingAudioCompletionUs: Long?,
+    val writtenAudioIntervals: Int
+) : IOException("TIMEOUT: track $track recovery produced no usable fresh media within ten seconds")
+
 /** Each track owns its recovery generation; the other TCP lane keeps its original timeline. */
 internal class StreamRecoverySender(
     private val session: Long,
@@ -22,6 +36,7 @@ internal class StreamRecoverySender(
     private val sourcePts = LongArray(3) { -1 }
     private val configs = arrayOfNulls<JSONObject>(3)
     private val unresolvedAt = arrayOfNulls<Long>(3)
+    private val lastTrigger = Array(3) { "unknown" }
     private val minimumPts = LongArray(3)
     private val sentKeyPts = arrayOfNulls<Long>(3)
     private val completedPts = arrayOfNulls<Long>(3)
@@ -75,6 +90,7 @@ internal class StreamRecoverySender(
     }
 
     @Synchronized fun request(track: Int, generation: Int) {
+        TelemetryRegistry.evidence("sender", session, track, generation, IncidentEvidence.Stage.REQUEST)
         requireTrack(track)
         requireWithinDeadline()
         validateGeneration(track, generation)
@@ -239,8 +255,35 @@ internal class StreamRecoverySender(
 
     private fun requireWithinDeadline() {
         for (track in 1..if (withAudio) 2 else 1) {
-            if (unresolvedAt[track]?.let { now() - it >= 10_000_000_000L } == true)
-                throw IOException("TIMEOUT: track $track recovery produced no usable fresh media within ten seconds")
+            val started = unresolvedAt[track] ?: continue
+            val elapsed = (now() - started).coerceAtLeast(0)
+            if (elapsed >= 10_000_000_000L) {
+                TelemetryRegistry.evidence("sender", session, track, wireGeneration[track],
+                    IncidentEvidence.Stage.DEADLINE_EXPIRED, unresolvedAt[track] ?: -1, now(),
+                    state[track].ordinal.toLong(), minimumPts[track], sourcePts[track])
+                TelemetryRegistry.event("sender", session,
+                    DiagnosticKind.RECOVERY.ordinal + 1, DiagnosticStage.FAILED.ordinal,
+                    track, wireGeneration[track], minimumPts[track],
+                    listOf(sourcePts[track], state[track].ordinal.toLong(), elapsed, 10_000_000_000L,
+                            sentKeyPts[track] ?: -1, if (keyProved) 1L else 0L,
+                            pendingAudioCompletion ?: -1, writtenAudio.size.toLong(),
+                            when (lastTrigger[track]) {
+                                "capture" -> 1L
+                                "receiver" -> 2L
+                                "sender" -> 3L
+                                "audio-preroll-capacity" -> 4L
+                                "initial-audio-preroll-retired" -> 5L
+                                "audio-source-window-lost" -> 6L
+                                "audio-proof-window-capacity" -> 7L
+                                else -> 0L
+                            }), failure = true)
+                RemoteDiagnostics.recorder.observe("sender", session, DiagnosticKind.RECOVERY, DiagnosticStage.FAILED,
+                    track, wireGeneration[track], pts = sourcePts[track], cutoff = minimumPts[track],
+                    reason = DiagnosticReason.FAILURE, point = DiagnosticPoint.RECOVERY)
+                throw RecoveryDeadlineException(track, wireGeneration[track], state[track].name, lastTrigger[track],
+                    elapsed, minimumPts[track], sourcePts[track], sentKeyPts[track], keyProved,
+                    pendingAudioCompletion, writtenAudio.size)
+            }
         }
     }
 
@@ -253,6 +296,7 @@ internal class StreamRecoverySender(
     }
 
     private fun begin(track: Int, reason: String, initial: Boolean = false) {
+        lastTrigger[track] = reason
         RemoteDiagnostics.recorder.observe("sender", session, DiagnosticKind.RECOVERY, DiagnosticStage.RESET,
             track, wireGeneration[track], cutoff = minimumPts[track],
             reason = when (reason) {
@@ -277,9 +321,15 @@ internal class StreamRecoverySender(
             pendingAudioCompletion = null
         }
         wireGeneration[track] = next(wireGeneration[track])
+        TelemetryRegistry.evidence("sender", session, track, wireGeneration[track],
+            IncidentEvidence.Stage.DEADLINE, unresolvedAt[track] ?: -1,
+            (unresolvedAt[track] ?: now()) + 10_000_000_000L, state[track].ordinal.toLong())
         RemoteDiagnostics.recorder.observe("sender", session, DiagnosticKind.RECOVERY, DiagnosticStage.BEGIN,
             track, wireGeneration[track], cutoff = minimumPts[track])
         val config = JSONObject(checkNotNull(configs[track]).toString())
+        TelemetryRegistry.trackConfiguration("sender", session, track, wireGeneration[track],
+            config.optString("codec"), config.optInt("width"), config.optInt("height"),
+            config.optInt("sampleRate"), config.optInt("channels"))
         if (track == 2 && !initial) config.put("recoveryPtsUs", minimumPts[2].toString())
         budget.offer(Wire.config(session, track, wireGeneration[track], config))
         diagnostic("event=STREAM_RECOVERY_BEGIN track=$track reason=$reason generation=${wireGeneration[track]}")

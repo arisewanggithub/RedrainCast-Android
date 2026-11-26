@@ -15,6 +15,12 @@ import android.widget.AbsListView
 import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
+import dev.redrain.cast.diagnostics.IncidentStore
+import dev.redrain.cast.diagnostics.SessionTelemetryCollector
+import dev.redrain.cast.diagnostics.TelemetryHistory
+import dev.redrain.cast.diagnostics.TelemetryReport
+import dev.redrain.cast.diagnostics.TelemetryRow
+import dev.redrain.cast.diagnostics.DiagnosticStage
 import dev.screencopy.sender.EncoderMetadata
 import dev.screencopy.sender.HardwareEncoders
 import dev.screencopy.sender.Settings
@@ -29,22 +35,201 @@ import org.robolectric.annotation.Config
 import org.robolectric.annotation.ConscryptMode
 import org.robolectric.annotation.GraphicsMode
 import org.robolectric.shadows.ShadowAlertDialog
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.Executor
 
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [30])
 @GraphicsMode(GraphicsMode.Mode.LEGACY)
 @ConscryptMode(ConscryptMode.Mode.OFF)
 class SharingSettingsTest {
+    private class HeldIncidentIo {
+        private val tasks = java.util.ArrayDeque<Runnable>()
+        val executor = Executor { tasks.addLast(it) }
+        fun runNext() {
+            assertFalse(tasks.isEmpty())
+            tasks.removeFirst().run()
+            shadowOf(Looper.getMainLooper()).idle()
+        }
+    }
+
+    private fun seedTelemetryReport(activity: Activity): String {
+        val store = IncidentStore(activity, executor = Executor { it.run() })
+        store.clear {}
+        val key = java.util.UUID.randomUUID().toString().replace("-", "")
+        store.writeTelemetry(key, telemetryReport())
+        var reports: List<IncidentStore.Report>? = null
+        store.list { reports = it }
+        return checkNotNull(reports).single().name
+    }
+
+    private fun telemetryReport(): ByteArray {
+        val collector = SessionTelemetryCollector { 1 }
+        collector.event(
+            TelemetryRow(1, DiagnosticStage.PRESSURE.ordinal, 1, 1, 1, 5, listOf(0, 0, 0, 0, 1)),
+            pressure = true
+        )
+        val history = TelemetryHistory(receiverSupported = false)
+        assertTrue(history.accept(
+            TelemetryHistory.Endpoint.SENDER, collector.publish(), 1))
+        return TelemetryReport.encode(checkNotNull(history.finish(1)))
+    }
+
+    private fun showWithIncidentIo(activity: Activity, io: HeldIncidentIo, export: (String) -> Unit = {}) =
+        SharingSettings.show(activity, Settings(), {}, {}, inventory(), null, export,
+            { IncidentStore(it, executor = io.executor) })
+
+    @Test fun delayedReportListCannotReopenClosedSettings() {
+        val controller = activity()
+        val io = HeldIncidentIo()
+        val first = showWithIncidentIo(controller.get(), io)
+        field<Button>(first, "sessionTelemetryReports").performClick()
+        first.dismiss()
+        val reopened = showWithIncidentIo(controller.get(), io)
+        assertSame(reopened, latestDialog())
+        io.runNext()
+        assertSame(reopened, latestDialog())
+        assertTrue(reopened.isShowing)
+        reopened.dismiss()
+        controller.pause().stop().destroy()
+    }
+
+    @Test fun delayedReportReadCannotReopenSettingsAfterActivityStop() {
+        val controller = Robolectric.buildActivity(MainActivity::class.java).setup()
+        val activity = controller.get()
+        seedTelemetryReport(activity)
+        val io = HeldIncidentIo()
+        val first = showWithIncidentIo(activity, io)
+        org.robolectric.util.ReflectionHelpers.setField(activity, "settingsDialog", first)
+        field<Button>(first, "sessionTelemetryReports").performClick()
+        io.runNext()
+        val reports = latestDialog()
+        val list = reports.listView
+        assertTrue(list.adapter.count > 0)
+        list.performItemClick(list.adapter.getView(0, null, list), 0, 0)
+        controller.pause().stop()
+        shadowOf(Looper.getMainLooper()).idle()
+        assertFalse(first.isShowing)
+        controller.start().resume().visible()
+        val reopened = showWithIncidentIo(activity, io)
+        assertSame(reopened, latestDialog())
+        io.runNext()
+        assertSame(reopened, latestDialog())
+        assertTrue(reopened.isShowing)
+        reopened.dismiss()
+        IncidentStore(activity, executor = Executor { it.run() }).clear {}
+        controller.pause().stop().destroy()
+    }
+
+    @Test fun reportChildrenCloseWithSettingsAndExportRemainsAvailable() {
+        val controller = activity()
+        val activity = controller.get()
+        val name = seedTelemetryReport(activity)
+        val io = HeldIncidentIo()
+        var exported: String? = null
+        fun settings() = showWithIncidentIo(activity, io) { exported = it }
+        fun reports(parent: AlertDialog): AlertDialog {
+            field<Button>(parent, "sessionTelemetryReports").performClick()
+            io.runNext()
+            return latestDialog()
+        }
+        fun summary(parent: AlertDialog): AlertDialog {
+            val list = reports(parent).listView
+            list.performItemClick(list.adapter.getView(0, null, list), 0, 0)
+            io.runNext()
+            return latestDialog()
+        }
+
+        var parent = settings()
+        val list = reports(parent)
+        parent.dismiss()
+        shadowOf(Looper.getMainLooper()).idle()
+        assertFalse(list.isShowing)
+
+        parent = settings()
+        val confirmationList = reports(parent)
+        click(confirmationList, AlertDialog.BUTTON_NEUTRAL)
+        val confirmation = latestDialog()
+        parent.dismiss()
+        shadowOf(Looper.getMainLooper()).idle()
+        assertFalse(confirmation.isShowing)
+
+        parent = settings()
+        val details = summary(parent)
+        assertNull(exported)
+        parent.dismiss()
+        shadowOf(Looper.getMainLooper()).idle()
+        assertFalse(details.isShowing)
+        assertNull(exported)
+
+        parent = settings()
+        val exportDetails = summary(parent)
+        click(exportDetails, AlertDialog.BUTTON_NEUTRAL)
+        assertEquals(name, exported)
+        assertTrue(parent.isShowing)
+        parent.dismiss()
+        IncidentStore(activity, executor = Executor { it.run() }).clear {}
+        controller.pause().stop().destroy()
+    }
+
+    @Test fun retainedTelemetrySummaryExportsOnlyAfterExplicitActionWithoutRestoringSettingsProse() {
+        val controller = activity()
+        val store = dev.redrain.cast.diagnostics.IncidentStore(controller.get())
+        val key = java.util.UUID.randomUUID().toString().replace("-", "")
+        store.writeTelemetry(key, telemetryReport())
+        val saved = CountDownLatch(1)
+        store.list { saved.countDown() }
+        assertTrue(saved.await(5, TimeUnit.SECONDS))
+        var exported: String? = null
+        val dialog = SharingSettings.show(controller.get(), Settings(), {}, {}, inventory(), null, { exported = it })
+        latestDialog()
+        assertNull(checkNotNull(dialog.window).decorView.findViewWithTag<View>("automaticIncidentDisclosure"))
+        field<Button>(dialog, "sessionTelemetryReports").performClick()
+        val listed = CountDownLatch(1)
+        store.list { listed.countDown() }
+        assertTrue(listed.await(5, TimeUnit.SECONDS))
+        shadowOf(Looper.getMainLooper()).idle()
+        val reports = latestDialog()
+        val list = reports.listView
+        assertTrue(list.adapter.count > 0)
+        list.performItemClick(list.adapter.getView(0, null, list), 0, 0)
+        val read = CountDownLatch(1)
+        store.list { read.countDown() }
+        assertTrue(read.await(5, TimeUnit.SECONDS))
+        shadowOf(Looper.getMainLooper()).idle()
+        val details = latestDialog()
+        assertNull(exported)
+        val scroll = details.findViewById<ViewGroup>(android.R.id.custom).getChildAt(0) as ScrollView
+        assertTrue((scroll.getChildAt(0) as TextView).text.contains("bounded metadata"))
+        click(details, AlertDialog.BUTTON_NEUTRAL)
+        val selected = java.util.concurrent.atomic.AtomicReference<dev.redrain.cast.diagnostics.IncidentStore.ReadResult>()
+        val selectedRead = CountDownLatch(1)
+        store.read(checkNotNull(exported)) { selected.set(it); selectedRead.countDown() }
+        assertTrue(selectedRead.await(5, TimeUnit.SECONDS))
+        val bundle = org.json.JSONObject(dev.redrain.cast.diagnostics.IncidentSummary.export(
+            (selected.get() as dev.redrain.cast.diagnostics.IncidentStore.ReadResult.Success).content))
+        assertFalse(bundle.getBoolean("receiverSupported"))
+        assertTrue(bundle.getString("summary").contains("Receiver telemetry: unsupported"))
+        assertTrue(bundle.getString("summary").contains("unknown"))
+        assertTrue(bundle.has("vocabulary"))
+        details.dismiss(); reports.dismiss(); dialog.dismiss()
+        controller.pause().stop().destroy()
+    }
     @Test fun remoteConsentIsIndependentButCannotBeGrantedByAnUnsavedDraft() {
         val controller = activity()
         val dialog = show(controller.get(), Settings(), {}, {})
         latestDialog()
         val statistics = field<CheckBox>(dialog, "showPlaybackStatistics")
         val remote = field<CheckBox>(dialog, "allowRemoteDiagnostics")
-        val warning = field<android.widget.TextView>(dialog, "remoteDiagnosticsWarning")
-        assertTrue(warning.text.contains("Anyone on this LAN"))
-        assertTrue(warning.text.contains("unencrypted and unauthenticated"))
-        assertTrue(warning.text.contains("without a receiver settings change"))
+        val settingsView = checkNotNull(dialog.window).decorView as ViewGroup
+        assertNull(settingsView.findViewWithTag<View>("automaticIncidentDisclosure"))
+        assertEquals("View or clear session telemetry reports",
+            settingsView.findViewWithTag<Button>("sessionTelemetryReports").text.toString())
+        assertNull(settingsView.findViewWithTag<View>("playbackStatisticsHint"))
+        assertNotNull(settingsView.findViewWithTag<View>("remoteDiagnosticsWarning"))
+        assertEquals(controller.get().getString(R.string.rc_playback_statistics),
+            statistics.text.toString())
         assertTrue(remote.text.contains("unpaired LAN"))
         assertTrue(remote.isEnabled)
         remote.isChecked = true
@@ -64,6 +249,43 @@ class SharingSettingsTest {
         controller.pause().stop().destroy()
     }
 
+    @Test fun remoteConsentShowsInlineWarningBeforeSavingWithoutPlaybackStatistics() {
+        val controller = activity()
+        val activity = controller.get()
+        dev.redrain.cast.diagnostics.DiagnosticAccess.setEnabled(activity, false)
+        var saved: Settings? = null
+        val dialog = show(activity, Settings(), { saved = it }, {})
+        assertSame(dialog, latestDialog())
+        try {
+            field<Button>(dialog, "advancedToggle").performClick()
+            val remote = field<CheckBox>(dialog, "allowRemoteDiagnostics")
+            val warning = field<TextView>(dialog, "remoteDiagnosticsWarning")
+            val parent = remote.parent as LinearLayout
+            assertSame(warning, parent.getChildAt(parent.indexOfChild(remote) + 1))
+            assertTrue(warning.isShown)
+            assertTrue(warning.text.contains("Anyone on this LAN"))
+            assertTrue(warning.text.contains("unencrypted and unauthenticated"))
+            assertTrue(warning.text.contains("without a receiver settings change"))
+            assertTrue(warning.text.contains("diagnostic captures"))
+            assertFalse(field<CheckBox>(dialog, "showPlaybackStatistics").isChecked)
+            remote.performClick()
+            assertTrue(remote.isChecked)
+            assertTrue(warning.isShown)
+            assertFalse(dev.redrain.cast.diagnostics.DiagnosticAccess.enabled)
+            val generation = dev.redrain.cast.diagnostics.DiagnosticAccess.consentGeneration
+            assertTrue(dialog.getButton(AlertDialog.BUTTON_POSITIVE).isEnabled)
+            click(dialog, AlertDialog.BUTTON_POSITIVE)
+            assertNotNull(field<TextView>(dialog, "settingsError").text.toString(), saved)
+            assertFalse(checkNotNull(saved).showPlaybackStatistics)
+            assertFalse(dialog.isShowing)
+            assertEquals(generation + 1, dev.redrain.cast.diagnostics.DiagnosticAccess.consentGeneration)
+        } finally {
+            dev.redrain.cast.diagnostics.DiagnosticAccess.setEnabled(activity, false)
+            dialog.dismiss()
+            controller.pause().stop().destroy()
+        }
+    }
+
     @Test fun remoteEndpointDialogIsScreenshotProtectedAndDoesNotSaveSettings() {
         val controller = activity()
         var saved = false
@@ -72,6 +294,10 @@ class SharingSettingsTest {
         field<Button>(dialog, "remoteDiagnosticsStatus").performClick()
         val pairing = ShadowAlertDialog.getLatestAlertDialog()
         assertTrue(checkNotNull(pairing.window).attributes.flags and android.view.WindowManager.LayoutParams.FLAG_SECURE != 0)
+        val status = pairing.findViewById<ViewGroup>(android.R.id.custom).getChildAt(0) as TextView
+        assertTrue(status.text.contains("Anyone on this LAN"))
+        assertTrue(status.text.contains("unencrypted and unauthenticated"))
+        assertTrue(status.text.contains("without a receiver settings change"))
         assertFalse(saved)
         assertFalse(dev.redrain.cast.diagnostics.DiagnosticAccess.enabled)
         pairing.dismiss()
@@ -98,6 +324,34 @@ class SharingSettingsTest {
         controller.pause().stop().destroy()
     }
 
+    @Test fun clearReportsWarningIncludesPostStopRewrites() {
+        val controller = activity()
+        val dialog = show(controller.get(), Settings(), {}, {})
+        latestDialog()
+        field<Button>(dialog, "advancedToggle").performClick()
+        shadowOf(Looper.getMainLooper()).idle()
+        val settingsView = checkNotNull(dialog.window).decorView as ViewGroup
+        assertNull(settingsView.findViewWithTag<View>("automaticIncidentDisclosure"))
+        assertEquals("View or clear session telemetry reports",
+            field<Button>(dialog, "sessionTelemetryReports").text.toString())
+        field<Button>(dialog, "sessionTelemetryReports").performClick()
+
+        val listFinished = CountDownLatch(1)
+        dev.redrain.cast.diagnostics.IncidentStore(controller.get()).list { listFinished.countDown() }
+        assertTrue(listFinished.await(5, TimeUnit.SECONDS))
+        shadowOf(Looper.getMainLooper()).idle()
+        val reports = latestDialog()
+        reports.getButton(AlertDialog.BUTTON_NEUTRAL).performClick()
+        val confirmation = latestDialog()
+        val message = confirmation.findViewById<TextView>(android.R.id.message).text.toString()
+        assertTrue(message.contains("active or recently stopped cast"))
+        assertTrue(message.contains("after clearing"))
+        confirmation.dismiss()
+        reports.dismiss()
+        dialog.dismiss()
+        controller.pause().stop().destroy()
+    }
+
     @Test fun playbackStatisticsCheckboxDefaultsOffPersistsAndDoesNotMutateAnAlreadySelectedSession() {
         val controller = activity()
         val current = Settings()
@@ -107,16 +361,12 @@ class SharingSettingsTest {
         val checkbox = field<CheckBox>(dialog, "showPlaybackStatistics")
         assertFalse(checkbox.isChecked)
         assertFalse("Diagnostic option must start inside collapsed Advanced", checkbox.isShown)
-        val advanced = checkbox.parent as LinearLayout
-        assertEquals("playbackStatisticsHint", advanced.getChildAt(advanced.indexOfChild(checkbox) + 1).tag)
         val remote = field<CheckBox>(dialog, "allowRemoteDiagnostics")
         assertFalse(remote.isChecked)
         assertTrue(remote.isEnabled)
         field<Button>(dialog, "advancedToggle").performClick()
         shadowOf(Looper.getMainLooper()).idle()
         assertTrue(checkbox.isShown)
-        assertEquals(controller.get().getString(R.string.rc_playback_statistics_hint),
-            field<TextView>(dialog, "playbackStatisticsHint").text.toString())
         checkbox.isChecked = true
         assertTrue(remote.isEnabled)
         click(dialog, AlertDialog.BUTTON_POSITIVE)

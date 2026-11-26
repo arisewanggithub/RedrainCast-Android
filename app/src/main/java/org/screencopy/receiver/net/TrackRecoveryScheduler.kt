@@ -14,9 +14,11 @@ internal class TrackRecoveryScheduler(
             removeOnCancelPolicy = true
             executeExistingDelayedTasksAfterShutdownPolicy = false
         }
-    }
+    },
+    private val observed: (Int, Int, State, Long) -> Unit = { _, _, _, _ -> }
 ) {
-    private class Pending(val current: () -> Boolean, val reset: () -> Unit) {
+    enum class State { QUEUED, RUNNING, CANCELLED }
+    private class Pending(val generation: Int, val current: () -> Boolean, val reset: () -> Unit) {
         var future: ScheduledFuture<*>? = null
     }
     private val lock = Any()
@@ -24,12 +26,20 @@ internal class TrackRecoveryScheduler(
     private val lastReset = arrayOfNulls<Long>(2)
     private var stopped = false
 
-    fun schedule(track: Int, current: () -> Boolean, reset: () -> Unit) = synchronized(lock) {
+    fun schedule(track: Int, current: () -> Boolean, reset: () -> Unit) = schedule(track, 0, current, reset)
+
+    fun schedule(track: Int, generation: Int, current: () -> Boolean, reset: () -> Unit) = synchronized(lock) {
         require(track in 1..2)
-        if (stopped) return@synchronized
+        if (stopped) {
+            observed(track, generation, State.CANCELLED, 0)
+            return@synchronized
+        }
         val index = track - 1
-        pending[index]?.future?.cancel(false)
-        Pending(current, reset).also {
+        pending[index]?.let {
+            it.future?.cancel(false)
+            observed(track, it.generation, State.CANCELLED, 0)
+        }
+        Pending(generation, current, reset).also {
             pending[index] = it
             enqueue(index, it)
         }
@@ -38,11 +48,13 @@ internal class TrackRecoveryScheduler(
 
     private fun enqueue(index: Int, task: Pending) {
         val delay = lastReset[index]?.let { (cooldownMs - (nowMs() - it)).coerceAtLeast(0) } ?: 0
+        observed(index + 1, task.generation, State.QUEUED, delay)
         task.future = executors[index].schedule({
             val reset = synchronized(lock) {
                 if (stopped || pending[index] !== task) return@schedule
                 if (!task.current()) {
                     pending[index] = null
+                    observed(index + 1, task.generation, State.CANCELLED, 0)
                     return@schedule
                 }
                 // A preceding native operation may have started after this task was submitted.
@@ -52,6 +64,7 @@ internal class TrackRecoveryScheduler(
                 }
                 pending[index] = null
                 lastReset[index] = nowMs()
+                observed(index + 1, task.generation, State.RUNNING, 0)
                 task.reset
             }
             reset()
@@ -61,7 +74,10 @@ internal class TrackRecoveryScheduler(
     fun shutdown() {
         synchronized(lock) {
             stopped = true
-            pending.forEach { it?.future?.cancel(false) }
+            pending.forEachIndexed { index, task -> task?.let {
+                it.future?.cancel(false)
+                observed(index + 1, it.generation, State.CANCELLED, 0)
+            } }
             pending.fill(null)
         }
         executors.forEach { it.shutdown() }

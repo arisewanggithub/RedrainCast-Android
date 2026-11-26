@@ -51,6 +51,18 @@ abstract class TrackWorker(
     }
 
     private fun publishQueueStatistics() {
+        if (TelemetryRegistry.has("receiver", diagnosticSession) && track in 1..2) {
+            val now = System.nanoTime()
+            val span = if (queue.isEmpty()) 0 else queue.maxOf { it.ptsUs } - queue.minOf { it.ptsUs }
+            TelemetryRegistry.evidence("receiver", diagnosticSession, track, diagnosticGeneration, IncidentEvidence.Stage.QUEUE_STATE,
+                queue.size.toLong(), queue.sumOf { it.bytes.size.toLong() }, span,
+                admittedAt.firstOrNull() ?: -1)
+            TelemetryRegistry.state("receiver", diagnosticSession, 60 + track,
+                DiagnosticKind.entries.size + 1, DiagnosticStage.SAMPLE.ordinal,
+                track, diagnosticGeneration, span,
+                detail = listOf(queue.size.toLong(), 48, queue.sumOf { it.bytes.size.toLong() },
+                    maxBytes.toLong(), admittedAt.firstOrNull()?.let { (now - it).coerceAtLeast(0) / 1_000_000 } ?: -1))
+        }
         if (!statisticsEnabled) return
         queueObservation = QueueObservation(EncodedQueueStatistics(queue.size, queue.sumOf { it.bytes.size },
             if (queue.isEmpty()) 0 else queue.maxOf { it.ptsUs } - queue.minOf { it.ptsUs },
@@ -65,7 +77,7 @@ abstract class TrackWorker(
             queue.addLast(packet)
             if (track == 2) lastAudioAdmissionNs = System.nanoTime()
             packetEvent("admit", packet, queue.size)
-            if (statisticsEnabled) admittedAt.addLast(System.nanoTime())
+            if (statisticsEnabled || diagnosticSession > 0) admittedAt.addLast(System.nanoTime())
             publishQueueStatistics()
             monitor.notifyAll()
         }
@@ -85,7 +97,7 @@ abstract class TrackWorker(
                     queue.addLast(packet)
                     if (track == 2) lastAudioAdmissionNs = System.nanoTime()
                     packetEvent("admit", packet, queue.size)
-                    if (statisticsEnabled) admittedAt.addLast(System.nanoTime())
+                    if (statisticsEnabled || diagnosticSession > 0) admittedAt.addLast(System.nanoTime())
                     publishQueueStatistics()
                     monitor.notifyAll()
                     diagnosticQueue(DiagnosticStage.ADMITTED, packet)
@@ -114,7 +126,13 @@ abstract class TrackWorker(
     private fun runTrack() {
         try {
             prepareThread()
-            while (running.get()) step()
+            while (running.get()) {
+                TelemetryRegistry.evidence("receiver", diagnosticSession, track, diagnosticGeneration,
+                    IncidentEvidence.Stage.WORKER_BEGIN)
+                step()
+                TelemetryRegistry.evidence("receiver", diagnosticSession, track, diagnosticGeneration,
+                    IncidentEvidence.Stage.WORKER_END)
+            }
         } catch (e: InterruptedException) {
             if (running.get()) failure("DECODER_FAILED", "Playback interrupted unexpectedly")
         } catch (e: Exception) {

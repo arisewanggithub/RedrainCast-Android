@@ -19,7 +19,7 @@ enum class DiagnosticKind(val group: String) {
 
 enum class DiagnosticStage {
     STARTED, ENDED, CONFIG, BEGIN, COMPLETE, FAILED, ADMITTED, REJECTED, PRESSURE,
-    READY, RESET, WINDOW, SAMPLE, PROOF, HOLD, EVICTED
+    READY, RESET, WINDOW, SAMPLE, PROOF, HOLD, EVICTED, SETTLED
 }
 
 enum class DiagnosticReason {
@@ -241,10 +241,8 @@ class DiagnosticRecorder(private val clock: () -> Long = System::nanoTime) {
     }
 
     fun operation(role: String, session: Long, kind: DiagnosticKind): Long {
-        val current = gate ?: return 0
-        if (!enabled(role, session, kind)) return 0
-        val id = operations.incrementAndGet()
-        return if (gate === current && current.collecting) id else 0
+        if (!enabled(role, session, kind) && !TelemetryRegistry.has(role, session)) return 0
+        return operations.incrementAndGet()
     }
 
     internal fun transportOperations(role: String, session: Long, includeAudio: Boolean): TransportOperationIds =
@@ -326,6 +324,7 @@ class DiagnosticRecorder(private val clock: () -> Long = System::nanoTime) {
         reason: DiagnosticReason = DiagnosticReason.NONE, sourceAtNs: Long? = null,
         delayUs: Long? = null, heldNs: Long? = null, releaseCallNs: Long? = null
     ) {
+        TelemetryRegistry.video(role, session, generation, stage, pts, bytes)
         val c = gate ?: return
         if (!enabled(role, session, DiagnosticKind.VIDEO_PROGRESS) || generation <= 0 || count <= 0) return
         val ns = clock()
@@ -438,6 +437,8 @@ class DiagnosticRecorder(private val clock: () -> Long = System::nanoTime) {
         reason: DiagnosticReason = DiagnosticReason.NONE, point: DiagnosticPoint = DiagnosticPoint.UNSPECIFIED,
         metadata: DiagnosticMetadata? = null
     ) {
+        TelemetryRegistry.observe(role, session, kind, stage, track, generation, operation, pts, bytes,
+            cutoff, reason, point)
         val current = gate ?: return
         if (delegatedOwner?.invoke() == false) return
         if (!current.collecting || current.role != role || current.session != session || kind.group !in current.flags) return

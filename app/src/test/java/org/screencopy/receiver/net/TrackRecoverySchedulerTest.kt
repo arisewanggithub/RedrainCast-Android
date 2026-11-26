@@ -9,6 +9,27 @@ import java.util.concurrent.ScheduledThreadPoolExecutor
 import java.util.concurrent.TimeUnit
 
 class TrackRecoverySchedulerTest {
+    @Test fun evidenceDistinguishesSupersededGenerationFromNewQueuedAndRunningGeneration() {
+        val lanes = List(2) { ManualExecutor() }
+        val events = mutableListOf<Triple<Int, TrackRecoveryScheduler.State, Long>>()
+        val scheduler = TrackRecoveryScheduler({ 5000 }, executors = lanes,
+            observed = { track, generation, state, delay ->
+                assertEquals(2, track)
+                events.add(Triple(generation, state, delay))
+            })
+        try {
+            scheduler.schedule(2, 11, { true }) { fail("Retired generation ran") }
+            scheduler.schedule(2, 12, { true }) {}
+            lanes[1].runNext(0)
+            lanes[1].runNext(0)
+            assertEquals(listOf(
+                Triple(11, TrackRecoveryScheduler.State.QUEUED, 0L),
+                Triple(11, TrackRecoveryScheduler.State.CANCELLED, 0L),
+                Triple(12, TrackRecoveryScheduler.State.QUEUED, 0L),
+                Triple(12, TrackRecoveryScheduler.State.RUNNING, 0L)
+            ), events)
+        } finally { scheduler.shutdown() }
+    }
     @Test fun cooldownLeavesTheOtherTrackRunnableAndDoesNotRepeatAReset() {
         var now = 0L
         val lanes = List(2) { ManualExecutor() }
