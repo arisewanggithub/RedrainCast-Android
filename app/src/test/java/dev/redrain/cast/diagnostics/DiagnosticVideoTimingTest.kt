@@ -329,6 +329,12 @@ class DiagnosticVideoTimingTest {
             if (schema == "video_progress") progress = true
         }
         assertTrue(progress)
+        val directory = File(File("build"), "diagnostics-contract").apply { mkdirs() }
+        val legacyHelloReply = JSONObject().put("v", 1).put("id", "r0").put("op", "HELLO")
+            .put("ok", true).put("result", JSONObject())
+        val fixture = JSONObject().put("hello", legacyHelloReply)
+            .put("fetch", JSONObject().put("result", result))
+        File(directory, "receiver-legacy-capture.json").writeText(fixture.toString())
     }
 
     @Test fun lateDuplicateRetractsRetainedCallbackMatchCadenceAndExemplar() {
