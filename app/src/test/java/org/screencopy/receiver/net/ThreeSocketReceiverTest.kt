@@ -6,6 +6,8 @@ import org.junit.Assert.*
 import org.junit.Test
 import org.mockito.Mockito
 import org.screencopy.receiver.media.AudioPlayer
+import org.screencopy.receiver.media.AccessUnit
+import org.screencopy.receiver.media.PlaybackClock
 import org.screencopy.receiver.media.AudioOutput
 import org.screencopy.receiver.media.AudioOutputTiming
 import org.screencopy.receiver.media.AudioClockSource
@@ -27,6 +29,7 @@ import java.util.concurrent.CompletableFuture
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.atomic.AtomicReference
 import dev.redrain.cast.diagnostics.DiagnosticKind
 import dev.redrain.cast.diagnostics.DiagnosticPoint
@@ -34,8 +37,306 @@ import dev.redrain.cast.diagnostics.DiagnosticStage
 import dev.redrain.cast.diagnostics.IncidentEvidence
 import dev.redrain.cast.diagnostics.ReceiverTelemetrySession
 import dev.redrain.cast.diagnostics.TelemetryRegistry
+import dev.redrain.cast.diagnostics.CausalEvidence
+import dev.redrain.cast.diagnostics.SessionTelemetryProtocol
+import dev.redrain.cast.diagnostics.TelemetryHistory
+import dev.redrain.cast.diagnostics.TelemetryReport
 
 class ThreeSocketReceiverTest {
+    @Test(timeout = 30_000) fun mediaMessageFailureCapturesMessageTrackAndGenerationAfterAudioConfiguration() {
+        for (case in 0..3) {
+            val failures = java.util.concurrent.ConcurrentLinkedQueue<org.screencopy.receiver.ui.FailureDiagnostic>()
+            val session = 280L + case
+            ReceiverServer.forProtocolTests("Receiver", onFailure = { failures.add(it) },
+                videoFactory = { _, _, _, generation ->
+                    if (case == 1 && generation == 2L) throw IllegalStateException("fixture")
+                    Mockito.mock(VideoPlayer::class.java)
+                }, audioFactory = { _, _, _ ->
+                    Mockito.mock(AudioPlayer::class.java).also {
+                        Mockito.`when`(it.decoderDescription).thenReturn("fixture")
+                    }
+                }).use { server ->
+                server.start()
+                control(server).use { owner ->
+                    MediaSockets.attach(server, negotiate(owner, session, telemetry = true, audio = true)).use { media ->
+                        fun ready() {
+                            var message: Message
+                            do { message = Wire.read(owner.inputStream) } while (message.type == Type.STATUS)
+                            assertEquals(Type.STREAM_READY, message.type)
+                        }
+                        configure(media.video, session)
+                        ready()
+                        if (case != 1) {
+                            Wire.write(media.video.outputStream, videoConfig(session).copy(generation = 2))
+                            ready()
+                        }
+                        Wire.write(media.audio.outputStream, Message.json(Type.STREAM_CONFIG,
+                            JSONObject().put("codec", "raw").put("sampleRate", 48000).put("channels", 2)
+                                .put("sampleFormat", "s16le").put("csd", JSONArray()), session, 2, 1))
+                        ready()
+                        if (case != 1) {
+                            val connection = checkNotNull((server.javaClass.getDeclaredField("active")
+                                .apply { isAccessible = true }.get(server) as AtomicReference<*>).get())
+                            val terminate = connection.javaClass.getDeclaredMethod("terminateMediaFailure",
+                                Exception::class.java, String::class.java, Int::class.javaPrimitiveType,
+                                java.lang.Long::class.java, java.lang.Long::class.java).apply { isAccessible = true }
+                            assertEquals(false, terminate.invoke(connection, IllegalStateException("retired"),
+                                null, 1, 1L, 1L))
+                            assertTrue(failures.isEmpty())
+                        }
+                        val generation = if (case == 2) 3L else 2L
+                        if (case == 3) {
+                            val connection = checkNotNull((server.javaClass.getDeclaredField("active")
+                                .apply { isAccessible = true }.get(server) as AtomicReference<*>).get())
+                            val terminate = connection.javaClass.getDeclaredMethod("terminateMediaFailure",
+                                Exception::class.java, String::class.java, Int::class.javaPrimitiveType,
+                                java.lang.Long::class.java, java.lang.Long::class.java).apply { isAccessible = true }
+                            assertEquals(true, terminate.invoke(connection,
+                                org.screencopy.receiver.ui.ReceiverOrientationException(), null, 1, generation, generation))
+                        } else if (case == 1) Wire.write(media.video.outputStream, videoConfig(session).copy(generation = generation))
+                        else Wire.write(media.video.outputStream, Message(Type.VIDEO_FRAME, session = session,
+                            track = 1, generation = generation, flags = if (case == 2) 0 else 2,
+                            ptsUs = 0, payload = byteArrayOf(1)))
+                        var final: SessionTelemetryProtocol.Batch? = null
+                        var message: Message
+                        do {
+                            message = Wire.read(owner.inputStream)
+                            if (message.type == Type.STATUS && message.json().optString("state") == "session-telemetry") {
+                                val batch = SessionTelemetryProtocol.parse(message.payload, "receiver")
+                                if (batch.final) final = batch
+                            }
+                        } while (message.type == Type.STATUS)
+                        assertEquals(Type.ERROR, message.type)
+                        val batch = checkNotNull(final)
+                        assertEquals(1, checkNotNull(batch.firstFailure).track)
+                        val capture = batch.events.single {
+                            it.kind == CausalEvidence.KIND && it.stage == CausalEvidence.Stage.CAPTURE.ordinal
+                        }
+                        assertEquals(generation.toInt(), capture.generation)
+                        assertEquals(1L, capture.detail[4])
+                        if (case == 3) {
+                            assertEquals(org.screencopy.receiver.ui.FailureOrigin.PRESENTATION, failures.single().origin)
+                            assertEquals(org.screencopy.receiver.ui.FailureReason.RECEIVER_ORIENTATION, failures.single().reason)
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    @Test(timeout = 15_000) fun receiverInitializationFailureCapturesFailingTrackGeneration() {
+        for (track in 1..2) {
+            val session = 290L + track
+            ReceiverServer.forProtocolTests("Receiver",
+                videoFactory = { _, _, _, _ ->
+                    if (track == 1) throw IllegalStateException("fixture")
+                    Mockito.mock(VideoPlayer::class.java)
+                }, audioFactory = { _, _, _ -> throw IllegalStateException("fixture") }).use { server ->
+                server.start()
+                control(server).use { owner ->
+                    MediaSockets.attach(server, negotiate(owner, session, telemetry = true, audio = track == 2)).use { media ->
+                        configure(media.video, session)
+                        if (track == 2) {
+                            var ready: Message
+                            do { ready = Wire.read(owner.inputStream) } while (ready.type == Type.STATUS)
+                            assertEquals(Type.STREAM_READY, ready.type)
+                            Wire.write(media.audio.outputStream, Message.json(Type.STREAM_CONFIG,
+                                JSONObject().put("codec", "raw").put("sampleRate", 48000).put("channels", 2)
+                                    .put("sampleFormat", "s16le").put("csd", JSONArray()), session, 2, 1))
+                        }
+                        var final: SessionTelemetryProtocol.Batch? = null
+                        var message: Message
+                        do {
+                            message = Wire.read(owner.inputStream)
+                            if (message.type == Type.STATUS && message.json().optString("state") == "session-telemetry") {
+                                val batch = SessionTelemetryProtocol.parse(message.payload, "receiver")
+                                if (batch.final) final = batch
+                            }
+                        } while (message.type == Type.STATUS)
+                        assertEquals(Type.ERROR, message.type)
+                        val batch = checkNotNull(final)
+                        assertEquals(0, checkNotNull(batch.firstFailure).generation)
+                        val capture = batch.events.single {
+                            it.kind == CausalEvidence.KIND && it.stage == CausalEvidence.Stage.CAPTURE.ordinal
+                        }
+                        assertEquals(1, capture.generation)
+                        assertEquals(track.toLong(), capture.detail[4])
+                    }
+                }
+            }
+        }
+    }
+
+    @Test(timeout = 30_000) fun receiverFailureCaptureUsesOriginatingTrackGenerationAndRejectsRetiredCallbacks() {
+        for (track in 1..2) for (generation in 1..2) {
+            val callbacks = java.util.concurrent.ConcurrentHashMap<Int, (String, String) -> Unit>()
+            val audioCreations = AtomicInteger()
+            val failures = java.util.concurrent.ConcurrentLinkedQueue<String>()
+            val session = 300L + track * 10 + generation
+            ReceiverServer.forProtocolTests("Receiver", onFailure = { failures.add(it.code) },
+                videoFactory = { _, _, failed, videoGeneration ->
+                    if (track == 1) callbacks[videoGeneration.toInt()] = failed
+                    Mockito.mock(VideoPlayer::class.java)
+                }, audioFactory = { _, _, failed ->
+                    if (track == 2) callbacks[audioCreations.incrementAndGet()] = failed
+                    Mockito.mock(AudioPlayer::class.java).also {
+                        Mockito.`when`(it.decoderDescription).thenReturn("fixture")
+                    }
+                }).use { server ->
+                server.start()
+                control(server).use { owner ->
+                    MediaSockets.attach(server, negotiate(owner, session, telemetry = true,
+                        recovery = track == 1, audio = track == 2)).use { media ->
+                        fun ready(expectedGeneration: Long) {
+                            var message: Message
+                            do { message = Wire.read(owner.inputStream) } while (message.type == Type.STATUS)
+                            assertEquals(Type.STREAM_READY, message.type)
+                            assertEquals(expectedGeneration, message.generation)
+                        }
+                        configure(media.video, session)
+                        ready(1)
+                        val audioConfig = Message.json(Type.STREAM_CONFIG,
+                            JSONObject().put("codec", "raw").put("sampleRate", 48000).put("channels", 2)
+                                .put("sampleFormat", "s16le").put("csd", JSONArray()), session, 2, 1)
+                        if (track == 2) {
+                            Wire.write(media.audio.outputStream, audioConfig)
+                            ready(1)
+                        }
+                        if (generation == 2) {
+                            val replacement = if (track == 1) videoConfig(session).copy(generation = 2)
+                                else audioConfig.copy(generation = 2)
+                            Wire.write(if (track == 1) media.video.outputStream else media.audio.outputStream, replacement)
+                            ready(2)
+                            checkNotNull(callbacks[1])("DECODER_FAILED", "retired callback")
+                            val connection = checkNotNull((server.javaClass.getDeclaredField("active")
+                                .apply { isAccessible = true }.get(server) as AtomicReference<*>).get())
+                            connection.javaClass.getDeclaredMethod("playbackFailed", String::class.java, String::class.java,
+                                org.screencopy.receiver.ui.FailureOrigin::class.java, java.lang.Long.TYPE,
+                                java.lang.Long::class.java).apply { isAccessible = true }.invoke(
+                                connection, "DECODER_FAILED", "retired after callback check",
+                                if (track == 1) org.screencopy.receiver.ui.FailureOrigin.VIDEO
+                                else org.screencopy.receiver.ui.FailureOrigin.AUDIO, 1L,
+                                if (track == 2) 1L else null)
+                            assertTrue(failures.toString(), failures.isEmpty())
+                        }
+                        val code = if (track == 1) "DECODER_FAILED" else "AUDIO_FAILED"
+                        checkNotNull(callbacks[generation])(code, "current callback")
+                        var final: SessionTelemetryProtocol.Batch? = null
+                        var message: Message
+                        do {
+                            message = Wire.read(owner.inputStream)
+                            if (message.type == Type.STATUS && message.json().optString("state") == "session-telemetry") {
+                                val batch = SessionTelemetryProtocol.parse(message.payload, "receiver")
+                                if (batch.final) final = batch
+                            }
+                        } while (message.type == Type.STATUS)
+                        assertEquals(Type.ERROR, message.type)
+                        assertEquals(listOf(code), failures.toList())
+                        val batch = checkNotNull(final)
+                        assertEquals(0, checkNotNull(batch.firstFailure).generation)
+                        assertEquals(track, checkNotNull(batch.firstFailure).track)
+                        val capture = batch.events.single {
+                            it.kind == CausalEvidence.KIND && it.stage == CausalEvidence.Stage.CAPTURE.ordinal
+                        }
+                        assertEquals(generation, capture.generation)
+                        assertEquals(track.toLong(), capture.detail[4])
+                    }
+                }
+            }
+        }
+    }
+
+    @Test(timeout = 15_000) fun nonRecoveryAudioRetainsDurationGapAndBurstWithoutRejectingLegacyLongPcm() {
+        val now = AtomicLong(1_000_000_000)
+        val entered = CountDownLatch(1)
+        val release = CountDownLatch(1)
+        val offered = CountDownLatch(4)
+        val arrivals = AtomicInteger()
+        val failures = java.util.concurrent.ConcurrentLinkedQueue<String>()
+        try {
+            ReceiverServer.forProtocolTests("Receiver",
+                onFailure = { failures.add(it.logMessage()) },
+                videoFactory = { _, _, _, _ -> Mockito.mock(VideoPlayer::class.java) },
+                clockFactory = { PlaybackClock(now::get) },
+                audioFactory = { format, clock, failed ->
+                    val actual = AudioPlayer(format, clock, failed,
+                        { Mockito.mock(AudioOutput::class.java) },
+                        resamplerFactory = { _, channels -> IdentityPcmResampler(channels) }, threadCpuNs = { 0 },
+                        prepareThread = { entered.countDown(); release.await() })
+                    val player = Mockito.mock(AudioPlayer::class.java, org.mockito.AdditionalAnswers.delegatesTo<Any>(actual))
+                    Mockito.doAnswer { invocation ->
+                        now.addAndGet(when (arrivals.incrementAndGet()) {
+                            1 -> 0L
+                            2 -> 20_000_000L
+                            3 -> 1_000_000L
+                            else -> 300_000_000L
+                        })
+                        actual.offer(invocation.getArgument(0), invocation.getArgument(1))
+                        offered.countDown()
+                        null
+                    }.`when`(player).offer(
+                        Mockito.any(AccessUnit::class.java) ?: AccessUnit(0, byteArrayOf()), Mockito.anyLong())
+                    player
+                }
+            ).use { server ->
+                server.start()
+                control(server).use { owner ->
+                    val acceptance = negotiate(owner, 216, telemetry = true, audio = true)
+                    assertFalse(acceptance.json().has("streamRecovery"))
+                    MediaSockets.attach(server, acceptance).use { media ->
+                        configure(media.video, 216)
+                        var response: Message
+                        do { response = Wire.read(owner.inputStream) } while (response.type == Type.STATUS)
+                        assertEquals("failures=$failures response=${response.json()}", Type.STREAM_READY, response.type)
+                        Wire.write(media.audio.outputStream, Message.json(Type.STREAM_CONFIG,
+                            JSONObject().put("codec", "raw").put("sampleRate", 48000).put("channels", 2)
+                                .put("sampleFormat", "s16le").put("csd", JSONArray()), 216, 2, 1))
+                        do { response = Wire.read(owner.inputStream) } while (response.type == Type.STATUS)
+                        assertEquals("failures=$failures response=${response.json()}", Type.STREAM_READY, response.type)
+                        assertTrue(entered.await(2, TimeUnit.SECONDS))
+                        for ((pts, bytes) in listOf(1_000_000L to 3840, 1_020_000L to 3840,
+                            1_200_000L to 3840, 1_220_000L to 48000)) {
+                            Wire.write(media.audio.outputStream,
+                                Message(Type.AUDIO_PACKET, session = 216, track = 2, generation = 1,
+                                    ptsUs = pts, payload = ByteArray(bytes)))
+                        }
+                        assertTrue(offered.await(2, TimeUnit.SECONDS))
+                        assertTrue(failures.toString(), failures.isEmpty())
+                        send(owner, Type.ERROR, JSONObject().put("code", "AUDIO_FAILED")
+                            .put("message", "test sender failure").put("fatal", true), 216)
+                        var final: ByteArray? = null
+                        do {
+                            response = Wire.read(owner.inputStream)
+                            if (response.type == Type.STATUS && SessionTelemetryProtocol.parse(response.payload).final)
+                                final = response.payload
+                        } while (response.type == Type.STATUS)
+                        assertEquals(Type.ERROR, response.type)
+                        assertNotNull("terminal=${response.json()} failures=$failures", final)
+                        val payload = checkNotNull(final)
+                        val batch = SessionTelemetryProtocol.parse(payload, "receiver")
+                        val history = TelemetryHistory(true)
+                        history.accept(TelemetryHistory.Endpoint.RECEIVER, payload, 1)
+                        history.terminal(TelemetryHistory.Endpoint.RECEIVER, batch.sequence, true, 1)
+                        val report = StrictJson.decode(TelemetryReport.encode(checkNotNull(history.finish(1))))
+                        assertTrue(TelemetryReport.validate(report))
+                        val stored = report.getJSONObject("receiver").getJSONArray("blocks")
+                            .getJSONArray(0).getJSONObject(1).toString().toByteArray()
+                        val input = SessionTelemetryProtocol.parse(stored, "receiver").events.single {
+                            it.kind == CausalEvidence.KIND && it.stage == CausalEvidence.Stage.INPUT.ordinal &&
+                                it.value == 1L
+                        }
+                        assertEquals(250_000L, input.detail[4])
+                        assertTrue(input.detail[5] > 0)
+                        assertEquals(180_000L, input.detail[6])
+                        assertEquals(1L, input.detail[9])
+                        assertEquals(4L, input.detail[10])
+                        assertEquals(1_220_000L, input.detail[12])
+                    }
+                }
+            }
+        } finally { release.countDown() }
+    }
+
     @Test(timeout = 15_000) fun releaseFaultsStillCloseLeaseAndClearOwnership() {
         fatalReleaseHardening(fault = true)
     }
@@ -526,7 +827,11 @@ class ThreeSocketReceiverTest {
                                 null
                             }
                             assertTrue(stopHaltedVideo.await(2, TimeUnit.SECONDS))
-                            do { message = Wire.read(owner.inputStream) } while (message.type == Type.STATUS)
+                            do {
+                                message = Wire.read(owner.inputStream)
+                                if (message.type == Type.PING)
+                                    send(owner, Type.PONG, JSONObject().put("nonce", message.json().getInt("nonce")), 206)
+                            } while (message.type == Type.STATUS || message.type == Type.PING)
                             assertEquals(if (receiverInitiated) Type.STOP else Type.SESSION_END, message.type)
                             assertFalse(message.json().getBoolean("cleanupSucceeded"))
                             stop?.get(3, TimeUnit.SECONDS)

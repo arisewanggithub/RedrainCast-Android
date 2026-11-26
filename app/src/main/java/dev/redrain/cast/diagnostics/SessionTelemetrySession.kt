@@ -44,6 +44,8 @@ internal class ReceiverTelemetrySession(
     data class FinalResult(val batch: FinalBatch?, val reason: FinalSkipReason?)
 
     private val collector = SessionTelemetryCollector(clock)
+    fun causal(row: TelemetryRow) = produce { collector.causal.record(row) }
+    fun freezeCausal(generation: Int, atNs: Long) = produce { collector.causal.freeze(generation, atNs) }
     private val active = AtomicBoolean(true)
     private val producers = AtomicInteger()
     private val quiesced = CountDownLatch(1)
@@ -69,8 +71,9 @@ internal class ReceiverTelemetrySession(
     fun operation(slot: Int, row: TelemetryRow, unknownGeneration: Boolean) =
         produce { collector.operation(slot, row, unknownGeneration) }
 
-    fun event(row: TelemetryRow, pressure: Boolean = false, failure: Boolean = false) =
-        produce { collector.event(row, pressure, failure) }
+    fun event(row: TelemetryRow, pressure: Boolean = false, failure: Boolean = false,
+              causalGeneration: Int? = null) =
+        produce { collector.event(row, pressure, failure, causalGeneration) }
 
     /** Also call when the writer replaces a previously accepted pending publication. */
     fun publicationUnsent() = collector.publicationUnsent()
@@ -202,8 +205,9 @@ internal class SenderTelemetrySession(
     fun operation(slot: Int, row: TelemetryRow, unknownGeneration: Boolean) =
         produce { collector.operation(slot, row, unknownGeneration) }
 
-    fun event(row: TelemetryRow, pressure: Boolean = false, failure: Boolean = false) =
-        produce { collector.event(row, pressure, failure) }
+    fun event(row: TelemetryRow, pressure: Boolean = false, failure: Boolean = false,
+              causalGeneration: Int? = null) =
+        produce { collector.event(row, pressure, failure, causalGeneration) }
 
     private inline fun produce(action: () -> Unit) {
         if (!active.get()) return

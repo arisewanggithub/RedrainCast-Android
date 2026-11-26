@@ -47,7 +47,7 @@ class DiagnosticListenerRuntimeTest {
     }
 
     private fun command(client: Socket, op: String, args: JSONObject = JSONObject()): JSONObject {
-        val request = JSONObject().put("v", 1).put("id", "r${++sequence}").put("op", op).put("args", args)
+        val request = JSONObject().put("v", 2).put("id", "r${++sequence}").put("op", op).put("args", args)
         client.outputStream.write((request.toString() + "\n").toByteArray(Charsets.UTF_8))
         client.outputStream.flush()
         return JSONObject(String(checkNotNull(DiagnosticProtocol.readLine(client.inputStream)), Charsets.UTF_8))
@@ -129,9 +129,9 @@ class DiagnosticListenerRuntimeTest {
             val id = client(port).use {
                 command(it, "HELLO")
                 val capture = command(it, "START", JSONObject().put("target",
-                    JSONObject().put("role", "sender").put("nextSession", true))
-                    .put("flags", JSONArray(listOf("session"))).put("durationMs", 10000)
-                    .put("samplePeriodMs", 1000)).getString("captureId")
+                    JSONObject().put("nextSession", true))
+                    .put("senderFlags", JSONArray(listOf("session"))).put("receiverFlags", JSONArray(listOf("session")))
+                    .put("durationMs", 10000).put("samplePeriodMs", 1000)).getString("pairId")
                 assertTrue(RemoteDiagnostics.recorder.collecting)
                 disconnect(it)
                 capture
@@ -142,10 +142,10 @@ class DiagnosticListenerRuntimeTest {
                 command(it, "HELLO")
                 val status = command(it, "STATUS")
                 assertEquals("frozen", status.getString("state"))
-                assertEquals(id, status.getString("captureId"))
+                assertEquals(id, status.getString("pairId"))
                 assertEquals("client_disconnected", status.getString("endReason"))
-                val records = command(it, "FETCH", JSONObject().put("captureId", id)
-                    .put("afterSeq", "0").put("limit", 32)).getJSONArray("records")
+                val records = command(it, "FETCH", JSONObject().put("pairId", id)
+                    .put("afterSenderSeq", "0").put("afterReceiverSeq", "0").put("limit", 32)).getJSONArray("records")
                 assertTrue(records.length() >= 2)
                 assertFalse(RemoteDiagnostics.recorder.collecting)
                 DiagnosticAccess.setEnabled(context, false)
@@ -160,12 +160,10 @@ class DiagnosticListenerRuntimeTest {
         } finally { disable() }
     }
 
-    @Test fun admissionDuringLocalBindReportsBoundEndpointUnlessDisabledOrRetired() {
-        for (race in listOf("complete", "disabled", "retired", "failed")) {
+    @Test fun localBindPublishesEndpointOnlyWhileStillEnabled() {
+        for (race in listOf("complete", "disabled", "failed")) {
             val binding = CountDownLatch(1)
             val release = CountDownLatch(1)
-            val reports = mutableListOf<String>()
-            val access = DiagnosticAccess.sessionAccess(context)
             try {
                 DiagnosticAccess.setEnabled(context, true) {
                     binding.countDown()
@@ -176,32 +174,16 @@ class DiagnosticListenerRuntimeTest {
                 assertTrue(binding.await(3, TimeUnit.SECONDS))
                 assertTrue(DiagnosticAccess.enabled)
                 assertNull(DiagnosticAccess.discovery)
-                access.admitted(77, true, { true }) {
-                    assertFalse(Thread.holdsLock(access))
-                    assertFalse(Thread.holdsLock(DiagnosticAccess))
-                    if (it == "local") assertNotNull(DiagnosticAccess.discovery)
-                    reports.add(it)
-                }
-                assertTrue(reports.isEmpty())
-                when (race) {
-                    "disabled" -> DiagnosticAccess.setEnabled(context, false)
-                    "retired" -> access.ended(77)
-                }
+                if (race == "disabled") DiagnosticAccess.setEnabled(context, false)
                 release.countDown()
                 drainControlWorker()
-                assertEquals(race, when (race) {
-                    "complete" -> listOf("local")
-                    "disabled", "failed" -> listOf("unavailable")
-                    else -> emptyList<String>()
-                }, reports)
-                if (race in setOf("complete", "retired")) assertNotNull(DiagnosticAccess.discovery)
+                if (race == "complete") assertNotNull(DiagnosticAccess.discovery)
                 else {
                     assertFalse(DiagnosticAccess.enabled)
                     assertNull(DiagnosticAccess.discovery)
                 }
             } finally {
                 release.countDown()
-                access.ended(77)
                 disable()
             }
         }

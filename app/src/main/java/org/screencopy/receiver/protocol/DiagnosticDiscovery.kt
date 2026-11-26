@@ -3,9 +3,9 @@ package org.screencopy.receiver.protocol
 import org.json.JSONObject
 
 /** Untrusted endpoint hint only; never carries certificate or authentication material. */
-data class DiagnosticDiscovery(val port: Int) {
-    init { require(port in 1..65535) }
-    fun json(): JSONObject = JSONObject().put("version", 1).put("port", port).put("access", "lan")
+data class DiagnosticDiscovery(val port: Int, val version: Int = 1) {
+    init { require(port in 1..65535 && version in 1..2) }
+    fun json(): JSONObject = JSONObject().put("version", version).put("port", port).put("access", "lan")
 
     companion object {
         fun parse(value: Any?): DiagnosticDiscovery? {

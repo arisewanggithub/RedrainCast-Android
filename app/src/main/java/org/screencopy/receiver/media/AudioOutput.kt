@@ -20,10 +20,14 @@ interface AudioOutput : AutoCloseable {
     fun setSpeed(speed: Float)
 }
 
+internal interface AudioTimingDiagnostic {
+    var timingCheckpoint: ((Int) -> Unit)?
+}
+
 internal class PlatformAudioOutput private constructor(
     format: AudioFormat, failure: (String, String) -> Unit, platform: AudioOutputPlatform,
     private val prepared: (String) -> Unit
-) : AudioOutput {
+) : AudioOutput, AudioTimingDiagnostic {
     constructor(format: AudioFormat, failure: (String, String) -> Unit) :
         this(format, failure, AndroidAudioOutputPlatform, { android.util.Log.i("ScreenCopyReceiver", it) })
     internal constructor(format: AudioFormat, failure: (String, String) -> Unit, platform: AudioOutputPlatform) :
@@ -33,6 +37,9 @@ internal class PlatformAudioOutput private constructor(
         prepared("event=AUDIO_OUTPUT_HEADROOM_RETRY stage=OUTPUT_PREPARE ${it.logMessage()}")
     }
     private val device = opened.first
+    override var timingCheckpoint: ((Int) -> Unit)?
+        get() = (device as? AudioTimingDiagnostic)?.timingCheckpoint
+        set(value) { (device as? AudioTimingDiagnostic)?.timingCheckpoint = value }
     internal val bufferFrames: Int get() = device.bufferFrames
     internal val capacityFrames: Int get() = device.capacityFrames
     internal val preparedSpeed: Float get() = device.speed
@@ -90,7 +97,9 @@ private object AndroidAudioOutputPlatform : AudioOutputPlatform {
         AndroidRateAudioTrack(format, bytes, failure)
 }
 
-private class AndroidRateAudioTrack(format: AudioFormat, bytes: Int, failure: (String, String) -> Unit) : RateAudioTrack {
+private class AndroidRateAudioTrack(format: AudioFormat, bytes: Int, failure: (String, String) -> Unit) :
+    RateAudioTrack, AudioTimingDiagnostic {
+    override var timingCheckpoint: ((Int) -> Unit)? = null
     private val track: AudioTrack
     private val position: AudioPosition
     @Volatile private var playing = false
@@ -118,7 +127,7 @@ private class AndroidRateAudioTrack(format: AudioFormat, bytes: Int, failure: (S
             position = AudioPosition(format.sampleRate, track.bufferSizeInFrames, System::nanoTime, {
                 val value = AudioTimestamp()
                 if (track.getTimestamp(value)) FrameTimestamp(value.framePosition, value.nanoTime) else null
-            }, { track.playbackHeadPosition })
+            }, { track.playbackHeadPosition }, { timingCheckpoint?.invoke(it) })
         } catch (e: Exception) {
             track.release()
             throw e

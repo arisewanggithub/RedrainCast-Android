@@ -15,11 +15,15 @@ offers report retrieval after the cast.
 ## Negotiation and publication
 
 The cast control handshake advertises the capability
-`"sessionTelemetry":{"version":1,"intervalMs":1000,"maxBatchBytes":8192}`.
+`"sessionTelemetry":{"version":2,"intervalMs":1000,"maxBatchBytes":8192}`.
 The publication interval is one second. An older or
 incompatible peer continues casting normally with receiver telemetry marked
 unsupported and sender-local diagnostics available. There is no automatic
 legacy incident protocol, retry, listener reconnect or retrieval fallback.
+Version 2 adds a distinct causal row vocabulary. Version 1 peers do not negotiate
+version 2: casting continues without receiver telemetry, not with mislabeled
+new rows. Stored version 1 batches remain readable; version 1 batches cannot
+contain causal rows. The enclosing stored report remains version 2.
 
 One owner per endpoint lifecycle maintains its state and publication sequence.
 Each publication is independently interpretable: it includes current state,
@@ -54,6 +58,9 @@ same payload limit applies to the final batch. Per endpoint:
 | Event ingress | 128 events and 64 KiB |
 | Current state | 64 role-relevant rows, including up to 16 operations |
 | Pending events | 64 events and 32 KiB |
+| Additional causal checkpoint cache | 8 rows plus first gate decision, at most 4.5 KiB |
+| Frozen first-fault context | 8 rows plus first gate decision, at most 4.5 KiB |
+| Later causal transitions | first/latest mapping, first detach/prepare, first/latest start; at most 6 rows/3 KiB |
 
 Dropped and coalesced events, serialization omissions, unsent publications
 and observed sequence gaps are separately accounted for. Saturation or a
@@ -147,7 +154,100 @@ without these fields remains a cast failure with incomplete receiver evidence.
 These are optional existing numeric-row and terminal extensions under telemetry
 v1: strict framing/JSON validation is unchanged, old readers accept arbitrary
 numeric current-row details and ignore unknown ERROR object members. No new
-kind, stage, enum code, required key or skip-reason vocabulary is introduced.
+kind, stage, enum code, required key or skip-reason vocabulary was introduced
+by those terminal extensions. The separate causal vocabulary below requires
+telemetry version 2.
+
+## Automatic first-fault causal context (telemetry v2)
+
+Causal rows have kind `DiagnosticKind.size + 3` (11), track 2, and their own
+stage dictionary: BUILD, WORKER, SERVICE, OUTPUT, INPUT, MAPPING, START, TRIM,
+CAPTURE (0 through 8). Existing diagnostic enums and row meanings are unchanged.
+`value` identifies provenance: 0 current checkpoint, 1 frozen first fault,
+2 transition published after the latch, 3 capture accounting, 4 first gate decision of the current
+checkpoint generation (also frozen with the first bundle). Each row keeps its original local
+observation timestamp and generation. An independently timestamped cached copy
+is not an atomic or fresh inspection of all media resources.
+
+At first audio pressure, the receiver freezes cached primitive checkpoints
+**before** beginning clock recovery or retiring the player. Pressure/failure
+publication and externally requested audio recovery also freeze any
+as-yet-unfrozen context. Freezing never calls
+the player, acquires the clock/queue monitor, waits for a worker, or queries
+AudioTrack. A stalled producer therefore need not complete. The original bundle
+is repeated in every subsequent publication, including the final batch, ahead
+of current state and ordinary events; replacement STATUS and ordinary event
+saturation cannot erase it. Before a fault, current causal checkpoints are
+published instead. Later transitions have their own fixed retention: first
+and latest mapping, first detach and first preparation mapping, and first and
+latest start, with omission accounting. Pinning detach/preparation preserves
+the first recovery's old/new bases even after subsequent recoveries.
+Their timestamps identify the original mutation/decision, which can precede
+the latch if publication was delayed after releasing the clock monitor.
+Obsolete out-of-order transitions rejected from the checkpoint cache are
+also counted as omitted. Mapping generation is captured with the primitive
+transition under the clock monitor, not read again during publication.
+
+The export's `telemetryCausalLayouts` dictionary gives the exact ordered numeric
+fields; `causalWorkerPhases`, `causalMappingReasons` and `causalOutputBoundaries`
+decode their codes. Detail counts for stages 0 through 8 are respectively
+3, 17, 18, 20, 15, 20, 13, 7, 5. The layouts are:
+
+* BUILD: versionCode, sourceRevision (-1 unavailable), layoutRevision (1).
+  There is no runtime Git lookup or fabricated revision.
+* WORKER: phase/phaseBegin, step begin/end, last dequeue time/PTS, first and
+  maximum >=5 ms measured interval begin/end/wall/CPU/kind, slow-interval count.
+  Interval kinds are STEP, INPUT, DECODE, REFILL (0 through 3).
+  CPU is -1 when no existing worker CPU observation is available.
+* SERVICE: window begin, step/slow-step counts, maximum refill gap with preceding
+  padding/PCM/arrival-age context, minimum padding/PCM, zero writes, silence
+  frames/episodes, empty/queued-empty observations, total/window underruns,
+  first >=5 ms refill-gap time, counter resets. These are numeric copies of
+  existing worker-owned service aggregates, not logcat text.
+* OUTPUT: boundary, operation/point, call begin, last completion/duration,
+  maximum duration, zero/partial-write counts and first times, cached output
+  observation time/frame counters/timestamp age/source/underruns/last progress,
+  last completed operation point.
+  TIMING boundaries distinguish position-lock entry/acquisition and the existing
+  timestamp/head/underrun queries. No additional device queries are made.
+* INPUT: latest arrival time/PTS and consecutive deltas, expected duration from
+  configured format and codec headers (-1 when unavailable), first PTS discontinuity time/step,
+  maximum PTS step/arrival gap, arrivals less than half a packet duration apart,
+  arrival count, and last admission/dequeue time/PTS. No packet history is stored.
+  Duration observation also covers non-recovery sessions; it does not impose
+  recovery packet-duration limits or change legacy packet admission.
+* MAPPING: reason, old/new revisions, old/new base PTS/local time, old/new clock
+  mode and monotonic position floor, new audio observation PTS/time, flags,
+  audio observation sequence, old audio observation PTS/time, last packet
+  correction before/after offset and correction sequence (0 unavailable).
+  Signed offsets, including -1, are valid only when that sequence is positive.
+  Primitive copies are made under the existing
+  clock monitor and published only after releasing it.
+* START: operation, decision/mode, target/position/delay, revision/flags,
+  waited time, last released-video PTS, original decoded PTS, effective trim
+  cutoff and trim reason (-1 none; otherwise the TRIM reason vocabulary).
+  The raw target/cutoff remain attached to the retained decision even when
+  a later generation overwrites the ordinary trim checkpoint.
+  Only decision/mode/target/revision/
+  flag changes are retained as transitions, not every periodic wait observation.
+  Signed delay uses int64-min for unavailable; -1 is a valid delay.
+* TRIM: reason (0 startup, 1 recovery, 2 recovery refresh, 3 clock preparation),
+  raw/trimmed PTS, cutoff/observed clock position, raw/remaining frames.
+* CAPTURE: layout revision, available-stage mask, omitted later transitions,
+  later-transition sequence, trigger track (-1 before freezing). The CAPTURE
+  row's generation belongs to that trigger track, not necessarily audio.
+  Track failure captures retain the originating track generation, while the
+  legacy SESSION FAILED event continues to use generation zero.
+  Missing bits and -1 fields explicitly mean unavailable.
+
+All rows still satisfy 512 bytes/20 numeric details. The first bundle, later
+transitions and accounting share the existing 64-event/8192-byte publication
+budget; current state is omitted with existing accounting when necessary.
+No new periodic timer, unbounded history, per-packet retained trace or live
+capture consent is involved. Boundary entry proves only an uncompleted boundary,
+not a native hang; old progress is not proof of continuous blockage. Wall minus
+CPU includes locks, waits and GC, not proof of scheduler starvation. Device/OS
+internals and unsynchronized endpoint clocks remain limits on attribution.
 
 ## Audio-start causal current row
 

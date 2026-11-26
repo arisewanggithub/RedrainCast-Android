@@ -7,145 +7,164 @@ import java.io.ByteArrayOutputStream
 import java.io.InputStream
 import java.util.UUID
 
-/** Unauthenticated LAN metadata protocol; called only by its diagnostic I/O lane. */
-class DiagnosticProtocol(
+internal class DiagnosticDeliveryExhausted : Exception()
+
+/** Unauthenticated paired collector protocol, confined to its diagnostic I/O worker. */
+internal class DiagnosticProtocol(
     private val recorder: DiagnosticRecorder,
     private val clock: () -> Long = System::nanoTime,
     private val acquire: () -> Boolean = { true },
-    private val connections: () -> JSONObject = { JSONObject().put("version", 1) }
+    private val registry: DiagnosticArmRegistry = DiagnosticArmRegistry(recorder, clock)
 ) {
+    data class Ownership(val pairId: String, val generation: Long)
+
     private val ids = HashSet<String>()
     private val connectionId = UUID.randomUUID().toString()
+    private val delivery = DiagnosticDeliveryBudget()
     private var tokens = 20.0
     private var budgetAt = clock()
-    private data class Delivery(val at: Long, val records: Int, val bytes: Int)
-    private val deliveries = java.util.ArrayDeque<Delivery>()
-    private var outputRecords = 0
-    private var outputBytes = 0
+    private var ownership: Ownership? = null
     var ready = false
         private set
     var closing = false
         private set
 
+    fun ownership(): Ownership? = ownership
+
+    fun disconnected(snapshot: Ownership?, reason: String) {
+        if (snapshot != null)
+            registry.disconnected(connectionId, snapshot.pairId, snapshot.generation, reason)
+    }
+
     fun handle(bytes: ByteArray): JSONObject {
-        require(bytes.size <= 16384) { "Oversized diagnostic frame" }
+        require(bytes.size <= 16_384) { "Oversized diagnostic frame" }
         val request = StrictJson.decode(bytes, maxDepth = 8, trackSizes = false)
-        // A syntactically valid request with bad typed fields receives a controlled error.
         val id = (request.opt("id") as? String)?.takeIf { it.matches(Regex("[A-Za-z0-9_-]{1,64}")) }
         val op = (request.opt("op") as? String)?.takeIf { it.length in 1..64 }
-        val response = JSONObject().put("v", 1).put("id", id ?: JSONObject.NULL).put("op", op ?: JSONObject.NULL)
+        val responseOp = op?.takeIf { it in setOf("HELLO", "START", "STATUS", "CONNECTIONS", "FETCH",
+            "END", "CLEAR", "CLOCK", "PING") }
+        val response = JSONObject().put("v", 2).put("id", id ?: JSONObject.NULL).put("op", responseOp ?: JSONObject.NULL)
         val received = clock()
+        var reserved = false
         try {
-            fields(request, "v", "id", "op", "args")
             if (request.opt("v") !is Int) invalid()
-            if (request.opt("v") != 1) throw DiagnosticError("UNSUPPORTED_VERSION")
+            if (request.opt("v") != 2) {
+                closing = true
+                throw DiagnosticError("UNSUPPORTED_VERSION")
+            }
+            fields(request, "v", "id", "op", "args")
             if (id == null || op == null) invalid()
             val args = request.opt("args") as? JSONObject ?: invalid()
-            if (id in ids) throw DiagnosticError("DUPLICATE_ID")
-            if (ids.size >= 4096) { closing = true; throw DiagnosticError("RATE_LIMITED") }
-            ids.add(id)
             val now = clock()
             tokens = (tokens + (now - budgetAt).coerceAtLeast(0) * 20.0 / 1e9).coerceAtMost(20.0)
             budgetAt = now
             if (tokens < 1) throw DiagnosticError("RATE_LIMITED")
             tokens--
-            if (op == "AUTH") throw DiagnosticError("UNKNOWN_OPERATION")
+            if (id in ids) throw DiagnosticError("DUPLICATE_ID")
+            if (ids.size >= 4096) { closing = true; throw DiagnosticError("RATE_LIMITED") }
+            ids.add(id)
             if (!ready && op != "HELLO") {
                 closing = true
                 throw DiagnosticError("HELLO_REQUIRED")
+            }
+            if (op in setOf("START", "END", "CLEAR")) {
+                if (!delivery.tryAcquire(clock(), 0, 8192, reserveBytes = 256, reserveSlots = 1))
+                    throw DiagnosticError("RATE_LIMITED")
+                reserved = true
             }
             val result = when (op) {
                 "HELLO" -> {
                     fields(args)
                     if (ready) invalid()
-                    if (!acquire()) {
-                        closing = true
-                        throw DiagnosticError("BUSY")
-                    }
+                    if (!acquire()) { closing = true; throw DiagnosticError("BUSY") }
                     ready = true
-                    val caps = JSONObject()
-                    val scope = recorder.scope()
-                    DiagnosticRecorder.capabilities.forEach { (role, flags) ->
-                        caps.put(role, JSONArray(if (scope != null && role != "receiver") emptyList() else flags.toList()))
-                    }
-                    JSONObject().put("access", "lan").put("clockId", recorder.clockId).put("capabilities", caps)
-                        .put("roles", JSONArray(listOf("sender", "receiver"))).put("connectionId", connectionId)
+                    JSONObject().put("access", "lan").put("clockId", recorder.clockId)
+                        .put("connectionId", connectionId).put("pairedNextCast", 1)
+                        .put("senderFlags", JSONArray(DiagnosticRecorder.capabilities.getValue("sender").sorted()))
+                        .put("receiverFlags", JSONArray(DiagnosticRecorder.capabilities.getValue("receiver").sorted()))
                         .put("limits", DiagnosticRecorder.limits()).put("delivery", "fetch")
-                        .put("scope", scope ?: JSONObject.NULL)
-                        .put("connections", connections())
                         .put("metricAvailability", JSONObject().put("tcpKernel", false)
                             .put("transportProvenance", "application_socket_calls")
                             .put("videoPresentation", "codec_release_and_optional_render_callback")
                             .put("physicalDisplay", false))
                 }
-                "STATUS" -> { fields(args); recorder.status().put("connections", connections()) }
-                "CONNECTIONS" -> { fields(args); connections() }
-                "CLOCK" -> {
-                    fields(args, "clientSendNs")
-                    val sent = decimal(args, "clientSendNs")
-                    JSONObject().put("clientSendNs", "$sent").put("receiveNs", "$received")
-                        .put("sendNs", "${clock()}").put("clockId", recorder.clockId)
-                }
                 "START" -> {
-                    fields(args, "target", "flags", "durationMs", "samplePeriodMs")
+                    fields(args, "target", "senderFlags", "receiverFlags", "durationMs", "samplePeriodMs")
                     val target = args.opt("target") as? JSONObject ?: invalid()
-                    val role = string(target, "role", 16)
-                    if (role !in DiagnosticRecorder.capabilities) invalid()
-                    val session = if (target.has("session")) {
-                        fields(target, "role", "session"); decimal(target, "session")
-                    } else {
-                        fields(target, "role", "nextSession")
-                        if (target.opt("nextSession") != true) invalid()
-                        null
-                    }
-                    val values = args.opt("flags") as? JSONArray ?: invalid()
-                    if (values.length() !in 1..16) invalid()
-                    val flags = HashSet<String>()
-                    for (i in 0 until values.length()) {
-                        val flag = values.opt(i) as? String ?: invalid()
-                        if (!flags.add(flag)) invalid()
-                    }
-                    recorder.start(role, session, flags, integer(args, "durationMs"), integer(args, "samplePeriodMs"))
-                }
-                "END" -> {
-                    fields(args, "captureId"); recorder.end(string(args, "captureId", 64))
-                }
-                "CLEAR" -> {
-                    fields(args, "captureId"); recorder.clear(string(args, "captureId", 64))
-                }
-                "FETCH" -> {
-                    fields(args, "captureId", "afterSeq", "limit")
-                    val limit = integer(args, "limit")
-                    if (limit !in 1..32) invalid()
-                    val result = recorder.fetch(string(args, "captureId", 64), decimal(args, "afterSeq"), limit)
-                    val records = result.getJSONArray("records").length()
-                    val size = result.toString().toByteArray(Charsets.UTF_8).size + 160
-                    val at = clock()
-                    while (deliveries.isNotEmpty() && at - deliveries.first.at >= 1_000_000_000L) {
-                        val old = deliveries.removeFirst()
-                        outputRecords -= old.records; outputBytes -= old.bytes
-                    }
-                    if (outputRecords + records > 256 || outputBytes + size > 131072) throw DiagnosticError("RATE_LIMITED")
-                    deliveries.addLast(Delivery(at, records, size))
-                    outputRecords += records; outputBytes += size
+                    fields(target, "nextSession")
+                    if (target.opt("nextSession") != true) invalid()
+                    val result = registry.start(connectionId, flags(args, "senderFlags"), flags(args, "receiverFlags"),
+                        integer(args, "durationMs"), integer(args, "samplePeriodMs"))
+                    ownership = Ownership(result.getString("pairId"), decimal(result, "armGeneration"))
                     result
+                }
+                "STATUS" -> {
+                    if (args.length() == 0) registry.statusCurrent(connectionId)
+                    else { fields(args, "pairId"); registry.status(connectionId, string(args, "pairId", 64)) }
+                }
+                "CONNECTIONS" -> { fields(args); registry.connections(connectionId) }
+                "FETCH" -> {
+                    fields(args, "pairId", "afterSenderSeq", "afterReceiverSeq", "limit")
+                    registry.fetch(connectionId, string(args, "pairId", 64), decimal(args, "afterSenderSeq"),
+                        decimal(args, "afterReceiverSeq"), integer(args, "limit"), id)
+                }
+                "END" -> { fields(args, "pairId"); registry.end(connectionId, string(args, "pairId", 64)) }
+                "CLEAR" -> { fields(args, "pairId"); registry.clear(connectionId, string(args, "pairId", 64)) }
+                "CLOCK" -> {
+                    val role = string(args, "role", 16)
+                    val sent = decimal(args, "clientSendNs")
+                    when (role) {
+                        "sender" -> {
+                            fields(args, "role", "clientSendNs")
+                            JSONObject().put("clientSendNs", sent.toString()).put("receiveNs", received.toString())
+                                .put("sendNs", clock().toString()).put("clockId", recorder.clockId)
+                        }
+                        "receiver" -> {
+                            fields(args, "role", "pairId", "clientSendNs")
+                            registry.receiverClock(connectionId, string(args, "pairId", 64), sent.toString())
+                        }
+                        else -> invalid()
+                    }
                 }
                 "PING" -> { fields(args); JSONObject().put("alive", true) }
                 else -> throw DiagnosticError("UNKNOWN_OPERATION")
             }
             response.put("ok", true).put("result", result)
+            val output = response.toString().toByteArray(Charsets.UTF_8)
+            if (output.size + 1 > DiagnosticProxyWire.FRAME_BYTES) throw DiagnosticError("RECORD_TOO_LARGE")
+            StrictJson.decode(output, maxDepth = DiagnosticProxyWire.FETCH_DEPTH, trackSizes = false)
+            val records = if (op == "FETCH") result.getJSONArray("records").length() else 0
+            if (reserved && output.size + 1 > 8192 &&
+                !delivery.tryAcquire(clock(), 0, output.size + 1 - 8192, reserveBytes = 256, reserveSlots = 1))
+                throw DiagnosticError("RATE_LIMITED")
+            if (!reserved && !delivery.tryAcquire(clock(), records, output.size + 1,
+                    reserveBytes = 256, reserveSlots = 1))
+                throw DiagnosticError("RATE_LIMITED")
         } catch (e: DiagnosticError) {
+            response.remove("result")
             response.put("ok", false).put("error", JSONObject().put("code", e.code).put("message", e.code))
         } catch (e: Exception) {
             android.util.Log.e("RemoteDiagnostics", "Internal diagnostic protocol failure", e)
-            recorder.disconnect("internal_error")
+            disconnected(ownership, "internal_error")
             closing = true
+            response.remove("result")
             response.put("ok", false).put("error", JSONObject().put("code", "INTERNAL").put("message", "INTERNAL"))
+        }
+        if (!response.getBoolean("ok") && !reserved) {
+            val bytesOut = response.toString().toByteArray(Charsets.UTF_8).size + 1
+            if (!delivery.tryAcquire(clock(), 0, bytesOut)) {
+                closing = true
+                throw DiagnosticDeliveryExhausted()
+            }
         }
         return response
     }
 
     companion object {
+        fun successBytes(id: String, op: String, result: JSONObject): Int =
+            JSONObject().put("v", 2).put("id", id).put("op", op).put("ok", true).put("result", result)
+                .toString().toByteArray(Charsets.UTF_8).size + 1
+
         fun readLine(input: InputStream): ByteArray? {
             val buffer = ByteArrayOutputStream()
             while (true) {
@@ -155,14 +174,13 @@ class DiagnosticProtocol(
                     return null
                 }
                 if (value == 10) return buffer.toByteArray()
-                require(buffer.size() < 16384) { "Oversized diagnostic frame" }
+                require(buffer.size() < 16_384) { "Oversized diagnostic frame" }
                 buffer.write(value)
             }
         }
         private fun invalid(): Nothing = throw DiagnosticError("INVALID_ARGUMENT")
         private fun fields(value: JSONObject, vararg names: String) {
-            val keys = value.keys().asSequence().toSet()
-            if (keys != names.toSet()) invalid()
+            if (value.keys().asSequence().toSet() != names.toSet()) invalid()
         }
         private fun string(value: JSONObject, name: String, max: Int): String =
             (value.opt(name) as? String)?.takeIf { it.isNotEmpty() && it.length <= max } ?: invalid()
@@ -171,6 +189,16 @@ class DiagnosticProtocol(
             val raw = string(value, name, 19)
             if (!raw.matches(Regex("0|[1-9][0-9]*"))) invalid()
             return raw.toLongOrNull() ?: invalid()
+        }
+        private fun flags(value: JSONObject, name: String): Set<String> {
+            val array = value.opt(name) as? JSONArray ?: invalid()
+            if (array.length() !in 1..16) invalid()
+            val flags = HashSet<String>()
+            repeat(array.length()) {
+                val flag = array.opt(it) as? String ?: invalid()
+                if (flag.isEmpty() || flag.length > 64 || !flags.add(flag)) invalid()
+            }
+            return flags
         }
     }
 }

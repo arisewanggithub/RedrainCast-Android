@@ -49,6 +49,7 @@ class AudioWriteProgressPipelineTest {
             assertTrue(row.detail[1] > 0)
             assertEquals(-1L, row.detail[11])
             assertEquals("Waiting must not query an output that has not started", 0, fixture.track.timingCalls)
+            TelemetryRegistry.freezeReceiver(503, 3)
             release.countDown()
             assertTrue(readyPublished.await(3, TimeUnit.SECONDS))
             val progressed = ready.get()
@@ -72,6 +73,12 @@ class AudioWriteProgressPipelineTest {
             assertEquals(4, reset.generation)
             assertEquals(0L, reset.detail[2])
             assertEquals(-1L, reset.detail[11])
+            val frozenWait = final.events.single { it.kind == CausalEvidence.KIND &&
+                it.stage == CausalEvidence.Stage.START.ordinal && it.value == 1L }
+            assertEquals(1L, frozenWait.detail[1])
+            assertEquals(1_000_000L, frozenWait.detail[3])
+            assertTrue(final.events.any { it.kind == CausalEvidence.KIND &&
+                it.stage == CausalEvidence.Stage.START.ordinal && it.value == 2L && it.detail[1] == 4L })
         } finally {
             release.countDown()
             fixture.close()
@@ -138,6 +145,11 @@ class AudioWriteProgressPipelineTest {
             TelemetryRegistry.end("receiver", telemetry)
             val final = checkNotNull(telemetry.requestFinal(true, System.nanoTime() + 1_000_000_000L))
             val batch = SessionTelemetryProtocol.parse(final.payload)
+            val worker = batch.events.single { it.kind == CausalEvidence.KIND &&
+                it.stage == CausalEvidence.Stage.WORKER.ordinal }
+            assertEquals(1_000_000L, worker.detail[5])
+            assertTrue(worker.detail[3] >= worker.detail[4])
+            assertTrue(worker.atNs <= fixture.now.get())
             assertTrue(batch.state.toString(), batch.state.any {
                 it.kind == dev.redrain.cast.diagnostics.DiagnosticKind.AUDIO_OUTPUT.ordinal + 1 &&
                     it.stage == dev.redrain.cast.diagnostics.DiagnosticStage.COMPLETE.ordinal &&
@@ -189,9 +201,13 @@ class AudioWriteProgressPipelineTest {
         }
     }
 
-    @Test fun resumedRawOutputTrimsToPresentedVideoWithoutWaitingOrRetimingSamples() {
-        Fixture { _, count, _ -> count }.use { fixture ->
+    @Test fun resumedRawOutputTrimsToPresentedVideoWithoutWaitingOrRetimingSamples() = listOf(false, true).forEach { freezeBefore ->
+        val telemetry = ReceiverTelemetrySession({ true })
+        TelemetryRegistry.beginReceiver(9703, telemetry)
+        try { Fixture { _, count, _ -> count }.use { fixture ->
             val clock = fixture.clock
+            fixture.player.diagnosticSession = 9703
+            fixture.player.diagnosticGeneration = 2
             clock.prepareAudio(TrimmedAudio(0, 960, 1_000_000), 48000)
             assertTrue(clock.awaitAudioStart(1_000_000) { true })
             clock.anchorAudio(1_000_000) { 20_000 }
@@ -205,6 +221,7 @@ class AudioWriteProgressPipelineTest {
             val before = fixture.now.get()
             val bytes = ByteBuffer.allocate(1920 * 2).order(ByteOrder.LITTLE_ENDIAN)
             repeat(1920) { bytes.putShort(it.toShort()) }
+            if (freezeBefore) TelemetryRegistry.freezeReceiver(9703, 1)
             fixture.player.start()
             fixture.player.offer(AccessUnit(1_980_000, bytes.array()))
             await { fixture.player.sourceSubmittedFrames == 480L || fixture.errors.isNotEmpty() }
@@ -217,6 +234,22 @@ class AudioWriteProgressPipelineTest {
             assertTrue(clock.currentUs()!! >= 1_990_000)
             clock.endAudioRecovery()
             clock.checkStartup()
+            if (!freezeBefore) TelemetryRegistry.freezeReceiver(9703, 2)
+            val final = checkNotNull(telemetry.requestFinal(true, System.nanoTime() + 1_000_000_000))
+            val rows = SessionTelemetryProtocol.parse(final.payload).events
+            if (!freezeBefore) {
+                val trim = rows.single {
+                    it.kind == CausalEvidence.KIND && it.stage == CausalEvidence.Stage.TRIM.ordinal && it.value == 1L
+                }
+                assertEquals(listOf(1L, 1_980_000L, 1_990_000L, 1_000_000L, 1_990_000L, 960L, 480L), trim.detail)
+            }
+            val gate = rows.single { it.kind == CausalEvidence.KIND &&
+                it.stage == CausalEvidence.Stage.START.ordinal && it.value == if (freezeBefore) 2L else 1L }
+            assertEquals(1_990_000L, gate.detail[3])
+            assertEquals(listOf(1_980_000L, 1_990_000L, 1L), gate.detail.takeLast(3))
+        } } finally {
+            TelemetryRegistry.end("receiver", telemetry)
+            telemetry.requestFinal(false, System.nanoTime())
         }
     }
 

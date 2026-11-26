@@ -5,6 +5,11 @@ import org.junit.Assert.*
 import org.junit.Test
 import org.screencopy.receiver.protocol.ProtocolException
 import org.screencopy.receiver.protocol.StrictJson
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.TimeoutException
+import java.util.concurrent.atomic.AtomicBoolean
 
 class SessionTelemetryTest {
     private fun row(value: Long = 1, detail: List<Long> = emptyList()) =
@@ -47,6 +52,84 @@ class SessionTelemetryTest {
         assertEquals(1, result.unsent)
         assertEquals(listOf(4L, 0, 0, 0, 1), result.state.single().detail)
         assertEquals(listOf(4L, 0, 0, 0, 1), result.firstPressure!!.detail)
+    }
+
+    @Test fun concurrentPressureCaptureAndAnchorChooseTheSameTrigger() {
+        val collector = SessionTelemetryCollector { 123 }
+        collector.causal.record(TelemetryRow(CausalEvidence.KIND, CausalEvidence.Stage.BUILD.ordinal,
+            2, 1, 50, 0, listOf(38, -1, CausalEvidence.LAYOUT)))
+        repeat(128) { collector.event(row(it.toLong())) }
+        val firstFrozen = CountDownLatch(1)
+        val releaseFirst = CountDownLatch(1)
+        val normalPublished = CountDownLatch(1)
+        val firstGate = AtomicBoolean(true)
+        collector.afterFaultFreezeForTest = {
+            if (firstGate.compareAndSet(true, false)) {
+                firstFrozen.countDown()
+                check(releaseFirst.await(5, TimeUnit.SECONDS))
+            }
+        }
+        val details = mutableListOf(0L, 0, 0, 0, 1)
+        val first = row(901, details).copy(stage = DiagnosticStage.PRESSURE.ordinal)
+        val second = first.copy(track = 2, generation = 2, atNs = 200, value = 902)
+        val executor = Executors.newFixedThreadPool(2)
+        try {
+            val firstEvent = executor.submit { collector.event(first, pressure = true) }
+            assertTrue(firstFrozen.await(2, TimeUnit.SECONDS))
+            details[0] = 9
+            val secondEvent = executor.submit {
+                collector.event(row(903))
+                normalPublished.countDown()
+                collector.event(second, pressure = true)
+            }
+            assertTrue("Ordinary ingress must not wait for fault capture",
+                normalPublished.await(2, TimeUnit.SECONDS))
+            assertThrows(TimeoutException::class.java) { secondEvent.get(200, TimeUnit.MILLISECONDS) }
+            releaseFirst.countDown()
+            firstEvent.get(2, TimeUnit.SECONDS)
+            secondEvent.get(2, TimeUnit.SECONDS)
+            val batch = SessionTelemetryProtocol.parse(collector.publish(final = true))
+            val anchor = checkNotNull(batch.firstPressure)
+            val capture = batch.events.single { it.kind == CausalEvidence.KIND &&
+                it.stage == CausalEvidence.Stage.CAPTURE.ordinal }
+            assertEquals(first.value, anchor.value)
+            assertEquals(first.generation, anchor.generation)
+            assertEquals(anchor.generation, capture.generation)
+            assertEquals(anchor.atNs, capture.atNs)
+            assertEquals(anchor.track.toLong(), capture.detail[4])
+            assertEquals(listOf(0L, 0, 0, 0, 1), anchor.detail)
+            assertEquals(67L, batch.dropped)
+            assertNull(batch.firstFailure)
+            val repeated = SessionTelemetryProtocol.parse(collector.publish(final = true))
+            assertEquals(anchor, repeated.firstPressure)
+            assertEquals(capture, repeated.events.single { it.kind == CausalEvidence.KIND &&
+                it.stage == CausalEvidence.Stage.CAPTURE.ordinal })
+        } finally {
+            releaseFirst.countDown()
+            executor.shutdownNow()
+            collector.afterFaultFreezeForTest = null
+        }
+    }
+
+    @Test fun earlierFailureCaptureDoesNotPreventIndependentFirstPressureSelection() {
+        val collector = SessionTelemetryCollector { 123 }
+        collector.causal.record(TelemetryRow(CausalEvidence.KIND, CausalEvidence.Stage.BUILD.ordinal,
+            2, 1, 50, 0, listOf(38, -1, CausalEvidence.LAYOUT)))
+        val failure = TelemetryRow(DiagnosticKind.SESSION.ordinal + 1, DiagnosticStage.FAILED.ordinal,
+            2, 1, 100, 0, listOf(0, 0, 0, 0, 1))
+        val pressure = row(902, listOf(0, 0, 0, 0, 1)).copy(
+            stage = DiagnosticStage.PRESSURE.ordinal, generation = 2, atNs = 200)
+        collector.event(failure, failure = true)
+        collector.event(pressure, pressure = true, causalGeneration = 7)
+        collector.event(pressure.copy(generation = 3, atNs = 300), pressure = true)
+        val batch = SessionTelemetryProtocol.parse(collector.publish())
+        val capture = batch.events.single { it.kind == CausalEvidence.KIND &&
+            it.stage == CausalEvidence.Stage.CAPTURE.ordinal }
+        assertEquals(failure, batch.firstFailure)
+        assertEquals(pressure, batch.firstPressure)
+        assertEquals(failure.generation, capture.generation)
+        assertEquals(failure.atNs, capture.atNs)
+        assertEquals(failure.track.toLong(), capture.detail[4])
     }
 
     @Test fun latestCleanupStateSurvivesCrowdedFinalPublication() {
@@ -117,8 +200,8 @@ class SessionTelemetryTest {
         fun supported(capability: JSONObject) =
             SessionTelemetryProtocol.supported(JSONObject().put("sessionTelemetry", capability))
 
-        assertFalse(supported(JSONObject().put("version", 2)))
-        assertFalse(supported(JSONObject().put("version", 2).put("newField", JSONObject().put("mode", "batch"))
+        assertFalse(supported(JSONObject().put("version", 3)))
+        assertFalse(supported(JSONObject().put("version", 3).put("newField", JSONObject().put("mode", "batch"))
             .put("intervalMs", "different schema")))
         for (invalid in listOf<Any>("2", 2.0, 0, -1, 2147483648L, JSONObject.NULL)) {
             assertThrows(ProtocolException::class.java) {
@@ -127,7 +210,7 @@ class SessionTelemetryTest {
         }
         assertThrows(ProtocolException::class.java) { supported(JSONObject().put("newField", true)) }
         for (invalid in listOf(
-            JSONObject().put("version", 1),
+            JSONObject().put("version", 2),
             SessionTelemetryProtocol.capability().put("extra", true),
             SessionTelemetryProtocol.capability().put("intervalMs", 0),
             SessionTelemetryProtocol.capability().put("maxBatchBytes", -1),
@@ -145,14 +228,14 @@ class SessionTelemetryTest {
         assertTrue(SessionTelemetryProtocol.supported(JSONObject().put("sessionTelemetry",
             SessionTelemetryProtocol.capability())))
         assertFalse(SessionTelemetryProtocol.supported(JSONObject().put("sessionTelemetry",
-            SessionTelemetryProtocol.capability().put("version", 2))))
+            SessionTelemetryProtocol.capability().put("version", 1))))
         assertThrows(ProtocolException::class.java) {
             SessionTelemetryProtocol.supported(JSONObject().put("sessionTelemetry",
                 SessionTelemetryProtocol.capability().put("intervalMs", "1000")))
         }
         val valid = SessionTelemetryCollector { 123 }.publish().toString(Charsets.UTF_8)
         assertThrows(ProtocolException::class.java) {
-            SessionTelemetryProtocol.parse(valid.replace("\"version\":1", "\"version\":1,\"version\":1")
+            SessionTelemetryProtocol.parse(valid.replace("\"version\":2", "\"version\":2,\"version\":2")
                 .toByteArray())
         }
         assertThrows(ProtocolException::class.java) {

@@ -18,6 +18,21 @@ internal class AudioPacketTiming(
         else -> 0
     }
 
+    /** Observation only: do not impose recovery admission limits on legacy packets. */
+    fun diagnosticDurationUs(bytes: ByteArray): Long? {
+        if (bytes.isEmpty()) return null
+        val frames = when (codec) {
+            "raw", "pcm" -> {
+                if (bytes.size % (channels * 2) != 0) return null
+                bytes.size / (channels * 2)
+            }
+            "aac" -> aacFrames
+            "opus" -> opusFrames(bytes) { null } ?: return null
+            else -> return null
+        }
+        return frames * 1_000_000L / rate
+    }
+
     fun endPts(pts: Long, bytes: ByteArray): Long {
         protocolRequire(pts >= 0 && bytes.isNotEmpty(), "Invalid audio packet timing")
         val frames = when (codec) {
@@ -26,7 +41,7 @@ internal class AudioPacketTiming(
                 bytes.size / (channels * 2)
             }
             "aac" -> aacFrames
-            "opus" -> opusFrames(bytes)
+            "opus" -> checkNotNull(opusFrames(bytes))
             else -> throw ProtocolException("UNSUPPORTED_CONFIG", "Unsupported recovery audio codec")
         }
         protocolRequire(frames in 1..rate * 120 / 1000, "Audio packet exceeds the 120 ms budget")
@@ -36,7 +51,8 @@ internal class AudioPacketTiming(
 
     fun windowStart(cutoff: Long) = (cutoff - prerollUs).coerceAtLeast(0)
 
-    private fun opusFrames(bytes: ByteArray): Int {
+    private fun opusFrames(bytes: ByteArray,
+                           invalid: (String) -> Int? = { throw ProtocolException("PROTOCOL", it) }): Int? {
         val toc = bytes[0].toInt() and 255
         val config = toc ushr 3
         val samples = when {
@@ -46,14 +62,14 @@ internal class AudioPacketTiming(
         }
         val count = when (toc and 3) {
             0 -> 1
-            1 -> { protocolRequire((bytes.size - 1) % 2 == 0, "Malformed Opus CBR packet"); 2 }
-            2 -> { protocolRequire(bytes.size >= 2, "Truncated Opus VBR packet"); 2 }
+            1 -> { if ((bytes.size - 1) % 2 != 0) return invalid("Malformed Opus CBR packet"); 2 }
+            2 -> { if (bytes.size < 2) return invalid("Truncated Opus VBR packet"); 2 }
             else -> {
-                protocolRequire(bytes.size >= 2, "Truncated Opus frame count")
+                if (bytes.size < 2) return invalid("Truncated Opus frame count")
                 bytes[1].toInt() and 63
             }
         }
-        protocolRequire(count in 1..48 && samples * count <= 5760, "Invalid Opus packet duration")
+        if (count !in 1..48 || samples * count > 5760) return invalid("Invalid Opus packet duration")
         return samples * count
     }
 

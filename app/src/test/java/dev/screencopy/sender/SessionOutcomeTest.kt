@@ -6,6 +6,22 @@ import java.io.EOFException
 import java.io.IOException
 
 class SessionOutcomeTest {
+    @Test fun setupCauseUsesTypedLocalReasonsWithoutPromotingPrivateTextToPeerEvidence() {
+        val cases = listOf(
+            EOFException("private") to "eof",
+            java.net.ConnectException("private") to "connect",
+            java.net.SocketTimeoutException("private") to "timeout",
+            IOException("TIMEOUT: private") to "timeout",
+            IOException("PROTOCOL: private") to "setup"
+        )
+        for ((error, reason) in cases) {
+            val failure = setupFailure(DiagnosticProxySetupException("lane", error), false).json()
+            assertEquals("sender_local", failure.getString("provenance"))
+            assertEquals(reason, failure.getString("reason"))
+            assertFalse(failure.toString().contains("private"))
+        }
+    }
+
     @Test fun receiverErrorSupersedesOnlyProvisionalMediaDisconnect() {
         val outcome = SessionOutcome()
         assertTrue(outcome.record(MediaConnectionFailure(EOFException()), SessionOutcome.Origin.RECEIVER_READ))
@@ -30,6 +46,20 @@ class SessionOutcomeTest {
         assertFalse(outcome.record(MediaConnectionFailure(EOFException()), SessionOutcome.Origin.RECEIVER_READ))
         assertNull(outcome.failure)
         assertEquals(Wire.STOP, outcome.terminal(7, false).type)
+    }
+
+    @Test fun terminalCommitIsPublishedOnlyForAcceptedTransitions() {
+        val outcome = SessionOutcome()
+        var commits = 0
+        assertTrue(outcome.requestStop { commits++ })
+        assertFalse(outcome.requestStop { commits++ })
+        assertFalse(outcome.record(EOFException(), SessionOutcome.Origin.RECEIVER_READ,
+            commit = { commits++ }))
+        assertEquals(1, commits)
+        val failed = SessionOutcome()
+        assertTrue(failed.record(IOException("failed"), SessionOutcome.Origin.CAPTURE, commit = { commits++ }))
+        assertFalse(failed.record(IOException("later"), SessionOutcome.Origin.CAPTURE, commit = { commits++ }))
+        assertEquals(2, commits)
     }
 
     @Test fun peerErrorCodeIsValidatedAndDiagnosticSummaryDoesNotExposePeerText() {

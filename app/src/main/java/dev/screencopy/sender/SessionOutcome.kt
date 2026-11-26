@@ -30,9 +30,10 @@ internal class SessionOutcome {
     @Volatile private var first: Failure? = null
     private var atStop: Failure? = null
     val failure get() = first?.error
-    fun requestStop(): Boolean = synchronized(lock) {
+    fun requestStop(commit: () -> Unit = {}): Boolean = synchronized(lock) {
         if (stopping) return false
         atStop = first
+        commit()
         stopping = true
         true
     }
@@ -40,15 +41,18 @@ internal class SessionOutcome {
         if (stopping) throw SessionCancelledException()
         failure?.let { throw IOException(it.message, it) }
     }
-    fun record(error: Exception, origin: Origin, closing: Boolean = false): Boolean = synchronized(lock) {
+    fun record(error: Exception, origin: Origin, closing: Boolean = false,
+               commit: () -> Unit = {}): Boolean = synchronized(lock) {
         if ((stopping || closing) && cancellation(error)) return false
         val previous = first
         if (previous != null) {
             if (previous.error !is MediaConnectionFailure || error !is ReceiverReportedFailure) return false
+            commit()
             first = Failure(error, origin)
             if (atStop === previous) atStop = first
             return true
         }
+        commit()
         first = Failure(error, origin)
         true
     }

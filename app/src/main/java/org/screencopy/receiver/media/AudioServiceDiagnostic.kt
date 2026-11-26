@@ -33,6 +33,13 @@ internal class AudioServiceDiagnostic(private val rate: Int) {
     private var starvationSamples = 0L
     private var queuedStarvationSamples = 0L
     private var lastDiscardedFrames = 0L
+    private var firstAnomalyNs = -1L
+
+    fun snapshot(): LongArray = longArrayOf(windowNs, steps, slowSteps, maxRefillGapNs,
+        gapPreviousPaddingUs, gapPcmFrames.toLong(), gapArrivalAgeUs ?: -1,
+        minimumPaddingUs.takeIf { it != Long.MAX_VALUE } ?: -1, minimumPaddingPcmFrames.toLong(),
+        zeroWrites, silenceFrames, silenceEpisodes, starvationSamples, queuedStarvationSamples,
+        totalUnderruns, windowUnderruns, firstAnomalyNs, counterResets)
 
     fun start(nowNs: Long, underruns: Int) {
         started = true
@@ -56,6 +63,7 @@ internal class AudioServiceDiagnostic(private val rate: Int) {
         if (!started) return
         previousRefillNs?.let { previous ->
             val gap = nowNs - previous
+            if (gap >= 5_000_000 && firstAnomalyNs < 0) firstAnomalyNs = nowNs
             if (gap > maxRefillGapNs) {
                 maxRefillGapNs = gap
                 gapPreviousPaddingUs = previousPaddingUs

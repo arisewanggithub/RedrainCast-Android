@@ -453,8 +453,6 @@ class MainActivity : Activity(), SurfaceHolder.Callback, TextureView.SurfaceText
                             showPlayer()
                         }
                     } }, supportsPlaybackStatistics = true, receiveCapabilities = { receiveCapabilities.get() },
-                    diagnosticDiscovery = { dev.redrain.cast.diagnostics.DiagnosticAccess.discoveryFor(it) },
-                    diagnosticSessionAccess = dev.redrain.cast.diagnostics.DiagnosticAccess.sessionAccess(this),
                     videoSurface = { format -> presentationSurface(format, run) })
                 checkNotNull(run.server).start()
                 run.port = checkNotNull(run.server).listeningPort

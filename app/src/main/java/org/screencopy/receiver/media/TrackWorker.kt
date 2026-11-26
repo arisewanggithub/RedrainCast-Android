@@ -18,6 +18,21 @@ abstract class TrackWorker(
     @Volatile internal var statisticsEnabled = false
     @Volatile internal var diagnosticSession = 0L
     @Volatile internal var diagnosticGeneration = 0
+    private val inputProgress = AudioInputProgress { values, at ->
+        if (track == 2) TelemetryRegistry.causal(diagnosticSession, CausalEvidence.Stage.INPUT,
+            diagnosticGeneration, *values, atNs = at)
+    }
+    private val workerProgress = AudioCausalProgress { stage, values, at ->
+        if (track == 2) TelemetryRegistry.causal(diagnosticSession, stage, diagnosticGeneration, *values, atNs = at)
+    }
+    private fun causalEnabled(): Boolean = track == 2 && TelemetryRegistry.has("receiver", diagnosticSession)
+    protected fun causalPhase(phase: Long) {
+        if (causalEnabled()) workerProgress.phase(phase, causalNowNs())
+    }
+    protected fun causalInterval(begin: Long, end: Long, cpu: Long, kind: Long) {
+        if (causalEnabled()) workerProgress.interval(begin, end, cpu, kind)
+    }
+    protected open fun causalNowNs(): Long = System.nanoTime()
     @Volatile protected var lastAudioAdmissionNs: Long? = null
         private set
     private fun diagnosticQueue(stage: DiagnosticStage, packet: AccessUnit) {
@@ -37,7 +52,10 @@ abstract class TrackWorker(
     protected val running = AtomicBoolean(true)
     private val thread = Thread({ runTrack() }, name)
 
-    fun start() = thread.start()
+    fun start() {
+        causalPhase(CausalEvidence.phases.indexOf("THREAD_START").toLong())
+        thread.start()
+    }
     protected open fun packetEvent(kind: String, packet: AccessUnit, queued: Int) {}
 
     internal fun queuedPackets(): Int = synchronized(monitor) { queue.size }
@@ -69,13 +87,15 @@ abstract class TrackWorker(
             null, maxBytes), admittedAt.firstOrNull())
     }
 
-    fun tryOffer(packet: AccessUnit): QueuePressure? = synchronized(monitor) {
+    fun tryOffer(packet: AccessUnit, durationUs: Long = -1): QueuePressure? = synchronized(monitor) {
         if (!running.get()) throw TrackStoppedException()
+        if (causalEnabled()) inputProgress.arrival(causalNowNs(), packet.ptsUs, durationUs)
         val pressure = budget.pressure(packet, track, 48)
         if (pressure == null) {
             budget.add(packet)
             queue.addLast(packet)
             if (track == 2) lastAudioAdmissionNs = System.nanoTime()
+            if (causalEnabled()) inputProgress.admitted(causalNowNs(), packet.ptsUs)
             packetEvent("admit", packet, queue.size)
             if (statisticsEnabled || diagnosticSession > 0) admittedAt.addLast(System.nanoTime())
             publishQueueStatistics()
@@ -85,10 +105,11 @@ abstract class TrackWorker(
         pressure
     }
 
-    fun offer(packet: AccessUnit) {
+    fun offer(packet: AccessUnit, durationUs: Long = -1) {
         val started = System.nanoTime()
         val deadline = started + TimeUnit.MILLISECONDS.toNanos(250)
         synchronized(monitor) {
+            if (causalEnabled()) inputProgress.arrival(causalNowNs(), packet.ptsUs, durationUs)
             while (true) {
                 if (!running.get()) throw TrackStoppedException()
                 val pressure = budget.pressure(packet, track, 48, TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - started))
@@ -96,6 +117,7 @@ abstract class TrackWorker(
                     budget.add(packet)
                     queue.addLast(packet)
                     if (track == 2) lastAudioAdmissionNs = System.nanoTime()
+                    if (causalEnabled()) inputProgress.admitted(causalNowNs(), packet.ptsUs)
                     packetEvent("admit", packet, queue.size)
                     if (statisticsEnabled || diagnosticSession > 0) admittedAt.addLast(System.nanoTime())
                     publishQueueStatistics()
@@ -116,6 +138,11 @@ abstract class TrackWorker(
         if (queue.isEmpty()) null else queue.removeFirst().also {
             if (admittedAt.isNotEmpty()) admittedAt.removeFirst()
             budget.remove()
+            if (causalEnabled()) {
+                val now = causalNowNs()
+                inputProgress.dequeued(now, it.ptsUs)
+                workerProgress.dequeue(now, it.ptsUs)
+            }
             publishQueueStatistics()
             diagnosticQueue(DiagnosticStage.COMPLETE, it)
             packetEvent("dequeue", it, queue.size)
@@ -125,11 +152,14 @@ abstract class TrackWorker(
 
     private fun runTrack() {
         try {
+            causalPhase(CausalEvidence.phases.indexOf("THREAD_PREPARE").toLong())
             prepareThread()
             while (running.get()) {
+                if (causalEnabled()) workerProgress.begin(causalNowNs())
                 TelemetryRegistry.evidence("receiver", diagnosticSession, track, diagnosticGeneration,
                     IncidentEvidence.Stage.WORKER_BEGIN)
                 step()
+                if (causalEnabled()) workerProgress.end(causalNowNs())
                 TelemetryRegistry.evidence("receiver", diagnosticSession, track, diagnosticGeneration,
                     IncidentEvidence.Stage.WORKER_END)
             }

@@ -36,7 +36,9 @@ object Wire {
     const val MAX_AUDIO = 256 * 1024
     const val MAX_CONTROL = 65536
 
-    fun read(input: InputStream, started: () -> Unit = {}): Message {
+    fun read(input: InputStream, started: () -> Unit = {}): Message = read(input, started) {}
+
+    fun read(input: InputStream, started: () -> Unit, received: (Type) -> Unit): Message {
         val first = input.read()
         if (first < 0) throw EOFException()
         started()
@@ -57,6 +59,7 @@ object Wire {
         validate(type, length, flags, session, track, generation, pts)
         val payload = ByteArray(length.toInt())
         stream.readFully(payload)
+        received(type)
         return Message(type, session, track, generation, pts, flags, payload).also {
             if (type != Type.VIDEO_FRAME && type != Type.AUDIO_PACKET) it.json()
         }

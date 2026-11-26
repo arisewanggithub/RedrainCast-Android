@@ -28,7 +28,7 @@ class ReceiverServerTest {
             Triple(capability, capability, true),
             Triple(null, null, false),
             Triple(capability, null, false),
-            Triple(dev.redrain.cast.diagnostics.SessionTelemetryProtocol.capability().put("version", 2), null, false),
+            Triple(dev.redrain.cast.diagnostics.SessionTelemetryProtocol.capability().put("version", 1), null, false),
             Triple(dev.redrain.cast.diagnostics.SessionTelemetryProtocol.capability().put("intervalMs", 2000), null, false),
             Triple(dev.redrain.cast.diagnostics.SessionTelemetryProtocol.capability().put("maxBatchBytes", 8191), null, false)
         )
@@ -49,7 +49,7 @@ class ReceiverServerTest {
                 assertEquals(expected, accept.json().has("sessionTelemetry"))
                 if (expected) {
                     val actual = accept.json().getJSONObject("sessionTelemetry")
-                    assertEquals(1, actual.getInt("version"))
+                    assertEquals(2, actual.getInt("version"))
                     assertEquals(1000, actual.getInt("intervalMs"))
                     assertEquals(8192, actual.getInt("maxBatchBytes"))
                 }
@@ -66,10 +66,10 @@ class ReceiverServerTest {
     }
 
     @Test fun futureTelemetryHelloStillAttachesAndRoutesSessionWithoutTelemetry() {
-        ReceiverServer.forProtocolTests("Receiver").use { server ->
+        for (version in listOf(1, 3)) ReceiverServer.forProtocolTests("Receiver").use { server ->
             server.start()
             connect(server).use { peer ->
-                val future = JSONObject().put("version", 2)
+                val future = JSONObject().put("version", version)
                     .put("batching", JSONObject().put("mode", "new"))
                 val response = hello(peer, helloPayload().put("sessionTelemetry", future))
                 assertFalse(response.json().has("sessionTelemetry"))

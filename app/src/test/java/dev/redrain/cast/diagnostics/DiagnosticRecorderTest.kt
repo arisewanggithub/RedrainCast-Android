@@ -5,6 +5,7 @@ import org.junit.Assert.*
 import org.junit.Test
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicReference
 
 class DiagnosticRecorderTest {
@@ -71,6 +72,128 @@ class DiagnosticRecorderTest {
         val evicted = retention.getJSONObject("routine").getString("count").toLong() +
             retention.getJSONObject("critical").getString("count").toLong()
         assertEquals(response.getString("evictedAfterRetention").toLong(), evicted)
+    }
+    @Test fun admittedReceiverStartsBoundOnceWithOriginalLocalDeadlineAndFencedOwner() {
+        recorder.revoke()
+        val owner = AtomicBoolean(true)
+        val expiry = now + 500_000_000L
+        val started = recorder.startAdmittedReceiver(77, setOf("session"), expiry, 100, owner)
+        val id = started.getString("captureId")
+        assertEquals("$expiry", started.getString("expiresNs"))
+        recorder.sessionStarted("receiver", 77)
+        val events = allRecords(id)
+        assertEquals(1, events.count { it.getString("kind") == "SESSION_BOUND" })
+        assertEquals(1, events.count {
+            it.getString("kind") == "SESSION" && it.getJSONObject("data").optString("stage") == "started"
+        })
+        assertTrue(events.all { it.getString("role") == "receiver" && it.getString("session") == "77" })
+        owner.set(false)
+        assertFalse(recorder.enabled("receiver", 77, DiagnosticKind.SESSION))
+        recorder.observe("receiver", 77, DiagnosticKind.SESSION, DiagnosticStage.CONFIG)
+        recorder.finishAdmittedReceiver(id, "retired")
+        assertFalse(allRecords(id).any { it.getJSONObject("data").optString("stage") == "config" })
+        recorder.discardAdmittedReceiver(id)
+        recorder.sessionEnded("receiver", 77)
+        error("CAPTURE_NOT_FOUND") { recorder.fetch(id, 0, 32) }
+    }
+
+    @Test fun invalidAdmittedReceiverStartDoesNotRegisterOrAllocate() {
+        val owner = AtomicBoolean(false)
+        error("SESSION_ENDED") {
+            recorder.startAdmittedReceiver(77, setOf("session"), now + 500_000_000L, 100, owner)
+        }
+        owner.set(true)
+        error("INVALID_ARGUMENT") {
+            recorder.startAdmittedReceiver(77, setOf("video.timing"), now + 500_000_000L, 100, owner)
+        }
+        error("INVALID_ARGUMENT") {
+            recorder.startAdmittedReceiver(77, setOf("session"), now, 100, owner)
+        }
+        val started = recorder.startAdmittedReceiver(77, setOf("session"), now + 500_000_000L, 100, owner)
+        assertTrue(recorder.collecting)
+        recorder.finishAdmittedReceiver(started.getString("captureId"), "retired")
+        recorder.discardAdmittedReceiver(started.getString("captureId"))
+        recorder.sessionEnded("receiver", 77)
+    }
+    @Test fun retiredProxyGateCannotFenceAReplacementCapture() {
+        val owner = AtomicBoolean(true)
+        val id = recorder.startAdmittedReceiver(77, setOf("session"), now + 500_000_000L, 100, owner)
+            .getString("captureId")
+        recorder.finishAdmittedReceiver(id, "retired")
+        recorder.clear(id)
+        recorder.sessionEnded("receiver", 77)
+        recorder.grantConsent()
+        val next = recorder.start("sender", null, setOf("session"), 1000, 100).getString("captureId")
+        owner.set(false)
+        assertTrue(recorder.collecting)
+        recorder.end(next)
+    }
+    @Test fun receiverLaneCanShortenButNeverRenewAdmittedLease() {
+        val owner = AtomicBoolean(true)
+        val expires = now + 5_000_000_000L
+        val id = recorder.startAdmittedReceiver(77, setOf("session"), expires, 100, owner).getString("captureId")
+        now += 1_000_000_000L
+        assertEquals(expires, recorder.shortenAdmittedReceiver(id, 5000, now))
+        assertEquals(now + 500_000_000L, recorder.shortenAdmittedReceiver(id, 500, now))
+        now += 500_000_000L
+        error("SESSION_ENDED") { recorder.shortenAdmittedReceiver(id, 1000, now) }
+        assertEquals("lease_expired", recorder.end(id).getString("reason"))
+        recorder.discardAdmittedReceiver(id)
+        recorder.sessionEnded("receiver", 77)
+    }
+    @Test fun laneLeaseUsesReceiptTimeDespiteDelayedProcessingAndNeverExtendsShorterDeadline() {
+        val owner = AtomicBoolean(true)
+        val initialExpiry = now + 5_000_000_000L
+        val id = recorder.startAdmittedReceiver(77, setOf("session"), initialExpiry, 100, owner)
+            .getString("captureId")
+        val receipt = now + 100_000_000L
+        now = receipt + 250_000_000L
+        error("INVALID_ARGUMENT") { recorder.shortenAdmittedReceiver(id, 1000, Long.MAX_VALUE) }
+        assertEquals("$initialExpiry", recorder.status().getString("expiresNs"))
+        assertEquals(receipt + 1_000_000_000L, recorder.shortenAdmittedReceiver(id, 1000, receipt))
+        assertEquals(receipt + 1_000_000_000L, recorder.shortenAdmittedReceiver(id, 5000, now))
+        now = receipt + 1_000_000_000L
+        error("SESSION_ENDED") { recorder.shortenAdmittedReceiver(id, 5000, now) }
+        recorder.discardAdmittedReceiver(id)
+        recorder.sessionEnded("receiver", 77)
+    }
+
+    @Test fun laneLeaseAlreadyExpiredAtProcessingFailsClosed() {
+        val owner = AtomicBoolean(true)
+        val id = recorder.startAdmittedReceiver(77, setOf("session"), now + 5_000_000_000L, 100, owner)
+            .getString("captureId")
+        val receipt = now
+        now += 500_000_000L
+        error("SESSION_ENDED") { recorder.shortenAdmittedReceiver(id, 500, receipt) }
+        assertEquals("lease_expired", recorder.end(id).getString("reason"))
+        recorder.discardAdmittedReceiver(id)
+        recorder.sessionEnded("receiver", 77)
+    }
+    @Test fun claimingNextSenderIsCaptureFencedAndNeverRebinds() {
+        val id = recorder.start("sender", null, setOf("session"), 1000, 100).getString("captureId")
+        assertFalse(recorder.claimNextSender("old-capture", 77))
+        assertTrue(recorder.claimNextSender(id, 77))
+        assertFalse(recorder.claimNextSender(id, 78))
+        val bound = allRecords(id).filter { it.getString("kind") == "SESSION_BOUND" }
+        assertEquals(1, bound.size)
+        assertEquals("77", bound.single().getString("session"))
+        recorder.sessionEnded("sender", 77)
+        recorder.clear(id)
+        val expired = recorder.start("sender", null, setOf("session"), 1000, 100).getString("captureId")
+        now += 1_000_000_000L
+        assertFalse(recorder.claimNextSender(expired, 78))
+        assertEquals("lease_expired", recorder.end(expired).getString("reason"))
+    }
+    @Test fun stagedUnboundLifecycleRecordKeepsItsOriginalIdentityAfterBinding() {
+        val id = recorder.start("sender", null, setOf("session"), 1000, 100).getString("captureId")
+        val field = DiagnosticRecorder::class.java.getDeclaredField("capture").apply { isAccessible = true }
+        val capture = field.get(recorder) as DiagnosticRecorder.Capture
+        capture.session = 77
+        val event = records(id).getJSONObject(0)
+        assertEquals("CAPTURE_STARTED", event.getString("kind"))
+        assertFalse(event.has("role"))
+        assertFalse(event.has("session"))
+        recorder.end(id)
     }
     @Test fun noHistoryOrClockReadsBeforeStartAndOnlySelectedGroups() {
         var clocks = 0
@@ -463,23 +586,13 @@ class DiagnosticRecorderTest {
     @Test fun frozenFetchDistinguishesUnpublishedReservationAndDeliversFinalTailAfterResume() {
         var id = ""
         var endedNs = ""
-        val protocol = DiagnosticProtocol(recorder, { now })
-        var request = 0
-        fun command(op: String, args: JSONObject = JSONObject()): JSONObject {
-            val response = protocol.handle(JSONObject().put("v", 1).put("id", "r${++request}")
-                .put("op", op).put("args", args).toString().toByteArray())
-            assertTrue(response.toString(), response.getBoolean("ok"))
-            assertTrue(response.toString().toByteArray().size <= 16384)
-            return response.getJSONObject("result")
-        }
-        fun fetch() = command("FETCH", JSONObject().put("captureId", id).put("afterSeq", "2").put("limit", 32))
-        command("HELLO")
+        fun fetch() = recorder.fetch(id, 2, 32)
         withReservedProducer { capture ->
             id = capture
             val operation = recorder.operation("receiver", 73, DiagnosticKind.AUDIO_OUTPUT)
             recorder.observe("receiver", 73, DiagnosticKind.AUDIO_OUTPUT, DiagnosticStage.BEGIN,
                 operation = operation, point = DiagnosticPoint.READ)
-            endedNs = command("END", JSONObject().put("captureId", id)).getString("endedNs")
+            endedNs = recorder.end(id).getString("endedNs")
             repeat(3) {
                 val page = fetch()
                 assertEquals(0, page.getJSONArray("records").length())

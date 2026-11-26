@@ -60,7 +60,8 @@ internal class AudioPosition(
     private val bufferFrames: Int,
     private val nanoTime: () -> Long,
     private val timestamp: () -> FrameTimestamp?,
-    private val playbackHead: () -> Int
+    private val playbackHead: () -> Int,
+    private val checkpoint: (Int) -> Unit = {}
 ) {
     internal companion object {
         const val TIMESTAMP_VALID_NS = 100_000_000L
@@ -83,10 +84,22 @@ internal class AudioPosition(
 
     @Synchronized fun speed(value: Float) { speed = value }
 
-    @Synchronized fun current(): AudioOutputTiming {
+    fun current(): AudioOutputTiming {
+        checkpoint(dev.redrain.cast.diagnostics.CausalEvidence.Output.POSITION_ENTER.ordinal)
+        return synchronized(this) {
+            checkpoint(dev.redrain.cast.diagnostics.CausalEvidence.Output.POSITION_LOCKED.ordinal)
+            currentLocked()
+        }
+    }
+
+    private fun currentLocked(): AudioOutputTiming {
         // Android requires the presentation counter to be read before the consumption counter.
+        checkpoint(dev.redrain.cast.diagnostics.CausalEvidence.Output.TIMESTAMP_BEGIN.ordinal)
         val stamp = timestamp()
+        checkpoint(dev.redrain.cast.diagnostics.CausalEvidence.Output.TIMESTAMP_END.ordinal)
+        checkpoint(dev.redrain.cast.diagnostics.CausalEvidence.Output.HEAD_BEGIN.ordinal)
         val head = playbackHead().toLong() and 0xffffffffL
+        checkpoint(dev.redrain.cast.diagnostics.CausalEvidence.Output.HEAD_END.ordinal)
         val now = nanoTime()
         ageUs = stamp?.let { (now - it.nanoTime) / 1000 }
         val delta = (head - previousHead) and 0xffffffffL

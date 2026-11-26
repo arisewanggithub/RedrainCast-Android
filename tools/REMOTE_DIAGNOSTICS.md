@@ -1,4 +1,60 @@
-# Paired Android remote diagnostics
+# Paired Android remote diagnostics (v2)
+
+The [v2 contract](../protocol/REMOTE_DIAGNOSTICS.md) uses one collector
+connection to the sender and no standalone receiver diagnostic endpoint.
+Both peers must support the proxy capability. It does not install an app or
+remotely enable consent.
+
+1. Enable **Allow unpaired LAN diagnostics** on the sender before casting.
+   The traffic is plaintext and unauthenticated; use only a trusted LAN.
+2. Obtain the sender endpoint from its settings or query its known private
+   IPv4 address (one unicast UDP query, not a scan):
+
+   ```powershell
+   python -B .\tools\collect-diagnostics.py --discover-sender 192.168.1.135
+   ```
+
+3. Before starting the cast, arm a paired capture:
+
+   ```powershell
+   python -B .\tools\collect-diagnostics.py --lan `
+       --sender PHONE_HOST:PHONE_PORT --duration 180 --output .\diagnostic-capture-001
+   ```
+
+   Start the cast when prompted. The lease starts at START, including waiting
+   and setup. The receiver bootstrap must be retained before media begins.
+   Optional strict flag lists use `--sender-flags` and `--receiver-flags`;
+   receiver `video.timing` requires `video.progress`.
+4. The collector writes `paired.jsonl` once and never overwrites it. It reports
+   sender and receiver records with independent cursors, source identity,
+   loss, and terminal state. Full bootstrap, selected flags and detailed terminal
+   outcomes are saved in `status` lines as soon as available and after freezing.
+   Setup failures include a sanitized code and sender-local or receiver-control
+   provenance in the final `status`; receiver coverage is not implied.
+   Partial output remains after errors or Ctrl+C.
+   A missing or truncated receiver terminal is an explicit collection failure,
+   not a complete paired capture. Retained frozen pages are drained with bounded
+   pacing and a 120-second deadline.
+   STATUS may describe an admitted but unconfirmed receiver outcome using
+   `confirmed:false` and null receiver time and reason; it is reconstructed by
+   the sender, not receiver evidence or confirmation of cleanup.
+
+There is no `--receiver`, `--follow-receiver`, receiver discovery, existing
+session attach, TLS, or v1 fallback. See the contract for source identity and
+depth limits. Unit tests do not establish device overhead or display timing.
+
+```powershell
+python -B .\tools\diagnostics-test.py
+python -B .\tools\diagnostics-v2-test.py
+```
+
+The archived guide below contains event interpretation details but its v1
+transport, commands, examples, validation claims, and limits are obsolete.
+
+<details>
+<summary>Archived v1 guide (not current collection instructions)</summary>
+
+# Paired Android remote diagnostics (archived v1)
 
 The [v1 control contract](../protocol/REMOTE_DIAGNOSTICS.md) defines a separate
 opt-in diagnostic channel. This collector does not install an application,
@@ -6,110 +62,9 @@ enable diagnostics remotely or change casting configuration. It requires an
 Android build implementing the service; earlier v0.4.19 releases do not
 implement it.
 
-## Capture
-
-To find receivers with diagnostics enabled, listen to existing LAN discovery:
-
-```powershell
-python -B .\tools\collect-diagnostics.py --discover --discover-seconds 5
-```
-
-This prints the diagnostic endpoint advertised by each receiver, including busy
-receivers. It does not probe ports, start collection or discover sender services.
-Advertisements are untrusted. Disabled services are omitted, and
-old builds without the diagnostic advertisement cannot be found this way.
-Discovery listens on UDP 27183; failure to bind is reported explicitly and no
-other discovery service is stopped. Local firewall/LAN policy may block packets.
-
-For an already-casting sender whose startup log is no longer available, query
-its known private LAN IPv4 address (updated builds only):
-
-```powershell
-python -B .\tools\collect-diagnostics.py --discover-sender 192.168.1.135 --discover-seconds 5
-```
-
-This sends **one** 256-byte unicast query to UDP **27184**, not a port scan or
-broadcast. It prints only the current consenting listener's TCP endpoint. It
-does not open settings, toggle consent, restart the app/cast, connect TCP or
-start collection. Use that endpoint as `--sender` below. The responder is owned
-by the diagnostic listener, not the Activity or casting UI, and remains usable
-while casting/backgrounded. Process exit, consent/permission/network revocation
-and listener closure remove it. A new process requires fresh consent; no endpoint
-or consent file is persisted. Receiver session delegation retains only its
-existing bounded frozen grace and is revoked on owner replacement.
-
-The nonce/source-checked response is still **unauthenticated**: use a trusted
-LAN. A timeout can mean an old build, disabled consent, a changed network or
-firewall policy; it is not permission to probe other ports. A busy diagnostic
-TCP collector does not prevent this read-only query. UDP 27184 deliberately
-does not share the Activity-owned receiver-advertisement socket on UDP 27183.
-There is no debug/run-as dependency; the same path is compiled into optimized
-release builds and tested by the existing collector/JVM/assembly CI workflow.
-
-1. Enable remote diagnostics on the sender before
-   starting the cast. Accept its LAN-access warning. On a compatible receiver,
-   the admitted cast automatically opens session-scoped diagnostics without
-   changing projector settings. Both devices need the updated build.
-   The receiver endpoint may become discoverable after cast admission when
-   the advertisement's source address matches its diagnostic bind address.
-   Alternatively, standalone receiver-local diagnostics can still be enabled.
-   The playback statistics panel is optional and independent.
-2. Run the collector with Python 3.10 or newer, following the session selection
-   instructions in step 4:
-
-   ```powershell
-   python -B .\tools\collect-diagnostics.py --lan `
-       --sender PHONE_HOST:PHONE_PORT `
-       --follow-receiver `
-       --duration 180 --output .\diagnostic-capture-001
-   ```
-
-3. LAN mode requires no pairing code or fingerprint. It is intentionally
-   plaintext and unauthenticated: anyone on the reachable LAN can access the
-   permitted diagnostic metadata, occupy the one collector slot, or impersonate
-   a diagnostic service. Use only a trusted LAN and disable access when finished.
-4. For sender-delegated access, start the cast first and use `--follow-receiver`.
-   It asks the sender's diagnostic TCP `CONNECTIONS` command for its current
-   in-memory receiver endpoint/session, connects both listeners, checks receiver
-   HELLO scope and explicitly STARTs both exact-session captures. No projector
-   endpoint, receiver UDP packets or settings UI is needed. The receiver's HELLO scope automatically
-   selects that exact admitted session; it rejects other/next-session requests.
-   If the cast uses a different receiver interface or IPv6, the receiver hint is
-   unavailable; casting continues, but follow-receiver cannot attach.
-   For standalone local diagnostics, wait for both captures to become active
-   before starting a new cast, or pass explicit existing session IDs.
-5. Captures end on session end or after the requested duration, whichever comes
-   first. Ctrl+C closes connections and ends collection; partial local evidence
-   is retained. The collector does not automatically retry, reconnect or START
-   another capture after failure.
-
-Use `--sender-session DECIMAL_SESSION_ID` / `--receiver-session ...` to attach to
-an existing session. Session IDs are protocol IDs, not Android process IDs.
-Either device can be collected alone by omitting the other role.
-Manual `--receiver PROJECTOR_HOST:PROJECTOR_PORT` remains available, but cannot
-be combined with `--follow-receiver`. The latter requires `--lan --sender`;
-`--sender-session` can optionally pin the expected cast. Missing/legacy,
-unsupported, malformed, frozen, expired or changed-session information fails
-explicitly without silently scanning, retrying or capturing the next session.
-
-Prefer `--discover-sender` to bootstrap the sender during a cast. Settings are
-intentionally unavailable while a casting role is active. The local display
-before casting, or an ordinary startup event still present in already authorized
-ADB logs, remain optional alternatives:
-
-```powershell
-& "$env:ANDROID_HOME\platform-tools\adb.exe" -s PHONE_SERIAL logcat -d -s RemoteDiagnostics:I |
-    Select-String 'DIAGNOSTIC_LISTENER_STARTED.*role=local'
-```
-
-Use only an event from the current enabled process; it may already have rolled
-out of logcat, so logs are not durable discovery. Disabling/re-enabling changes
-the ephemeral TCP port. Neither the new query nor a new APK can repair discovery
-in an already-running old process that lacks the responder. If its endpoint is
-unknown and its startup log is gone, there is no supported non-disruptive
-bootstrap for that old process. Do not stop a live cast to obtain it. Receiver
-broadcast discovery alone still does not discover senders. Connection hints
-remain process-only and no tokens/secrets are logged.
+The historical two-listener capture procedure has been removed. The current
+collector has one sender connection and must be armed before the cast; use the
+v2 instructions above.
 
 The default flags negotiate the advertised audio investigation surfaces,
 `video.progress`, the optional receiver `video.timing` extension, and application
@@ -139,11 +94,10 @@ producer is an explicit collection error, not a successful truncated capture.
 
 ## Evidence and limits
 
-For a focused paired video capture, explicitly request
+For a focused paired video capture, use the v2 command above with
 `--sender-flags session,recovery,video.progress,transport.health` and
-`--receiver-flags session,recovery,video.progress,video.timing,transport.health` with the
-existing `--follow-receiver` flow. This fails on older peers lacking video;
-omit the explicit flag lists to negotiate backward-compatible defaults.
+`--receiver-flags session,recovery,video.progress,video.timing,transport.health`.
+Unsupported explicit flags fail rather than silently narrowing coverage.
 
 `VIDEO_PROGRESS` snapshots distinguish encoder output, source filtering,
 sender queue admission/discard/handoff, send start/return/failure, receiver
@@ -201,22 +155,19 @@ Frozen draining is capped at 5,120 records / 14,385,152 record bytes, covering
 The CI collector integration runs after the JVM fixture generator with
 `DIAGNOSTICS_REQUIRE_FIXTURE=1`; standalone Python tests may skip absent fixtures.
 
-Each device writes its own JSONL file with selected flags, process clock ID,
-start/end clock samples, capture identity, events and retention/drop counters.
+The v2 collector writes a single paired JSONL file with selected flags, process
+clock IDs, clock samples, capture identities, events and retention/drop counters.
 Secrets, endpoints and certificate material are not written into the evidence.
 Keep the files private: timing and session metadata can still be sensitive.
 There is no automatic upload or sharing.
 
 `--lan` is an explicit client opt-in, not an automatic downgrade after failed
-authentication. It sends HELLO, then the bounded read-only diagnostic commands.
-The collector retains pinned TLS support for the earlier prototype only when
-`--lan` is omitted; the current LAN-mode Android service does not implement that
-prototype handshake. Do not interpret LAN capture output as authenticated device
-identity. No pairing secrets or certificates are needed for LAN mode.
+authentication. It sends HELLO, then the bounded diagnostic commands. The v2
+collector has no TLS fallback; LAN output is not authenticated device identity.
 
-Collection is independent on each device; a failed connection makes the paired
-command fail explicitly and closes the other connection. Already written
-partial evidence is retained, not presented as a complete paired capture.
+The sender proxies receiver evidence; a missing lane or incomplete receiver
+tail fails the paired command explicitly. Already written partial evidence is
+retained, not presented as a complete paired capture.
 The output contains clock-offset bounds, not an assumption of equal device
 clocks. Compare beginning/end bounds to assess uncertainty and drift.
 
@@ -257,7 +208,6 @@ devices are contacted by these tests.
 Unit/loopback success does not establish Android integration or physical
 projector performance. Device acceptance must also verify the app's consent
 gates, matching service schema and that diagnostics do not perturb playback.
-The app's `DiagnosticListenerTest` additionally runs this Python collector
-against simultaneous actual JVM sender and delegated receiver listeners,
-reading the receiver endpoint and exact session from sender TCP CONNECTIONS
-using `--follow-receiver`, with no explicit receiver or session argument.
+Current `DiagnosticListenerTest` runs this Python collector against the sender's
+v2 listener; receiver evidence arrives through the sender-owned proxy lane.
+</details>

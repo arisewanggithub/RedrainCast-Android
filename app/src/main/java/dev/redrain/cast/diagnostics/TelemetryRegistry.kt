@@ -10,7 +10,7 @@ internal object TelemetryRegistry {
         val owner: Any,
         val state: (Int, TelemetryRow) -> Unit,
         val operation: (Int, TelemetryRow, Boolean) -> Unit,
-        val event: (TelemetryRow, Boolean, Boolean) -> Unit
+        val event: (TelemetryRow, Boolean, Boolean, Int?) -> Unit
     ) {
         val sampled = AtomicLongArray(64)
         fun sample(slot: Int): Boolean {
@@ -28,6 +28,21 @@ internal object TelemetryRegistry {
 
     fun beginReceiver(session: Long, owner: ReceiverTelemetrySession) {
         receiver.set(Sink(session, owner, owner::state, owner::operation, owner::event))
+        causal(session, CausalEvidence.Stage.BUILD, 0,
+            dev.redrain.cast.BuildConfig.VERSION_CODE.toLong(), -1, CausalEvidence.LAYOUT)
+    }
+
+    fun causal(session: Long, stage: CausalEvidence.Stage, generation: Int, vararg values: Long,
+               atNs: Long = System.nanoTime()) {
+        val owner = find("receiver", session)?.owner as? ReceiverTelemetrySession ?: return
+        if (generation < 0) return
+        owner.causal(TelemetryRow(CausalEvidence.KIND, stage.ordinal, 2, generation,
+            atNs.coerceAtLeast(0), 0, values.toList()))
+    }
+
+    fun freezeReceiver(session: Long, generation: Int) {
+        (find("receiver", session)?.owner as? ReceiverTelemetrySession)
+            ?.freezeCausal(generation, System.nanoTime().coerceAtLeast(0))
     }
 
     fun end(role: String, owner: Any?) {
@@ -96,16 +111,16 @@ internal object TelemetryRegistry {
                 listOf(bytes, cutoff, reason.ordinal.toLong(), point.ordinal.toLong(), operation))
             if (sample) sink.state(checkNotNull(index), value)
             if (critical) sink.event(value, stage == DiagnosticStage.PRESSURE,
-                stage == DiagnosticStage.FAILED && (kind == DiagnosticKind.SESSION || kind == DiagnosticKind.RECOVERY))
+                stage == DiagnosticStage.FAILED && (kind == DiagnosticKind.SESSION || kind == DiagnosticKind.RECOVERY), null)
         }
     }
 
     fun event(role: String, session: Long, kind: Int, stage: Int, track: Int, generation: Int,
               value: Long = 0, detail: List<Long> = emptyList(), pressure: Boolean = false,
-              failure: Boolean = false) {
+              failure: Boolean = false, causalGeneration: Int? = null) {
         val sink = find(role, session) ?: return
-        if (track !in 0..2 || generation < 0) return
-        sink.event(row(kind, stage, track, generation, value, detail), pressure, failure)
+        if (track !in 0..2 || generation < 0 || causalGeneration != null && causalGeneration < 0) return
+        sink.event(row(kind, stage, track, generation, value, detail), pressure, failure, causalGeneration)
     }
 
     fun state(role: String, session: Long, slot: Int, kind: Int, stage: Int, track: Int,

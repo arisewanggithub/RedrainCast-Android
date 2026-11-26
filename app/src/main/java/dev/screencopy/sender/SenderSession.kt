@@ -12,6 +12,43 @@ import java.util.concurrent.atomic.AtomicBoolean
 import org.screencopy.receiver.protocol.ProtocolException
 import org.screencopy.receiver.protocol.StreamRecoveryProtocol
 
+internal fun setupFailure(error: Exception, setupTimedOut: Boolean): DiagnosticArmRegistry.SetupFailure {
+    val cause = (error as? DiagnosticProxySetupException)?.cause as? Exception ?: error
+    val remote = cause as? ReceiverReportedFailure
+    val timeout = cause is java.net.SocketTimeoutException || SessionOutcome.errorCode(cause) == "TIMEOUT" ||
+        (setupTimedOut && cause is java.net.SocketException)
+    val code = if (remote != null) remote.code else if (timeout) "TIMEOUT" else SessionOutcome.errorCode(cause)
+    val reason = when {
+        remote != null -> DiagnosticArmRegistry.SetupReason.receiver_reported
+        timeout -> DiagnosticArmRegistry.SetupReason.timeout
+        cause is java.io.EOFException -> DiagnosticArmRegistry.SetupReason.eof
+        cause is java.net.ConnectException || cause is java.net.NoRouteToHostException ||
+            cause is java.net.UnknownHostException -> DiagnosticArmRegistry.SetupReason.connect
+        else -> DiagnosticArmRegistry.SetupReason.setup
+    }
+    return DiagnosticArmRegistry.SetupFailure(DiagnosticArmRegistry.SetupCode.valueOf(code),
+        if (remote != null) DiagnosticArmRegistry.SetupProvenance.receiver_control
+        else DiagnosticArmRegistry.SetupProvenance.sender_local, reason)
+}
+
+internal fun finishSenderDiagnostic(
+    recorder: DiagnosticRecorder, arms: DiagnosticArmRegistry, claim: DiagnosticArmRegistry.Claim?,
+    session: Long, failed: Boolean, retire: () -> Unit, dispatch: (() -> Unit) -> Unit
+) {
+    recorder.observe("sender", session, DiagnosticKind.SESSION,
+        if (failed) DiagnosticStage.FAILED else DiagnosticStage.ENDED,
+        reason = if (failed) DiagnosticReason.FAILURE else DiagnosticReason.STOPPED)
+    recorder.sessionEnded("sender", session)
+    if (claim != null) {
+        claim.senderFinished.set(true)
+        retire()
+        dispatch {
+            try { arms.senderEnded(claim) }
+            catch (_: DiagnosticError) { /* Revocation already fenced this arm. */ }
+        }
+    }
+}
+
 /**
  * One consent-backed cast. Assign [projectionOwner] before running on a worker thread.
  * The service owns that projection across size switches and closes it after [finished].
@@ -20,7 +57,10 @@ import org.screencopy.receiver.protocol.StreamRecoveryProtocol
  */
 class SenderSession internal constructor(
     private val context: Context, settings: Settings, private val receiver: ReceiverTarget,
-    private val status: (String) -> Unit, private val finished: () -> Unit, private val diagnostic: (String) -> Unit
+    private val status: (String) -> Unit, private val finished: () -> Unit, private val diagnostic: (String) -> Unit,
+    private val diagnosticSetupTimeoutNs: Long = 5_000_000_000L,
+    private val diagnosticBeforeReadyCommit: () -> Unit = {},
+    private val diagnosticAfterReadyCheck: () -> Unit = {}
 ) : Runnable, ScrcpyAdapter.Sink {
     constructor(context: Context, settings: Settings, receiver: ReceiverTarget,
                 status: (String) -> Unit, finished: () -> Unit) :
@@ -61,13 +101,14 @@ class SenderSession internal constructor(
     @Volatile private var recovery: StreamRecoverySender? = null
     @Volatile private var telemetryNegotiated = false
     @Volatile private var telemetry: SenderTelemetrySession? = null
+    @Volatile private var proxyClaim: DiagnosticArmRegistry.Claim? = null
+    @Volatile private var proxyClient: DiagnosticProxyClient? = null
+    @Volatile private var proxyEstablished = false
     var projectionOwner: ProjectionOwner? = null
     private val stopping get() = outcome.stopping
     @Volatile private var requestSent = false
     @Volatile private var acceptedSession = false
     private var receiverReaderStarted = false
-    private var diagnosticRevocation: AutoCloseable? = null
-    private val diagnosticRevoked = AtomicBoolean()
     @Volatile private var remoteStop = false
     @Volatile private var closing = false
     @Volatile private var mediaRetiring = false
@@ -97,7 +138,15 @@ class SenderSession internal constructor(
         return true
     }
     @Synchronized private fun requestStop() {
-        if (!outcome.requestStop()) return
+        val committed = synchronized(outcomePublication) {
+            outcome.requestStop { proxyClaim?.commitTerminal(now()) }
+        }
+        if (!committed) return
+        if (!proxyEstablished) {
+            val client = proxyClient
+            if (client != null) try { timer.execute { client.cancel("startup_cancelled") } }
+            catch (_: java.util.concurrent.RejectedExecutionException) { }
+        }
         trace.mark(SessionStopTrace.Stage.REQUESTED)
         status("Stopping")
         queueTerminal()
@@ -118,7 +167,10 @@ class SenderSession internal constructor(
         val classified = if (origin == SessionOutcome.Origin.CAPTURE && error !is SenderProtocolException &&
             SessionOutcome.errorCode(error) == "PROTOCOL") SenderProtocolException(CaptureProtocolFailure.unknown(error), error) else error
         val retained = synchronized(outcomePublication) {
-            outcome.record(classified, origin, closing).also { accepted ->
+            outcome.record(classified, origin, closing, commit = {
+                if (origin != SessionOutcome.Origin.RECEIVER_READ)
+                    proxyClaim?.commitTerminal(now())
+            }).also { accepted ->
                 if (accepted) {
                     TelemetryRegistry.event("sender", session, DiagnosticKind.SESSION.ordinal + 1,
                         DiagnosticStage.FAILED.ordinal, (classified as? RecoveryDeadlineException)?.track ?: 0,
@@ -205,10 +257,13 @@ class SenderSession internal constructor(
     }
 
     override fun run() {
-        DiagnosticAccess.connections.begin(session, receiver.host, requested = false, supported = false)
-        RemoteDiagnostics.recorder.sessionStarted("sender", session)
         mux.diagnosticSession = session
+        var setupStage = "hello"
+        val setupTimedOut = AtomicBoolean()
         try {
+            val armed = DiagnosticAccess.arms.claim(session)
+            proxyClaim = armed
+            if (armed == null) RemoteDiagnostics.recorder.sessionStarted("sender", session)
             trace.sessionStarted(session)
             if (dev.redrain.cast.BuildConfig.DEBUG &&
                 android.util.Log.isLoggable("RedrainVideoTrace", android.util.Log.DEBUG)) {
@@ -224,8 +279,15 @@ class SenderSession internal constructor(
             val owner = projectionOwner ?: throw IOException("CAPTURE_FAILED: screen-sharing consent is required")
             phase("ConnectingReceiver", SessionStopTrace.Phase.CONNECTING)
             val connected = ReceiverLink(receiver).also { link = it }
+            if (armed != null) timer.scheduleWithFixedDelay({
+                if (!armed.valid.get()) {
+                    proxyClient?.cancel("capture_ended")
+                    if (!armed.bootstrapAccepted.get()) connected.close()
+                }
+            }, 0, 100, TimeUnit.MILLISECONDS)
             check()
-            connected.connect()
+            if (armed == null) connected.connect()
+            else connected.connectArmed(10_000, armed) { DiagnosticAccess.arms.remainingMs(armed) }
             lastIncoming = now()
             trace.phase(SessionStopTrace.Phase.CAPABILITIES)
             connected.requireVideoRotation()
@@ -246,52 +308,31 @@ class SenderSession internal constructor(
             if (statisticsUnavailable)
                 diagnostic("event=RECEIVER_OPTION_UNAVAILABLE option=playbackStats nonfatal=true")
             val request = org.screencopy.receiver.protocol.ReceiverOptionProtocol.apply(settings.request(), options)
-            val diagnosticConsentGeneration = DiagnosticAccess.consentGeneration
-            val delegateDiagnostics = DiagnosticAccess.enabled
-            DiagnosticAccess.connections.begin(session, connected.connectedHost,
-                delegateDiagnostics, connected.delegatedDiagnostics)
-            DiagnosticAccess.receiverSession(if (delegateDiagnostics) session else null)
-            DiagnosticAccess.receiverStatus(if (!delegateDiagnostics) "Not requested" else
-                if (connected.delegatedDiagnostics) "starting" else "unsupported")
-            if (delegateDiagnostics && connected.delegatedDiagnostics)
-                request.put("diagnostic", org.screencopy.receiver.protocol.DiagnosticDelegation.request(true))
             connected.selectSessionTelemetry(request)
+            if (armed != null) connected.selectDiagnosticProxy(request, armed)
+            val proxyDeadline = if (armed != null) minOf(now() + diagnosticSetupTimeoutNs, phaseDeadline, armed.expiresNs) else 0
+            setupStage = "request"
+            val setupTimeout = if (armed != null) timer.schedule({
+                val expired = synchronized(outcomePublication) {
+                    if (armed.bootstrapAccepted.get()) false else {
+                        setupTimedOut.set(true)
+                        true
+                    }
+                }
+                if (expired) {
+                    proxyClient?.cancel("setup_timeout")
+                    connected.close()
+                }
+            }, (proxyDeadline - now()).coerceAtLeast(0), TimeUnit.NANOSECONDS) else null
             connected.send(Wire.control(Wire.SESSION_REQUEST, session, request))
             worker("receiver-control-write") { writeLoop(0) }
             requestSent = true
-            if (delegateDiagnostics && connected.delegatedDiagnostics) {
-                diagnosticRevocation = DiagnosticAccess.onDisabled(diagnosticConsentGeneration) {
-                    DiagnosticAccess.connections.revoke(session)
-                    if (diagnosticRevoked.compareAndSet(false, true) && !stopping && !closing) {
-                        try {
-                            DiagnosticAccess.receiverStatus("revocation requested")
-                            timer.execute {
-                                try {
-                                    mux.offer(Wire.control(Wire.STATUS, session, Wire.obj("state" to "diagnostics",
-                                        "message" to "disabled", "diagnostic" to
-                                            org.screencopy.receiver.protocol.DiagnosticDelegation.request(false))))
-                                } catch (_: IOException) {
-                                    DiagnosticAccess.receiverStatus("Revocation delivery failed; closing cast transport")
-                                    link?.close()
-                                }
-                            }
-                        } catch (_: java.util.concurrent.RejectedExecutionException) {
-                            DiagnosticAccess.receiverStatus("Session teardown in progress")
-                        }
-                    }
-                }
-            }
             if (stopping) queueTerminal()
             val accepted = connected.receive()
             lastIncoming = now()
             if (accepted.session != session) throw IOException("PROTOCOL: negotiation session mismatch")
             if (accepted.type == Wire.REJECT || accepted.type == Wire.ERROR)
-                throw IOException("${Json.string(accepted.json(), "code")}: ${Json.string(accepted.json(), "message")}")
-            if (delegateDiagnostics && connected.delegatedDiagnostics) {
-                DiagnosticAccess.connections.update(session,
-                    org.screencopy.receiver.protocol.StrictJson.decode(accepted.payload))
-                DiagnosticAccess.receiverStatus(DiagnosticAccess.connections.snapshot().getString("state"))
-            }
+                throw ReceiverReportedFailure(Json.string(accepted.json(), "code"), Json.string(accepted.json(), "message"))
             val acceptedJson = org.screencopy.receiver.protocol.StrictJson.decode(accepted.payload)
             telemetryNegotiated = connected.acceptedSessionTelemetry(acceptedJson)
             try {
@@ -307,6 +348,29 @@ class SenderSession internal constructor(
             }
             check()
             acceptedSession = true
+            if (armed != null) {
+                startReceiverReader()
+                setupStage = "lane"
+                val selection = connected.acceptedDiagnosticProxy(acceptedJson, armed)
+                check()
+                val client = DiagnosticProxyClient(receiver, DiagnosticAccess.arms, armed, timer,
+                    beforeReadyCommit = diagnosticBeforeReadyCommit, startupStopped = { outcome.stopping })
+                proxyClient = client
+                check()
+                client.start(selection, proxyDeadline, commitReady = { commit ->
+                    synchronized(outcomePublication) {
+                        if (setupTimedOut.get()) throw java.net.SocketTimeoutException("TIMEOUT: diagnostic setup expired")
+                        check()
+                        diagnosticAfterReadyCheck()
+                        commit()
+                        DiagnosticAccess.arms.beginMedia(armed)
+                        proxyEstablished = true
+                    }
+                }) { DiagnosticAccess.arms.remainingMs(armed) }
+                check()
+                setupTimeout?.cancel(false)
+                check()
+            }
             attachReceiver(connected, accepted)
             check()
             for (track in 1..2) {
@@ -323,7 +387,22 @@ class SenderSession internal constructor(
                 Thread.sleep(100)
             }
         } catch (e: Exception) {
-            fail(e, SessionOutcome.Origin.STARTUP)
+            synchronized(outcomePublication) {
+                fail(e, SessionOutcome.Origin.STARTUP)
+                proxyClaim?.let { claim ->
+                    if (!proxyEstablished) {
+                        val stage = (e as? DiagnosticProxySetupException)?.stage
+                            ?: if (e.message?.contains("UNSUPPORTED_CONFIG") == true) "unsupported" else setupStage
+                        val failure = outcome.failure
+                        if (failure != null) RemoteDiagnostics.recorder.observe("sender", session,
+                            DiagnosticKind.SESSION, DiagnosticStage.FAILED, reason = DiagnosticReason.FAILURE)
+                        try {
+                            DiagnosticAccess.arms.setupFailed(claim, stage,
+                                failure?.let { setupFailure(it, setupTimedOut.get() && it === e) })
+                        } catch (_: DiagnosticError) { /* Revocation already fenced this arm. */ }
+                    }
+                }
+            }
             if (e is InterruptedException) Thread.currentThread().interrupt()
         } finally {
             retireTransport()
@@ -343,17 +422,10 @@ class SenderSession internal constructor(
             status(outcome.failure?.let { "Error: ${SessionOutcome.safeMessage(it)}" } ?: "Idle")
             trace.mark(SessionStopTrace.Stage.FINISHED)
             cleanupComplete = true
-            RemoteDiagnostics.recorder.observe("sender", session, DiagnosticKind.SESSION,
-                if (outcome.failure == null) DiagnosticStage.ENDED else DiagnosticStage.FAILED,
-                reason = if (outcome.failure == null) DiagnosticReason.STOPPED else DiagnosticReason.FAILURE)
-            RemoteDiagnostics.recorder.sessionEnded("sender", session)
+            finishSenderDiagnostic(RemoteDiagnostics.recorder, DiagnosticAccess.arms, proxyClaim, session,
+                outcome.failure != null, { proxyClient?.retire() }, DiagnosticAccess::dispatch)
             TelemetryRegistry.end("sender", telemetry)
             telemetry?.finish(cleanupSucceeded)
-            diagnosticRevocation?.close()
-            DiagnosticAccess.connections.ended(session)
-            if (DiagnosticAccess.receiverSession == session &&
-                DiagnosticAccess.receiverStatus !in setOf("unsupported", "unavailable", "local", "Not requested"))
-                DiagnosticAccess.receiverStatus("Cast ended; receiver frozen retrieval only, at most 120 seconds")
             finished()
         }
     }
@@ -361,17 +433,18 @@ class SenderSession internal constructor(
     internal fun attachReceiver(connected: ReceiverLink, accepted: Wire.Message) {
         connected.attach(session, accepted, settings.audio,
             onFailure = { fail(it, SessionOutcome.Origin.STARTUP) }) {
-            synchronized(this) {
-                if (!closing) {
-                    worker("receiver-read", ::readLoop)
-                    receiverReaderStarted = true
-                }
-            }
+            startReceiverReader()
+        }
+    }
+
+    private fun startReceiverReader() = synchronized(this) {
+        if (!closing && !receiverReaderStarted) {
+            worker("receiver-read", ::readLoop)
+            receiverReaderStarted = true
         }
     }
 
     internal fun retireTransport() {
-        DiagnosticAccess.connections.ended(session)
         trace.phase(SessionStopTrace.Phase.CLEANUP)
         val orderly = orderlyTeardown
         val fatal = negotiatedFatalCleanup && terminalMessage().type == Wire.ERROR
@@ -384,6 +457,7 @@ class SenderSession internal constructor(
             fatalTeardown = fatal
             phaseDeadline = if (orderly && !remoteStop && terminalWrittenAt != null)
                 checkNotNull(terminalWrittenAt) + 2_000_000_000L else now() + timeoutNanos
+            proxyClaim?.capTerminalDeadline(phaseDeadline)
             closing = true
         }
         status("Stopping")
@@ -588,11 +662,6 @@ class SenderSession internal constructor(
                             if (telemetryNegotiated) telemetry?.acceptPeer(message.payload)
                             continue
                         }
-                        if (json.has("diagnostic") && state == "diagnostics") {
-                            DiagnosticAccess.connections.update(session,
-                                org.screencopy.receiver.protocol.StrictJson.decode(message.payload))
-                            DiagnosticAccess.receiverStatus(DiagnosticAccess.connections.snapshot().getString("state"))
-                        }
                         if (state in setOf(StreamRecoveryProtocol.REQUEST, StreamRecoveryProtocol.KEY, StreamRecoveryProtocol.COMPLETE)) {
                             val current = recovery ?: throw IOException("PROTOCOL: stream recovery was not negotiated")
                             val track = StreamRecoveryProtocol.track(json)
@@ -616,6 +685,7 @@ class SenderSession internal constructor(
                         val error = ReceiverReportedFailure(code, text)
                         if (Json.bool(json, "fatal")) {
                             recordReceiverTerminal(json)
+                            proxyClaim?.commitTerminal(now())
                             receiverTerminal.set(true)
                             diagnostic("receiver_session_error ${Wire.obj("code" to code, "fatal" to true)}")
                             throw error
@@ -625,12 +695,14 @@ class SenderSession internal constructor(
                     Wire.SESSION_END -> {
                         Json.string(json, "reason")
                         recordReceiverTerminal(json)
+                        proxyClaim?.commitTerminal(now())
                         receiverTerminal.set(true)
                         if (sizeSwitch.requested) sizeSwitch.acknowledge()
                         else { remoteStop = true; stop(); return }
                     }
                     Wire.STOP -> {
                         Json.string(json, "reason"); recordReceiverTerminal(json)
+                        proxyClaim?.commitTerminal(now())
                         receiverTerminal.set(true); remoteStop = true; stop(); return
                     }
                     else -> throw IOException("PROTOCOL: unexpected receiver message ${message.type}")

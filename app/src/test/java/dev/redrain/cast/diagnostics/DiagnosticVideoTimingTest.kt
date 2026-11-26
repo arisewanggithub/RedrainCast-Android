@@ -243,31 +243,56 @@ class DiagnosticVideoTimingTest {
         }
         t.decoded(500, 0)
         recorder.end(id)
-        val protocol = DiagnosticProtocol(recorder)
-        fun request(op: String, args: JSONObject, serial: Int) = protocol.handle(
-            JSONObject().put("v", 1).put("id", "r$serial").put("op", op).put("args", args)
-                .toString().toByteArray(Charsets.UTF_8))
-        assertTrue(request("HELLO", JSONObject(), 0).getBoolean("ok"))
-        var cursor = "0"
-        var serial = 1
+        val sender = DiagnosticRecorder { 1_000_000_000L }
+        val registry = DiagnosticArmRegistry(sender) { 1_000_000_000L }
+        val pair = registry.start("collector", setOf("session"),
+            setOf("video.progress", "video.timing"), 1000, 100).getString("pairId")
+        val claim = checkNotNull(registry.claim(91))
+        val stages = JSONArray()
+        org.screencopy.receiver.protocol.DiagnosticProxyNegotiation.stages.forEachIndexed { index, stage ->
+            stages.put(JSONObject().put("stage", stage).put("monoNs", "$index"))
+        }
+        val bootstrap = JSONObject().put("session", "91").put("pairId", pair).put("captureId", id)
+            .put("clockId", recorder.clockId).put("complete", true).put("loss", false).put("stages", stages)
+        val intake = DiagnosticProxyIntake("91", pair, id, recorder.clockId, true, bootstrap)
+        var sourceCursor = 0L
+        do {
+            val sourcePage = recorder.fetch(id, sourceCursor, 32)
+            val sourceRecords = sourcePage.getJSONArray("records")
+            for (index in 0 until sourceRecords.length()) {
+                val source = sourceRecords.getJSONObject(index)
+                val frame = JSONObject().put("v", 2).put("type", "RECORD").put("record", source)
+                val output = java.io.ByteArrayOutputStream()
+                DiagnosticProxyWire.writeFrame(output, frame)
+                intake.record(source, output.size())
+                intake.consume()
+            }
+            sourceCursor = sourcePage.getString("nextAfterSeq").toLong()
+        } while (sourcePage.getBoolean("hasMore"))
+        registry.covered(claim, intake, id, recorder.clockId)
+        var cursor = 0L
         var populated: JSONObject? = null
         do {
-            val reply = request("FETCH", JSONObject().put("captureId", id).put("afterSeq", cursor).put("limit", 32), serial++)
-            assertTrue(reply.getBoolean("ok"))
+            val result = registry.fetch("collector", pair, Long.MAX_VALUE, cursor, 32)
+            val reply = JSONObject().put("v", 2).put("id", "r1").put("op", "FETCH")
+                .put("ok", true).put("result", result)
             assertTrue(reply.toString().toByteArray(Charsets.UTF_8).size <= 16384)
-            val result = reply.getJSONObject("result")
             val records = result.getJSONArray("records")
             for (index in 0 until records.length()) {
-                val metrics = records.getJSONObject(index).getJSONObject("data").optJSONObject("metrics")
+                val source = records.getJSONObject(index).getJSONObject("record")
+                val metrics = source.getJSONObject("data").optJSONObject("metrics")
                 if (metrics?.optString("schema") == "video_frame_timing") {
+                    assertEquals("91", DiagnosticProxyWire.validateSource(source, "receiver", "91", id, true))
+                    org.screencopy.receiver.protocol.StrictJson.decode(reply.toString().toByteArray(),
+                        maxDepth = DiagnosticProxyWire.FETCH_DEPTH, trackSizes = false)
                     val correction = metrics.getJSONObject("minimumDeadlineCadenceExample")
                         .getJSONObject("previous").getJSONObject("clock").getJSONObject("lastPacketCorrection")
                     assertEquals("2", correction.getString("sequence"))
                     populated = reply
                 }
             }
-            cursor = result.getString("nextAfterSeq")
-        } while (result.getBoolean("hasMore"))
+            cursor = result.getJSONObject("receiver").getString("nextAfterSeq").toLong()
+        } while (result.getJSONObject("receiver").getBoolean("hasMore"))
         val directory = File(File("build"), "diagnostics-contract").apply { mkdirs() }
         File(directory, "receiver-timing-fetch.json").writeText(checkNotNull(populated).toString())
     }
@@ -281,29 +306,18 @@ class DiagnosticVideoTimingTest {
         } catch (error: DiagnosticError) {
             assertEquals("INVALID_ARGUMENT", error.code)
         }
-        val protocol = DiagnosticProtocol(recorder)
-        fun request(op: String, args: JSONObject, serial: Int) = protocol.handle(
-            JSONObject().put("v", 1).put("id", "r$serial").put("op", op).put("args", args)
-                .toString().toByteArray(Charsets.UTF_8))
-        val hello = request("HELLO", JSONObject(), 0)
-        assertTrue(hello.getBoolean("ok"))
         val flags = listOf("session", "recovery", "audio.transport", "audio.queue", "audio.output",
             "video.progress", "transport.health")
-        val start = request("START", JSONObject().put("target", JSONObject().put("role", "receiver").put("session", "91"))
-            .put("flags", JSONArray(flags)).put("durationMs", 1000).put("samplePeriodMs", 100), 1)
-        assertTrue(start.getBoolean("ok"))
-        assertEquals(2048, start.getJSONObject("result").getInt("maxRecordBytes"))
-        val id = start.getJSONObject("result").getString("captureId")
+        val start = recorder.start("receiver", 91, flags.toSet(), 1000, 100)
+        assertEquals(2048, start.getInt("maxRecordBytes"))
+        val id = start.getString("captureId")
         for (n in 1..10) {
             recorder.video("receiver", 91, 1, DiagnosticVideoStage.RELEASED, n * 100L,
                 delayUs = -100, releaseCallNs = 100)
             assertNull(recorder.videoTiming(91, 1))
         }
-        val end = request("END", JSONObject().put("captureId", id), 2)
-        assertTrue(end.getBoolean("ok"))
-        val fetch = request("FETCH", JSONObject().put("captureId", id).put("afterSeq", "0").put("limit", 32), 3)
-        assertTrue(fetch.getBoolean("ok"))
-        val result = fetch.getJSONObject("result")
+        recorder.end(id)
+        val result = recorder.fetch(id, 0, 32)
         assertFalse(result.getBoolean("hasMore"))
         val records = result.getJSONArray("records")
         var progress = false
@@ -315,10 +329,6 @@ class DiagnosticVideoTimingTest {
             if (schema == "video_progress") progress = true
         }
         assertTrue(progress)
-        val directory = File(File("build"), "diagnostics-contract").apply { mkdirs() }
-        File(directory, "receiver-legacy-capture.json").writeText(
-            JSONObject().put("hello", hello).put("start", start).put("end", end).put("fetch", fetch)
-                .put("flags", JSONArray(flags)).toString())
     }
 
     @Test fun lateDuplicateRetractsRetainedCallbackMatchCadenceAndExemplar() {

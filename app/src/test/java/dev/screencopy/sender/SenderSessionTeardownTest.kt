@@ -23,6 +23,216 @@ import java.util.concurrent.atomic.AtomicReference
 import kotlin.concurrent.thread
 
 class SenderSessionTeardownTest {
+    @Test(timeout = 30_000) fun stopAndReadyCommitShareStartupOutcomeBoundary() {
+        for (mode in listOf("before_ready", "before_commit", "ready_first")) {
+            val stopFirst = mode != "ready_first"
+            val arms = dev.redrain.cast.diagnostics.DiagnosticAccess.arms
+            val recorder = dev.redrain.cast.diagnostics.RemoteDiagnostics.recorder
+            val entered = CountDownLatch(1)
+            val release = CountDownLatch(1)
+            val stopStarted = CountDownLatch(1)
+            val senderRef = AtomicReference<SenderSession>()
+            val tasks = java.util.concurrent.Executors.newFixedThreadPool(2)
+            arms.revoke()
+            recorder.grantConsent()
+            val pair = arms.start("collector", setOf("session"), setOf("session"), 20_000, 100)
+            val blocked = {
+                entered.countDown()
+                check(release.await(6, TimeUnit.SECONDS))
+            }
+            try {
+                org.screencopy.receiver.net.ReceiverServer.forProtocolTests("Receiver",
+                    proxyRecorder = dev.redrain.cast.diagnostics.DiagnosticRecorder(),
+                    proxyBeforeReady = if (mode == "before_ready") blocked else ({})).use { receiver ->
+                    receiver.start()
+                    val run = tasks.submit {
+                        Mockito.mockConstruction(ProjectionCapture::class.java) { capture, _ ->
+                            Mockito.`when`(capture.validate(Mockito.any(Settings::class.java) ?: Settings()))
+                                .thenAnswer { it.arguments[0] }
+                        }.use { captures ->
+                            Mockito.mockStatic(android.util.Log::class.java).use {
+                                val sender = SenderSession(Mockito.mock(Context::class.java),
+                                    Settings().apply { audio = false },
+                                    ReceiverTarget("127.0.0.1", receiver.listeningPort), {}, {}, {},
+                                    diagnosticBeforeReadyCommit = if (mode == "before_commit") blocked else ({}),
+                                    diagnosticAfterReadyCheck = if (mode == "ready_first") blocked else ({}))
+                                sender.projectionOwner = Mockito.mock(ProjectionOwner::class.java)
+                                senderRef.set(sender)
+                                sender.run()
+                                if (stopFirst) Mockito.verify(captures.constructed().single(), Mockito.never())
+                                    .start(Mockito.any(Settings::class.java) ?: Settings(), Mockito.anyLong(),
+                                        Mockito.any(ScrcpyAdapter.Sink::class.java) ?: sender)
+                            }
+                        }
+                    }
+                    assertTrue(entered.await(8, TimeUnit.SECONDS))
+                    val stop = tasks.submit { stopStarted.countDown(); checkNotNull(senderRef.get()).stop() }
+                    assertTrue(stopStarted.await(3, TimeUnit.SECONDS))
+                    if (stopFirst) stop.get(3, TimeUnit.SECONDS)
+                    else assertFalse(stop.isDone)
+                    release.countDown()
+                    stop.get(3, TimeUnit.SECONDS)
+                    run.get(7, TimeUnit.SECONDS)
+                    val status = arms.status("collector", pair.getString("pairId"))
+                    if (stopFirst) {
+                        assertEquals("setup_failed", status.getString("endReason"))
+                        assertTrue(status.isNull("receiverCaptureId"))
+                        assertTrue(status.isNull("bootstrap"))
+                        assertTrue(status.toString(), status.isNull("setupFailure"))
+                    } else {
+                        assertFalse(status.isNull("receiverCaptureId"))
+                        assertTrue(status.getJSONObject("bootstrap").getBoolean("complete"))
+                        assertNotEquals("setup_failed", status.optString("endReason"))
+                    }
+                }
+            } finally { release.countDown(); tasks.shutdownNow(); arms.revoke() }
+        }
+    }
+
+    @Test(timeout = 15_000) fun fatalControlBeforeReadyCommitRetainsSetupCauseAndDoesNotStartMedia() {
+        val arms = dev.redrain.cast.diagnostics.DiagnosticAccess.arms
+        val recorder = dev.redrain.cast.diagnostics.RemoteDiagnostics.recorder
+        val ready = CountDownLatch(1)
+        val release = CountDownLatch(1)
+        val failed = CountDownLatch(1)
+        val control = AtomicReference<Socket>()
+        val acceptedSession = AtomicLong()
+        val executor = java.util.concurrent.Executors.newSingleThreadExecutor()
+        arms.revoke()
+        recorder.grantConsent()
+        val id = arms.start("collector", setOf("session"), setOf("session"), 20_000, 100).getString("pairId")
+        val secret = "private-control-detail-192.0.2.1"
+        try {
+            org.screencopy.receiver.net.ReceiverServer.forProtocolTests("Receiver",
+                proxyRecorder = dev.redrain.cast.diagnostics.DiagnosticRecorder(), controlWrite = { socket, message ->
+                    org.screencopy.receiver.protocol.Wire.write(socket.outputStream, message)
+                    if (message.type == org.screencopy.receiver.protocol.Type.SESSION_ACCEPT) {
+                        acceptedSession.set(message.session)
+                        control.set(socket)
+                    }
+                }).use { receiver ->
+                receiver.start()
+                val run = executor.submit {
+                    Mockito.mockConstruction(ProjectionCapture::class.java) { capture, _ ->
+                        Mockito.`when`(capture.validate(Mockito.any(Settings::class.java) ?: Settings()))
+                            .thenAnswer { it.arguments[0] }
+                    }.use { captures ->
+                      Mockito.mockStatic(android.util.Log::class.java).use {
+                        val sender = SenderSession(Mockito.mock(Context::class.java), Settings().apply { audio = false },
+                            ReceiverTarget("127.0.0.1", receiver.listeningPort), {}, {}, {
+                                if (it.startsWith("sender_session_failure ")) failed.countDown()
+                            }, diagnosticBeforeReadyCommit = {
+                                ready.countDown()
+                                check(release.await(5, TimeUnit.SECONDS))
+                            })
+                        sender.projectionOwner = Mockito.mock(ProjectionOwner::class.java)
+                        sender.run()
+                        Mockito.verify(captures.constructed().single(), Mockito.never())
+                            .start(Mockito.any(Settings::class.java) ?: Settings(), Mockito.anyLong(),
+                                Mockito.any(ScrcpyAdapter.Sink::class.java) ?: sender)
+                      }
+                    }
+                }
+                assertTrue(ready.await(7, TimeUnit.SECONDS))
+                org.screencopy.receiver.protocol.Wire.write(checkNotNull(control.get()).outputStream,
+                    org.screencopy.receiver.protocol.Message.json(org.screencopy.receiver.protocol.Type.ERROR,
+                        JSONObject().put("code", "PROTOCOL").put("message", secret).put("fatal", true),
+                        acceptedSession.get()))
+                assertTrue("control failure was not retained", failed.await(3, TimeUnit.SECONDS))
+                release.countDown()
+                run.get(5, TimeUnit.SECONDS)
+                val status = arms.status("collector", id)
+                assertEquals("setup_failed", status.getString("endReason"))
+                assertEquals("PROTOCOL", status.getJSONObject("setupFailure").getString("code"))
+                assertEquals("receiver_control", status.getJSONObject("setupFailure").getString("provenance"))
+                assertTrue(status.isNull("receiverCaptureId"))
+                val page = arms.fetch("collector", id, 0, 0, 32)
+                assertTrue(page.isNull("receiver"))
+                assertFalse(status.toString().contains(secret))
+                assertFalse(page.toString().contains(secret))
+                assertTrue((0 until page.getJSONArray("records").length()).any {
+                    page.getJSONArray("records").getJSONObject(it).getJSONObject("record")
+                        .optJSONObject("data")?.optString("stage") == "failed"
+                })
+            }
+        } finally { release.countDown(); executor.shutdownNow(); arms.revoke() }
+    }
+
+    @Test(timeout = 15_000) fun armedRequestRejectRetainsSanitizedRemoteFirstCauseAndFailureRecord() {
+        requestSetupFailure(remoteReject = true)
+    }
+
+    @Test(timeout = 15_000) fun armedRequestTimeoutRetainsLocalCauseAndFailureRecord() {
+        requestSetupFailure(remoteReject = false)
+    }
+
+    private fun requestSetupFailure(remoteReject: Boolean) {
+        val arms = dev.redrain.cast.diagnostics.DiagnosticAccess.arms
+        val recorder = dev.redrain.cast.diagnostics.RemoteDiagnostics.recorder
+        val release = CountDownLatch(1)
+        val entered = CountDownLatch(1)
+        val statuses = java.util.concurrent.CopyOnWriteArrayList<String>()
+        val diagnostics = java.util.concurrent.CopyOnWriteArrayList<String>()
+        val secret = "private-token-address-192.0.2.1"
+        arms.revoke()
+        recorder.grantConsent()
+        val pair = arms.start("collector", setOf("session"), setOf("session"), 20_000, 100)
+        val id = pair.getString("pairId")
+        try {
+            org.screencopy.receiver.net.ReceiverServer.forProtocolTests("Receiver",
+                proxyRecorder = dev.redrain.cast.diagnostics.DiagnosticRecorder(), validateRequest = {
+                entered.countDown()
+                if (remoteReject) throw org.screencopy.receiver.protocol.ProtocolException("PROTOCOL", secret)
+                check(release.await(8, TimeUnit.SECONDS))
+            }).use { receiver ->
+                try {
+                    receiver.start()
+                    Mockito.mockConstruction(ProjectionCapture::class.java) { capture, _ ->
+                        Mockito.`when`(capture.validate(Mockito.any(Settings::class.java) ?: Settings()))
+                            .thenAnswer { it.arguments[0] }
+                        if (remoteReject) Mockito.doThrow(java.io.IOException("TIMEOUT: cleanup $secret"))
+                            .`when`(capture).close()
+                    }.use {
+                        Mockito.mockStatic(android.util.Log::class.java).use {
+                            val sender = SenderSession(Mockito.mock(Context::class.java),
+                                Settings().apply { audio = false }, ReceiverTarget("127.0.0.1", receiver.listeningPort),
+                                statuses::add, {}, diagnostics::add,
+                                diagnosticSetupTimeoutNs = if (remoteReject) 5_000_000_000L else 500_000_000L)
+                            sender.projectionOwner = Mockito.mock(ProjectionOwner::class.java)
+                            sender.run()
+                        }
+                    }
+                    val status = arms.status("collector", id)
+                    assertEquals("status=$status states=$statuses diagnostics=$diagnostics", 0L, entered.count)
+                    assertEquals("frozen", status.getString("state"))
+                    assertEquals("setup_failed", status.getString("endReason"))
+                    assertEquals("request", status.getString("setupStage"))
+                    val failure = status.getJSONObject("setupFailure")
+                    assertEquals(if (remoteReject) "PROTOCOL" else "TIMEOUT", failure.getString("code"))
+                    assertEquals(if (remoteReject) "receiver_control" else "sender_local", failure.getString("provenance"))
+                    assertEquals(if (remoteReject) "receiver_reported" else "timeout", failure.getString("reason"))
+                    assertTrue(status.isNull("receiverCaptureId"))
+                    assertEquals("unknown", status.getJSONObject("receiverRole").getString("ownershipCleanup"))
+                    val page = arms.fetch("collector", id, 0, 0, 32)
+                    assertTrue(page.getBoolean("setupFailureAvailable"))
+                    assertFalse(page.has("setupFailure"))
+                    assertTrue(page.isNull("receiver"))
+                    val records = page.getJSONArray("records")
+                    assertTrue((0 until records.length()).any {
+                        records.getJSONObject(it).getJSONObject("record").optJSONObject("data")
+                            ?.optString("stage") == "failed"
+                    })
+                    assertFalse(status.toString().contains(secret))
+                    assertFalse(page.toString().contains(secret))
+                    assertEquals(failure.toString(), arms.status("collector", id).getJSONObject("setupFailure").toString())
+                } finally { release.countDown() }
+            }
+        } finally {
+            release.countDown()
+            arms.revoke()
+        }
+    }
+
     @Test(timeout = 15_000) fun receiverFirstRecoveryDeadlineRetainsTimeoutInSenderReport() {
         val receiverTime = AtomicLong(1_000)
         val receiverRequest = CountDownLatch(1)
@@ -33,7 +243,7 @@ class SenderSessionTeardownTest {
         Mockito.doReturn(org.screencopy.receiver.media.QueuePressure(1,
             org.screencopy.receiver.media.QueueLimit.BYTES, 0, 0, 1, 8_388_609, 0, 64, 8_388_608, 0))
             .`when`(player).tryOffer(Mockito.any(org.screencopy.receiver.media.AccessUnit::class.java)
-                ?: org.screencopy.receiver.media.AccessUnit(0, byteArrayOf()))
+                ?: org.screencopy.receiver.media.AccessUnit(0, byteArrayOf()), Mockito.anyLong())
         Mockito.doAnswer {
             dev.redrain.cast.diagnostics.TelemetryRegistry.event("receiver", ID,
                 dev.redrain.cast.diagnostics.DiagnosticKind.SESSION.ordinal + 1,

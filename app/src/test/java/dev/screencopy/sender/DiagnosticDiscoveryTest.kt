@@ -1,8 +1,5 @@
 package dev.screencopy.sender
 
-import dev.redrain.cast.diagnostics.DiagnosticIdentity
-import dev.redrain.cast.diagnostics.DiagnosticListener
-import dev.redrain.cast.diagnostics.DiagnosticRecorder
 import org.json.JSONObject
 import org.junit.Assert.*
 import org.junit.Test
@@ -12,8 +9,7 @@ import java.net.DatagramPacket
 import java.net.DatagramSocket
 import java.net.InetAddress
 import java.net.InetSocketAddress
-import java.net.Socket
-import java.util.concurrent.atomic.AtomicReference
+import java.util.concurrent.atomic.AtomicInteger
 
 class DiagnosticDiscoveryTest {
     private fun advertisement(extra: String = "") =
@@ -68,59 +64,33 @@ class DiagnosticDiscoveryTest {
         rejects("$atLimit ")
     }
 
-    @Test fun receiverProviderAdvertisesOnlyEnabledSnapshotAndNeverAfterReceiverClose() {
-        var snapshot: DiagnosticDiscovery? = null
-        val address = InetAddress.getByName("127.0.0.1")
-        ReceiverServer.forProtocolTests("Receiver", diagnosticDiscovery = { if (it == address) snapshot else null }).use { server ->
+    @Test fun receiverNeverAdvertisesStandaloneDiagnosticEndpoint() {
+        val called = AtomicInteger()
+        ReceiverServer.forProtocolTests("Receiver", diagnosticDiscovery = {
+            called.incrementAndGet()
+            DiagnosticDiscovery(43210)
+        }).use { server ->
             server.start()
-            assertFalse(JSONObject(String(server.advertisement(address))).has("diagnostic"))
-            snapshot = DiagnosticDiscovery(43210)
-            val advertised = JSONObject(String(server.advertisement(address)))
-            val diagnostic = advertised.getJSONObject("diagnostic")
-            assertEquals(setOf("version", "port", "access"), diagnostic.keys().asSequence().toSet())
-            assertEquals("lan", diagnostic.getString("access"))
-            assertEquals(1, diagnostic.getInt("version"))
-            assertEquals(43210, diagnostic.getInt("port"))
-            assertEquals(43210, Discovery.decode(server.advertisement(address), "127.0.0.1", 1).diagnostic?.port)
-            assertTrue(server.advertisement(address).size <= 1024)
-            assertFalse(advertised.toString().contains("secret"))
-            assertFalse(advertised.toString().contains("fingerprint"))
-            snapshot = null
-            assertFalse(JSONObject(String(server.advertisement(address))).has("diagnostic"))
-            snapshot = DiagnosticDiscovery(43210)
+            assertFalse(JSONObject(String(server.advertisement())).has("diagnostic"))
+            assertNull(Discovery.decode(server.advertisement(), "127.0.0.1", 1).diagnostic)
+            assertTrue(server.advertisement().size <= 1024)
             server.close()
-            assertFalse(JSONObject(String(server.advertisement(address))).has("diagnostic"))
+            assertFalse(JSONObject(String(server.advertisement())).has("diagnostic"))
+            assertEquals(0, called.get())
         }
     }
 
-    @Test fun udpHintUsesActualPacketSourceAndOmitsOtherInterface() {
+    @Test fun udpAdvertisementDoesNotExposeDiagnosticEndpoint() {
         val first = InetAddress.getByName("127.0.0.1")
-        val other = InetAddress.getByName("127.0.0.2")
-        DiagnosticListener(DiagnosticRecorder(), DiagnosticIdentity(first)).use { firstListener ->
-            DiagnosticListener(DiagnosticRecorder(), DiagnosticIdentity(other)).use { otherListener ->
-                val active = AtomicReference(firstListener)
-                ReceiverServer.forProtocolTests("Receiver",
-                    diagnosticDiscovery = { active.get().discoveryFor(it) }).use { server ->
-                    server.start()
-                    DatagramSocket(InetSocketAddress(first, 0)).use { receiver ->
-                        receiver.soTimeout = 3000
-                        fun receive(): Pair<InetAddress, JSONObject> {
-                            server.sendAdvertisement(InetSocketAddress(first, receiver.localPort))
-                            val packet = DatagramPacket(ByteArray(1024), 1024)
-                            receiver.receive(packet)
-                            return packet.address to JSONObject(String(packet.data, 0, packet.length, Charsets.UTF_8))
-                        }
-                        val (source, firstPacket) = receive()
-                        assertEquals(first, source)
-                        val port = firstPacket.getJSONObject("diagnostic").getInt("port")
-                        assertEquals(firstListener.discovery!!.port, port)
-                        Socket().use { it.connect(InetSocketAddress(source, port), 1000) }
-                        active.set(otherListener)
-                        val (otherSource, secondPacket) = receive()
-                        assertEquals(first, otherSource)
-                        assertFalse(secondPacket.has("diagnostic"))
-                    }
-                }
+        ReceiverServer.forProtocolTests("Receiver", diagnosticDiscovery = { DiagnosticDiscovery(43210) }).use { server ->
+            server.start()
+            DatagramSocket(InetSocketAddress(first, 0)).use { receiver ->
+                receiver.soTimeout = 3000
+                server.sendAdvertisement(InetSocketAddress(first, receiver.localPort))
+                val packet = DatagramPacket(ByteArray(1024), 1024)
+                receiver.receive(packet)
+                assertEquals(first, packet.address)
+                assertFalse(JSONObject(String(packet.data, 0, packet.length, Charsets.UTF_8)).has("diagnostic"))
             }
         }
     }
