@@ -39,6 +39,50 @@ import java.net.Socket
 @GraphicsMode(GraphicsMode.Mode.LEGACY)
 @ConscryptMode(ConscryptMode.Mode.OFF)
 class MainActivityTest {
+    private fun enqueueExportBarrier(executor: java.util.concurrent.ThreadPoolExecutor): java.util.concurrent.CountDownLatch {
+        val done = java.util.concurrent.CountDownLatch(1)
+        assertFalse(executor.isShutdown)
+        assertTrue(executor.queue.offer({ done.countDown() }, 5, java.util.concurrent.TimeUnit.SECONDS))
+        return done
+    }
+
+    @Test fun exportBarrierWaitsForAFullExecutorQueue() {
+        val executor = java.util.concurrent.ThreadPoolExecutor(1, 1, 0,
+            java.util.concurrent.TimeUnit.MILLISECONDS, java.util.concurrent.ArrayBlockingQueue(1))
+        val entered = java.util.concurrent.CountDownLatch(1)
+        val release = java.util.concurrent.CountDownLatch(1)
+        val queued = java.util.concurrent.CountDownLatch(1)
+        val caller = java.util.concurrent.Executors.newSingleThreadExecutor()
+        try {
+            executor.execute {
+                entered.countDown()
+                check(release.await(5, java.util.concurrent.TimeUnit.SECONDS))
+            }
+            assertTrue(entered.await(5, java.util.concurrent.TimeUnit.SECONDS))
+            executor.execute { queued.countDown() }
+            val attempted = java.util.concurrent.CountDownLatch(1)
+            val result = caller.submit<java.util.concurrent.CountDownLatch> {
+                attempted.countDown()
+                enqueueExportBarrier(executor)
+            }
+            assertTrue(attempted.await(5, java.util.concurrent.TimeUnit.SECONDS))
+            try {
+                result.get(200, java.util.concurrent.TimeUnit.MILLISECONDS)
+                fail("Barrier must wait for queue capacity")
+            } catch (_: java.util.concurrent.TimeoutException) {
+                // The queue is deliberately full until the running task is released.
+            }
+            release.countDown()
+            val done = result.get(5, java.util.concurrent.TimeUnit.SECONDS)
+            assertTrue(done.await(5, java.util.concurrent.TimeUnit.SECONDS))
+            assertEquals(0L, queued.count)
+        } finally {
+            release.countDown()
+            caller.shutdownNow()
+            executor.shutdownNow()
+        }
+    }
+
     private fun legacySnapshot() = org.json.JSONObject()
         .put("role", "sender")
         .put("final", false)
@@ -118,8 +162,7 @@ class MainActivityTest {
             val executorField = MainActivity::class.java.getDeclaredField("incidentExports").apply {
                 isAccessible = true
             }
-            val finished = java.util.concurrent.CountDownLatch(1)
-            (executorField.get(null) as java.util.concurrent.ThreadPoolExecutor).execute { finished.countDown() }
+            val finished = enqueueExportBarrier(executorField.get(null) as java.util.concurrent.ThreadPoolExecutor)
             assertTrue(finished.await(5, java.util.concurrent.TimeUnit.SECONDS))
             shadowOf(Looper.getMainLooper()).idle()
             assertNull(org.robolectric.util.ReflectionHelpers.getField<String?>(controller.get(), "problem"))
@@ -213,8 +256,7 @@ class MainActivityTest {
             assertTrue(done.await(5, java.util.concurrent.TimeUnit.SECONDS))
         }
         fun exportBarrier() {
-            val done = java.util.concurrent.CountDownLatch(1)
-            executor.execute { done.countDown() }
+            val done = enqueueExportBarrier(executor)
             assertTrue(done.await(5, java.util.concurrent.TimeUnit.SECONDS))
             shadowOf(Looper.getMainLooper()).idle()
         }
@@ -262,7 +304,6 @@ class MainActivityTest {
         val stored = java.util.concurrent.CountDownLatch(1)
         val entered = java.util.concurrent.CountDownLatch(1)
         val release = java.util.concurrent.CountDownLatch(1)
-        val finished = java.util.concurrent.CountDownLatch(1)
         val fail = java.util.concurrent.atomic.AtomicBoolean(true)
         val output = object : java.io.ByteArrayOutputStream() {
             override fun write(bytes: ByteArray, offset: Int, length: Int) {
@@ -301,8 +342,7 @@ class MainActivityTest {
             val readFinished = java.util.concurrent.CountDownLatch(1)
             store.list { readFinished.countDown() }
             assertTrue(readFinished.await(5, java.util.concurrent.TimeUnit.SECONDS))
-            val firstFinished = java.util.concurrent.CountDownLatch(1)
-            executor.execute { firstFinished.countDown() }
+            val firstFinished = enqueueExportBarrier(executor)
             assertTrue(firstFinished.await(5, java.util.concurrent.TimeUnit.SECONDS))
             shadowOf(Looper.getMainLooper()).idle()
             assertEquals(message, org.robolectric.util.ReflectionHelpers.getField<String?>(activity, "problem"))
@@ -311,7 +351,7 @@ class MainActivityTest {
             fail.set(false)
             launch(activity)
             assertTrue(entered.await(5, java.util.concurrent.TimeUnit.SECONDS))
-            executor.execute { finished.countDown() }
+            val finished = enqueueExportBarrier(executor)
             if (unrelatedError) {
                 org.robolectric.util.ReflectionHelpers.callInstanceMethod<Unit>(activity, "showError",
                     org.robolectric.util.ReflectionHelpers.ClassParameter.from(Exception::class.java,
@@ -377,7 +417,6 @@ class MainActivityTest {
         val stored = java.util.concurrent.CountDownLatch(1)
         val entered = java.util.concurrent.CountDownLatch(1)
         val release = java.util.concurrent.CountDownLatch(1)
-        val finished = java.util.concurrent.CountDownLatch(1)
         val output = object : java.io.ByteArrayOutputStream() {
             override fun write(bytes: ByteArray, offset: Int, length: Int) {
                 entered.countDown()
@@ -403,7 +442,7 @@ class MainActivityTest {
             val executorField = MainActivity::class.java.getDeclaredField("incidentExports")
             executorField.isAccessible = true
             val executor = executorField.get(null) as java.util.concurrent.ThreadPoolExecutor
-            executor.execute { finished.countDown() }
+            val finished = enqueueExportBarrier(executor)
             controller.recreate()
             val current = controller.get()
             assertNotSame(old, current)
@@ -460,8 +499,7 @@ class MainActivityTest {
             assertTrue(closed.await(5, java.util.concurrent.TimeUnit.SECONDS))
             val executorField = MainActivity::class.java.getDeclaredField("incidentExports")
             executorField.isAccessible = true
-            val finished = java.util.concurrent.CountDownLatch(1)
-            (executorField.get(null) as java.util.concurrent.ThreadPoolExecutor).execute { finished.countDown() }
+            val finished = enqueueExportBarrier(executorField.get(null) as java.util.concurrent.ThreadPoolExecutor)
             assertTrue(finished.await(5, java.util.concurrent.TimeUnit.SECONDS))
             shadowOf(Looper.getMainLooper()).idle()
             assertEquals(key, org.json.JSONObject(output.toString("UTF-8")).getString("incident"))
