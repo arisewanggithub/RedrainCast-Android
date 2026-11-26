@@ -7,6 +7,11 @@ LAN/lifetime acceptance or a physical sender/projector overhead/display
 measurement; those remain required before a nonperturbing-performance claim.
 This is a separate diagnostic service, not an extension of SCPY media/control framing.
 It must not change casting behavior or require both casting peers to support it.
+The approved, integration-in-progress [automatic session telemetry
+replacement](PRESSURE_INCIDENTS.md) instead uses the admitted cast control
+connection and sender-owned reports; it does not enable this listener or use
+this service's frozen-capture retrieval. The 120-second retrieval rules below
+apply only to this separately consented live diagnostic service.
 
 **Intentional revised, unreleased v1 draft:** local opt-in now authorizes
 unauthenticated, unencrypted LAN TCP diagnostics without manual pairing. This
@@ -22,8 +27,9 @@ explicit access remains available independently. No media or casting control is 
 ## Local consent and lifetime
 
 - Settings expose an independent **Allow unpaired LAN
-  diagnostics** switch beside an explicit risk warning, off by default. It alone authorizes the
-  local diagnostic listener. Delegated receiver access is described below.
+  diagnostics** switch, off by default. The detailed risk warning is available in
+  **LAN diagnostics endpoint / status**. The switch alone authorizes the local
+  diagnostic listener. Delegated receiver access is described below.
   LAN permission remains required where applicable.
 - Enabling access starts only the listener and HELLO machinery. It does
   not enable additional media instrumentation, event history or disk logging.
@@ -540,10 +546,10 @@ connection. The collector requires explicit `--lan` to acknowledge plaintext,
 unauthenticated access. Network policy, NAT and stale packets can still prevent
 reachability; the exact locally displayed bound endpoint remains authoritative.
 
-Local access: **Settings → Advanced → Allow unpaired LAN
-diagnostics (this process only)**, read the warning, then **Save**. Reopen **LAN diagnostics
-endpoint / status** after listener startup, before casting, to read the actual TCP endpoint and
-unauthenticated-access status/warning. Settings cannot be opened during an active
+Local access: **Settings → Advanced → LAN diagnostics endpoint / status**, read the warning,
+then select **Allow unpaired LAN diagnostics (this process only)** and **Save**. Reopen
+**LAN diagnostics endpoint / status** after listener startup, before casting, to read the actual
+TCP endpoint and unauthenticated-access status/warning. Settings cannot be opened during an active
 casting role; use the bounded unicast bootstrap above instead. This dialog remains screenshot-protected.
 Nothing is persisted about remote consent or capture buffers. A process restart
 requires new local consent. There is no pairing step.

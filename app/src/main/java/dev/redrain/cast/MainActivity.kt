@@ -44,12 +44,96 @@ import org.screencopy.receiver.ui.PlaybackStatisticsDetails
 import org.screencopy.receiver.ui.StatisticsWindowProtection
 import org.screencopy.receiver.ui.InlineStatisticsHost
 import java.util.concurrent.CountDownLatch
+import java.io.IOException
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicReference
 
 class MainActivity : Activity(), SurfaceHolder.Callback, TextureView.SurfaceTextureListener {
+    private var pendingIncidentExport: String? = null
+    private class RetainedState(val updateCheck: LaunchUpdateCheck) {
+        val exports = IncidentExportState()
+    }
+
+    private class IncidentExportError(val message: String)
+
+    private class IncidentExportState {
+        private class Outcome(val error: String?)
+        private val main = Handler(Looper.getMainLooper())
+        private var listener: ((IncidentExportError?, IncidentExportError?) -> Unit)? = null
+        private var pending: Outcome? = null
+        private var displayedError: IncidentExportError? = null
+        private var closed = false
+        private var active = false
+        private var overlapRejected = false
+
+        fun attach(listener: (IncidentExportError?, IncidentExportError?) -> Unit) {
+            this.listener = listener
+            displayedError?.let { listener(it, null) }
+            pending?.let { pending = null; deliver(it.error) }
+        }
+
+        fun detach() { listener = null }
+        fun clearError() { displayedError = null }
+        fun close() { closed = true; detach(); pending = null; clearError() }
+
+        private fun deliver(error: String?) {
+            val current = listener
+            if (current == null) pending = Outcome(error)
+            else {
+                val previous = displayedError
+                displayedError = error?.let(::IncidentExportError)
+                current(displayedError, if (error == null) previous else null)
+            }
+        }
+
+        private fun complete(error: String?) {
+            main.post {
+                if (error != null) android.util.Log.e("RedrainCast", "Telemetry export failed: $error")
+                if (!closed) {
+                    active = false
+                    if (!overlapRejected) deliver(error)
+                }
+            }
+        }
+
+        fun start(context: android.content.Context, report: String, uri: android.net.Uri) {
+            if (active) {
+                overlapRejected = true
+                val error = "Telemetry export already in progress; this destination was not written. Wait for it to finish and try again."
+                android.util.Log.e("RedrainCast", "Telemetry export failed: $error")
+                deliver(error)
+                return
+            }
+            active = true
+            overlapRejected = false
+            val app = context.applicationContext
+            incidentStoreFactory(app).read(report) { result ->
+                when (result) {
+                    dev.redrain.cast.diagnostics.IncidentStore.ReadResult.Missing ->
+                        complete("Session telemetry report is no longer retained; reopen Reports and try again.")
+                    is dev.redrain.cast.diagnostics.IncidentStore.ReadResult.Failure ->
+                        complete("Could not read session telemetry report; the destination was not written. Reopen Reports and try again.")
+                    is dev.redrain.cast.diagnostics.IncidentStore.ReadResult.Success -> try {
+                        incidentExports.execute {
+                            try {
+                                val exported = dev.redrain.cast.diagnostics.IncidentSummary.export(result.content)
+                                checkNotNull(app.contentResolver.openOutputStream(uri, "wt")).use {
+                                    it.write(exported.toByteArray(Charsets.UTF_8))
+                                }
+                                complete(null)
+                            } catch (_: Exception) {
+                                complete("Could not export session telemetry report; the destination may contain an incomplete file.")
+                            }
+                        }
+                    } catch (_: java.util.concurrent.RejectedExecutionException) {
+                        complete("Telemetry export unavailable; reopen the report and try again.")
+                    }
+                }
+            }
+        }
+    }
     private class ListenerRun(val surface: Surface, val hdrSurface: Surface) {
         val output = ResourceSlot<VideoPlayer>()
         @Volatile var server: ReceiverServer? = null
@@ -117,6 +201,7 @@ class MainActivity : Activity(), SurfaceHolder.Callback, TextureView.SurfaceText
     private var detail = ""
     private var endpoints = emptyList<String>()
     private var problem: String? = null
+    private var exportProblem: IncidentExportError? = null
     private var playing = false
     private var aspect = 16.0 / 9
     private var rotation = 0
@@ -129,6 +214,7 @@ class MainActivity : Activity(), SurfaceHolder.Callback, TextureView.SurfaceText
     private var dialog: AlertDialog? = null
     private var settingsDialog: AlertDialog? = null
     private lateinit var updateCheck: LaunchUpdateCheck
+    private lateinit var retainedState: RetainedState
     private var updateDialog: AlertDialog? = null
     private var resumed = false
     private var windowFocused = false
@@ -142,6 +228,9 @@ class MainActivity : Activity(), SurfaceHolder.Callback, TextureView.SurfaceText
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        pendingIncidentExport = savedInstanceState?.getString("pendingIncidentExport")?.takeIf {
+            it.matches(Regex("incident-[0-9a-f]{32}\\.json"))
+        }
         sessionOrientation = SessionOrientation.forActivity(this)
         networkPermissionRequested = savedInstanceState?.getBoolean("networkPermissionRequested") ?: false
         networkPermissionDenied = savedInstanceState?.getBoolean("networkPermissionDenied") ?: false
@@ -177,6 +266,8 @@ class MainActivity : Activity(), SurfaceHolder.Callback, TextureView.SurfaceText
         root.addView(videoBox, FrameLayout.LayoutParams(-1, -1))
         home = HomeView(this, ::showSettings, ::manualConnect, ::prepareSend, ::stopSending, ::showHelp) {
             problem = null
+            exportProblem = null
+            if (::retainedState.isInitialized) retainedState.exports.clearError()
             CastState.failure = null
             render()
         }
@@ -196,10 +287,11 @@ class MainActivity : Activity(), SurfaceHolder.Callback, TextureView.SurfaceText
         }
         render()
         @Suppress("DEPRECATION")
-        val retained = lastNonConfigurationInstance as? LaunchUpdateCheck
+        val retained = lastNonConfigurationInstance as? RetainedState
         val installedVersion = if (BuildConfig.DEBUG) BuildConfig.VERSION_NAME.removeSuffix("-debug")
             else BuildConfig.VERSION_NAME
-        updateCheck = retained ?: updateFactory(installedVersion)
+        retainedState = retained ?: RetainedState(updateFactory(installedVersion))
+        updateCheck = retainedState.updateCheck
         updateCheck.attach(::showUpdateIfIdle)
         updateCheck.start()
     }
@@ -227,9 +319,13 @@ class MainActivity : Activity(), SurfaceHolder.Callback, TextureView.SurfaceText
         if (run != null) worker.execute { if (current(run)) run.server?.displayCapabilitiesChanged() }
     }
 
-    private fun showError(error: Exception) {
+    private fun showError(error: Exception) = showError(error, null)
+
+    private fun showError(error: Exception, exportError: IncidentExportError?) {
         android.util.Log.e("RedrainCast", "Operation failed", error)
         problem = error.message ?: error.javaClass.simpleName
+        exportProblem = exportError
+        if (exportError == null && ::retainedState.isInitialized) retainedState.exports.clearError()
         updateDialog?.dismiss()
         updateDialog = null
         if (::home.isInitialized) render()
@@ -393,6 +489,8 @@ class MainActivity : Activity(), SurfaceHolder.Callback, TextureView.SurfaceText
                 updateDialog?.dismiss()
                 updateDialog = null
                 problem = null
+                exportProblem = null
+                retainedState.exports.clearError()
                 CastState.failure = null
                 readiness = "CONNECTING"
                 detail = getString(R.string.flow_connecting)
@@ -462,6 +560,8 @@ class MainActivity : Activity(), SurfaceHolder.Callback, TextureView.SurfaceText
             CastState.message = getString(R.string.flow_waiting_consent)
             CastState.failure = null
             problem = null
+            exportProblem = null
+            retainedState.exports.clearError()
             render()
             retireListener { success ->
                 if (pendingRequestId != request.id) return@retireListener
@@ -510,6 +610,8 @@ class MainActivity : Activity(), SurfaceHolder.Callback, TextureView.SurfaceText
             if (networkPermissionDenied) showError(IllegalStateException(getString(R.string.flow_network_permission_denied)))
             else {
                 problem = null
+                exportProblem = null
+                retainedState.exports.clearError()
                 listenerFault = false
                 discoveryAttempted = false
                 readiness = "STARTING"
@@ -535,6 +637,18 @@ class MainActivity : Activity(), SurfaceHolder.Callback, TextureView.SurfaceText
     @Deprecated("Android Activity consent callback")
     override fun onActivityResult(code: Int, result: Int, data: Intent?) {
         super.onActivityResult(code, result, data)
+        if (code == 12) {
+            val report = pendingIncidentExport
+            pendingIncidentExport = null
+            if (result != RESULT_OK) return
+            val uri = data?.data
+            if (report == null || uri == null) {
+                showError(IOException("Telemetry export unavailable; reopen the retained report and try again."))
+                return
+            }
+            retainedState.exports.start(applicationContext, report, uri)
+            return
+        }
         if (code != 11) return
         val request = pendingRequest() ?: return
         if (result != RESULT_OK || data == null) {
@@ -610,8 +724,24 @@ class MainActivity : Activity(), SurfaceHolder.Callback, TextureView.SurfaceText
         if (CastState.roles.role() != null) return
         try {
             settingsDialog = SharingSettings.show(this, settings, { saved -> settings = saved; render() }, ::showNotices,
-                ::showPlaybackDiagnostics)
+                ::showPlaybackDiagnostics, ::exportIncident)
         } catch (error: Exception) { showError(error) }
+    }
+
+    @Suppress("DEPRECATION")
+    private fun exportIncident(report: String) {
+        try {
+            require(report.matches(Regex("incident-[0-9a-f]{32}\\.json")))
+            pendingIncidentExport = report
+            startActivityForResult(Intent(Intent.ACTION_CREATE_DOCUMENT).apply {
+                addCategory(Intent.CATEGORY_OPENABLE)
+                type = "application/json"
+                putExtra(Intent.EXTRA_TITLE, "cast-session-telemetry.json")
+            }, 12)
+        } catch (_: Exception) {
+            pendingIncidentExport = null
+            showError(IOException("No document provider is available for telemetry export."))
+        }
     }
 
     private fun showPlaybackDiagnostics() {
@@ -903,7 +1033,7 @@ class MainActivity : Activity(), SurfaceHolder.Callback, TextureView.SurfaceText
     }
 
     @Deprecated("Activity non-configuration retention")
-    override fun onRetainNonConfigurationInstance(): Any = updateCheck
+    override fun onRetainNonConfigurationInstance(): Any = retainedState
 
     override fun onStart() {
         super.onStart()
@@ -920,6 +1050,18 @@ class MainActivity : Activity(), SurfaceHolder.Callback, TextureView.SurfaceText
         detail = getString(R.string.flow_starting)
         discoveryAttempted = false
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        retainedState.exports.attach { error, clearedError ->
+            if (error != null) showError(IOException(error.message), error)
+            else {
+                if (clearedError != null && exportProblem === clearedError) {
+                    problem = null
+                    exportProblem = null
+                    render()
+                }
+                android.widget.Toast.makeText(this, "Session telemetry report exported",
+                    android.widget.Toast.LENGTH_SHORT).show()
+            }
+        }
         main.post(refresh)
     }
 
@@ -935,6 +1077,7 @@ class MainActivity : Activity(), SurfaceHolder.Callback, TextureView.SurfaceText
     }
 
     override fun onStop() {
+        retainedState.exports.detach()
         foreground = false
         main.removeCallbacks(statisticsRefresh)
         inlineStatisticsHost.stop()
@@ -955,6 +1098,7 @@ class MainActivity : Activity(), SurfaceHolder.Callback, TextureView.SurfaceText
     }
 
     override fun onSaveInstanceState(state: Bundle) {
+        pendingIncidentExport?.let { state.putString("pendingIncidentExport", it) }
         state.putBoolean("networkPermissionRequested", networkPermissionRequested)
         state.putBoolean("networkPermissionDenied", networkPermissionDenied)
         pendingRequestId?.let { state.putLong("pendingRequest", it) }
@@ -970,6 +1114,10 @@ class MainActivity : Activity(), SurfaceHolder.Callback, TextureView.SurfaceText
         if (::updateCheck.isInitialized) {
             updateCheck.detach()
             if (!isChangingConfigurations) updateCheck.close()
+        }
+        if (::retainedState.isInitialized) {
+            retainedState.exports.detach()
+            if (!isChangingConfigurations) retainedState.exports.close()
         }
         updateDialog?.dismiss()
         updateDialog = null
@@ -993,6 +1141,11 @@ class MainActivity : Activity(), SurfaceHolder.Callback, TextureView.SurfaceText
     }
 
     companion object {
+        private val incidentExports = java.util.concurrent.ThreadPoolExecutor(1, 1, 0,
+            TimeUnit.MILLISECONDS, java.util.concurrent.ArrayBlockingQueue(1),
+            { task -> Thread(task, "telemetry-export").apply { isDaemon = true } })
         internal var updateFactory: (String) -> LaunchUpdateCheck = { LaunchUpdateCheck(GitHubUpdateSource(), it) }
+        internal var incidentStoreFactory: (android.content.Context) -> dev.redrain.cast.diagnostics.IncidentStore =
+            { dev.redrain.cast.diagnostics.IncidentStore(it) }
     }
 }

@@ -9,6 +9,7 @@ import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
+import org.screencopy.receiver.protocol.ProtocolException
 import org.screencopy.receiver.protocol.StreamRecoveryProtocol
 
 /**
@@ -36,6 +37,7 @@ class SenderSession internal constructor(
     private val session = (SecureRandom().nextLong() and Long.MAX_VALUE) or 1
     private val mux = MediaBudget(settings.audio)
     private val outcome = SessionOutcome()
+    private val outcomePublication = Any()
     private val trace = SessionStopTrace(diagnostic)
     private var frameTrace: VideoFrameTrace? = null
     private val terminalQueued = AtomicBoolean()
@@ -45,6 +47,7 @@ class SenderSession internal constructor(
     private val receiverTerminal = AtomicBoolean()
     private val sizeSwitch = SizeSwitchAuthorization()
     private val captureCleanup = Any()
+    private val captureAbortStarted = AtomicBoolean()
     @Volatile private var linkClosed = false
     @Volatile private var startupTransportAborted = false
     @Volatile private var playing = false
@@ -56,10 +59,13 @@ class SenderSession internal constructor(
     @Volatile private var link: ReceiverLink? = null
     @Volatile private var backend: ProjectionCapture? = null
     @Volatile private var recovery: StreamRecoverySender? = null
+    @Volatile private var telemetryNegotiated = false
+    @Volatile private var telemetry: SenderTelemetrySession? = null
     var projectionOwner: ProjectionOwner? = null
     private val stopping get() = outcome.stopping
     @Volatile private var requestSent = false
     @Volatile private var acceptedSession = false
+    private var receiverReaderStarted = false
     private var diagnosticRevocation: AutoCloseable? = null
     private val diagnosticRevoked = AtomicBoolean()
     @Volatile private var remoteStop = false
@@ -70,6 +76,7 @@ class SenderSession internal constructor(
     @Volatile private var writeStarted = 0L
     @Volatile private var phaseDeadline = 0L
     @Volatile private var terminalWrittenAt: Long? = null
+    @Volatile private var fatalTeardown = false
 
     private fun phase(value: String, stage: SessionStopTrace.Phase) {
         trace.phase(stage)
@@ -95,7 +102,7 @@ class SenderSession internal constructor(
         status("Stopping")
         queueTerminal()
         val orderlyRemoteStop = remoteStop && acceptedSession && link?.streamRecovery == true && link?.mediaAttached == true
-        if (!playing) Thread({
+        if (!playing) startCaptureAbort {
             trace.mark(SessionStopTrace.Stage.STARTUP_CANCEL)
             if (!playing && !orderlyRemoteStop) {
                 if (requestSent) try { terminalSent.await(500, TimeUnit.MILLISECONDS) }
@@ -103,16 +110,34 @@ class SenderSession internal constructor(
                 startupTransportAborted = true
                 closeLink()
             }
-            abortCapture()
-        }, "cancel-capture-startup").start()
+        }
     }
     private fun fail(error: Exception, origin: SessionOutcome.Origin) {
         if (origin == SessionOutcome.Origin.CLEANUP) cleanupSucceeded = false
         val atFailure = trace.currentPhase()
         val classified = if (origin == SessionOutcome.Origin.CAPTURE && error !is SenderProtocolException &&
             SessionOutcome.errorCode(error) == "PROTOCOL") SenderProtocolException(CaptureProtocolFailure.unknown(error), error) else error
-        val retained = outcome.record(classified, origin, closing)
+        val retained = synchronized(outcomePublication) {
+            outcome.record(classified, origin, closing).also { accepted ->
+                if (accepted) {
+                    TelemetryRegistry.event("sender", session, DiagnosticKind.SESSION.ordinal + 1,
+                        DiagnosticStage.FAILED.ordinal, (classified as? RecoveryDeadlineException)?.track ?: 0,
+                        (classified as? RecoveryDeadlineException)?.generation ?: 0,
+                        IncidentEvidence.cause(SessionOutcome.errorCode(classified)),
+                        listOf(atFailure.ordinal.toLong(), origin.ordinal.toLong()), failure = true)
+                    TelemetryRegistry.state("sender", session, 60, DiagnosticKind.SESSION.ordinal + 1,
+                        DiagnosticStage.SETTLED.ordinal, (classified as? RecoveryDeadlineException)?.track ?: 0,
+                        (classified as? RecoveryDeadlineException)?.generation ?: 0,
+                        IncidentEvidence.cause(SessionOutcome.errorCode(classified)),
+                        listOf(atFailure.ordinal.toLong(), origin.ordinal.toLong()))
+                }
+            }
+        }
         if (retained) sizeSwitch.cancel()
+        if (origin == SessionOutcome.Origin.CLEANUP) TelemetryRegistry.state("sender", session, 63,
+            DiagnosticKind.SESSION.ordinal + 1, DiagnosticStage.FAILED.ordinal, 0, 0,
+            IncidentEvidence.cause(SessionOutcome.errorCode(classified)),
+            listOf(atFailure.ordinal.toLong(), origin.ordinal.toLong()))
         if (retained) trace.firstFailure(classified, atFailure, origin, session, settings,
             lastReceiveAgeMs = lastIncoming.takeIf { it > 0 }?.let { ((now() - it) / 1_000_000).coerceAtLeast(0) },
             writeElapsedMs = writeStarted.takeIf { it > 0 }?.let { ((now() - it) / 1_000_000).coerceAtLeast(0) })
@@ -194,7 +219,7 @@ class SenderSession internal constructor(
                 diagnostic("event=VIDEO_FRAME_TRACE_ENABLED session=$session duration_ms=${durationNs / 1_000_000} capacity=$capacity")
             }
             settings.validate()
-            timer.scheduleWithFixedDelay(::watchdog, 500, 500, TimeUnit.MILLISECONDS)
+            startWatchdog()
             phase("Checking screen-sharing permission", SessionStopTrace.Phase.ACCESS)
             val owner = projectionOwner ?: throw IOException("CAPTURE_FAILED: screen-sharing consent is required")
             phase("ConnectingReceiver", SessionStopTrace.Phase.CONNECTING)
@@ -230,6 +255,7 @@ class SenderSession internal constructor(
                 if (connected.delegatedDiagnostics) "starting" else "unsupported")
             if (delegateDiagnostics && connected.delegatedDiagnostics)
                 request.put("diagnostic", org.screencopy.receiver.protocol.DiagnosticDelegation.request(true))
+            connected.selectSessionTelemetry(request)
             connected.send(Wire.control(Wire.SESSION_REQUEST, session, request))
             worker("receiver-control-write") { writeLoop(0) }
             requestSent = true
@@ -266,10 +292,22 @@ class SenderSession internal constructor(
                     org.screencopy.receiver.protocol.StrictJson.decode(accepted.payload))
                 DiagnosticAccess.receiverStatus(DiagnosticAccess.connections.snapshot().getString("state"))
             }
+            val acceptedJson = org.screencopy.receiver.protocol.StrictJson.decode(accepted.payload)
+            telemetryNegotiated = connected.acceptedSessionTelemetry(acceptedJson)
+            try {
+                telemetry = SenderTelemetrySession(telemetryNegotiated, IncidentStore(context),
+                    java.util.UUID.randomUUID().toString().replace("-", ""),
+                    { error -> android.util.Log.w("SessionTelemetry", "telemetry_failed=${error.javaClass.simpleName}") })
+                    .also { TelemetryRegistry.beginSender(session, it) }
+                TelemetryRegistry.sessionConfiguration("sender", session, settings.videoCodec,
+                    settings.audioCodec.takeIf { settings.audio }, settings.maxFps,
+                    settings.videoBitrate, settings.audioBitrate.takeIf { settings.audio && settings.audioCodec != "raw" })
+            } catch (e: Exception) {
+                android.util.Log.w("SessionTelemetry", "telemetry_start_failed=${e.javaClass.simpleName}")
+            }
             check()
             acceptedSession = true
-            worker("receiver-read", ::readLoop)
-            connected.attach(session, accepted, settings.audio)
+            attachReceiver(connected, accepted)
             check()
             for (track in 1..2) {
                 worker("receiver-media-write-$track") { writeLoop(track) }
@@ -309,6 +347,8 @@ class SenderSession internal constructor(
                 if (outcome.failure == null) DiagnosticStage.ENDED else DiagnosticStage.FAILED,
                 reason = if (outcome.failure == null) DiagnosticReason.STOPPED else DiagnosticReason.FAILURE)
             RemoteDiagnostics.recorder.sessionEnded("sender", session)
+            TelemetryRegistry.end("sender", telemetry)
+            telemetry?.finish(cleanupSucceeded)
             diagnosticRevocation?.close()
             DiagnosticAccess.connections.ended(session)
             if (DiagnosticAccess.receiverSession == session &&
@@ -318,14 +358,34 @@ class SenderSession internal constructor(
         }
     }
 
+    internal fun attachReceiver(connected: ReceiverLink, accepted: Wire.Message) {
+        connected.attach(session, accepted, settings.audio,
+            onFailure = { fail(it, SessionOutcome.Origin.STARTUP) }) {
+            synchronized(this) {
+                if (!closing) {
+                    worker("receiver-read", ::readLoop)
+                    receiverReaderStarted = true
+                }
+            }
+        }
+    }
+
     internal fun retireTransport() {
         DiagnosticAccess.connections.ended(session)
-        synchronized(this) { closing = true }
         trace.phase(SessionStopTrace.Phase.CLEANUP)
         val orderly = orderlyTeardown
-        val timeoutNanos = if (orderly) 22_000_000_000L else 2_000_000_000L
-        phaseDeadline = if (orderly && !remoteStop && terminalWrittenAt != null)
-            checkNotNull(terminalWrittenAt) + 2_000_000_000L else now() + timeoutNanos
+        val fatal = negotiatedFatalCleanup && terminalMessage().type == Wire.ERROR
+        val timeoutNanos = when {
+            orderly -> 22_000_000_000L
+            fatal -> TelemetryTerminalBudget.CONTROL_FRAME_NS
+            else -> 2_000_000_000L
+        }
+        synchronized(this) {
+            fatalTeardown = fatal
+            phaseDeadline = if (orderly && !remoteStop && terminalWrittenAt != null)
+                checkNotNull(terminalWrittenAt) + 2_000_000_000L else now() + timeoutNanos
+            closing = true
+        }
         status("Stopping")
         trace.mark(SessionStopTrace.Stage.CLOSING)
         queueTerminal()
@@ -333,18 +393,21 @@ class SenderSession internal constructor(
         try {
             if (requestSent) {
                 val delivered = terminalSent.await(
-                    if (orderly) (phaseDeadline - now()).coerceAtLeast(0) else minOf(500_000_000L,
+                    if (orderly || fatal) (retirementDeadline() - now()).coerceAtLeast(0) else minOf(500_000_000L,
                         (phaseDeadline - now()).coerceAtLeast(0)), TimeUnit.NANOSECONDS)
-                if (orderly && !delivered)
-                    fail(IOException("TIMEOUT: orderly terminal frame did not finish within 22 seconds"),
+                if ((orderly || fatal) && !delivered)
+                    fail(IOException(if (fatal) "TIMEOUT: fatal terminal frame did not finish within 10 seconds"
+                        else "TIMEOUT: orderly terminal frame did not finish within 22 seconds"),
                         SessionOutcome.Origin.CLEANUP)
             }
             if (orderly && !remoteStop) terminalWrittenAt?.let { phaseDeadline = it + 2_000_000_000L }
             mediaRetiring = true
             try { link?.closeMedia() } catch (error: IOException) { fail(error, SessionOutcome.Origin.CLEANUP) }
-            if (acceptedSession) {
-                val drained = receiverReleased.await((phaseDeadline - now()).coerceAtLeast(0), TimeUnit.NANOSECONDS)
-                if (!drained) fail(IOException("TIMEOUT: receiver terminal response did not arrive within two seconds"),
+            if (receiverReaderStarted) {
+                val drained = receiverReleased.await((retirementDeadline() - now()).coerceAtLeast(0), TimeUnit.NANOSECONDS)
+                if (!drained) fail(IOException(if (fatal)
+                    "TIMEOUT: receiver fatal terminal response exceeded its negotiated cleanup budget"
+                    else "TIMEOUT: receiver terminal response did not arrive within two seconds"),
                     SessionOutcome.Origin.CLEANUP)
                 else if (!receiverTerminal.get() && !startupTransportAborted && outcome.failure == null)
                     fail(IOException("PROTOCOL: receiver closed control before terminal acknowledgement"),
@@ -366,14 +429,34 @@ class SenderSession internal constructor(
         link?.streamRecovery == true && (playing || remoteStop && link?.mediaAttached == true) &&
             acceptedSession && outcome.failure == null
 
+    private val negotiatedFatalCleanup: Boolean get() =
+        telemetryNegotiated && acceptedSession && outcome.failure != null && !receiverTerminal.get() && !linkClosed
+
+    private fun retirementDeadline(): Long {
+        val writtenAt = terminalWrittenAt
+        return if (fatalTeardown && writtenAt != null)
+            writtenAt + TelemetryTerminalBudget.FATAL_RESPONSE_NS else phaseDeadline
+    }
+
+    internal fun startWatchdog() {
+        timer.scheduleWithFixedDelay(::watchdog, 500, 500, TimeUnit.MILLISECONDS)
+    }
+
     private fun watchdog() {
         dumpVideoTrace()
         val current = now()
         if (closing) {
             // Bound terminal TCP delivery without interrupting independently bounded codec cleanup.
-            if (current > phaseDeadline) {
-                if (orderlyTeardown && (terminalSent.count != 0L || !receiverTerminal.get()))
-                    fail(IOException(if (terminalSent.count != 0L)
+            val frameStarted = writeStarted
+            val frameExpired = fatalTeardown && frameStarted > 0 &&
+                current - frameStarted > TelemetryTerminalBudget.CONTROL_FRAME_NS
+            if (current > retirementDeadline() || frameExpired) {
+                if ((orderlyTeardown || fatalTeardown) && (terminalSent.count != 0L || !receiverTerminal.get()))
+                    fail(IOException(if (fatalTeardown) {
+                        if (terminalWrittenAt == null || frameExpired)
+                            "TIMEOUT: fatal terminal frame did not finish within 10 seconds"
+                        else "TIMEOUT: receiver fatal terminal response exceeded its negotiated cleanup budget"
+                    } else if (terminalSent.count != 0L)
                         "TIMEOUT: orderly terminal frame did not finish within 22 seconds"
                         else "TIMEOUT: receiver terminal response did not arrive within two seconds"), SessionOutcome.Origin.CLEANUP)
                 if (sizeSwitch.requested && !sizeSwitch.receiverClosed)
@@ -388,15 +471,16 @@ class SenderSession internal constructor(
             if (recovery?.retryKeyFrame() == true) checkNotNull(backend).requestKeyFrame()
         } catch (error: IOException) {
             fail(error, SessionOutcome.Origin.WATCHDOG)
-            closeLink(); abortCapture(); return
+            if (!negotiatedFatalCleanup) closeLink()
+            startCaptureAbort(); return
         }
         if (phaseDeadline > 0 && current > phaseDeadline || lastIncoming > 0 && current - lastIncoming > 10_000_000_000L ||
             writeStarted > 0 && current - writeStarted > 10_000_000_000L) {
             fail(IOException("TIMEOUT: receiver/capture did not make progress within 10 seconds"), SessionOutcome.Origin.WATCHDOG)
-            closeLink(); abortCapture(); return
+            closeLink(); startCaptureAbort(); return
         }
         mux.expiredTrack()?.let { track ->
-            fail(IOException("TIMEOUT: receiver did not initialize track $track"), SessionOutcome.Origin.WATCHDOG); closeLink(); abortCapture()
+            fail(IOException("TIMEOUT: receiver did not initialize track $track"), SessionOutcome.Origin.WATCHDOG); closeLink(); startCaptureAbort()
         }
     }
     private fun dumpVideoTrace(force: Boolean = false) {
@@ -412,6 +496,19 @@ class SenderSession internal constructor(
             android.util.Log.e("ScreenCopySender", "event=VIDEO_FRAME_TRACE_WRITE_FAILED session=$session", error)
         }
     }
+    private fun startCaptureAbort(beforeAbort: () -> Unit = {}) {
+        if (!captureAbortStarted.compareAndSet(false, true)) return
+        try {
+            Thread({
+                try { beforeAbort() }
+                finally { abortCapture() }
+            }, "cancel-capture-startup").start()
+        } catch (error: Exception) {
+            fail(IOException("Capture abort could not be started", error), SessionOutcome.Origin.CLEANUP)
+            closeLink()
+        }
+    }
+
     private fun abortCapture() {
         trace.mark(SessionStopTrace.Stage.STARTUP_BRIDGE_CLOSE_BEGIN)
         try { closeCapture() }
@@ -425,6 +522,28 @@ class SenderSession internal constructor(
         try { link?.close() } catch (e: IOException) { fail(e, SessionOutcome.Origin.CLEANUP) }
         trace.mark(SessionStopTrace.Stage.LINK_CLOSED)
     }
+    private fun recordReceiverTerminal(json: JSONObject) {
+        if (!telemetryNegotiated) return
+        val rawSequence = json.opt("finalSeq")
+        val sequence = if (rawSequence == null || rawSequence === JSONObject.NULL) null
+            else SessionTelemetryProtocol.number(rawSequence).also {
+                if (it <= 0) throw IOException("PROTOCOL: invalid final telemetry sequence")
+            }
+        val cleanup = json.opt("cleanupSucceeded")
+        if (cleanup != null && cleanup !is Boolean)
+            throw IOException("PROTOCOL: invalid receiver cleanup outcome")
+        if (sequence != null && cleanup == null)
+            throw IOException("PROTOCOL: missing receiver cleanup outcome")
+        val rawSkip = json.opt("finalSkipReason")
+        val skip = if (rawSkip == null) null else {
+            if (rawSkip !is String) throw IOException("PROTOCOL: invalid final telemetry skip reason")
+            ReceiverTelemetrySession.FinalSkipReason.entries.firstOrNull { it.name == rawSkip }
+                ?: throw IOException("PROTOCOL: unknown final telemetry skip reason")
+        }
+        if (sequence != null && skip != null)
+            throw IOException("PROTOCOL: final telemetry cannot be both sent and skipped")
+        telemetry?.terminal(sequence, cleanup == true, skipReason = skip)
+    }
     private fun worker(name: String, action: () -> Unit) { threads.add(Thread(action, name).also { it.start() }) }
     private fun readLoop() {
         try {
@@ -434,12 +553,16 @@ class SenderSession internal constructor(
                 lastIncoming = now()
                 if (message.session != session) throw IOException("PROTOCOL: wrong session")
                 val json = message.json()
-                if ((stopping || closing) && message.type !in setOf(Wire.ERROR, Wire.STOP, Wire.SESSION_END)) continue
+                val telemetryStatus = message.type == Wire.STATUS && json.optString("state") == "session-telemetry"
+                if ((stopping || closing) && !telemetryStatus &&
+                    message.type !in setOf(Wire.ERROR, Wire.STOP, Wire.SESSION_END)) continue
                 when (message.type) {
                     Wire.STREAM_READY -> {
                         if (!Json.bool(json, "ok")) throw IOException("DECODER_FAILED: track not ready")
                         mux.ready(message.track, message.generation)
                         if (recovery?.ready() == true) checkNotNull(backend).requestKeyFrame()
+                        TelemetryRegistry.evidence("sender", session, message.track, message.generation,
+                            IncidentEvidence.Stage.READY_PROCESSED)
                         if (mux.allReady() && !stopping && !closing && outcome.failure == null) {
                             phaseDeadline = 0
                             playing = true
@@ -461,6 +584,10 @@ class SenderSession internal constructor(
                         val detail = Json.string(json, "message")
                         if (state.length > 80 || detail.length > 2048)
                             throw IOException("PROTOCOL: oversized STATUS fields")
+                        if (telemetryStatus) {
+                            if (telemetryNegotiated) telemetry?.acceptPeer(message.payload)
+                            continue
+                        }
                         if (json.has("diagnostic") && state == "diagnostics") {
                             DiagnosticAccess.connections.update(session,
                                 org.screencopy.receiver.protocol.StrictJson.decode(message.payload))
@@ -488,6 +615,7 @@ class SenderSession internal constructor(
                         val code = Json.string(json, "code"); val text = Json.string(json, "message")
                         val error = ReceiverReportedFailure(code, text)
                         if (Json.bool(json, "fatal")) {
+                            recordReceiverTerminal(json)
                             receiverTerminal.set(true)
                             diagnostic("receiver_session_error ${Wire.obj("code" to code, "fatal" to true)}")
                             throw error
@@ -496,17 +624,20 @@ class SenderSession internal constructor(
                     }
                     Wire.SESSION_END -> {
                         Json.string(json, "reason")
+                        recordReceiverTerminal(json)
                         receiverTerminal.set(true)
                         if (sizeSwitch.requested) sizeSwitch.acknowledge()
                         else { remoteStop = true; stop(); return }
                     }
                     Wire.STOP -> {
-                        Json.string(json, "reason"); receiverTerminal.set(true); remoteStop = true; stop(); return
+                        Json.string(json, "reason"); recordReceiverTerminal(json)
+                        receiverTerminal.set(true); remoteStop = true; stop(); return
                     }
                     else -> throw IOException("PROTOCOL: unexpected receiver message ${message.type}")
                 }
             }
-        } catch (e: Exception) {
+        } catch (error: Exception) {
+            val e = if (error is ProtocolException) IOException("${error.code}: ${error.message}", error) else error
             if (sizeSwitch.requested && !linkClosed) {
                 if (e is java.io.EOFException && sizeSwitch.acknowledged) sizeSwitch.peerClosed()
                 else fail(IOException("Size change lost receiver before confirmed cleanup", e), SessionOutcome.Origin.RECEIVER_READ)
@@ -615,6 +746,8 @@ class SenderSession internal constructor(
     }
     override fun config(track: Int, generation: Int, config: JSONObject) {
         check()
+        TelemetryRegistry.trackConfiguration("sender", session, track, generation, config.optString("codec"),
+            config.optInt("width"), config.optInt("height"), config.optInt("sampleRate"), config.optInt("channels"))
         RemoteDiagnostics.recorder.observe("sender", session, DiagnosticKind.SESSION, DiagnosticStage.CONFIG,
             track, generation, metadata = if (track == 2 && RemoteDiagnostics.recorder.enabled("sender", session, DiagnosticKind.SESSION))
                 DiagnosticConfiguration(DiagnosticCodec.from(config.optString("codec")), config.optInt("sampleRate"),

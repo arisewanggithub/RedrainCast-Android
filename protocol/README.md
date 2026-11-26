@@ -25,6 +25,18 @@ that receiver hint and the sender's actual listener endpoint. Collector
 `--lan --sender HOST:PORT --follow-receiver` attaches both exact-session captures
 without a receiver endpoint argument or UDP reception; no capture starts at HELLO.
 
+The implemented replacement for automatic incident diagnostics is
+[sender-owned session telemetry](PRESSURE_INCIDENTS.md). Compatible Android
+endpoints negotiate `sessionTelemetry`; the receiver publishes bounded
+metadata over the admitted control connection and the sender retains and,
+on pressure or failure, saves the paired report. STATUS payloads are capped
+at 8 KiB (8,192 bytes); with the 40-byte SCPY header, one telemetry frame is
+at most 8,232 bytes on the wire, excluding TCP framing. There is no receiver
+report persistence or automatic post-stop fetch/fallback. An older peer casts
+normally without receiver telemetry. This is separate from the consented LAN
+diagnostic listener above; neither transport is encrypted or cryptographically
+paired.
+
 ## Optional uncapped capture FPS
 
 Updated Android control HELLO advertises Boolean `uncappedFps:true`. The
@@ -324,6 +336,26 @@ After its own STOP is successfully written, its peer acknowledgement wait remain
 two seconds: started media has already drained. Legacy and fatal teardown retain
 their original two-second total bound.
 
+For negotiated session telemetry, receiver cleanup and final publication are
+part of the existing teardown budget. The final batch, if delivered, precedes
+the receiver's STOP or SESSION_END and the terminal references its sequence;
+otherwise the terminal gives a skipped reason. Final preparation is limited to
+250 ms and transmission to 750 ms, not extra time added to the existing stop
+deadline. An unstarted final can be skipped; a partially written timed-out
+frame requires closing control rather than writing another frame. The sender
+continues reading telemetry while stopping. A matching terminal and successful
+cleanup are required before marking the receiver side complete. Fatal ERROR
+retains priority, and simultaneous Stops retain the media-drain and terminal
+arbitration rules below.
+Fatal ERROR uses the same optional final sequence and cleanup metadata after
+bounded playback retirement; a fatal cast does not imply failed cleanup.
+Audio-start current rows include clock-decision and cached output-progress
+evidence while blocked. See [the numeric layout and bounds](PRESSURE_INCIDENTS.md).
+
+The optional `finalSkipReason` is `PREPARATION_TIMEOUT`, `PREPARATION_FAILED`,
+`UNAVAILABLE`, or `WRITE_SKIPPED`; a terminal naming a final sequence must not
+also name a skip reason. Older peers may omit this field.
+
 For receiver-initiated v2 Stop, the 22-second SESSION_END acknowledgement window
 starts only after the complete STOP control frame is successfully written/flushed,
 not when it is enqueued or an earlier control frame completes. This allows two
@@ -490,7 +522,8 @@ out-of-range signed 32-bit JSON integers, malformed input, and unknown/reserved
 packet types fail. Untracked packets use track/generation zero and PTS -1.
 Configuration/readiness are tracked but use PTS -1. Media uses positive track
 and generation and nonnegative PTS. Limits are 64 KiB control/configuration,
-4 MiB video and 256 KiB audio. Media payloads cannot be empty.
+4 MiB video and 256 KiB audio. Negotiated session telemetry STATUS envelopes
+are further limited to 8192 original UTF-8 bytes. Media payloads cannot be empty.
 
 Video configuration carries requested `codec`, fixed `width`/`height`, and
 canonical Base64 `csd` buffers (Annex B for H.264/H.265). Audio configuration

@@ -89,12 +89,14 @@ class ReceiverServer private constructor(
     private val timeMilliseconds: () -> Long = { System.nanoTime() / 1_000_000 },
     private val controlWrite: (Socket, Message) -> Unit = { target, message -> Wire.write(target.outputStream, message) },
     private val diagnosticDiscovery: (InetAddress) -> DiagnosticDiscovery? = { null },
-    private val diagnosticSessionAccess: org.screencopy.receiver.protocol.DiagnosticSessionAccess? = null
+    private val diagnosticSessionAccess: org.screencopy.receiver.protocol.DiagnosticSessionAccess? = null,
+    private val incidentSave: () -> ((String, JSONObject) -> Unit) = { { _, _ -> } }
 ) : AutoCloseable {
     private fun now() = timeMilliseconds()
     private data class VideoProofCandidate(
         val generation: Long, val ptsUs: Long, val audioObservation: SourceTimestampObservation?
     )
+    private enum class FatalWork { NOT_STARTED, RUNNING, RETIRED, FAILED }
     constructor(
         name: String, surface: Surface,
         onStatus: (String, String) -> Unit, onVideoSize: (Int, Int) -> Unit,
@@ -115,13 +117,15 @@ class ReceiverServer private constructor(
         },
         videoSurface: ((VideoFormat) -> Surface)? = null,
         diagnosticDiscovery: (InetAddress) -> DiagnosticDiscovery? = { null },
-        diagnosticSessionAccess: org.screencopy.receiver.protocol.DiagnosticSessionAccess? = null
+        diagnosticSessionAccess: org.screencopy.receiver.protocol.DiagnosticSessionAccess? = null,
+        incidentSave: () -> ((String, JSONObject) -> Unit) = { { _, _ -> } }
     ) : this(name, surface, onStatus, onVideoSize, onListener, port, videoOutput, ::validateCapabilities, onScreenEvent,
         { android.util.Log.e("ScreenCopyReceiver", it.logMessage()) }, onPresentationStart, null,
         onDiscoveryDiagnostic = { android.util.Log.i("ScreenCopyReceiver", it) }, onVideoRotation = onVideoRotation,
         acquireSession = acquireSession, instanceId = instanceId, onFramePresented = onFramePresented,
         supportsPlaybackStatistics = supportsPlaybackStatistics, receiveCapabilities = receiveCapabilities,
-        videoSurface = videoSurface, diagnosticDiscovery = diagnosticDiscovery, diagnosticSessionAccess = diagnosticSessionAccess)
+        videoSurface = videoSurface, diagnosticDiscovery = diagnosticDiscovery, diagnosticSessionAccess = diagnosticSessionAccess,
+        incidentSave = incidentSave)
 
     private val name = name.take(80)
     private val running = AtomicBoolean(false)
@@ -321,6 +325,7 @@ class ReceiverServer private constructor(
             check(acceptThread?.isAlive != true) { "Listener thread did not terminate after socket close" }
         }
         cleanup { check(clients.awaitTermination(5, TimeUnit.SECONDS)) { "Session cleanup timed out; reopen the app before receiving" } }
+        cleanup { active.get()?.receiverDestroyed() }
         cleanup { check(timer.awaitTermination(2, TimeUnit.SECONDS)) { "Network cleanup timed out" } }
         cleanup { check(statisticsTimer.awaitTermination(2, TimeUnit.SECONDS)) { "Statistics cleanup timed out" } }
         if (errors.isNotEmpty()) throw IllegalStateException("Receiver cleanup failed; reopen the app", errors.first()).also {
@@ -337,6 +342,9 @@ class ReceiverServer private constructor(
         @Volatile private var phase = "Setup"
         @Volatile private var session = 0L
         private var diagnosticsNegotiated = false
+        private var telemetryOffered = false
+        @Volatile private var telemetryNegotiated = false
+        @Volatile private var telemetry: ReceiverTelemetrySession? = null
         private var diagnosticOwner = false
         private fun diagnosticReport(state: String) {
             if (active.get() !== this || !accepted || socket.isClosed || stopping.get()) return
@@ -371,11 +379,29 @@ class ReceiverServer private constructor(
         private val firstFailure = AtomicReference<FailureDiagnostic?>()
         private val connectionError = AtomicReference<Pair<String, String>?>()
         private val mediaDisconnect = AtomicReference<Pair<Exception, Long>?>()
-        private val failureRetirement = AtomicBoolean()
+        private val fatalWork = AtomicReference(FatalWork.NOT_STARTED)
+        private val resourceRetirementFailed = AtomicBoolean()
+        private val retirementLock = Any()
+        private var controlCleanupStarted = false
+        private val controlCleanupFinished = CountDownLatch(1)
+        private var retirementFailed = false
+        private var ownershipReleased = false
+        private var ordinaryStopInProgress = false
+        private val fatalReply = AtomicReference<Pair<String, String>?>()
+        private val fatalTerminalClaimed = AtomicBoolean()
+        private val fatalAdmissionLock = Any()
+        private var fatalCleanupDeadline: java.util.concurrent.ScheduledFuture<*>? = null
         private val playbackLock = Any()
         private val trackPlaybackOperations = Array(3) { Any() }
         private val recoveryExecutor = Executors.newSingleThreadExecutor()
-        private val recoveryScheduler = TrackRecoveryScheduler(::now)
+        private val recoveryScheduler = TrackRecoveryScheduler(::now, observed = { track, generation, state, delayMs ->
+            TelemetryRegistry.evidence("receiver", session, track, generation, when (state) {
+                TrackRecoveryScheduler.State.QUEUED -> IncidentEvidence.Stage.RECOVERY_QUEUED
+                TrackRecoveryScheduler.State.RUNNING -> IncidentEvidence.Stage.RECOVERY_RUNNING
+                TrackRecoveryScheduler.State.CANCELLED -> IncidentEvidence.Stage.RECOVERY_CANCELLED
+            }, delayMs)
+        })
+        private var controlWriteOperation = 0L
         private var playbackClock: PlaybackClock? = null
         private val clock: PlaybackClock get() = synchronized(playbackLock) {
             playbackClock ?: clockFactory().also { playbackClock = it }
@@ -461,6 +487,8 @@ class ReceiverServer private constructor(
         private val mediaToken = ByteArray(32).also { SecureRandom().nextBytes(it) }
             .joinToString("") { "%02x".format(it.toInt() and 255) }
         @Volatile private var accepted = false
+        // Media EOF revokes routing, not the admitted control session's final-telemetry contract.
+        @Volatile private var sessionAccepted = false
         @Volatile private var mediaOwner: Connection? = null
         private var mediaTrack = 0
 
@@ -529,6 +557,10 @@ class ReceiverServer private constructor(
         }
 
         private fun receiveMedia(message: Message) {
+            TelemetryRegistry.evidence("receiver", session, message.track, message.generation.toInt(),
+                IncidentEvidence.Stage.ADMISSION_BEGIN, message.ptsUs, message.payload.size.toLong())
+            var admitted = false
+            try {
             if (message.track == 1) RemoteDiagnostics.recorder.video("receiver", session,
                 message.generation.toInt(), DiagnosticVideoStage.RECEIVED, message.ptsUs,
                 message.payload.size.toLong(), keyFrame = message.flags and 1 != 0)
@@ -598,6 +630,7 @@ class ReceiverServer private constructor(
             // Admission may wait; never hold the other media lane behind a full track.
             try {
                 val pressure = if (!streamRecovery) { target.offer(packet); null } else target.tryOffer(packet)
+                admitted = pressure == null
                 if (message.track == 1) RemoteDiagnostics.recorder.video("receiver", session,
                     message.generation.toInt(), if (pressure == null) DiagnosticVideoStage.ADMITTED else DiagnosticVideoStage.REJECTED,
                     message.ptsUs, message.payload.size.toLong(), keyFrame = packet.keyFrame,
@@ -622,6 +655,12 @@ class ReceiverServer private constructor(
                     message.generation.toInt(), DiagnosticVideoStage.REJECTED, message.ptsUs,
                     message.payload.size.toLong(), reason = DiagnosticReason.STALE)
                 onDiscoveryDiagnostic("event=RETIRED_MEDIA_ADMISSION track=${message.track}")
+            }
+            } finally {
+                if (admitted) TelemetryRegistry.evidence("receiver", session, message.track, message.generation.toInt(),
+                    IncidentEvidence.Stage.ADMISSION_END)
+                else TelemetryRegistry.evidence("receiver", session, message.track, message.generation.toInt(),
+                    IncidentEvidence.Stage.ADMISSION_END, 0)
             }
         }
 
@@ -651,6 +690,7 @@ class ReceiverServer private constructor(
                 if (track == 1) videoGeneration else audioGeneration
             }
             onDiscoveryDiagnostic("event=STREAM_RECOVERY_REQUEST track=$track generation=$generation ${pressure.logMessage()}")
+            recordTelemetryPressure(pressure, generation.toInt())
             RemoteDiagnostics.recorder.observe("receiver", session, DiagnosticKind.RECOVERY, DiagnosticStage.PRESSURE,
                 track, generation.toInt(), reason = DiagnosticReason.PRESSURE)
             send(Type.STATUS, JSONObject().put("state", "stream-recovery-request")
@@ -678,32 +718,34 @@ class ReceiverServer private constructor(
             terminateMediaFailure(error)
         }
 
-        private fun terminateMediaFailure(error: Exception) {
-            if (!running.get() || stopping.get()) return
-            val code = when (error) {
-                is ProtocolException -> error.code
-                is PlaybackException -> error.code
-                is java.net.SocketTimeoutException -> "TIMEOUT"
-                is IOException -> "PROTOCOL"
-                else -> "INTERNAL"
+        private fun terminateMediaFailure(error: Exception, detailOverride: String? = null) {
+            synchronized(retirementLock) {
+                if (controlCleanupStarted) return
+                if (!running.get() || stopping.get()) return
+                val code = when (error) {
+                    is ProtocolException -> error.code
+                    is PlaybackException -> error.code
+                    is java.net.SocketTimeoutException -> "TIMEOUT"
+                    is IOException -> "PROTOCOL"
+                    else -> "INTERNAL"
+                }
+                val detail = detailOverride ?: "Media connection failed: ${error.message ?: error.javaClass.simpleName}"
+                if (!connectionError.compareAndSet(null, code to detail)) return
+                stopAt = now()
+                if (!stopping.compareAndSet(false, true)) return
+                terminalError = true
+                reportFailure(code, detail, when {
+                    error is ReceiverOrientationException -> FailureOrigin.PRESENTATION
+                    initializingTrack == 1 -> FailureOrigin.VIDEO
+                    initializingTrack == 2 -> FailureOrigin.AUDIO
+                    else -> FailureOrigin.SESSION
+                }, (error as? QueueCongestionException)?.pressure,
+                    (error as? AudioOutputPreparationException)?.diagnostic,
+                    (error as? VideoPlaybackException)?.diagnostic)
+                onStatus("Session error: $code", "$detail\nReconnect after correcting the sender settings or network.")
+                beginFatalRetirement(code, detail)
+                retireFailedSession()
             }
-            val detail = "Media connection failed: ${error.message ?: error.javaClass.simpleName}"
-            if (!connectionError.compareAndSet(null, code to detail)) return
-            stopAt = now()
-            if (!stopping.compareAndSet(false, true)) return
-            terminalError = true
-            reportFailure(code, detail, when {
-                error is ReceiverOrientationException -> FailureOrigin.PRESENTATION
-                initializingTrack == 1 -> FailureOrigin.VIDEO
-                initializingTrack == 2 -> FailureOrigin.AUDIO
-                else -> FailureOrigin.SESSION
-            }, (error as? QueueCongestionException)?.pressure,
-                (error as? AudioOutputPreparationException)?.diagnostic,
-                (error as? VideoPlaybackException)?.diagnostic)
-            onStatus("Session error: $code", "$detail\nReconnect after correcting the sender settings or network.")
-            try {
-                send(Type.ERROR, JSONObject().put("code", code).put("message", detail).put("fatal", true))
-            } finally { retireFailedSession() }
         }
 
         fun run() {
@@ -712,6 +754,10 @@ class ReceiverServer private constructor(
                 socket.soTimeout = 10_000
                 writer = ControlWriter(socket, { message ->
                     lastWrite = now()
+                    if (message.type == Type.ERROR && fatalTerminalClaimed.get()) {
+                        socket.close()
+                        writer?.close()
+                    }
                     if (message.type == Type.STOP) {
                         stopWrittenAt = lastWrite
                         stopWritten.countDown()
@@ -721,18 +767,41 @@ class ReceiverServer private constructor(
                     if (orderlyStop && running.get() && !socket.isClosed)
                         failOrderlyStop(ProtocolException("PROTOCOL", detail))
                     else socket.close()
-                }, controlWrite, ::now)
+                }, controlWrite, ::now, observed@{ message, boundary, packets, bytes, oldestMs ->
+                    if (active.get() !== this || message.session != session ||
+                        !TelemetryRegistry.has("receiver", session)) return@observed
+                    if (boundary == ControlWriter.Boundary.WRITING) {
+                        controlWriteOperation = RemoteDiagnostics.recorder.operation("receiver", session, DiagnosticKind.TRANSPORT_HEALTH)
+                        RemoteDiagnostics.recorder.observe("receiver", session, DiagnosticKind.TRANSPORT_HEALTH,
+                            DiagnosticStage.BEGIN, operation = controlWriteOperation, bytes = message.payload.size.toLong(),
+                            point = DiagnosticPoint.WRITE)
+                    } else if (boundary == ControlWriter.Boundary.WRITTEN) {
+                        RemoteDiagnostics.recorder.observe("receiver", session, DiagnosticKind.TRANSPORT_HEALTH,
+                            DiagnosticStage.COMPLETE, operation = controlWriteOperation, bytes = message.payload.size.toLong(),
+                            point = DiagnosticPoint.WRITE)
+                    } else if (boundary == ControlWriter.Boundary.FAILED) {
+                        RemoteDiagnostics.recorder.observe("receiver", session, DiagnosticKind.TRANSPORT_HEALTH,
+                            DiagnosticStage.FAILED, operation = controlWriteOperation, bytes = message.payload.size.toLong(),
+                            point = DiagnosticPoint.WRITE)
+                    }
+                    ControlWriter.observeReadyBoundary(message, boundary)
+                    if (packets >= 0) TelemetryRegistry.evidence("receiver", session, 0, 0,
+                        IncidentEvidence.Stage.QUEUE_STATE, packets.toLong(), bytes.toLong(), -1,
+                        if (oldestMs >= 0) oldestMs * 1_000_000 else -1)
+                })
                 val hello = read()
                 protocolRequire(hello.type == Type.HELLO, "Expected HELLO")
                 val h = hello.json()
-                if (h.string("role") == "media") {
+                val role = h.string("role")
+                if (role == "media") {
                     readMedia(attachMedia(hello))
                     return
                 }
                 protocolRequire(hello.session == 0L, "Control HELLO requires session zero")
-                protocolRequire(h.string("role") == "sender", "Unexpected peer role")
+                protocolRequire(role == "sender", "Unexpected peer role")
                 diagnosticsNegotiated = org.screencopy.receiver.protocol.DiagnosticDelegation.supported(h) &&
                     diagnosticSessionAccess != null
+                telemetryOffered = SessionTelemetryProtocol.supported(h)
                 val versions = h.array("versions")
                 protocolRequire(versions.length() in 1..16 && (0 until versions.length()).all { versions.opt(it) is Int }, "Invalid version list")
                 protocolRequire((0 until versions.length()).any { versions.opt(it) == Wire.VERSION }, "No compatible protocol version", "VERSION")
@@ -758,6 +827,7 @@ class ReceiverServer private constructor(
                 if (hdrVideoVersion == 1) response.put("receiveCapabilities", receiveCapabilities().json())
                 if (diagnosticsNegotiated) response.put("diagnostics",
                     org.screencopy.receiver.protocol.DiagnosticDelegation.capability())
+                if (telemetryOffered) response.put("sessionTelemetry", SessionTelemetryProtocol.capability())
                 send(Type.HELLO, response)
                 phase = "Negotiating"
                 phaseAt = now()
@@ -781,6 +851,8 @@ class ReceiverServer private constructor(
                 request = Request.parse(negotiation.json(), negotiatedOptions, hdrVideoVersion == 1, receiveCapabilities())
                 controlStatistics.validControl(now())
                 val settings = checkNotNull(request)
+                telemetryNegotiated = SessionTelemetryProtocol.supported(negotiation.json())
+                protocolRequire(!telemetryNegotiated || telemetryOffered, "Unsolicited session telemetry capability")
                 validateRequest(settings)
                 requestSummary = settings.summary
                 tracks = TrackState(settings.tracks)
@@ -788,15 +860,34 @@ class ReceiverServer private constructor(
                 phase = "Initializing tracks"
                 phaseAt = now()
                 onStatus(phase, "$senderName\n$requestSummary")
-                synchronized(mediaLock) { accepted = true }
+                RemoteDiagnostics.recorder.sessionStarted("receiver", session)
+                if (telemetryNegotiated) {
+                    lateinit var owner: ReceiverTelemetrySession
+                    owner = ReceiverTelemetrySession(
+                        offerTelemetry = { payload ->
+                            if (stopping.get() || socket.isClosed) false
+                            else when (checkNotNull(writer).offerTelemetry(Message(Type.STATUS, session = session, payload = payload))) {
+                                ControlWriter.TelemetryAdmission.ACCEPTED -> true
+                                ControlWriter.TelemetryAdmission.REPLACED -> { owner.publicationUnsent(); true }
+                                ControlWriter.TelemetryAdmission.REJECTED -> false
+                            }
+                        },
+                        failed = { onDiscoveryDiagnostic("event=TELEMETRY_FAILED error=${it.javaClass.simpleName}") }
+                    )
+                    telemetry = owner
+                    TelemetryRegistry.beginReceiver(session, owner)
+                    TelemetryRegistry.sessionConfiguration("receiver", session, settings.videoCodec, settings.audioCodec,
+                        settings.fps, settings.videoBitrate, settings.audioBitrate)
+                }
+                synchronized(mediaLock) { accepted = true; sessionAccepted = true }
                 send(Type.SESSION_ACCEPT, JSONObject().put("tracks", JSONArray(settings.tracks)).put("mediaToken", mediaToken).apply {
                     settings.videoColor?.let { put("videoColor", it.json()) }
                     if (settings.diagnosticRequested) put("diagnostic",
                         org.screencopy.receiver.protocol.DiagnosticDelegation.result(
                             if (diagnosticsNegotiated) "starting" else "unsupported", session, null))
+                    if (telemetryNegotiated) put("sessionTelemetry", SessionTelemetryProtocol.capability())
                 })
                 diagnosticOwner = true
-                RemoteDiagnostics.recorder.sessionStarted("receiver", session)
                 try {
                     diagnosticSessionAccess?.admitted(session, settings.diagnosticRequested && diagnosticsNegotiated,
                         { active.get() === this && accepted && !stopping.get() && !socket.isClosed }, ::diagnosticReport)
@@ -806,18 +897,7 @@ class ReceiverServer private constructor(
                 }
                 if (streamRecovery) socket.soTimeout = 0
                 while (running.get() && !socket.isClosed) {
-                    val operation = RemoteDiagnostics.recorder.operation("receiver", session, DiagnosticKind.TRANSPORT_HEALTH)
-                    RemoteDiagnostics.recorder.observe("receiver", session, DiagnosticKind.TRANSPORT_HEALTH,
-                        DiagnosticStage.BEGIN, operation = operation, point = DiagnosticPoint.READ)
-                    val message = try { read() } catch (e: Exception) {
-                        RemoteDiagnostics.recorder.observe("receiver", session, DiagnosticKind.TRANSPORT_HEALTH,
-                            DiagnosticStage.FAILED, operation = operation, reason = DiagnosticReason.FAILURE,
-                            point = DiagnosticPoint.READ)
-                        throw e
-                    }
-                    RemoteDiagnostics.recorder.observe("receiver", session, DiagnosticKind.TRANSPORT_HEALTH,
-                        DiagnosticStage.COMPLETE, operation = operation, bytes = message.payload.size.toLong(),
-                        point = DiagnosticPoint.READ)
+                    val message = read()
                     protocolRequire(message.session == session, "Session ID changed")
                     if (message.type == Type.SESSION_END) {
                         protocolRequire(stopping.get(), "Unexpected SESSION_END")
@@ -887,42 +967,60 @@ class ReceiverServer private constructor(
                         e is EOFException -> "Sender disconnected or truncated a message"
                         else -> e.message ?: e.javaClass.simpleName
                     }
-                    try {
-                        send(if (phase == "Negotiating" && session > 0) Type.REJECT else Type.ERROR,
-                            JSONObject().put("code", code).put("message", detail).put("fatal", true))
-                    } catch (sendError: Exception) {
-                        if (active.get() === this) onStatus("Connection closed", "$detail; could not deliver error (${sendError.javaClass.simpleName})")
-                    }
-                    if (active.get() === this) {
-                        onStatus("Session error: $code", "$detail\nReconnect after correcting the sender settings or network.")
-                        reportFailure(code, detail,
-                            when {
-                                e is ReceiverOrientationException -> FailureOrigin.PRESENTATION
-                                phase == "Initializing tracks" && initializingTrack == 2 -> FailureOrigin.AUDIO
-                                phase == "Initializing tracks" && initializingTrack == 1 -> FailureOrigin.VIDEO
-                                else -> FailureOrigin.SESSION
-                            },
-                            (e as? QueueCongestionException)?.pressure, (e as? AudioOutputPreparationException)?.diagnostic,
-                            (e as? VideoPlaybackException)?.diagnostic)
-                    } else {
-                        onDiscoveryDiagnostic("event=UNOWNED_CONNECTION_FAILURE code=$code phase=$phase exception=${e.javaClass.simpleName}")
+                    synchronized(retirementLock) {
+                        if (!stopping.get()) {
+                            if (active.get() === this) {
+                                onStatus("Session error: $code", "$detail\nReconnect after correcting the sender settings or network.")
+                                reportFailure(code, detail,
+                                    when {
+                                        e is ReceiverOrientationException -> FailureOrigin.PRESENTATION
+                                        phase == "Initializing tracks" && initializingTrack == 2 -> FailureOrigin.AUDIO
+                                        phase == "Initializing tracks" && initializingTrack == 1 -> FailureOrigin.VIDEO
+                                        else -> FailureOrigin.SESSION
+                                    },
+                                    (e as? QueueCongestionException)?.pressure, (e as? AudioOutputPreparationException)?.diagnostic,
+                                    (e as? VideoPlaybackException)?.diagnostic)
+                            } else {
+                                onDiscoveryDiagnostic("event=UNOWNED_CONNECTION_FAILURE code=$code phase=$phase exception=${e.javaClass.simpleName}")
+                            }
+                            try {
+                                if (sessionAccepted && telemetryNegotiated) {
+                                    stopping.set(true)
+                                    stopAt = now()
+                                    beginFatalRetirement(code, detail)
+                                    retireFailedSession()
+                                } else send(if (phase == "Negotiating" && session > 0) Type.REJECT else Type.ERROR,
+                                    JSONObject().put("code", code).put("message", detail).put("fatal", true))
+                            } catch (sendError: Exception) {
+                                if (active.get() === this) onStatus("Connection closed", "$detail; could not deliver error (${sendError.javaClass.simpleName})")
+                            }
+                        }
                     }
                 }
             } finally {
                 diagnosticEnd()
                 var cleanupFailed = false
+                var fatalControlFailed = false
                 if (mediaOwner == null) closeMedia()
+                // Claim and submission are serialized with fatal initiation; only that worker halts players.
+                val fatalWorker = synchronized(retirementLock) {
+                    controlCleanupStarted = true
+                    fatalWork.get() != FatalWork.NOT_STARTED
+                }
                 recoveryScheduler.shutdown()
                 recoveryExecutor.shutdown()
-                try {
-                    check(recoveryScheduler.awaitTermination(3, TimeUnit.SECONDS)) { "Track recovery workers did not retire" }
-                    check(recoveryExecutor.awaitTermination(3, TimeUnit.SECONDS)) { "Recovery worker did not retire" }
-                } catch (e: Exception) {
-                    cleanupFailed = true
-                    onStatus("Recovery cleanup failed", e.message ?: e.javaClass.simpleName)
+                if (!fatalWorker || !telemetryNegotiated) {
+                    try {
+                        check(recoveryScheduler.awaitTermination(3, TimeUnit.SECONDS)) { "Track recovery workers did not retire" }
+                        check(recoveryExecutor.awaitTermination(3, TimeUnit.SECONDS)) { "Recovery worker did not retire" }
+                    } catch (e: Exception) {
+                        cleanupFailed = true
+                        resourceRetirementFailed.set(true)
+                        onStatus("Recovery cleanup failed", e.message ?: e.javaClass.simpleName)
+                    }
                 }
                 try {
-                    if (mediaOwner == null) {
+                    if (mediaOwner == null && !fatalWorker) {
                         stopPlayback()
                     }
                 } catch (e: Exception) {
@@ -930,33 +1028,51 @@ class ReceiverServer private constructor(
                     onStatus("Playback cleanup failed", "${e.message ?: e.javaClass.simpleName}; reopen receiver")
                     reportFailure("INTERNAL", "Playback cleanup failed", FailureOrigin.CLEANUP)
                 } finally {
+                    if (mediaOwner == null && !fatalWorker && fatalReply.get() != null) {
+                        try { completeFatalRetirement(!cleanupFailed) }
+                        catch (error: Exception) {
+                            fatalControlFailed = true
+                            onStatus("Connection cleanup failed", error.message ?: error.javaClass.simpleName)
+                            socket.close()
+                        }
+                    }
                     try {
-                        writer?.close()
+                        if (!fatalWorker || !telemetryNegotiated) writer?.close()
                     } catch (e: Exception) {
                         cleanupFailed = true
+                        fatalControlFailed = true
                         onStatus("Connection cleanup failed", "${e.message ?: e.javaClass.simpleName}; reopen receiver")
                         reportFailure("INTERNAL", "Connection cleanup failed", FailureOrigin.CLEANUP)
                     } finally {
-                        try { socket.close() } finally {
-                            val released = active.compareAndSet(this, null)
-                            if (released) RemoteDiagnostics.recorder.sessionEnded("receiver", session)
-                            try { sessionLease?.close() } catch (e: Exception) {
-                                cleanupFailed = true
-                                onStatus("Session cleanup failed", e.message ?: e.javaClass.simpleName)
-                                reportFailure("INTERNAL", "Session ownership cleanup failed", FailureOrigin.CLEANUP)
-                            } finally {
-                                sessionLease = null
-                                if (released && running.get() && !cleanupFailed) available()
-                            }
+                        try { if (!fatalWorker || !telemetryNegotiated) socket.close() } finally {
+                            if (fatalWorker) finishFatalCleanup(control = true, failed = fatalControlFailed)
+                            else finishOrdinaryCleanup(cleanupFailed)
                         }
                     }
                 }
             }
         }
 
-        private fun read(): Message = Wire.read(socket.inputStream, { readStartedAt = now() }).also {
-            readStartedAt = null
-            lastRead = now()
+        private fun read(): Message {
+            val observed = active.get() === this && accepted
+            val operation = if (observed)
+                RemoteDiagnostics.recorder.operation("receiver", session, DiagnosticKind.TRANSPORT_HEALTH) else 0
+            if (observed) RemoteDiagnostics.recorder.observe("receiver", session, DiagnosticKind.TRANSPORT_HEALTH,
+                DiagnosticStage.BEGIN, operation = operation, point = DiagnosticPoint.READ)
+            try {
+                return Wire.read(socket.inputStream, { readStartedAt = now() }).also {
+                    readStartedAt = null
+                    lastRead = now()
+                    if (observed) RemoteDiagnostics.recorder.observe("receiver", session, DiagnosticKind.TRANSPORT_HEALTH,
+                        DiagnosticStage.COMPLETE, operation = operation, bytes = it.payload.size.toLong(),
+                        point = DiagnosticPoint.READ)
+                }
+            } catch (error: Exception) {
+                if (observed) RemoteDiagnostics.recorder.observe("receiver", session, DiagnosticKind.TRANSPORT_HEALTH,
+                    DiagnosticStage.FAILED, operation = operation, reason = DiagnosticReason.FAILURE,
+                    point = DiagnosticPoint.READ)
+                throw error
+            }
         }
 
         private fun readControlUntilRequest(): Message {
@@ -977,6 +1093,8 @@ class ReceiverServer private constructor(
         }
 
         private fun configure(message: Message) {
+            TelemetryRegistry.evidence("receiver", session, message.track, message.generation.toInt(),
+                IncidentEvidence.Stage.CONFIG_RECEIVED)
             if (streamRecovery && message.generation > 1) {
                 configureRecovery(message)
                 return
@@ -1000,6 +1118,9 @@ class ReceiverServer private constructor(
             val json = message.json()
             val videoFormat = if (message.track == 1) validateHdrOutput(Configuration.video(json, settings)) else null
             val audioFormat = if (message.track == 2) Configuration.audio(json, settings) else null
+            TelemetryRegistry.trackConfiguration("receiver", session, message.track, message.generation.toInt(),
+                if (message.track == 1) settings.videoCodec else audioFormat?.codec.orEmpty(),
+                videoFormat?.width ?: 0, videoFormat?.height ?: 0, audioFormat?.sampleRate ?: 0, audioFormat?.channels ?: 0)
             var startPresentation = false
             val retired = synchronized(playbackLock) {
                 if (stopping.get()) return
@@ -1030,7 +1151,9 @@ class ReceiverServer private constructor(
                 onDiscoveryDiagnostic("event=RETIRED_TRACK_CONFIGURATION track=${message.track} generation=${message.generation}")
                 return
             }
-            try { retired.first?.let { videoOutput.release(it) } } finally { retired.second?.close() }
+            retireResources {
+                try { retired.first?.let { videoOutput.release(it) } } finally { retired.second?.close() }
+            }
             fun current() = running.get() && accepted && !stopping.get() && active.get() === this &&
                 (message.track != 1 || !videoOutput.isClosed) &&
                 (if (message.track == 1) videoGeneration else audioGeneration) == message.generation
@@ -1086,8 +1209,10 @@ class ReceiverServer private constructor(
             } finally {
                 if (!installed) {
                     onDiscoveryDiagnostic("event=RETIRED_TRACK_CONFIGURATION track=${message.track} generation=${message.generation}")
-                    try { createdVideo?.let { videoOutput.release(it) } } finally {
-                        try { createdAudio?.close() } finally { createdPresentation?.close() }
+                    retireResources {
+                        try { createdVideo?.let { videoOutput.release(it) } } finally {
+                            try { createdAudio?.close() } finally { createdPresentation?.close() }
+                        }
                     }
                 }
             }
@@ -1095,7 +1220,8 @@ class ReceiverServer private constructor(
 
         private inline fun <T> diagnosticRecoveryCall(track: Int, generation: Long, point: DiagnosticPoint, call: () -> T): T {
             val diagnostics = RemoteDiagnostics.recorder
-            if (!diagnostics.enabled("receiver", session, DiagnosticKind.RECOVERY)) return call()
+            if (!diagnostics.enabled("receiver", session, DiagnosticKind.RECOVERY) &&
+                !TelemetryRegistry.has("receiver", session)) return call()
             val operation = diagnostics.operation("receiver", session, DiagnosticKind.RECOVERY)
             diagnostics.observe("receiver", session, DiagnosticKind.RECOVERY, DiagnosticStage.BEGIN,
                 track, generation.toInt(), operation = operation, point = point)
@@ -1111,6 +1237,15 @@ class ReceiverServer private constructor(
             }
         }
 
+        private fun retireResources(action: () -> Unit) {
+            try {
+                action()
+            } catch (e: Exception) {
+                resourceRetirementFailed.set(true)
+                throw e
+            }
+        }
+
         private fun configureRecovery(message: Message) {
             val track = message.track
             if (track == 1) lastVideoPacketAt = null else lastAudioPacketAt = null
@@ -1122,6 +1257,9 @@ class ReceiverServer private constructor(
             val json = message.json()
             val videoFormat = if (track == 1) validateHdrOutput(Configuration.video(json, settings)) else null
             val audioFormat = if (track == 2) Configuration.audio(json, settings) else null
+            TelemetryRegistry.trackConfiguration("receiver", session, track, message.generation.toInt(),
+                if (track == 1) settings.videoCodec else audioFormat?.codec.orEmpty(),
+                videoFormat?.width ?: 0, videoFormat?.height ?: 0, audioFormat?.sampleRate ?: 0, audioFormat?.channels ?: 0)
             synchronized(playbackLock) {
                 if (stopping.get()) return
                 protocolRequire(accepted && active.get() === this && request === settings && tracksReady, "Recovery preceded initialized tracks")
@@ -1157,7 +1295,7 @@ class ReceiverServer private constructor(
             fun current() = accepted && !stopping.get() && active.get() === this &&
                 (track != 1 || !videoOutput.isClosed) &&
                 (if (track == 1) videoGeneration else audioGeneration) == message.generation
-            recoveryScheduler.schedule(track, ::current) {
+            recoveryScheduler.schedule(track, message.generation.toInt(), ::current) {
                 try {
                     synchronized(trackPlaybackOperations[track]) operations@ {
                         if (!current()) return@operations
@@ -1165,8 +1303,10 @@ class ReceiverServer private constructor(
                             if (track == 1) (video to null).also { video = null }
                             else (null to audio).also { audio = null }
                         }
-                        diagnosticRecoveryCall(track, message.generation, DiagnosticPoint.RECOVERY_RETIRE) {
-                            try { retired.first?.let { videoOutput.release(it) } } finally { retired.second?.close() }
+                        retireResources {
+                            diagnosticRecoveryCall(track, message.generation, DiagnosticPoint.RECOVERY_RETIRE) {
+                                try { retired.first?.let { videoOutput.release(it) } } finally { retired.second?.close() }
+                            }
                         }
                         if (!current()) return@operations
                         val sameRaster = videoFormat?.let { format ->
@@ -1175,6 +1315,15 @@ class ReceiverServer private constructor(
                         var createdVideo: VideoPlayer? = null
                         var createdAudio: AudioPlayer? = null
                         var installed = false
+                        fun retireCreated() {
+                            val oldVideo = createdVideo
+                            val oldAudio = createdAudio
+                            createdVideo = null
+                            createdAudio = null
+                            retireResources {
+                                try { oldVideo?.let { videoOutput.release(it) } } finally { oldAudio?.close() }
+                            }
+                        }
                         try {
                             if (track == 1) {
                                 createdVideo = diagnosticRecoveryCall(track, message.generation, DiagnosticPoint.RECOVERY_CONSTRUCT) {
@@ -1211,17 +1360,14 @@ class ReceiverServer private constructor(
                             if (track == 1) videoOutput.whileOpen { installIfCurrent() }
                             else installIfCurrent()
                             if (!installed) {
-                                createdVideo?.let { videoOutput.release(it) }
-                                createdAudio?.close()
+                                retireCreated()
                                 return@operations
                             }
                             if (current()) {
                                 onDiscoveryDiagnostic("event=STREAM_RECOVERY_READY track=$track generation=${message.generation}")
                             }
                         } catch (e: Exception) {
-                            if (!installed) {
-                                try { createdVideo?.let { videoOutput.release(it) } } finally { createdAudio?.close() }
-                            }
+                            if (!installed) retireCreated()
                             throw e
                         }
                     }
@@ -1297,6 +1443,7 @@ class ReceiverServer private constructor(
                 onServiceDiagnostic = { android.util.Log.i("ScreenCopyReceiver", "session=$session audio_epoch=$epoch $it") })).also {
                 it.diagnosticSession = session
                 it.diagnosticGeneration = audioGeneration.toInt()
+                it.resetAudioStartEvidence()
                 it.statisticsEnabled = request?.receiverOptions?.playbackStats == true
                 it.recoveryCutoffUs = cutoff
                 if (RemoteDiagnostics.recorder.enabled("receiver", session, DiagnosticKind.SESSION))
@@ -1380,6 +1527,14 @@ class ReceiverServer private constructor(
                 track, generation.toInt())
         }
 
+        private fun recordTelemetryPressure(pressure: QueuePressure, generation: Int) {
+            TelemetryRegistry.event("receiver", session, DiagnosticKind.RECOVERY.ordinal + 1,
+                DiagnosticStage.PRESSURE.ordinal, pressure.track, generation, pressure.spanUs,
+                listOf(pressure.limit.ordinal.toLong(), pressure.queuedPackets.toLong(), pressure.queuedBytes.toLong(),
+                    pressure.attemptedPackets.toLong(), pressure.attemptedBytes, pressure.maxPackets.toLong(),
+                    pressure.maxBytes.toLong(), pressure.maxSpanUs, pressure.waitedMs), pressure = true)
+        }
+
         private fun send(type: Type, json: JSONObject, track: Int = 0, generation: Long = 0) {
             synchronized(playbackLock) {
                 if (stopping.get() && type in setOf(Type.STATUS, Type.STREAM_READY)) return
@@ -1390,11 +1545,85 @@ class ReceiverServer private constructor(
             }
         }
 
+        private fun sendTerminal(type: Type, reason: String, cleanupSucceeded: Boolean = true,
+                                 errorCode: String? = null,
+                                 skip: ReceiverTelemetrySession.FinalSkipReason? = null) {
+            fun body() = if (type == Type.ERROR) JSONObject().put("code", errorCode)
+                .put("message", reason).put("fatal", true) else JSONObject().put("reason", reason)
+            if (!telemetryNegotiated) {
+                synchronized(playbackLock) {
+                    checkNotNull(writer).offerTerminalTransaction(type, null, now() + 2000,
+                        { Message.json(type, body(), session) })
+                }
+                return
+            }
+            val deadlineNs = System.nanoTime() + TelemetryTerminalBudget.FINAL_TRANSACTION_NS
+            val owner = telemetry
+            var result: ReceiverTelemetrySession.FinalResult? = null
+            checkNotNull(writer) { "TCP writer is not available" }.offerTerminalTransaction(
+                    type, null, now() + TelemetryTerminalBudget.FINAL_TRANSACTION_NS / 1_000_000,
+                    { sent -> Message.json(type, body().apply {
+                        if (telemetryNegotiated) {
+                            put("finalSeq", if (sent) result?.batch?.sequence?.toString() ?: JSONObject.NULL else JSONObject.NULL)
+                            put("cleanupSucceeded", cleanupSucceeded)
+                            if (!sent) put("finalSkipReason",
+                                (result?.reason ?: if (result?.batch != null)
+                                    ReceiverTelemetrySession.FinalSkipReason.WRITE_SKIPPED
+                                else ReceiverTelemetrySession.FinalSkipReason.UNAVAILABLE).name)
+                        }
+
+                    }, session) }, bounded = true, prepareFinal = { discardedTelemetry ->
+                        if (discardedTelemetry) owner?.publicationUnsent()
+                        TelemetryRegistry.end("receiver", owner)
+                        result = if (skip == null) owner?.requestFinalResult(cleanupSucceeded, deadlineNs) else {
+                            owner?.requestFinal(false, System.nanoTime())
+                            ReceiverTelemetrySession.FinalResult(null, skip)
+                        }
+                        result?.batch?.let { Message(Type.STATUS, session = session, payload = it.payload) }
+                    })
+        }
+
+        private fun beginFatalRetirement(code: String, detail: String) {
+            if (!fatalReply.compareAndSet(null, code to detail)) return
+            if (!telemetryNegotiated) {
+                try { send(Type.ERROR, JSONObject().put("code", code).put("message", detail).put("fatal", true)) }
+                catch (error: Exception) {
+                    onStatus("Connection cleanup failed", error.message ?: error.javaClass.simpleName)
+                    socket.close()
+                }
+                return
+            }
+            fatalCleanupDeadline = timer.schedule({
+                try { completeFatalRetirement(false, ReceiverTelemetrySession.FinalSkipReason.UNAVAILABLE) }
+                catch (error: Exception) {
+                    onStatus("Connection cleanup failed", error.message ?: error.javaClass.simpleName)
+                    socket.close()
+                    writer?.close()
+                }
+            }, TelemetryTerminalBudget.FATAL_CLEANUP_MS, TimeUnit.MILLISECONDS)
+        }
+
+        private fun completeFatalRetirement(cleanupSucceeded: Boolean,
+                                            skip: ReceiverTelemetrySession.FinalSkipReason? = null) {
+            synchronized(fatalAdmissionLock) {
+                val reply = fatalReply.get() ?: return
+                if (!telemetryNegotiated || !fatalTerminalClaimed.compareAndSet(false, true)) return
+                fatalCleanupDeadline?.cancel(false)
+                sendTerminal(Type.ERROR, reply.second, cleanupSucceeded, reply.first, skip)
+            }
+        }
+
         private fun reportFailure(code: String, detail: String, origin: FailureOrigin, pressure: QueuePressure? = null,
             outputPreparation: OutputPreparationDiagnostic? = null, videoDiagnostic: VideoDiagnostic? = null) {
             if (active.get() === this) playbackStatistics = null
             val diagnostic = FailureDiagnostic.classify(code, origin, phase, detail, pressure, outputPreparation, videoDiagnostic)
             if (!firstFailure.compareAndSet(null, diagnostic)) return
+            val failureTrack = when (origin) { FailureOrigin.AUDIO -> 2; FailureOrigin.VIDEO -> 1; else -> 0 }
+            pressure?.let { recordTelemetryPressure(it,
+                (if (it.track == 1) videoGeneration else if (it.track == 2) audioGeneration else 0).toInt()) }
+            TelemetryRegistry.event("receiver", session, DiagnosticKind.SESSION.ordinal + 1,
+                DiagnosticStage.FAILED.ordinal, failureTrack, 0, IncidentEvidence.cause(code),
+                listOf(origin.ordinal.toLong()), failure = true)
             RemoteDiagnostics.recorder.observe("receiver", session, DiagnosticKind.SESSION, DiagnosticStage.FAILED,
                 track = when (origin) { FailureOrigin.AUDIO -> 2; FailureOrigin.VIDEO -> 1; else -> 0 },
                 reason = DiagnosticReason.FAILURE)
@@ -1403,76 +1632,213 @@ class ReceiverServer private constructor(
         }
 
         private fun playbackFailed(code: String, reason: String, origin: FailureOrigin) {
-            synchronized(playbackLock) {
-                if (stopping.get() || !playbackError.compareAndSet(null, reason)) return
-                terminalError = true
-                stopAt = now()
-                stopping.set(true)
-            }
-            onStatus("Playback failed", "$reason\nReconnect after reducing sender load or fixing the output device.")
-            if (active.get() === this) reportFailure(code, reason, if (code == "AUDIO_FAILED") FailureOrigin.AUDIO else origin)
-            try {
-                send(Type.ERROR, JSONObject().put("code", code).put("message", reason).put("fatal", true))
-            } catch (e: Exception) {
-                onStatus("Playback failed", "$reason; could not notify sender (${e.javaClass.simpleName})")
-            } finally {
+            synchronized(retirementLock) {
+                if (controlCleanupStarted) return
+                synchronized(playbackLock) {
+                    if (stopping.get() || !playbackError.compareAndSet(null, reason)) return
+                    terminalError = true
+                    stopAt = now()
+                    stopping.set(true)
+                }
+                onStatus("Playback failed", "$reason\nReconnect after reducing sender load or fixing the output device.")
+                if (active.get() === this) reportFailure(code, reason, if (code == "AUDIO_FAILED") FailureOrigin.AUDIO else origin)
+                beginFatalRetirement(code, reason)
                 retireFailedSession()
             }
         }
 
         private fun retireFailedSession() {
             closeMedia()
-            if (!failureRetirement.compareAndSet(false, true)) return
+            if (!fatalWork.compareAndSet(FatalWork.NOT_STARTED, FatalWork.RUNNING)) return
             try {
                 recoveryExecutor.execute {
+                    var cleanupSucceeded = true
+                    var interrupted = false
                     try {
                         stopPlayback()
                     } catch (error: Exception) {
-                        onStatus("Playback cleanup failed", error.message ?: error.javaClass.simpleName)
+                        cleanupSucceeded = false
+                        if (running.get() && active.get() === this)
+                            onStatus("Playback cleanup failed", error.message ?: error.javaClass.simpleName)
                         reportFailure("INTERNAL", "Playback cleanup failed", FailureOrigin.CLEANUP)
                     } finally {
+                        recoveryScheduler.shutdown()
+                        while (true) {
+                            try {
+                                if (recoveryScheduler.awaitTermination(Long.MAX_VALUE, TimeUnit.NANOSECONDS)) break
+                            } catch (_: InterruptedException) {
+                                interrupted = true
+                            }
+                        }
+                        cleanupSucceeded = cleanupSucceeded && !resourceRetirementFailed.get()
+                        val retired = cleanupSucceeded
                         try {
+                            completeFatalRetirement(cleanupSucceeded)
                             writer?.close()
                         } catch (error: Exception) {
-                            onStatus("Connection cleanup failed", error.message ?: error.javaClass.simpleName)
+                            cleanupSucceeded = false
+                            if (running.get() && active.get() === this)
+                                onStatus("Connection cleanup failed", error.message ?: error.javaClass.simpleName)
                             reportFailure("INTERNAL", "Connection cleanup failed", FailureOrigin.CLEANUP)
-                        } finally { socket.close() }
+                        } finally {
+                            socket.close()
+                            finishFatalCleanup(control = false, failed = !cleanupSucceeded, retired = retired)
+                            if (interrupted) Thread.currentThread().interrupt()
+                        }
                     }
                 }
             } catch (error: java.util.concurrent.RejectedExecutionException) {
                 onStatus("Session cleanup failed", "Playback retirement worker is unavailable")
                 reportFailure("INTERNAL", "Playback retirement worker is unavailable", FailureOrigin.CLEANUP)
-                socket.close()
+                finishFatalCleanup(control = false, failed = true)
             }
+        }
+
+        private fun finishFatalCleanup(control: Boolean, failed: Boolean = false, retired: Boolean = false) {
+            synchronized(retirementLock) {
+                if (control) controlCleanupFinished.countDown() else {
+                    if (!fatalWork.compareAndSet(FatalWork.RUNNING,
+                            if (retired) FatalWork.RETIRED else FatalWork.FAILED)) return
+                }
+                retirementFailed = retirementFailed || failed
+                releaseOwnershipIfReady()
+            }
+        }
+
+        fun receiverDestroyed() {
+            try {
+                if (fatalWork.get() != FatalWork.NOT_STARTED) {
+                    socket.close()
+                    writer?.close()
+                }
+            } finally {
+                synchronized(retirementLock) {
+                    releaseOwnershipIfReady()
+                }
+            }
+        }
+
+        private fun finishOrdinaryCleanup(failed: Boolean) {
+            synchronized(retirementLock) {
+                retirementFailed = retirementFailed || failed
+                controlCleanupFinished.countDown()
+                releaseOwnershipIfReady()
+            }
+        }
+
+        private fun releaseOwnershipIfReady() {
+            if (ownershipReleased || controlCleanupFinished.count != 0L) return
+            val work = fatalWork.get()
+            val failedForReport = if (work != FatalWork.NOT_STARTED) {
+                // A control timeout is not retirement. Failed retirement remains fenced until destruction.
+                if (running.get() && work != FatalWork.RETIRED) return
+                retirementFailed
+            } else {
+                if (running.get() && (ordinaryStopInProgress || resourceRetirementFailed.get())) return
+                retirementFailed || resourceRetirementFailed.get()
+            }
+            ownershipReleased = true
+            releaseSession(failedForReport)
+        }
+
+        private fun releaseSession(cleanupFailed: Boolean) {
+            var error: Throwable? = null
+            var fatalError: Error? = null
+            fun record(e: Throwable) {
+                if (error == null) error = e else if (error !== e) error?.addSuppressed(e)
+                if (e is Error && fatalError == null) fatalError = e
+            }
+            fun attempt(action: () -> Unit) {
+                try { action() } catch (e: Throwable) { record(e) }
+            }
+            try {
+                if (active.get() === this) {
+                    attempt { RemoteDiagnostics.recorder.sessionEnded("receiver", session) }
+                    attempt { TelemetryRegistry.end("receiver", telemetry) }
+                    attempt { telemetry?.requestFinal(false, System.nanoTime()) }
+                }
+                attempt { sessionLease?.close() }
+                error?.let { failure ->
+                    attempt { onStatus("Session cleanup failed", failure.message ?: failure.javaClass.simpleName) }
+                    attempt { reportFailure("INTERNAL", "Session ownership cleanup failed", FailureOrigin.CLEANUP) }
+                    try {
+                        val details = listOf(failure, *failure.suppressed).joinToString("; ") {
+                            "${it.javaClass.simpleName}: ${it.message ?: "no detail"}"
+                        }
+                        onDiscoveryDiagnostic("event=SESSION_CLEANUP_FAILED errors=$details")
+                    } catch (e: Throwable) {
+                        record(e)
+                        try {
+                            android.util.Log.e("ScreenCopyReceiver", "Session cleanup reporting failed", failure)
+                        } catch (loggingError: Throwable) {
+                            record(loggingError)
+                            try { failure.printStackTrace() } catch (fallbackError: Throwable) { record(fallbackError) }
+                        }
+                    }
+                }
+            } finally {
+                sessionLease = null
+                val released = active.compareAndSet(this, null)
+                if (released && running.get() && !cleanupFailed && error == null &&
+                    !resourceRetirementFailed.get()) available()
+            }
+            fatalError?.let { throw it }
         }
 
         fun requestStop(reason: String) {
             if (active.get() === this) playbackStatistics = null
-            synchronized(playbackLock) {
-                if (stopping.get() || terminalError) return
-                receiverStopRequested = true
-                stopAt = now()
-                if (!stopping.compareAndSet(false, true)) {
-                    receiverStopRequested = false
-                    return
+            synchronized(retirementLock) {
+                if (controlCleanupStarted) return
+                synchronized(playbackLock) {
+                    if (stopping.get() || terminalError) return
+                    receiverStopRequested = true
+                    stopAt = now()
+                    if (!stopping.compareAndSet(false, true)) {
+                        receiverStopRequested = false
+                        return
+                    }
                 }
+                ordinaryStopInProgress = true
             }
             try {
-                if (orderlyStop) socket.soTimeout = 0
-                send(Type.STOP, JSONObject().put("reason", reason))
-            } catch (e: Exception) {
-                onStatus("Disconnect error", "${e.message ?: e.javaClass.simpleName}; connection closed")
-                abort()
-            } finally {
-                if (!orderlyStop) closeMedia()
+                if (!telemetryNegotiated) {
+                    try {
+                        if (orderlyStop) socket.soTimeout = 0
+                        sendTerminal(Type.STOP, reason)
+                    } catch (e: Exception) {
+                        onStatus("Disconnect error", "${e.message ?: e.javaClass.simpleName}; connection closed")
+                        abort()
+                    } finally {
+                        if (!orderlyStop) closeMedia()
+                        try { stopPlayback() } catch (e: Exception) {
+                            onStatus("Playback cleanup failed", "${e.message ?: e.javaClass.simpleName}; reopen receiver")
+                            socket.close()
+                        }
+                    }
+                    return
+                }
                 try {
-                    stopPlayback()
+                    if (orderlyStop) socket.soTimeout = 0
+                    if (!orderlyStop) closeMedia()
+                    var cleanupSucceeded = true
+                    try {
+                        stopPlaybackAndRecovery()
+                    } catch (e: Exception) {
+                        cleanupSucceeded = false
+                        onStatus("Playback cleanup failed", "${e.message ?: e.javaClass.simpleName}; reopen receiver")
+                        reportFailure("INTERNAL", "Playback cleanup failed", FailureOrigin.CLEANUP)
+                    }
+                    sendTerminal(Type.STOP, reason, cleanupSucceeded)
                 } catch (e: Exception) {
-                    onStatus("Playback cleanup failed", "${e.message ?: e.javaClass.simpleName}; reopen receiver")
-                    socket.close()
+                    onStatus("Disconnect error", "${e.message ?: e.javaClass.simpleName}; connection closed")
+                    abort()
+                }
+            } finally {
+                synchronized(retirementLock) {
+                    ordinaryStopInProgress = false
+                    if (fatalWork.get() == FatalWork.NOT_STARTED) releaseOwnershipIfReady()
                 }
             }
-
         }
 
         private fun receiveStop(reason: String): Boolean {
@@ -1486,8 +1852,20 @@ class ReceiverServer private constructor(
             }
             if (crossed) awaitStopWrite() else {
                 closeMedia()
-                stopPlayback()
-                send(Type.SESSION_END, JSONObject().put("reason", reason))
+                if (telemetryNegotiated) {
+                    var cleanupSucceeded = true
+                    try {
+                        stopPlaybackAndRecovery()
+                    } catch (e: Exception) {
+                        cleanupSucceeded = false
+                        onStatus("Playback cleanup failed", "${e.message ?: e.javaClass.simpleName}; reopen receiver")
+                        reportFailure("INTERNAL", "Playback cleanup failed", FailureOrigin.CLEANUP)
+                    }
+                    sendTerminal(Type.SESSION_END, reason, cleanupSucceeded)
+                } else {
+                    stopPlayback()
+                    sendTerminal(Type.SESSION_END, reason)
+                }
             }
             return true
         }
@@ -1517,10 +1895,23 @@ class ReceiverServer private constructor(
         }
 
         private fun stopPlayback() {
-            val installed = synchronized(playbackLock) { video to audio }
-            try { installed.first?.halt() } finally { installed.second?.halt() }
-            synchronized(trackPlaybackOperations[1]) {
-                synchronized(trackPlaybackOperations[2]) { retirePlayers() }
+            retireResources {
+                val installed = synchronized(playbackLock) { video to audio }
+                try { installed.first?.halt() } finally { installed.second?.halt() }
+                synchronized(trackPlaybackOperations[1]) {
+                    synchronized(trackPlaybackOperations[2]) { retirePlayers() }
+                }
+            }
+        }
+
+        private fun stopPlaybackAndRecovery() {
+            stopPlayback()
+            recoveryScheduler.shutdown()
+            recoveryExecutor.shutdown()
+            retireResources {
+                check(recoveryScheduler.awaitTermination(3, TimeUnit.SECONDS)) { "Track recovery workers did not retire" }
+                check(recoveryExecutor.awaitTermination(3, TimeUnit.SECONDS)) { "Recovery worker did not retire" }
+                check(!resourceRetirementFailed.get()) { "Playback resource retirement failed" }
             }
         }
 
@@ -1587,6 +1978,7 @@ class ReceiverServer private constructor(
                 }
                 return
             }
+            if (telemetryNegotiated && fatalReply.get() != null) return
             val disconnected = mediaDisconnect.get()
             if (!stopping.get() && disconnected != null && time - disconnected.second >= 500) {
                 terminateMediaFailure(disconnected.first)
@@ -1596,8 +1988,22 @@ class ReceiverServer private constructor(
                 !stopping.get() && streamRecovery && (videoRecoveryAt > 0 && time - videoRecoveryAt >= 10_000 ||
                     audioRecoveryAt > 0 && time - audioRecoveryAt >= 10_000) -> {
                     val track = if (videoRecoveryAt > 0 && time - videoRecoveryAt >= 10_000) 1 else 2
-                    connectionError.compareAndSet(null, "TIMEOUT" to "Track $track recovery produced no usable fresh media within 10 seconds")
-                    socket.close()
+                    TelemetryRegistry.event("receiver", session,
+                        DiagnosticKind.RECOVERY.ordinal + 1, DiagnosticStage.FAILED.ordinal,
+                        track, (if (track == 1) videoGeneration else audioGeneration).toInt(),
+                        if (track == 1) videoRecoveryAt else audioRecoveryAt,
+                        listOf(recoveryKeyPts ?: -1, time, 10_000, if (tracksReady) 1L else 0L,
+                            if (videoRecovering) 1L else 0L, if (audioRecovering) 1L else 0L,
+                            if (awaitingRecoveryKey) 1L else 0L, if (audioRecoveryAdmitted) 1L else 0L,
+                            audioRecoveryCutoff, keyProvedGeneration, completedGeneration,
+                            if (pendingVideoProof != null) 1L else 0L), failure = true)
+                    val detail = "Track $track recovery produced no usable fresh media within 10 seconds"
+                    if (sessionAccepted && telemetryNegotiated) {
+                        terminateMediaFailure(ProtocolException("TIMEOUT", detail), detail)
+                    } else {
+                        connectionError.compareAndSet(null, "TIMEOUT" to detail)
+                        socket.close()
+                    }
                 }
                 stopping.get() && time - stopAt >= 2000 -> socket.close()
                 progressExpired -> {
@@ -1695,13 +2101,14 @@ class ReceiverServer private constructor(
             videoOutput: ResourceSlot<VideoPlayer> = ResourceSlot(),
             onDiscoveryDiagnostic: (String) -> Unit = {},
             diagnosticDiscovery: (InetAddress) -> DiagnosticDiscovery? = { null },
-            diagnosticSessionAccess: org.screencopy.receiver.protocol.DiagnosticSessionAccess? = null) =
+            diagnosticSessionAccess: org.screencopy.receiver.protocol.DiagnosticSessionAccess? = null,
+            incidentSave: () -> ((String, JSONObject) -> Unit) = { { _, _ -> } }) =
             ReceiverServer(name, null, onStatus, onVideoSize, onListener, port, videoOutput, validateRequest, onScreenEvent,
                 onFailure, onPresentationStart, videoFactory, audioFactory, clockFactory, onVideoRotation = onVideoRotation,
                 acquireSession = acquireSession, instanceId = instanceId, supportsPlaybackStatistics = supportsPlaybackStatistics,
                 receiveCapabilities = receiveCapabilities, timeMilliseconds = timeMilliseconds, controlWrite = controlWrite,
                 onDiscoveryDiagnostic = onDiscoveryDiagnostic, diagnosticDiscovery = diagnosticDiscovery,
-                diagnosticSessionAccess = diagnosticSessionAccess)
+                diagnosticSessionAccess = diagnosticSessionAccess, incidentSave = incidentSave)
 
         private fun validateCapabilities(settings: Request) {
             val types = MediaCodecList(MediaCodecList.REGULAR_CODECS).codecInfos.filter { !it.isEncoder }.flatMap { it.supportedTypes.toList() }

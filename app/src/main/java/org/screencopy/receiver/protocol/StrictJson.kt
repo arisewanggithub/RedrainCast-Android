@@ -13,20 +13,26 @@ fun protocolRequire(condition: Boolean, message: String, code: String = "PROTOCO
 
 object StrictJson {
     private val sizes = java.util.WeakHashMap<JSONObject, Int>()
+    private val arraySizes = java.util.WeakHashMap<JSONArray, Int>()
     fun encodedSize(value: JSONObject): Int = synchronized(sizes) {
         sizes[value] ?: value.toString().toByteArray(Charsets.UTF_8).size
     }
-    fun decode(bytes: ByteArray, maxDepth: Int = 16, trackSizes: Boolean = true): JSONObject {
+    fun encodedSize(value: JSONArray): Int = synchronized(arraySizes) {
+        arraySizes[value] ?: value.toString().toByteArray(Charsets.UTF_8).size
+    }
+    fun decode(bytes: ByteArray, maxDepth: Int = 16, trackSizes: Boolean = true,
+               trackArraySizes: Boolean = false): JSONObject {
         val text = try {
             Charsets.UTF_8.newDecoder().onMalformedInput(CodingErrorAction.REPORT)
                 .onUnmappableCharacter(CodingErrorAction.REPORT).decode(ByteBuffer.wrap(bytes)).toString()
         } catch (_: java.nio.charset.CharacterCodingException) {
             throw ProtocolException("PROTOCOL", "Malformed UTF-8")
         }
-        return Parser(text, maxDepth, trackSizes).parse()
+        return Parser(text, maxDepth, trackSizes, trackArraySizes).parse()
     }
 
-    private class Parser(private val text: String, private val maxDepth: Int, private val trackSizes: Boolean) {
+    private class Parser(private val text: String, private val maxDepth: Int, private val trackSizes: Boolean,
+                         private val trackArraySizes: Boolean) {
         private var position = 0
         fun parse(): JSONObject {
             val result = value(0)
@@ -63,6 +69,7 @@ object StrictJson {
                     obj
                 }
                 '[' -> {
+                    val start = position
                     position++
                     val array = JSONArray()
                     whitespace()
@@ -72,6 +79,9 @@ object StrictJson {
                             whitespace()
                         } while (consume(','))
                         protocolRequire(consume(']'), "Unterminated JSON array")
+                    }
+                    if (trackArraySizes) synchronized(arraySizes) {
+                        arraySizes[array] = text.substring(start, position).toByteArray(Charsets.UTF_8).size
                     }
                     array
                 }

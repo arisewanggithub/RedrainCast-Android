@@ -8,6 +8,52 @@ import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
 
 class PlaybackClockTest {
+    @Test fun audioStartDecisionSamplesPinnedClockWhileBlockedAndTransitionsOnSourceProgress() {
+        val now = java.util.concurrent.atomic.AtomicLong(1_000_000_000)
+        val decisions = ArrayList<AudioStartDecision>()
+        lateinit var clock: PlaybackClock
+        lateinit var source: AudioSourceClock
+        var sleeps = 0
+        clock = PlaybackClock(now::get) {
+            now.addAndGet(1_000_000_000)
+            if (++sleeps == 2) clock.observeAudio(source, 200_000, now.get())
+        }
+        source = clock.anchorObservedAudio(1_000_000, 48000)
+        clock.audioWritten(400_000)
+        clock.beginAudioRecovery()
+        assertTrue(clock.awaitAudioStartObserved(1_200_000, {
+            assertFalse("Observers must not run under the clock monitor", Thread.holdsLock(clock))
+            decisions.add(it)
+        }) { true })
+        assertEquals(listOf(1, 1, 4), decisions.map { it.reason })
+        assertEquals(listOf(2, 2, 4), decisions.map { it.mode })
+        assertEquals(listOf(0L, 1_000_000L, 2_000_000L), decisions.map { it.waitedUs })
+        assertEquals(listOf(1_000_000L, 1_000_000L, 1_200_000L), decisions.map { it.positionUs })
+        assertEquals(listOf(200_000L, 200_000L, 0L), decisions.map { it.delayUs })
+        assertTrue(decisions.all { it.flags and 12L == 12L })
+    }
+
+    @Test fun audioStartDecisionDistinguishesPrerollStaleRecoveryAndCancellation() {
+        val now = java.util.concurrent.atomic.AtomicLong(1_000_000_000)
+        val clock = PlaybackClock(now::get) { now.addAndGet(2_000_000) }
+        clock.audioExpected = true
+        val decisions = ArrayList<AudioStartDecision>()
+        assertFalse(clock.awaitAudioStartObserved(1_000_000, decisions::add) { true })
+        assertEquals(2, decisions.last().reason)
+        assertNull(decisions.last().positionUs)
+        clock.anchorVideo(1_000_000)
+        clock.beginAudioRecovery()
+        clock.videoPresented(2_000_000)
+        assertFalse(clock.awaitAudioStartObserved(1_000_000, decisions::add) { true })
+        assertEquals(3, decisions.last().reason)
+        assertEquals(2_000_000L, decisions.last().releasedVideoUs)
+        assertEquals(-1_000_000L, decisions.last().delayUs)
+        var calls = 0
+        assertFalse(clock.awaitAudioStartObserved(2_100_000, decisions::add) { calls++ == 0 })
+        assertEquals(listOf(1, 5), decisions.takeLast(2).map { it.reason })
+        assertTrue(decisions.last().revision > decisions.first().revision)
+    }
+
     @Test fun qualifiedTimestampBehindFallbackFloorDoesNotProjectTheFloorWhileCatchingUp() {
         val time = FakeTime()
         val clock = time.clock()

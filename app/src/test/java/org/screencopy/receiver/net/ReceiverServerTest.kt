@@ -22,6 +22,141 @@ import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
 
 class ReceiverServerTest {
+    @Test fun telemetryNegotiationSelectsOnlySupportedOfferAndRequest() {
+        val capability = dev.redrain.cast.diagnostics.SessionTelemetryProtocol.capability()
+        val scenarios = listOf(
+            Triple(capability, capability, true),
+            Triple(null, null, false),
+            Triple(capability, null, false),
+            Triple(dev.redrain.cast.diagnostics.SessionTelemetryProtocol.capability().put("version", 2), null, false),
+            Triple(dev.redrain.cast.diagnostics.SessionTelemetryProtocol.capability().put("intervalMs", 2000), null, false),
+            Triple(dev.redrain.cast.diagnostics.SessionTelemetryProtocol.capability().put("maxBatchBytes", 8191), null, false)
+        )
+        for ((offered, selected, expected) in scenarios) ReceiverServer.forProtocolTests("Receiver").use { server ->
+            server.start()
+            connect(server).use { peer ->
+                val hello = helloPayload()
+                if (offered != null) hello.put("sessionTelemetry", offered)
+                send(peer, Type.HELLO, hello)
+                val response = read(peer)
+                assertEquals(Type.HELLO, response.type)
+                assertEquals(expected || offered === capability, response.json().has("sessionTelemetry"))
+                val request = settings()
+                if (selected != null) request.put("sessionTelemetry", selected)
+                send(peer, Type.SESSION_REQUEST, request, 77)
+                val accept = read(peer)
+                assertEquals(Type.SESSION_ACCEPT, accept.type)
+                assertEquals(expected, accept.json().has("sessionTelemetry"))
+                if (expected) {
+                    val actual = accept.json().getJSONObject("sessionTelemetry")
+                    assertEquals(1, actual.getInt("version"))
+                    assertEquals(1000, actual.getInt("intervalMs"))
+                    assertEquals(8192, actual.getInt("maxBatchBytes"))
+                }
+                send(peer, Type.STOP, JSONObject().put("reason", "done"), 77)
+                if (expected) {
+                    val final = read(peer)
+                    assertEquals(Type.STATUS, final.type)
+                    assertTrue(dev.redrain.cast.diagnostics.SessionTelemetryProtocol.parse(final.payload).final)
+                }
+                assertEquals(Type.SESSION_END, read(peer).type)
+            }
+            await { !server.busyForUpdate }
+        }
+    }
+
+    @Test fun futureTelemetryHelloStillAttachesAndRoutesSessionWithoutTelemetry() {
+        ReceiverServer.forProtocolTests("Receiver").use { server ->
+            server.start()
+            connect(server).use { peer ->
+                val future = JSONObject().put("version", 2)
+                    .put("batching", JSONObject().put("mode", "new"))
+                val response = hello(peer, helloPayload().put("sessionTelemetry", future))
+                assertFalse(response.json().has("sessionTelemetry"))
+                send(peer, Type.SESSION_REQUEST, settings(), 77)
+                val acceptance = read(peer)
+                assertEquals(Type.SESSION_ACCEPT, acceptance.type)
+                assertEquals(77L, acceptance.session)
+                assertFalse(acceptance.json().has("sessionTelemetry"))
+                MediaSockets.attach(server, acceptance).use {
+                    send(peer, Type.PING, JSONObject().put("nonce", 123), 77)
+                    val pong = read(peer)
+                    assertEquals(Type.PONG, pong.type)
+                    assertEquals(77L, pong.session)
+                    assertEquals(123, pong.json().getInt("nonce"))
+                    send(peer, Type.STOP, JSONObject().put("reason", "done"), 77)
+                    val end = read(peer)
+                    assertEquals(Type.SESSION_END, end.type)
+                    assertEquals(77L, end.session)
+                }
+            }
+            await { !server.busyForUpdate }
+        }
+    }
+
+    @Test(timeout = 10000) fun telemetryStreamsAndFinalPrecedesEitherTerminal() {
+        for (receiverStops in listOf(false, true)) ReceiverServer.forProtocolTests("Receiver").use { server ->
+            server.start()
+            connect(server).use { peer ->
+                val capability = dev.redrain.cast.diagnostics.SessionTelemetryProtocol.capability()
+                send(peer, Type.HELLO, helloPayload().put("sessionTelemetry", capability))
+                assertTrue(read(peer).json().has("sessionTelemetry"))
+                send(peer, Type.SESSION_REQUEST, settings().put("sessionTelemetry", capability), 77)
+                assertEquals(Type.SESSION_ACCEPT, read(peer).type)
+                dev.redrain.cast.diagnostics.TelemetryRegistry.event("receiver", 77,
+                    dev.redrain.cast.diagnostics.DiagnosticKind.RECOVERY.ordinal + 1,
+                    dev.redrain.cast.diagnostics.DiagnosticStage.PRESSURE.ordinal, 1, 1, 42,
+                    detail = listOf(0, 0, 0, 0, 1), pressure = true)
+                val periodic = read(peer)
+                assertEquals(Type.STATUS, periodic.type)
+                assertTrue(periodic.payload.size <= 8192)
+                val batch = dev.redrain.cast.diagnostics.SessionTelemetryProtocol.parse(periodic.payload)
+                assertFalse(batch.final)
+                assertEquals(42, batch.firstPressure!!.value)
+                if (receiverStops) server.disconnect("done")
+                else send(peer, Type.STOP, JSONObject().put("reason", "done"), 77)
+                val final = read(peer)
+                assertEquals(Type.STATUS, final.type)
+                val finalBatch = dev.redrain.cast.diagnostics.SessionTelemetryProtocol.parse(final.payload)
+                assertTrue(finalBatch.final)
+                assertTrue(final.payload.size <= 8192)
+                assertTrue(finalBatch.sequence > batch.sequence)
+                val terminal = read(peer)
+                assertEquals(if (receiverStops) Type.STOP else Type.SESSION_END, terminal.type)
+                assertEquals(finalBatch.sequence.toString(), terminal.json().getString("finalSeq"))
+                assertTrue(terminal.json().getBoolean("cleanupSucceeded"))
+                if (receiverStops) send(peer, Type.SESSION_END, JSONObject().put("reason", "done"), 77)
+            }
+            await { !server.busyForUpdate }
+        }
+    }
+
+    @Test fun telemetryNegotiationRejectsMalformedAndUnsolicitedCapabilities() {
+        val invalid = listOf<Any>("yes", JSONObject.NULL,
+            dev.redrain.cast.diagnostics.SessionTelemetryProtocol.capability().put("intervalMs", "1000"),
+            dev.redrain.cast.diagnostics.SessionTelemetryProtocol.capability().put("extra", 1))
+        for (value in invalid) ReceiverServer.forProtocolTests("Receiver").use { server ->
+            server.start()
+            connect(server).use { peer ->
+                send(peer, Type.HELLO, helloPayload().put("sessionTelemetry", value))
+                assertEquals(Type.ERROR, read(peer).type)
+            }
+            assertFalse(server.busyForUpdate)
+        }
+        for (value in invalid + dev.redrain.cast.diagnostics.SessionTelemetryProtocol.capability()) {
+            ReceiverServer.forProtocolTests("Receiver").use { server ->
+                server.start()
+                connect(server).use { peer ->
+                    send(peer, Type.HELLO, helloPayload())
+                    assertEquals(Type.HELLO, read(peer).type)
+                    send(peer, Type.SESSION_REQUEST, settings().put("sessionTelemetry", value), 77)
+                    assertEquals(Type.REJECT, read(peer).type)
+                }
+                await { !server.busyForUpdate }
+            }
+        }
+    }
+
     @Test fun uncappedCapabilityIsAdvertisedAndZeroFpsCanBeAcceptedWithoutInventingACap() {
         ReceiverServer.forProtocolTests("Receiver").use { server ->
             server.start()

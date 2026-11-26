@@ -2,6 +2,7 @@ package org.screencopy.receiver.media
 
 import dev.redrain.cast.MediaThreadDiagnostic
 import dev.redrain.cast.MediaThreadRole
+import dev.redrain.cast.diagnostics.*
 import org.junit.Assert.*
 import org.junit.Test
 import java.util.concurrent.ConcurrentLinkedQueue
@@ -11,6 +12,119 @@ import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicReference
 
 class TrackWorkerSchedulingTest {
+    @Test fun queueAdmitThenDequeuePublishesEmptyDuringIdleAndFinal() {
+        val published = CountDownLatch(1)
+        val periodic = AtomicReference<ByteArray>()
+        val telemetry = ReceiverTelemetrySession({ bytes -> periodic.set(bytes); published.countDown(); true })
+        TelemetryRegistry.beginReceiver(135, telemetry)
+        val worker = object : TrackWorker("telemetry-queue", 1024, { _, _ -> fail("not started") }, 2) {
+            fun dequeue() = next()
+            override fun step() {}
+            override fun release() {}
+        }.also { it.diagnosticSession = 135; it.diagnosticGeneration = 1 }
+        fun assertEmpty(batch: SessionTelemetryProtocol.Batch) {
+            val queue = batch.state.single { it.kind == TelemetryRow.EVIDENCE_KIND &&
+                it.stage == IncidentEvidence.Stage.QUEUE_STATE.ordinal && it.track == 2 }
+            assertEquals(listOf(0L, 0L, 0L, -1L), queue.detail)
+            val metrics = batch.state.single { it.kind == DiagnosticKind.entries.size + 1 && it.track == 2 }
+            assertEquals(0L, metrics.detail[0])
+        }
+        try {
+            worker.offer(AccessUnit(10_000, ByteArray(100)))
+            assertNotNull(worker.dequeue())
+            assertTrue(published.await(3, TimeUnit.SECONDS))
+            assertEmpty(SessionTelemetryProtocol.parse(periodic.get()))
+            worker.close()
+            TelemetryRegistry.end("receiver", telemetry)
+            assertEmpty(SessionTelemetryProtocol.parse(checkNotNull(
+                telemetry.requestFinal(true, System.nanoTime() + 1_000_000_000L)).payload))
+        } finally {
+            worker.close()
+            TelemetryRegistry.end("receiver", telemetry)
+            telemetry.requestFinal(false, System.nanoTime() + 1_000_000_000L)
+        }
+    }
+
+    @Test fun busyWorkersDoNotCrowdOutReadyMilestones() {
+        val telemetry = ReceiverTelemetrySession({ true })
+        TelemetryRegistry.beginReceiver(134, telemetry)
+        val busy = CountDownLatch(2)
+        val blocked = CountDownLatch(1)
+        val workers = (1..2).map { track ->
+            val loops = AtomicInteger()
+            object : TrackWorker("telemetry-storm-$track", 1024, { _, _ -> fail("worker failure") }, track) {
+                override fun step() {
+                    if (loops.incrementAndGet() == 512) {
+                        busy.countDown()
+                        blocked.await()
+                    }
+                }
+                override fun release() {}
+            }.also { it.diagnosticSession = 134; it.diagnosticGeneration = 1 }
+        }
+        try {
+            workers.forEach { it.start() }
+            assertTrue(busy.await(2, TimeUnit.SECONDS))
+            val ready = org.screencopy.receiver.protocol.Message.json(
+                org.screencopy.receiver.protocol.Type.STREAM_READY, org.json.JSONObject(), 134, 1, 1)
+            org.screencopy.receiver.net.ControlWriter.observeReadyBoundary(
+                ready, org.screencopy.receiver.net.ControlWriter.Boundary.WRITTEN)
+            workers.forEach { it.close() }
+            TelemetryRegistry.end("receiver", telemetry)
+            val batch = SessionTelemetryProtocol.parse(checkNotNull(
+                telemetry.requestFinal(true, System.nanoTime() + 1_000_000_000L)).payload)
+            assertEquals(0L, batch.dropped)
+            assertTrue(batch.events.any { it.kind == TelemetryRow.EVIDENCE_KIND &&
+                it.stage == IncidentEvidence.Stage.READY_WRITTEN.ordinal })
+            assertEquals(setOf(1, 2), batch.state.filter { it.kind == TelemetryRow.EVIDENCE_KIND &&
+                it.stage == IncidentEvidence.Stage.WORKER_END.ordinal }.map { it.track }.toSet())
+        } finally {
+            blocked.countDown()
+            workers.forEach { it.close() }
+            TelemetryRegistry.end("receiver", telemetry)
+            telemetry.requestFinal(false, System.nanoTime() + 1_000_000_000L)
+        }
+    }
+
+    @Test fun automaticQueueSamplesBothTracksWithoutStatisticsOrLiveDiagnostics() {
+        RemoteDiagnostics.recorder.revoke()
+        val telemetry = ReceiverTelemetrySession({ true })
+        TelemetryRegistry.beginReceiver(133, telemetry)
+        val workers = (1..2).map { track ->
+            object : TrackWorker("telemetry-$track", 1024, { _, _ -> fail("not started") }, track) {
+                override fun step() {}
+                override fun release() {}
+            }.also { it.diagnosticSession = 133; it.diagnosticGeneration = 1 }
+        }
+        try {
+            workers.forEachIndexed { index, worker -> worker.offer(AccessUnit(10_000L + index, ByteArray(100))) }
+            workers.forEach { it.close() }
+            TelemetryRegistry.end("receiver", telemetry)
+            val final = checkNotNull(telemetry.requestFinal(true, System.nanoTime() + 1_000_000_000L))
+            val state = SessionTelemetryProtocol.parse(final.payload).state
+            val rows = state.filter {
+                it.kind == TelemetryRow.EVIDENCE_KIND &&
+                    it.stage == IncidentEvidence.Stage.QUEUE_STATE.ordinal
+            }
+            assertEquals(setOf(1, 2), rows.map { it.track }.toSet())
+            rows.forEach {
+                assertEquals(listOf(0L, 0L, 0L, -1L), it.detail)
+            }
+            val metrics = state.filter {
+                it.kind == DiagnosticKind.entries.size + 1 && it.stage == DiagnosticStage.SAMPLE.ordinal
+            }
+            assertEquals(setOf(1, 2), metrics.map { it.track }.toSet())
+            metrics.forEach {
+                assertEquals(listOf(0L, 48L, 0L, 1024L, -1L), it.detail)
+            }
+            assertFalse(RemoteDiagnostics.recorder.collecting)
+        } finally {
+            workers.forEach { it.close() }
+            TelemetryRegistry.end("receiver", telemetry)
+            telemetry.requestFinal(false, System.nanoTime() + 1_000_000_000L)
+        }
+    }
+
     @Test fun setupRunsOnceOnEachWorkerBeforeServicingAndRetirementStillReleases() {
         val creator = Thread.currentThread()
         val workers = mutableSetOf<Thread>()

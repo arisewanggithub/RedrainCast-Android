@@ -39,6 +39,452 @@ import java.net.Socket
 @GraphicsMode(GraphicsMode.Mode.LEGACY)
 @ConscryptMode(ConscryptMode.Mode.OFF)
 class MainActivityTest {
+    private fun legacySnapshot() = org.json.JSONObject()
+        .put("role", "sender")
+        .put("final", false)
+        .put("frames", org.json.JSONArray())
+        .put("configuration", org.json.JSONArray())
+        .put("droppedEvents", "0")
+        .put("omittedFrames", 0)
+        .put("omittedRecords", 0)
+
+    @Test fun incidentReadFailureShowsRetryableWarningWithoutWritingAndRetrySurvivesRecreation() {
+        incidentReadFailureThenRetry(rejectQueue = false)
+    }
+
+    @Test fun rejectedIncidentReadShowsRetryableWarningWithoutWritingAndAllowsRetry() {
+        incidentReadFailureThenRetry(rejectQueue = true)
+    }
+
+    private fun incidentReadFailureThenRetry(rejectQueue: Boolean) {
+        val controller = Robolectric.buildActivity(MainActivity::class.java).setup()
+        val app = controller.get().applicationContext
+        val key = java.util.UUID.randomUUID().toString().replace("-", "")
+        val report = org.json.JSONObject().put("version", 1).put("incident", key)
+            .put("local", legacySnapshot())
+            .put("peer", org.json.JSONObject.NULL).put("peerState", "unsupported")
+            .put("peerProvenance", org.json.JSONObject.NULL).put("coalesced", "0")
+            .put("suppressedPressure", "0").put("inboundDropped", "0").put("sendDropped", "0")
+            .put("clockCorrelation", "unsynchronized; monotonic times are local to each peer")
+        val owned = java.io.File(app.filesDir, "pressure-incidents").apply { mkdirs() }
+        val file = java.io.File(owned, "incident-$key.json").apply { writeText(report.toString()) }
+        val fail = java.util.concurrent.atomic.AtomicBoolean(true)
+        val failure = if (rejectQueue) java.util.concurrent.RejectedExecutionException("Queue full")
+            else java.io.IOException("Report read failed")
+        val store = dev.redrain.cast.diagnostics.IncidentStore(app, readBytes = {
+            if (fail.get() && !rejectQueue) throw failure else it.readBytes()
+        }, executor = java.util.concurrent.Executor {
+            if (fail.get() && rejectQueue) throw failure else it.run()
+        })
+        val previousFactory = MainActivity.incidentStoreFactory
+        MainActivity.incidentStoreFactory = { store }
+        val writing = java.util.concurrent.CountDownLatch(1)
+        val output = object : java.io.ByteArrayOutputStream() {
+            override fun write(bytes: ByteArray, offset: Int, length: Int) {
+                writing.countDown()
+                super.write(bytes, offset, length)
+            }
+        }
+        val uri = android.net.Uri.parse("content://incident-test/read-retry-$key")
+        shadowOf(app.contentResolver).registerOutputStream(uri, output)
+        val message = "Could not read session telemetry report; the destination was not written. Reopen Reports and try again."
+        fun launch() {
+            org.robolectric.util.ReflectionHelpers.callInstanceMethod<Unit>(controller.get(), "exportIncident",
+                org.robolectric.util.ReflectionHelpers.ClassParameter.from(String::class.java, file.name))
+            org.robolectric.util.ReflectionHelpers.callInstanceMethod<Unit>(controller.get(), "onActivityResult",
+                org.robolectric.util.ReflectionHelpers.ClassParameter.from(Int::class.javaPrimitiveType, 12),
+                org.robolectric.util.ReflectionHelpers.ClassParameter.from(Int::class.javaPrimitiveType, Activity.RESULT_OK),
+                org.robolectric.util.ReflectionHelpers.ClassParameter.from(Intent::class.java, Intent().setData(uri)))
+        }
+        fun displayedMessage(): String {
+            val home = org.robolectric.util.ReflectionHelpers.getField<HomeView>(controller.get(), "home")
+            return org.robolectric.util.ReflectionHelpers.getField<android.widget.TextView>(home, "errorMessage")
+                .text.toString()
+        }
+        try {
+            launch()
+            shadowOf(Looper.getMainLooper()).idle()
+            assertEquals(message, displayedMessage())
+            assertEquals(0, output.size())
+            assertEquals(report.toString(), file.readText())
+            assertTrue(org.robolectric.shadows.ShadowLog.getLogsForTag("PressureIncident").any {
+                it.throwable === failure
+            })
+            controller.recreate()
+            assertEquals(message, displayedMessage())
+            fail.set(false)
+            launch()
+            assertTrue(writing.await(5, java.util.concurrent.TimeUnit.SECONDS))
+            val executorField = MainActivity::class.java.getDeclaredField("incidentExports").apply {
+                isAccessible = true
+            }
+            val finished = java.util.concurrent.CountDownLatch(1)
+            (executorField.get(null) as java.util.concurrent.ThreadPoolExecutor).execute { finished.countDown() }
+            assertTrue(finished.await(5, java.util.concurrent.TimeUnit.SECONDS))
+            shadowOf(Looper.getMainLooper()).idle()
+            assertNull(org.robolectric.util.ReflectionHelpers.getField<String?>(controller.get(), "problem"))
+            assertNotEquals(message, displayedMessage())
+            assertEquals(key, org.json.JSONObject(output.toString("UTF-8")).getString("incident"))
+            assertTrue(file.exists())
+            assertEquals("Session telemetry report exported", org.robolectric.shadows.ShadowToast.getTextOfLatestToast())
+        } finally {
+            MainActivity.incidentStoreFactory = previousFactory
+            file.delete()
+            if (!controller.get().isDestroyed) controller.pause().stop().destroy()
+        }
+    }
+
+    @Test fun failedIncidentWriteAfterRecreationReportsIncompleteDestinationToCurrentActivity() {
+        incidentWriteAcrossRecreation(fail = true)
+    }
+
+    @Test fun successfulIncidentWriteAfterRecreationNotifiesCurrentActivity() {
+        incidentWriteAcrossRecreation(fail = false)
+    }
+
+    @Test fun successfulIncidentRetryClearsWarningAcrossRecreation() {
+        incidentRetryAfterFailure(unrelatedError = false)
+    }
+
+    @Test fun successfulIncidentRetryPreservesNewerUnrelatedErrorWithSameMessage() {
+        incidentRetryAfterFailure(unrelatedError = true)
+    }
+
+    @Test fun successfulIncidentRetryWhileStoppedClearsWarningOnReattach() {
+        incidentRetryAfterFailure(unrelatedError = false, detached = true)
+    }
+
+    @Test fun rejectedOverlappingIncidentExportsSurviveOlderSuccessAndAllowRetry() {
+        overlappingIncidentExports(failOlder = false)
+    }
+
+    @Test fun rejectedOverlappingIncidentExportsSurviveOlderFailureAndLogIt() {
+        overlappingIncidentExports(failOlder = true)
+    }
+
+    private fun overlappingIncidentExports(failOlder: Boolean) {
+        val controller = Robolectric.buildActivity(MainActivity::class.java).setup()
+        val key = java.util.UUID.randomUUID().toString().replace("-", "")
+        val name = "incident-$key.json"
+        val report = org.json.JSONObject().put("version", 1).put("incident", key)
+            .put("local", legacySnapshot())
+            .put("peer", org.json.JSONObject.NULL).put("peerState", "unsupported")
+            .put("peerProvenance", org.json.JSONObject.NULL).put("coalesced", "0")
+            .put("suppressedPressure", "0").put("inboundDropped", "0").put("sendDropped", "0")
+            .put("clockCorrelation", "unsynchronized; monotonic times are local to each peer")
+        val entered = java.util.concurrent.CountDownLatch(1)
+        val release = java.util.concurrent.CountDownLatch(1)
+        val older = object : java.io.ByteArrayOutputStream() {
+            override fun write(bytes: ByteArray, offset: Int, length: Int) {
+                entered.countDown()
+                check(release.await(5, java.util.concurrent.TimeUnit.SECONDS))
+                if (failOlder) throw java.io.IOException("provider write failed")
+                super.write(bytes, offset, length)
+            }
+        }
+        val rejected = java.io.ByteArrayOutputStream()
+        val retry = java.io.ByteArrayOutputStream()
+        val resolver = controller.get().applicationContext.contentResolver
+        val firstUri = android.net.Uri.parse("content://incident-test/first-$key")
+        val secondUri = android.net.Uri.parse("content://incident-test/second-$key")
+        val thirdUri = android.net.Uri.parse("content://incident-test/third-$key")
+        val retryUri = android.net.Uri.parse("content://incident-test/retry-overlap-$key")
+        shadowOf(resolver).registerOutputStream(firstUri, older)
+        shadowOf(resolver).registerOutputStream(secondUri, rejected)
+        shadowOf(resolver).registerOutputStream(thirdUri, rejected)
+        shadowOf(resolver).registerOutputStream(retryUri, retry)
+        val store = dev.redrain.cast.diagnostics.IncidentStore(controller.get().applicationContext)
+        val executorField = MainActivity::class.java.getDeclaredField("incidentExports")
+        executorField.isAccessible = true
+        val executor = executorField.get(null) as java.util.concurrent.ThreadPoolExecutor
+        val warning = "Telemetry export already in progress; this destination was not written. Wait for it to finish and try again."
+        fun launch(uri: android.net.Uri) {
+            val activity = controller.get()
+            org.robolectric.util.ReflectionHelpers.callInstanceMethod<Unit>(activity, "exportIncident",
+                org.robolectric.util.ReflectionHelpers.ClassParameter.from(String::class.java, name))
+            org.robolectric.util.ReflectionHelpers.callInstanceMethod<Unit>(activity, "onActivityResult",
+                org.robolectric.util.ReflectionHelpers.ClassParameter.from(Int::class.javaPrimitiveType, 12),
+                org.robolectric.util.ReflectionHelpers.ClassParameter.from(Int::class.javaPrimitiveType, Activity.RESULT_OK),
+                org.robolectric.util.ReflectionHelpers.ClassParameter.from(Intent::class.java, Intent().setData(uri)))
+        }
+        fun storageBarrier() {
+            val done = java.util.concurrent.CountDownLatch(1)
+            store.list { done.countDown() }
+            assertTrue(done.await(5, java.util.concurrent.TimeUnit.SECONDS))
+        }
+        fun exportBarrier() {
+            val done = java.util.concurrent.CountDownLatch(1)
+            executor.execute { done.countDown() }
+            assertTrue(done.await(5, java.util.concurrent.TimeUnit.SECONDS))
+            shadowOf(Looper.getMainLooper()).idle()
+        }
+        try {
+            store.write(key, report)
+            storageBarrier()
+            launch(firstUri)
+            assertTrue(entered.await(5, java.util.concurrent.TimeUnit.SECONDS))
+            launch(secondUri)
+            launch(thirdUri)
+            assertEquals(warning, org.robolectric.util.ReflectionHelpers.getField<String?>(controller.get(), "problem"))
+            controller.recreate()
+            assertEquals(warning, org.robolectric.util.ReflectionHelpers.getField<String?>(controller.get(), "problem"))
+            val toastBefore = org.robolectric.shadows.ShadowToast.getTextOfLatestToast()
+            release.countDown()
+            exportBarrier()
+            assertEquals(warning, org.robolectric.util.ReflectionHelpers.getField<String?>(controller.get(), "problem"))
+            assertEquals(toastBefore, org.robolectric.shadows.ShadowToast.getTextOfLatestToast())
+            assertEquals(0, rejected.size())
+            if (failOlder) assertTrue(org.robolectric.shadows.ShadowLog.getLogsForTag("RedrainCast").any {
+                it.msg == "Telemetry export failed: Could not export session telemetry report; the destination may contain an incomplete file."
+            })
+            launch(retryUri)
+            storageBarrier()
+            exportBarrier()
+            assertNull(org.robolectric.util.ReflectionHelpers.getField<String?>(controller.get(), "problem"))
+            assertEquals(key, org.json.JSONObject(retry.toString("UTF-8")).getString("incident"))
+            assertEquals("Session telemetry report exported", org.robolectric.shadows.ShadowToast.getTextOfLatestToast())
+        } finally {
+            release.countDown()
+            if (!controller.get().isDestroyed) controller.pause().stop().destroy()
+        }
+    }
+
+    private fun incidentRetryAfterFailure(unrelatedError: Boolean, detached: Boolean = false) {
+        val controller = Robolectric.buildActivity(MainActivity::class.java).setup()
+        val key = java.util.UUID.randomUUID().toString().replace("-", "")
+        val name = "incident-$key.json"
+        val report = org.json.JSONObject().put("version", 1).put("incident", key)
+            .put("local", legacySnapshot())
+            .put("peer", org.json.JSONObject.NULL).put("peerState", "unsupported")
+            .put("peerProvenance", org.json.JSONObject.NULL).put("coalesced", "0")
+            .put("suppressedPressure", "0").put("inboundDropped", "0").put("sendDropped", "0")
+            .put("clockCorrelation", "unsynchronized; monotonic times are local to each peer")
+        val stored = java.util.concurrent.CountDownLatch(1)
+        val entered = java.util.concurrent.CountDownLatch(1)
+        val release = java.util.concurrent.CountDownLatch(1)
+        val finished = java.util.concurrent.CountDownLatch(1)
+        val fail = java.util.concurrent.atomic.AtomicBoolean(true)
+        val output = object : java.io.ByteArrayOutputStream() {
+            override fun write(bytes: ByteArray, offset: Int, length: Int) {
+                if (fail.get()) throw java.io.IOException("provider write failed")
+                entered.countDown()
+                check(release.await(5, java.util.concurrent.TimeUnit.SECONDS))
+                super.write(bytes, offset, length)
+            }
+        }
+        val uri = android.net.Uri.parse("content://incident-test/retry-$key")
+        val message = "Could not export session telemetry report; the destination may contain an incomplete file."
+        val executorField = MainActivity::class.java.getDeclaredField("incidentExports")
+        executorField.isAccessible = true
+        val executor = executorField.get(null) as java.util.concurrent.ThreadPoolExecutor
+        fun launch(activity: MainActivity) {
+            org.robolectric.util.ReflectionHelpers.callInstanceMethod<Unit>(activity, "exportIncident",
+                org.robolectric.util.ReflectionHelpers.ClassParameter.from(String::class.java, name))
+            org.robolectric.util.ReflectionHelpers.callInstanceMethod<Unit>(activity, "onActivityResult",
+                org.robolectric.util.ReflectionHelpers.ClassParameter.from(Int::class.javaPrimitiveType, 12),
+                org.robolectric.util.ReflectionHelpers.ClassParameter.from(Int::class.javaPrimitiveType, Activity.RESULT_OK),
+                org.robolectric.util.ReflectionHelpers.ClassParameter.from(Intent::class.java, Intent().setData(uri)))
+        }
+        fun displayedMessage(activity: MainActivity): String {
+            val home = org.robolectric.util.ReflectionHelpers.getField<HomeView>(activity, "home")
+            return org.robolectric.util.ReflectionHelpers.getField<android.widget.TextView>(home, "errorMessage")
+                .text.toString()
+        }
+        try {
+            val activity = controller.get()
+            val store = dev.redrain.cast.diagnostics.IncidentStore(activity.applicationContext)
+            store.write(key, report)
+            store.list { stored.countDown() }
+            assertTrue(stored.await(5, java.util.concurrent.TimeUnit.SECONDS))
+            shadowOf(activity.applicationContext.contentResolver).registerOutputStream(uri, output)
+            launch(activity)
+            val readFinished = java.util.concurrent.CountDownLatch(1)
+            store.list { readFinished.countDown() }
+            assertTrue(readFinished.await(5, java.util.concurrent.TimeUnit.SECONDS))
+            val firstFinished = java.util.concurrent.CountDownLatch(1)
+            executor.execute { firstFinished.countDown() }
+            assertTrue(firstFinished.await(5, java.util.concurrent.TimeUnit.SECONDS))
+            shadowOf(Looper.getMainLooper()).idle()
+            assertEquals(message, org.robolectric.util.ReflectionHelpers.getField<String?>(activity, "problem"))
+            assertEquals(message, displayedMessage(activity))
+
+            fail.set(false)
+            launch(activity)
+            assertTrue(entered.await(5, java.util.concurrent.TimeUnit.SECONDS))
+            executor.execute { finished.countDown() }
+            if (unrelatedError) {
+                org.robolectric.util.ReflectionHelpers.callInstanceMethod<Unit>(activity, "showError",
+                    org.robolectric.util.ReflectionHelpers.ClassParameter.from(Exception::class.java,
+                        IllegalStateException(message)))
+            } else if (detached) {
+                controller.pause().stop()
+            } else {
+                controller.recreate()
+                assertEquals(message,
+                    org.robolectric.util.ReflectionHelpers.getField<String?>(controller.get(), "problem"))
+            }
+            release.countDown()
+            assertTrue(finished.await(5, java.util.concurrent.TimeUnit.SECONDS))
+            shadowOf(Looper.getMainLooper()).idle()
+            if (detached) controller.start().resume().visible()
+            assertEquals(if (unrelatedError) message else null,
+                org.robolectric.util.ReflectionHelpers.getField<String?>(controller.get(), "problem"))
+            if (unrelatedError) assertEquals(message, displayedMessage(controller.get()))
+            else assertNotEquals(message, displayedMessage(controller.get()))
+            assertEquals(key, org.json.JSONObject(output.toString("UTF-8")).getString("incident"))
+            controller.recreate()
+            assertNull(org.robolectric.util.ReflectionHelpers.getField<String?>(controller.get(), "problem"))
+            assertNotEquals(message, displayedMessage(controller.get()))
+        } finally {
+            release.countDown()
+            if (!controller.get().isDestroyed) controller.pause().stop().destroy()
+        }
+    }
+
+    @Test fun evictedIncidentExportReportsThatTheReportIsNoLongerRetained() {
+        val controller = Robolectric.buildActivity(MainActivity::class.java).setup()
+        val activity = controller.get()
+        val store = dev.redrain.cast.diagnostics.IncidentStore(activity.applicationContext)
+        val finished = java.util.concurrent.CountDownLatch(1)
+        try {
+            org.robolectric.util.ReflectionHelpers.callInstanceMethod<Unit>(activity, "exportIncident",
+                org.robolectric.util.ReflectionHelpers.ClassParameter.from(String::class.java,
+                    "incident-${java.util.UUID.randomUUID().toString().replace("-", "")}.json"))
+            org.robolectric.util.ReflectionHelpers.callInstanceMethod<Unit>(activity, "onActivityResult",
+                org.robolectric.util.ReflectionHelpers.ClassParameter.from(Int::class.javaPrimitiveType, 12),
+                org.robolectric.util.ReflectionHelpers.ClassParameter.from(Int::class.javaPrimitiveType, Activity.RESULT_OK),
+                org.robolectric.util.ReflectionHelpers.ClassParameter.from(Intent::class.java,
+                    Intent().setData(android.net.Uri.parse("content://incident-test/evicted"))))
+            store.list { finished.countDown() }
+            assertTrue(finished.await(5, java.util.concurrent.TimeUnit.SECONDS))
+            shadowOf(Looper.getMainLooper()).idle()
+            assertEquals("Session telemetry report is no longer retained; reopen Reports and try again.",
+                org.robolectric.util.ReflectionHelpers.getField<String?>(activity, "problem"))
+        } finally { controller.pause().stop().destroy() }
+    }
+
+    private fun incidentWriteAcrossRecreation(fail: Boolean) {
+        val controller = Robolectric.buildActivity(MainActivity::class.java).setup()
+        val old = controller.get()
+        val key = if (fail) "b".repeat(32) else "c".repeat(32)
+        val name = "incident-$key.json"
+        val report = org.json.JSONObject().put("version", 1).put("incident", key)
+            .put("local", legacySnapshot())
+            .put("peer", org.json.JSONObject.NULL).put("peerState", "unsupported")
+            .put("peerProvenance", org.json.JSONObject.NULL).put("coalesced", "0")
+            .put("suppressedPressure", "0").put("inboundDropped", "0").put("sendDropped", "0")
+            .put("clockCorrelation", "unsynchronized; monotonic times are local to each peer")
+        val stored = java.util.concurrent.CountDownLatch(1)
+        val entered = java.util.concurrent.CountDownLatch(1)
+        val release = java.util.concurrent.CountDownLatch(1)
+        val finished = java.util.concurrent.CountDownLatch(1)
+        val output = object : java.io.ByteArrayOutputStream() {
+            override fun write(bytes: ByteArray, offset: Int, length: Int) {
+                entered.countDown()
+                check(release.await(5, java.util.concurrent.TimeUnit.SECONDS))
+                if (fail) throw java.io.IOException("provider write failed")
+                super.write(bytes, offset, length)
+            }
+        }
+        try {
+            val store = dev.redrain.cast.diagnostics.IncidentStore(old.applicationContext)
+            store.write(key, report)
+            store.list { stored.countDown() }
+            assertTrue(stored.await(5, java.util.concurrent.TimeUnit.SECONDS))
+            org.robolectric.util.ReflectionHelpers.callInstanceMethod<Unit>(old, "exportIncident",
+                org.robolectric.util.ReflectionHelpers.ClassParameter.from(String::class.java, name))
+            val uri = android.net.Uri.parse("content://incident-test/in-flight-$key")
+            shadowOf(old.applicationContext.contentResolver).registerOutputStream(uri, output)
+            org.robolectric.util.ReflectionHelpers.callInstanceMethod<Unit>(old, "onActivityResult",
+                org.robolectric.util.ReflectionHelpers.ClassParameter.from(Int::class.javaPrimitiveType, 12),
+                org.robolectric.util.ReflectionHelpers.ClassParameter.from(Int::class.javaPrimitiveType, Activity.RESULT_OK),
+                org.robolectric.util.ReflectionHelpers.ClassParameter.from(Intent::class.java, Intent().setData(uri)))
+            assertTrue(entered.await(5, java.util.concurrent.TimeUnit.SECONDS))
+            val executorField = MainActivity::class.java.getDeclaredField("incidentExports")
+            executorField.isAccessible = true
+            val executor = executorField.get(null) as java.util.concurrent.ThreadPoolExecutor
+            executor.execute { finished.countDown() }
+            controller.recreate()
+            val current = controller.get()
+            assertNotSame(old, current)
+            release.countDown()
+            assertTrue(finished.await(5, java.util.concurrent.TimeUnit.SECONDS))
+            shadowOf(Looper.getMainLooper()).idle()
+            if (fail) {
+                val message = "Could not export session telemetry report; the destination may contain an incomplete file."
+                assertEquals(message, org.robolectric.util.ReflectionHelpers.getField<String?>(current, "problem"))
+                assertNotEquals(message, org.robolectric.util.ReflectionHelpers.getField<String?>(old, "problem"))
+                controller.recreate()
+                assertEquals(message, org.robolectric.util.ReflectionHelpers.getField<String?>(controller.get(), "problem"))
+            } else {
+                assertEquals(key, org.json.JSONObject(output.toString("UTF-8")).getString("incident"))
+                assertEquals("Session telemetry report exported", org.robolectric.shadows.ShadowToast.getTextOfLatestToast())
+            }
+        } finally {
+            release.countDown()
+            if (!controller.get().isDestroyed) controller.pause().stop().destroy()
+        }
+    }
+
+    @Test fun incidentDocumentPickerSurvivesRecreationAndSavedStateRestorationWithoutReportInBundle() {
+        val controller = Robolectric.buildActivity(MainActivity::class.java).setup()
+        val key = "a".repeat(32)
+        val name = "incident-$key.json"
+        val store = dev.redrain.cast.diagnostics.IncidentStore(controller.get())
+        val report = org.json.JSONObject().put("version", 1).put("incident", key)
+            .put("local", legacySnapshot())
+            .put("peer", org.json.JSONObject.NULL).put("peerState", "unsupported")
+            .put("peerProvenance", org.json.JSONObject.NULL).put("coalesced", "0")
+            .put("suppressedPressure", "0").put("inboundDropped", "0").put("sendDropped", "0")
+            .put("clockCorrelation", "unsynchronized; monotonic times are local to each peer")
+        val stored = java.util.concurrent.CountDownLatch(1)
+        store.write(key, report)
+        store.list { stored.countDown() }
+        assertTrue(stored.await(5, java.util.concurrent.TimeUnit.SECONDS))
+        fun launch(activity: MainActivity) {
+            org.robolectric.util.ReflectionHelpers.callInstanceMethod<Unit>(activity, "exportIncident",
+                org.robolectric.util.ReflectionHelpers.ClassParameter.from(String::class.java, name))
+            assertEquals(Intent.ACTION_CREATE_DOCUMENT, shadowOf(activity).nextStartedActivityForResult.intent.action)
+        }
+        fun complete(activity: MainActivity) {
+            val closed = java.util.concurrent.CountDownLatch(1)
+            val output = object : java.io.ByteArrayOutputStream() {
+                override fun close() { super.close(); closed.countDown() }
+            }
+            val uri = android.net.Uri.parse("content://incident-test/export")
+            shadowOf(activity.contentResolver).registerOutputStream(uri, output)
+            org.robolectric.util.ReflectionHelpers.callInstanceMethod<Unit>(activity, "onActivityResult",
+                org.robolectric.util.ReflectionHelpers.ClassParameter.from(Int::class.javaPrimitiveType, 12),
+                org.robolectric.util.ReflectionHelpers.ClassParameter.from(Int::class.javaPrimitiveType, Activity.RESULT_OK),
+                org.robolectric.util.ReflectionHelpers.ClassParameter.from(Intent::class.java, Intent().setData(uri)))
+            assertTrue(closed.await(5, java.util.concurrent.TimeUnit.SECONDS))
+            val executorField = MainActivity::class.java.getDeclaredField("incidentExports")
+            executorField.isAccessible = true
+            val finished = java.util.concurrent.CountDownLatch(1)
+            (executorField.get(null) as java.util.concurrent.ThreadPoolExecutor).execute { finished.countDown() }
+            assertTrue(finished.await(5, java.util.concurrent.TimeUnit.SECONDS))
+            shadowOf(Looper.getMainLooper()).idle()
+            assertEquals(key, org.json.JSONObject(output.toString("UTF-8")).getString("incident"))
+            assertTrue(org.json.JSONObject(output.toString("UTF-8")).has("vocabulary"))
+        }
+        try {
+            launch(controller.get())
+            controller.recreate()
+            complete(controller.get())
+            launch(controller.get())
+            val saved = android.os.Bundle()
+            controller.saveInstanceState(saved)
+            assertEquals(name, saved.getString("pendingIncidentExport"))
+            assertFalse(saved.keySet().any { saved.get(it) == report.toString() })
+            controller.pause().stop().destroy()
+            val restored = Robolectric.buildActivity(MainActivity::class.java).create(saved).start().resume().visible()
+            try { complete(restored.get()) }
+            finally { restored.pause().stop().destroy() }
+        } finally {
+            if (!controller.get().isDestroyed) controller.pause().stop().destroy()
+        }
+    }
+
     private val holderSurfaces = mutableListOf<Pair<Surface, SurfaceTexture>>()
     private fun surfaceReady(activity: MainActivity): SurfaceHolder {
         // Legacy Robolectric's default holder does not create a valid native surface.
@@ -1002,8 +1448,8 @@ class MainActivityTest {
         assertEquals(if (BuildConfig.DEBUG) "RedrainCast Debug" else "RedrainCast",
             context.applicationInfo.loadLabel(context.packageManager).toString())
         val info = context.packageManager.getPackageInfo(packageName, 0)
-        assertEquals(if (BuildConfig.DEBUG) "0.5.3-debug" else "0.5.3", info.versionName)
-        assertEquals(37L, info.longVersionCode)
+        assertEquals(if (BuildConfig.DEBUG) "0.5.4-debug" else "0.5.4", info.versionName)
+        assertEquals(38L, info.longVersionCode)
         val activity = context.packageManager.getActivityInfo(
             android.content.ComponentName(context, MainActivity::class.java), 0)
         assertEquals("dev.redrain.cast.MainActivity", activity.name)

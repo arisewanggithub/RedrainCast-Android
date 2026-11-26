@@ -90,7 +90,21 @@ class StreamRecoverySenderTest {
         recovery.checkDeadline()
         assertNull(mux.pollLane(2, 1))
         now.set(11_000_000_000)
-        assertThrows(IOException::class.java) { recovery.checkDeadline() }
+        val error = assertThrows(RecoveryDeadlineException::class.java) { recovery.checkDeadline() }
+        assertEquals(2, error.track)
+        assertEquals(2, error.generation)
+        assertEquals("WAIT_PROOF", error.phase)
+        assertEquals("receiver", error.trigger)
+        assertEquals(10_000_000_000L, error.elapsedNs)
+        assertEquals(1, error.writtenAudioIntervals)
+        val logs = mutableListOf<String>()
+        SessionStopTrace(logs::add).firstFailure(error, SessionStopTrace.Phase.STREAMING,
+            SessionOutcome.Origin.CAPTURE, 73, Settings())
+        val retained = Wire.parseJson(logs.single().removePrefix("sender_session_failure ").toByteArray())
+            .getJSONObject("recovery_deadline")
+        assertEquals("WAIT_PROOF", retained.getString("phase"))
+        assertEquals("receiver", retained.getString("last_trigger"))
+        assertEquals("10000000000", retained.getString("elapsed_ns"))
     }
 
     @Test fun diagnosticsRetainRepeatedAacWindowRejectionsBeforeResetWithoutChangingRecovery() {

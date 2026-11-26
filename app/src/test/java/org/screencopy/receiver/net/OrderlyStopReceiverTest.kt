@@ -22,6 +22,7 @@ import java.util.concurrent.atomic.AtomicBoolean
 class OrderlyStopReceiverTest {
     @Test(timeout = 15_000) fun stopHaltsHealthyOutputBeforeRecoveryRetirementAndRejectsLateReplacement() {
         for (duringCreation in listOf(false, true)) {
+            val clock = AtomicLong(100_000)
             val entered = CountDownLatch(1)
             val resume = CountDownLatch(1)
             val paused = CountDownLatch(1)
@@ -34,7 +35,7 @@ class OrderlyStopReceiverTest {
             Mockito.`when`(output.playbackActive).thenAnswer { active.get() }
             Mockito.doAnswer { active.set(true); null }.`when`(output).play()
             Mockito.doAnswer { active.set(false); paused.countDown(); null }.`when`(output).pause()
-            ReceiverServer.forProtocolTests("Receiver", onFailure = failures::add,
+            ReceiverServer.forProtocolTests("Receiver", timeMilliseconds = clock::get, onFailure = failures::add,
                 videoFactory = { _, _, _, generation ->
                     if (duringCreation && generation == 2L) {
                         entered.countDown()
@@ -61,24 +62,26 @@ class OrderlyStopReceiverTest {
                     server.start()
                     control(server).use { peer ->
                         MediaSockets.attach(server, negotiate(peer, withAudio = true)).use { media ->
+                            clock.addAndGet(2000)
+                            tick(owner(server))
                             fun videoConfig(generation: Long) = Message.json(Type.STREAM_CONFIG,
                                 JSONObject().put("codec", "h265").put("width", 720).put("height", 1280)
                                     .put("csd", JSONArray().put("AAAAAQE=")), ID, 1, generation)
                             Wire.write(media.video.outputStream, videoConfig(1))
-                            assertEquals(Type.STREAM_READY, Wire.read(peer.inputStream).type)
+                            assertEquals(1, expect(peer, Type.STREAM_READY).track)
                             val head = "OpusHead".toByteArray() +
                                 byteArrayOf(1, 2, 0x38, 1, 0x80.toByte(), 0xbb.toByte(), 0, 0, 0, 0, 0)
                             Wire.write(media.audio.outputStream, Message.json(Type.STREAM_CONFIG,
                                 JSONObject().put("codec", "opus").put("sampleRate", 48000).put("channels", 2)
                                     .put("csd", JSONArray().put(java.util.Base64.getEncoder().encodeToString(head)))
                                     .put("codecDelayNs", 6_500_000).put("seekPrerollNs", 80_000_000), ID, 2, 1))
-                            assertEquals(Type.STREAM_READY, Wire.read(peer.inputStream).type)
+                            assertEquals(2, expect(peer, Type.STREAM_READY).track)
                             output.play()
                             Wire.write(media.video.outputStream, videoConfig(2))
                             assertTrue(entered.await(2, TimeUnit.SECONDS))
                             assertTrue(active.get())
                             val stopping = java.util.concurrent.CompletableFuture.runAsync { server.disconnect("user") }
-                            assertEquals(Type.STOP, Wire.read(peer.inputStream).type)
+                            expect(peer, Type.STOP)
                             assertTrue("Healthy output must halt before waiting for recovery retirement",
                                 paused.await(1, TimeUnit.SECONDS))
                             assertFalse(active.get())
@@ -499,6 +502,19 @@ class OrderlyStopReceiverTest {
     }
 
     private fun send(peer: Socket, type: Type, json: JSONObject) = Wire.write(peer.outputStream, Message.json(type, json, ID))
+    private fun expect(peer: Socket, type: Type): Message {
+        while (true) {
+            val message = Wire.read(peer.inputStream)
+            assertEquals(ID, message.session)
+            if (message.type == Type.PING) {
+                send(peer, Type.PONG, JSONObject().put("nonce", message.json().getInt("nonce")))
+                continue
+            }
+            assertEquals(type, message.type)
+            return message
+        }
+    }
+
     private fun frameBytes() = ByteArrayOutputStream().apply {
         Wire.write(this, Message(Type.VIDEO_FRAME, ID, 1, 1, 0, payload = ByteArray(1024)))
     }.toByteArray()

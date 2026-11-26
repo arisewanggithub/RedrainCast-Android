@@ -7,14 +7,35 @@ policy; there is no migration from the retired applications.
 
 ## Use
 
+**Automatic session telemetry:**
+the sender retains up to 60 seconds and 480 KiB of compact metadata per endpoint.
+A compatible receiver publishes bounded telemetry once per second over the
+existing cast control connection; it does not persist reports. The first
+pressure or retained failure creates at most one sender-owned report for the
+cast, with bounded post-trigger and terminal context. A normal successful cast
+without pressure or failure writes no report. Reports are private, contain no
+screen or audio payloads and are not uploaded. On the sender, Settings →
+Advanced → **View or clear session telemetry reports** provides summary,
+export through Android's document picker and deletion. Up to eight reports of
+at most 2 MiB each are retained for seven days, with expiry checked on later
+report access or save. Retained telemetry payload is bounded to 3 MiB across
+both endpoints. Missing receiver telemetry, publication gaps and
+incomplete teardown remain explicit; an older peer casts normally without
+receiver telemetry and there is no automatic retrieval fallback. Cast traffic
+is unencrypted and not cryptographically paired; use a trusted LAN. See
+[session telemetry](protocol/PRESSURE_INCIDENTS.md) for the approved bounds,
+terminal transaction and interpretation.
+
 **Remote diagnostics (default off, process-local):** in Settings → Advanced,
-read the warning, select **Allow unpaired LAN diagnostics** independently of playback statistics,
-then Save. The separate TCP endpoint appears in **LAN diagnostics endpoint / status**
+open **LAN diagnostics endpoint / status** to review the detailed warning, then select
+**Allow unpaired LAN diagnostics** independently of playback statistics and Save.
+The separate TCP endpoint appears in **LAN diagnostics endpoint / status**
 and the controlled `DIAGNOSTIC_LISTENER_STARTED` local log event.
 **Anyone on the LAN can read bounded metadata and control diagnostic captures
 while enabled. Traffic is unencrypted and unauthenticated; use a trusted LAN.**
 There is no pairing, certificate, or secret; the collector requires explicit
-`--lan` and sends HELLO. Only an explicit bounded START enables instrumentation.
+`--lan` and sends HELLO. Only an explicit bounded START enables this live
+diagnostic capture; automatic session telemetry is separate.
 When this device sends a cast, consent also requests session-scoped diagnostics
 on compatible receivers **without requiring projector settings or receiver
 statistics**. Normal cast admission is required; unsupported/unavailable access

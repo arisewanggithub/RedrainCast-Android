@@ -14,6 +14,7 @@ import android.widget.EditText
 import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
+import dev.redrain.cast.diagnostics.IncidentStore
 import dev.screencopy.sender.Settings
 import dev.screencopy.sender.HardwareEncoderDiscovery
 import dev.screencopy.sender.HardwareEncoders
@@ -62,10 +63,20 @@ object SharingSettings {
 
     fun show(activity: Activity, current: Settings, onSave: (Settings) -> Unit, onNotices: () -> Unit,
         onDiagnostics: (() -> Unit)? = null): AlertDialog =
-        show(activity, current, onSave, onNotices, HardwareEncoderDiscovery.read(), onDiagnostics)
+        show(activity, current, onSave, onNotices, HardwareEncoderDiscovery.read(), onDiagnostics, null)
+
+    fun show(activity: Activity, current: Settings, onSave: (Settings) -> Unit, onNotices: () -> Unit,
+        onDiagnostics: (() -> Unit)?, onIncidentExport: (String) -> Unit): AlertDialog =
+        show(activity, current, onSave, onNotices, HardwareEncoderDiscovery.read(), onDiagnostics, onIncidentExport)
 
     internal fun show(activity: Activity, current: Settings, onSave: (Settings) -> Unit, onNotices: () -> Unit,
-        encoders: HardwareEncoders, onDiagnostics: (() -> Unit)? = null): AlertDialog {
+        encoders: HardwareEncoders, onDiagnostics: (() -> Unit)? = null): AlertDialog =
+        show(activity, current, onSave, onNotices, encoders, onDiagnostics, null)
+
+    internal fun show(activity: Activity, current: Settings, onSave: (Settings) -> Unit, onNotices: () -> Unit,
+        encoders: HardwareEncoders, onDiagnostics: (() -> Unit)?,
+        onIncidentExport: ((String) -> Unit)?,
+        storeFactory: (Activity) -> IncidentStore = { IncidentStore(it) }): AlertDialog {
         appContext = activity.applicationContext
         val density = activity.resources.displayMetrics.density
         fun dp(value: Int) = (value * density + 0.5f).toInt()
@@ -79,6 +90,17 @@ object SharingSettings {
         val scroll = ScrollView(activity).apply { addView(body) }
         lateinit var dialog: AlertDialog
         var choiceDialog: AlertDialog? = null
+        var closed = false
+        fun parentActive() = !closed && dialog.isShowing && !activity.isFinishing && !activity.isDestroyed
+        fun showChild(child: AlertDialog, onDismiss: () -> Unit = {}) {
+            choiceDialog?.dismiss()
+            choiceDialog = child
+            child.setOnDismissListener {
+                if (choiceDialog === child) choiceDialog = null
+                onDismiss()
+            }
+            child.show()
+        }
         val error = TextView(activity).apply {
             tag = "settingsError"
             textSize = 15f
@@ -137,7 +159,6 @@ object SharingSettings {
             }
             val selection = Choice(value)
             button.setOnClickListener {
-                choiceDialog?.dismiss()
                 val previousScroll = scroll.scrollY
                 val picker = AlertDialog.Builder(activity)
                     .setTitle(title)
@@ -149,14 +170,11 @@ object SharingSettings {
                     }
                     .setNegativeButton(R.string.rc_cancel, null)
                     .create()
-                choiceDialog = picker
-                picker.setOnDismissListener {
-                    if (choiceDialog === picker) choiceDialog = null
+                showChild(picker) {
                     scroll.post {
-                        if (dialog.isShowing && !activity.isDestroyed) scroll.scrollTo(0, previousScroll)
+                        if (parentActive()) scroll.scrollTo(0, previousScroll)
                     }
                 }
-                picker.show()
             }
             return selection
         }
@@ -275,7 +293,75 @@ object SharingSettings {
             minimumHeight = dp(48)
             advanced.addView(this, spacing(16))
         }
-        label(advanced, R.string.rc_playback_statistics_hint).tag = "playbackStatisticsHint"
+        Button(activity).apply {
+            tag = "sessionTelemetryReports"
+            text = "View or clear session telemetry reports"
+            minimumHeight = dp(48)
+            setOnClickListener {
+                val store = storeFactory(activity)
+                store.list { reports ->
+                    activity.runOnUiThread {
+                        if (!parentActive()) return@runOnUiThread
+                        val builder = AlertDialog.Builder(activity).setTitle("Session telemetry reports")
+                        if (reports == null) builder.setMessage("Reports are unavailable; check the diagnostic log.")
+                        else if (reports.isEmpty()) builder.setMessage("No retained reports.")
+                        else {
+                            val format = java.text.SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.ROOT)
+                            builder.setItems(reports.map { format.format(java.util.Date(it.timestampMs)) }.toTypedArray()) { _, which ->
+                                store.read(reports[which].name) { result ->
+                                    activity.runOnUiThread {
+                                        if (!parentActive()) return@runOnUiThread
+                                        val text = TextView(activity).apply {
+                                            this.text = when (result) {
+                                                dev.redrain.cast.diagnostics.IncidentStore.ReadResult.Missing ->
+                                                    "Session telemetry report is no longer retained; reopen Reports and try again."
+                                                is dev.redrain.cast.diagnostics.IncidentStore.ReadResult.Failure ->
+                                                    "Could not read session telemetry report; reopen Reports and try again."
+                                                is dev.redrain.cast.diagnostics.IncidentStore.ReadResult.Success ->
+                                                    try { dev.redrain.cast.diagnostics.IncidentSummary.text(JSONObject(result.content)) }
+                                                    catch (_: Exception) { "Report could not be read." }
+                                            }
+                                            setTextIsSelectable(true)
+                                            setPadding(dp(16), dp(12), dp(16), dp(12))
+                                        }
+                                        val detailBuilder = AlertDialog.Builder(activity).setTitle("Session telemetry summary")
+                                            .setView(ScrollView(activity).apply { addView(text) })
+                                            .setPositiveButton(android.R.string.ok, null)
+                                        if (result is dev.redrain.cast.diagnostics.IncidentStore.ReadResult.Success &&
+                                            onIncidentExport != null)
+                                            detailBuilder.setNeutralButton("Export…") { _, _ ->
+                                                onIncidentExport(reports[which].name)
+                                            }
+                                        val detail = detailBuilder.create()
+                                        detail.window?.addFlags(android.view.WindowManager.LayoutParams.FLAG_SECURE)
+                                        showChild(detail)
+                                    }
+                                }
+                            }
+                        }
+                        val list = builder.setPositiveButton(android.R.string.ok, null)
+                            .setNeutralButton("Clear all") { _, _ ->
+                                val confirmation = AlertDialog.Builder(activity).setTitle("Clear session telemetry reports?")
+                                    .setMessage("All saved session telemetry reports on this device will be deleted. " +
+                                        "An active or recently stopped cast may save or update a report after clearing.")
+                                    .setNegativeButton(android.R.string.cancel, null)
+                                    .setPositiveButton("Clear") { _, _ ->
+                                        store.clear { success -> activity.runOnUiThread {
+                                            if (parentActive())
+                                                android.widget.Toast.makeText(activity,
+                                                    if (success) "Session telemetry reports cleared" else "Could not clear session telemetry reports",
+                                                    android.widget.Toast.LENGTH_SHORT).show()
+                                        } }
+                                    }.create()
+                                showChild(confirmation)
+                            }.create()
+                        list.window?.addFlags(android.view.WindowManager.LayoutParams.FLAG_SECURE)
+                        showChild(list)
+                    }
+                }
+            }
+            advanced.addView(this, spacing(8))
+        }
         val remoteDiagnostics = CheckBox(activity).apply {
             tag = "allowRemoteDiagnostics"
             text = "Allow unpaired LAN diagnostics (this process only)"
@@ -286,6 +372,8 @@ object SharingSettings {
         TextView(activity).apply {
             tag = "remoteDiagnosticsWarning"
             text = dev.redrain.cast.diagnostics.DiagnosticAccess.warning
+            textSize = 14f
+            setTextColor(activity.getColor(R.color.rc_text_secondary))
             advanced.addView(this, spacing(8))
         }
         remoteDiagnostics.setOnCheckedChangeListener { _, checked ->
@@ -318,6 +406,7 @@ object SharingSettings {
             .setPositiveButton(R.string.rc_save, null)
             .create()
         dialog.setOnDismissListener {
+            closed = true
             choiceDialog?.dismiss()
             choiceDialog = null
         }

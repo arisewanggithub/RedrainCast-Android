@@ -11,9 +11,12 @@ import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.ScheduledFuture
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicReference
 import org.screencopy.receiver.protocol.StreamRecoveryProtocol
 import org.screencopy.receiver.protocol.ReceiverOptionProtocol
 import org.screencopy.receiver.protocol.ReceiverOptionCapabilities
+import dev.redrain.cast.diagnostics.SessionTelemetryProtocol
+import org.json.JSONObject
 
 /** Three plain TCP connections on a trusted LAN; the media token binds them to one session. */
 class ReceiverLink(private val target: ReceiverTarget) : Closeable {
@@ -34,6 +37,8 @@ class ReceiverLink(private val target: ReceiverTarget) : Closeable {
     var receiverOptions = ReceiverOptionCapabilities()
         private set
     var delegatedDiagnostics = false
+        private set
+    internal var sessionTelemetry = false
         private set
     val connectedHost: String get() = checkNotNull(sockets[0].inetAddress?.hostAddress)
 
@@ -61,6 +66,37 @@ class ReceiverLink(private val target: ReceiverTarget) : Closeable {
         } finally { timeout.cancel(false) }
     }
 
+    private enum class AttachmentState { ACTIVE, COMPLETED, EXPIRED }
+
+    private fun attachmentDeadline(timeoutMillis: Long,
+                                   onTimeout: (SocketTimeoutException) -> Unit,
+                                   action: () -> Unit) {
+        require(timeoutMillis > 0) { "Deadline must be positive" }
+        if (closed.get()) throw SessionCancelledException()
+        val state = AtomicReference(AttachmentState.ACTIVE)
+        val timeoutError = SocketTimeoutException("TIMEOUT: receiver operation exceeded its deadline")
+        val timeout = timer.schedule({
+            if (state.compareAndSet(AttachmentState.ACTIVE, AttachmentState.EXPIRED)) {
+                try { onTimeout(timeoutError) } finally { close() }
+            }
+        }, timeoutMillis, TimeUnit.MILLISECONDS)
+        try {
+            action()
+            state.compareAndSet(AttachmentState.ACTIVE, AttachmentState.COMPLETED)
+            if (state.get() == AttachmentState.EXPIRED) throw timeoutError
+        } catch (error: IOException) {
+            state.compareAndSet(AttachmentState.ACTIVE, AttachmentState.COMPLETED)
+            if (state.get() == AttachmentState.EXPIRED) {
+                if (error !== timeoutError) timeoutError.initCause(error)
+                throw timeoutError
+            }
+            throw error
+        } finally {
+            state.compareAndSet(AttachmentState.ACTIVE, AttachmentState.COMPLETED)
+            timeout.cancel(false)
+        }
+    }
+
     fun connect(timeoutMillis: Long = 10_000) {
         try {
             deadline(timeoutMillis) {
@@ -70,7 +106,8 @@ class ReceiverLink(private val target: ReceiverTarget) : Closeable {
                     "name" to "RedrainCast", "videoRotation" to true, "streamRecovery" to true, "uncappedFps" to true,
                     "streamRecoveryVersion" to StreamRecoveryProtocol.VERSION,
                     "receiverOptions" to ReceiverOptionProtocol.IMPLEMENTED.wireValue(),
-                    "diagnostics" to org.screencopy.receiver.protocol.DiagnosticDelegation.capability()
+                    "diagnostics" to org.screencopy.receiver.protocol.DiagnosticDelegation.capability(),
+                    "sessionTelemetry" to SessionTelemetryProtocol.capability()
                 )))
                 val hello = receive()
                 reject(hello)
@@ -79,6 +116,7 @@ class ReceiverLink(private val target: ReceiverTarget) : Closeable {
                 val json = hello.json()
                 delegatedDiagnostics = org.screencopy.receiver.protocol.DiagnosticDelegation.supported(
                     org.screencopy.receiver.protocol.StrictJson.decode(hello.payload))
+                sessionTelemetry = telemetrySupported(org.screencopy.receiver.protocol.StrictJson.decode(hello.payload))
                 receiverOptions = try {
                     ReceiverOptionProtocol.capabilities(org.screencopy.receiver.protocol.StrictJson.decode(hello.payload))
                         .intersect(ReceiverOptionProtocol.IMPLEMENTED)
@@ -112,6 +150,23 @@ class ReceiverLink(private val target: ReceiverTarget) : Closeable {
         } catch (error: Exception) { close(); throw error }
     }
 
+    internal fun selectSessionTelemetry(request: JSONObject) {
+        if (sessionTelemetry) request.put("sessionTelemetry", SessionTelemetryProtocol.capability())
+    }
+
+    internal fun acceptedSessionTelemetry(acceptance: JSONObject): Boolean {
+        val selected = telemetrySupported(acceptance)
+        if (selected && !sessionTelemetry)
+            throw IOException("PROTOCOL: unsolicited session telemetry capability")
+        return selected
+    }
+
+    private fun telemetrySupported(json: JSONObject): Boolean = try {
+        SessionTelemetryProtocol.supported(json)
+    } catch (error: org.screencopy.receiver.protocol.ProtocolException) {
+        throw IOException("PROTOCOL: ${error.message}", error)
+    }
+
     /** Fixed-natural capture always needs presentation metadata, including future display rotations. */
     fun requireVideoRotation() {
         if (!videoRotation)
@@ -123,9 +178,19 @@ class ReceiverLink(private val target: ReceiverTarget) : Closeable {
             throw IOException("UNSUPPORTED_CONFIG: receiver does not support uncapped capture FPS; update the receiver or select an explicit Maximum capture FPS")
     }
 
-    fun attach(session: Long, acceptance: Wire.Message, withAudio: Boolean, timeoutMillis: Long = 10_000) {
+    fun attach(session: Long, acceptance: Wire.Message, withAudio: Boolean, timeoutMillis: Long = 10_000,
+               onFailure: (Exception) -> Unit = {},
+               onValidated: () -> Unit = {}) {
+        val failureGate = Any()
+        var failurePublished = false
+        fun publishFailure(error: Exception) = synchronized(failureGate) {
+            if (!failurePublished) {
+                failurePublished = true
+                onFailure(error)
+            }
+        }
         try {
-            deadline(timeoutMillis) {
+            attachmentDeadline(timeoutMillis, ::publishFailure) {
                 reject(acceptance)
                 if (session <= 0 || acceptance.session != session || acceptance.type != Wire.SESSION_ACCEPT || attached)
                     throw IOException("PROTOCOL: invalid SESSION_ACCEPT")
@@ -143,6 +208,7 @@ class ReceiverLink(private val target: ReceiverTarget) : Closeable {
                 if (!token.matches(Regex("[0-9A-Fa-f]{64}")))
                     throw IOException("PROTOCOL: invalid media connection token")
                 activeSession = session
+                onValidated()
                 for (track in 1..2) {
                     val channel = if (track == 1) "video" else "audio"
                     val socket = sockets[track]
@@ -157,7 +223,11 @@ class ReceiverLink(private val target: ReceiverTarget) : Closeable {
                 }
                 attached = true
             }
-        } catch (error: Exception) { close(); throw error }
+        } catch (error: Exception) {
+            // Publish the attachment failure before closing control wakes its concurrent reader.
+            try { publishFailure(error) } finally { close() }
+            throw error
+        }
     }
 
     fun send(message: Wire.Message) {
@@ -169,12 +239,46 @@ class ReceiverLink(private val target: ReceiverTarget) : Closeable {
             throw IOException("UNSUPPORTED_CONFIG: receiver did not negotiate videoRotation")
         synchronized(gates[lane]) {
             if (closed.get()) throw SessionCancelledException()
+            if (message.type == Wire.STREAM_CONFIG)
+                dev.redrain.cast.diagnostics.TelemetryRegistry.evidence("sender", message.session, message.track,
+                    message.generation, dev.redrain.cast.diagnostics.IncidentEvidence.Stage.CONFIG_WRITING)
             deadline(10_000) { Wire.write(sockets[lane].outputStream, message) }
+        }
+        if (message.type == Wire.STREAM_CONFIG)
+            dev.redrain.cast.diagnostics.TelemetryRegistry.evidence("sender", message.session, message.track,
+                message.generation, dev.redrain.cast.diagnostics.IncidentEvidence.Stage.CONFIG_WRITTEN)
+    }
+
+    fun receive(): Wire.Message = receive {}
+
+    internal fun receive(onReadStarted: () -> Unit): Wire.Message {
+        val diagnostics = dev.redrain.cast.diagnostics.RemoteDiagnostics.recorder
+        val operation = diagnostics.operation("sender", activeSession,
+            dev.redrain.cast.diagnostics.DiagnosticKind.TRANSPORT_HEALTH)
+        diagnostics.observe("sender", activeSession, dev.redrain.cast.diagnostics.DiagnosticKind.TRANSPORT_HEALTH,
+            dev.redrain.cast.diagnostics.DiagnosticStage.BEGIN, operation = operation,
+            point = dev.redrain.cast.diagnostics.DiagnosticPoint.READ)
+        try {
+            onReadStarted()
+            return readControl().also {
+                diagnostics.observe("sender", activeSession, dev.redrain.cast.diagnostics.DiagnosticKind.TRANSPORT_HEALTH,
+                    dev.redrain.cast.diagnostics.DiagnosticStage.COMPLETE, operation = operation,
+                    bytes = it.payload.size.toLong(), point = dev.redrain.cast.diagnostics.DiagnosticPoint.READ)
+            }
+        } catch (error: Exception) {
+            diagnostics.observe("sender", activeSession, dev.redrain.cast.diagnostics.DiagnosticKind.TRANSPORT_HEALTH,
+                dev.redrain.cast.diagnostics.DiagnosticStage.FAILED, operation = operation,
+                point = dev.redrain.cast.diagnostics.DiagnosticPoint.READ)
+            throw error
         }
     }
 
-    fun receive(): Wire.Message {
-        if (!streamRecovery) return Wire.read(sockets[0].inputStream)
+    private fun readControl(): Wire.Message {
+        if (!streamRecovery) return Wire.read(sockets[0].inputStream).also { message ->
+            if (message.type == Wire.STREAM_READY)
+                dev.redrain.cast.diagnostics.TelemetryRegistry.evidence("sender", message.session, message.track,
+                    message.generation, dev.redrain.cast.diagnostics.IncidentEvidence.Stage.READY_RECEIVED)
+        }
         val expired = AtomicBoolean()
         var timeout: ScheduledFuture<*>? = null
         try {
@@ -182,6 +286,9 @@ class ReceiverLink(private val target: ReceiverTarget) : Closeable {
                 timeout = timer.schedule({ expired.set(true); close() }, 10_000, TimeUnit.MILLISECONDS)
             }
             if (expired.get()) throw SocketTimeoutException("TIMEOUT: control frame exceeded its deadline")
+            if (message.type == Wire.STREAM_READY)
+                dev.redrain.cast.diagnostics.TelemetryRegistry.evidence("sender", message.session, message.track,
+                    message.generation, dev.redrain.cast.diagnostics.IncidentEvidence.Stage.READY_RECEIVED)
             return message
         } catch (error: IOException) {
             if (expired.get()) throw SocketTimeoutException("TIMEOUT: control frame exceeded its deadline").apply { initCause(error) }

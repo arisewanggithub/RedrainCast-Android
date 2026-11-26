@@ -1,6 +1,5 @@
 <resources>
     <string name="rc_playback_statistics">Show playback statistics on receiver (next cast)</string>
-    <string name="rc_playback_statistics_hint">Displays diagnostic statistics over receiver video.</string>
     <string name="rc_playback_diagnostics">Full playback diagnostics</string>
     <string name="rc_stats_stream_range">Stream range</string>
     <string name="rc_stats_stream_range_compact">Range</string>

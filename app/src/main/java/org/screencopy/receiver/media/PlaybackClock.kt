@@ -9,6 +9,12 @@ internal data class VideoSchedulingClock(
     val recoveringAudio: Boolean
 )
 
+internal data class AudioStartDecision(
+    val reason: Int, val mode: Int, val targetUs: Long, val positionUs: Long?,
+    val delayUs: Long?, val firstVideoUs: Long?, val releasedVideoUs: Long?,
+    val waitedUs: Long, val revision: Long, val flags: Long
+)
+
 class PlaybackClock(
     private val nanoTime: () -> Long = System::nanoTime,
     private val sleepMs: (Long) -> Unit = Thread::sleep
@@ -25,6 +31,7 @@ class PlaybackClock(
     private var lastPacketCorrection: AudioClockCorrection? = null
     private var audioProjection: ((Long) -> Long?)? = null
     private var lastVideoPositionUs: Long? = null
+    private var releasedVideoUs: Long? = null
     internal fun cachedPlayedAudioSource(): Long? = observedAudio?.ptsUs
     internal fun cachedPlayedAudioObservation(): SourceTimestampObservation? = observedAudio
     @Volatile var audioExpected = false
@@ -118,6 +125,7 @@ class PlaybackClock(
     @Synchronized
     internal fun videoPresented(ptsUs: Long, presentationAtNs: Long = nanoTime()) {
         require(ptsUs >= 0) { "Negative video presentation timestamp" }
+        releasedVideoUs = ptsUs
         if (!recoveringAudio || audioSource != null) return
         val current = positionLocked()
         if (current == null || ptsUs > current) {
@@ -151,24 +159,70 @@ class PlaybackClock(
         return delay
     }
 
-    fun awaitAudioStart(ptsUs: Long, running: () -> Boolean): Boolean {
+    fun awaitAudioStart(ptsUs: Long, running: () -> Boolean): Boolean =
+        awaitAudioStartObserved(ptsUs, {}, running)
+
+    internal fun awaitAudioStartObserved(ptsUs: Long, observed: (AudioStartDecision) -> Unit,
+                                         running: () -> Boolean): Boolean {
         val started = nanoTime()
-        while (running()) {
-            synchronized(this) {
-                if (audioExpected && !audioStarted && !resumingAudio &&
-                    (basePtsUs < 0 || prerollEpochUs?.let { ptsUs < it } == true))
-                    return false
+        var publishedAt: Long? = null
+        var publishedReason = -1
+        var publishedRevision = -1L
+        var publishedMode = -1
+        fun snapshotLocked(reason: Int, delay: Long? = null): AudioStartDecision? {
+            val mode = when {
+                audioSource == null -> if (basePtsUs < 0) 0 else 1
+                observedAudio == null -> 2
+                audioPositionUs != null -> 3
+                else -> 4
             }
-            val delay = audioStartDelayUs(ptsUs)
-            if (resumingAudio && delay < -250_000) return false
-            if (delay <= 0) return true
-            if (nanoTime() - started >= if (resumingAudio) 10_000_000_000L else 3_000_000_000L)
-                throw PlaybackException(if (resumingAudio) "Audio recovery produced no usable source audio within ten seconds"
-                    else "Audio startup did not complete within three seconds",
-                    if (resumingAudio) "AUDIO_FAILED" else "DECODER_FAILED")
-            sleepMs(2)
+            val now = nanoTime()
+            if (publishedReason == reason && publishedRevision == mappingRevision && publishedMode == mode &&
+                publishedAt?.let { now - it < 1_000_000_000L } == true) return null
+            publishedAt = now
+            publishedReason = reason
+            publishedRevision = mappingRevision
+            publishedMode = mode
+            return AudioStartDecision(reason, mode, ptsUs,
+                delay?.let { ptsUs - it } ?: positionLocked(), delay, firstVideoPtsUs, releasedVideoUs,
+                (now - started).coerceAtLeast(0) / 1000, mappingRevision,
+                (if (audioExpected) 1L else 0L) + (if (audioStarted) 2L else 0L) +
+                    (if (resumingAudio) 4L else 0L) + (if (recoveringAudio) 8L else 0L))
         }
-        return false
+        try {
+            while (running()) {
+                val preroll = synchronized(this) {
+                    if (audioExpected && !audioStarted && !resumingAudio &&
+                        (basePtsUs < 0 || prerollEpochUs?.let { ptsUs < it } == true))
+                        snapshotLocked(2) else null
+                }
+                if (preroll != null) { observed(preroll); return false }
+                observeCallback()
+                var reason: Int
+                val snapshot = synchronized(this) {
+                    val delay = audioStartDelayLocked(ptsUs)
+                    reason = when {
+                        resumingAudio && delay < -250_000 -> 3
+                        delay <= 0 -> 4
+                        else -> 1
+                    }
+                    snapshotLocked(reason, delay)
+                }
+                snapshot?.let(observed)
+                if (reason == 3) return false
+                if (reason == 4) return true
+                if (nanoTime() - started >= if (resumingAudio) 10_000_000_000L else 3_000_000_000L)
+                    throw PlaybackException(if (resumingAudio) "Audio recovery produced no usable source audio within ten seconds"
+                        else "Audio startup did not complete within three seconds",
+                        if (resumingAudio) "AUDIO_FAILED" else "DECODER_FAILED")
+                sleepMs(2)
+            }
+            synchronized(this) { snapshotLocked(5) }?.let(observed)
+            return false
+        } catch (error: Exception) {
+            synchronized(this) { snapshotLocked(6) }?.let(observed)
+            throw error
+        }
     }
 
     internal fun anchorAudio(ptsUs: Long, sampleRate: Int = 48000, positionUs: () -> Long) {

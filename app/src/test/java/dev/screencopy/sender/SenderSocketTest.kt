@@ -1,6 +1,10 @@
 package dev.screencopy.sender
 
 import org.json.JSONArray
+import dev.redrain.cast.diagnostics.DiagnosticKind
+import dev.redrain.cast.diagnostics.DiagnosticPoint
+import dev.redrain.cast.diagnostics.DiagnosticStage
+import dev.redrain.cast.diagnostics.IncidentEvidence
 import org.junit.Assert.*
 import org.junit.Test
 import java.io.ByteArrayOutputStream
@@ -12,6 +16,7 @@ import java.util.concurrent.CompletableFuture
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.ExecutionException
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicReference
 
 class SenderSocketTest {
     @Test fun localCloseRetiresBothMediaSocketsBeforeControl() {
@@ -41,7 +46,7 @@ class SenderSocketTest {
     private fun frame(track: Int) = Wire.Message(if (track == 1) Wire.VIDEO_FRAME else Wire.AUDIO_PACKET,
         0, session, track, 1, 123, byteArrayOf(1, 2, 3, 4))
 
-    private fun controlHello(server: ServerSocket): Socket {
+    private fun controlHello(server: ServerSocket, recovery: Boolean = false): Socket {
         val control = server.accept().apply { soTimeout = 3000 }
         val request = Wire.read(control.inputStream)
         assertEquals(Wire.HELLO, request.type)
@@ -50,7 +55,11 @@ class SenderSocketTest {
         assertEquals("RedrainCast", request.json().getString("name"))
         assertEquals("[3]", request.json().getJSONArray("versions").toString())
         assertTrue(request.json().getBoolean("videoRotation"))
-        Wire.write(control.outputStream, hello())
+        val response = hello()
+        if (recovery) Wire.write(control.outputStream, Wire.control(Wire.HELLO, 0,
+            response.json().put("streamRecovery", true).put("streamRecoveryVersion",
+                org.screencopy.receiver.protocol.StreamRecoveryProtocol.VERSION)))
+        else Wire.write(control.outputStream, response)
         return control
     }
 
@@ -78,12 +87,15 @@ class SenderSocketTest {
             val peer = CompletableFuture.runAsync {
                 server.accept().use { control ->
                     control.soTimeout = 3000
-                    assertTrue(Wire.read(control.inputStream).json().getBoolean("uncappedFps"))
+                    val offered = Wire.read(control.inputStream).json()
+                    assertTrue(offered.getBoolean("uncappedFps"))
+                    assertEquals(1, offered.getJSONObject("sessionTelemetry").getInt("version"))
                     Wire.write(control.outputStream, hello(uncapped = supported))
                 }
             }
             ReceiverLink(ReceiverTarget("127.0.0.1", server.localPort)).use { link ->
                 link.connect()
+                assertFalse(link.sessionTelemetry)
                 assertEquals(supported == true, link.uncappedFps)
                 link.requireFpsSupport(60)
                 if (supported == true) link.requireFpsSupport(0)
@@ -91,6 +103,136 @@ class SenderSocketTest {
                     val error = assertThrows(IOException::class.java) { link.requireFpsSupport(0) }
                     assertTrue(error.message!!.contains("UNSUPPORTED_CONFIG"))
                     assertTrue(error.message!!.contains("select an explicit Maximum capture FPS"))
+                }
+            }
+            peer.get(3, TimeUnit.SECONDS)
+        }
+    }
+
+    @Test fun sessionTelemetryHelloRequestAndAcceptSelectOnlyExactCapability() {
+        val capability = dev.redrain.cast.diagnostics.SessionTelemetryProtocol.capability()
+        for (offered in listOf<org.json.JSONObject?>(capability, null,
+            dev.redrain.cast.diagnostics.SessionTelemetryProtocol.capability().put("version", 2),
+            dev.redrain.cast.diagnostics.SessionTelemetryProtocol.capability().put("intervalMs", 2000),
+            dev.redrain.cast.diagnostics.SessionTelemetryProtocol.capability().put("maxBatchBytes", 8191))) {
+            ServerSocket(0).use { server ->
+                val selected = offered === capability
+                val peer = CompletableFuture.runAsync {
+                    server.accept().use { control ->
+                        control.soTimeout = 3000
+                        val helloRequest = Wire.read(control.inputStream).json()
+                        val advertised = helloRequest.getJSONObject("sessionTelemetry")
+                        assertEquals(1, advertised.getInt("version"))
+                        assertEquals(1000, advertised.getInt("intervalMs"))
+                        assertEquals(8192, advertised.getInt("maxBatchBytes"))
+                        val response = hello().json()
+                        if (offered != null) response.put("sessionTelemetry", offered)
+                        Wire.write(control.outputStream, Wire.control(Wire.HELLO, 0, response))
+                        val request = Wire.read(control.inputStream).json()
+                        assertEquals(selected, request.has("sessionTelemetry"))
+                        val acceptance = accepted(false).json()
+                        if (selected) acceptance.put("sessionTelemetry", capability)
+                        Wire.write(control.outputStream, Wire.control(Wire.SESSION_ACCEPT, session, acceptance))
+                    }
+                }
+                ReceiverLink(ReceiverTarget("127.0.0.1", server.localPort)).use { link ->
+                    link.connect()
+                    assertEquals(selected, link.sessionTelemetry)
+                    val request = Settings().apply { audio = false }.request()
+                    link.selectSessionTelemetry(request)
+                    link.send(Wire.control(Wire.SESSION_REQUEST, session, request))
+                    assertEquals(selected, link.acceptedSessionTelemetry(link.receive().json()))
+                }
+                peer.get(3, TimeUnit.SECONDS)
+            }
+        }
+    }
+
+    @Test fun futureTelemetryHelloStillAttachesAndRoutesSessionWithoutTelemetry() {
+        ServerSocket(0).use { server ->
+            val peer = CompletableFuture.runAsync {
+                server.accept().use { control ->
+                    control.soTimeout = 3000
+                    assertEquals(Wire.HELLO, Wire.read(control.inputStream).type)
+                    val future = org.json.JSONObject().put("version", 2)
+                        .put("batching", org.json.JSONObject().put("mode", "new"))
+                    Wire.write(control.outputStream, Wire.control(Wire.HELLO, 0,
+                        hello().json().put("sessionTelemetry", future)))
+                    val request = Wire.read(control.inputStream)
+                    assertEquals(Wire.SESSION_REQUEST, request.type)
+                    assertEquals(session, request.session)
+                    assertFalse(request.json().has("sessionTelemetry"))
+                    Wire.write(control.outputStream, accepted(false))
+                    mediaHello(server, "video").use { video ->
+                        mediaHello(server, "audio").use {
+                            val config = Wire.read(video.inputStream)
+                            assertEquals(Wire.STREAM_CONFIG, config.type)
+                            assertEquals(session, config.session)
+                            assertEquals(1, config.track)
+                            Wire.write(control.outputStream, ready(1))
+                            assertEquals(Wire.VIDEO_FRAME, Wire.read(video.inputStream).type)
+                            val ping = Wire.read(control.inputStream)
+                            assertEquals(Wire.PING, ping.type)
+                            assertEquals(session, ping.session)
+                            Wire.write(control.outputStream, Wire.control(Wire.PONG, session, Wire.obj("nonce" to 4)))
+                            assertEquals(Wire.STOP, Wire.read(control.inputStream).type)
+                            Wire.write(control.outputStream, Wire.control(Wire.SESSION_END, session, Wire.obj("reason" to "user")))
+                        }
+                    }
+                }
+            }
+            ReceiverLink(ReceiverTarget("127.0.0.1", server.localPort)).use { link ->
+                link.connect()
+                assertFalse(link.sessionTelemetry)
+                val request = Settings().apply { audio = false }.request()
+                link.selectSessionTelemetry(request)
+                assertFalse(request.has("sessionTelemetry"))
+                link.send(Wire.control(Wire.SESSION_REQUEST, session, request))
+                val acceptance = link.receive()
+                assertFalse(link.acceptedSessionTelemetry(acceptance.json()))
+                link.attach(session, acceptance, false)
+                link.send(Wire.config(session, 1, 1, Wire.obj("codec" to "h264")))
+                assertEquals(Wire.STREAM_READY, link.receive().type)
+                link.send(frame(1))
+                link.send(Wire.control(Wire.PING, session, Wire.obj("nonce" to 4)))
+                val pong = link.receive()
+                assertEquals(Wire.PONG, pong.type)
+                assertEquals(session, pong.session)
+                link.send(Wire.control(Wire.STOP, session, Wire.obj("reason" to "user")))
+                assertEquals(Wire.SESSION_END, link.receive().type)
+            }
+            peer.get(5, TimeUnit.SECONDS)
+        }
+    }
+
+    @Test fun sessionTelemetryRejectsMalformedHelloAndUnsolicitedOrMalformedAcceptance() {
+        for (invalid in listOf<Any>("yes", org.json.JSONObject.NULL,
+            dev.redrain.cast.diagnostics.SessionTelemetryProtocol.capability().put("intervalMs", "1000"),
+            dev.redrain.cast.diagnostics.SessionTelemetryProtocol.capability().put("extra", 1))) {
+            ServerSocket(0).use { server ->
+                val peer = CompletableFuture.runAsync {
+                    server.accept().use { control ->
+                        Wire.read(control.inputStream)
+                        Wire.write(control.outputStream, Wire.control(Wire.HELLO, 0,
+                            hello().json().put("sessionTelemetry", invalid)))
+                    }
+                }
+                ReceiverLink(ReceiverTarget("127.0.0.1", server.localPort)).use { link ->
+                    assertThrows(IOException::class.java) { link.connect() }
+                }
+                peer.get(3, TimeUnit.SECONDS)
+            }
+        }
+        ServerSocket(0).use { server ->
+            val peer = CompletableFuture.runAsync { controlHello(server).use { } }
+            ReceiverLink(ReceiverTarget("127.0.0.1", server.localPort)).use { link ->
+                link.connect()
+                assertThrows(IOException::class.java) {
+                    link.acceptedSessionTelemetry(org.json.JSONObject().put("sessionTelemetry",
+                        dev.redrain.cast.diagnostics.SessionTelemetryProtocol.capability()))
+                }
+                assertThrows(IOException::class.java) {
+                    link.acceptedSessionTelemetry(org.json.JSONObject().put("sessionTelemetry", "invalid"))
                 }
             }
             peer.get(3, TimeUnit.SECONDS)
@@ -177,6 +319,96 @@ class SenderSocketTest {
         }
     }
 
+    @Test fun firstControlReadIsAttributedWhileMediaAttachmentIsStillPending() {
+        for (truncated in listOf(false, true)) ServerSocket(0).use { server ->
+            val readStarted = CountDownLatch(1)
+            val mediaWaiting = CountDownLatch(1)
+            val sendControl = CountDownLatch(1)
+            val read = AtomicReference<CompletableFuture<Wire.Message>>()
+            val reports = java.util.concurrent.CopyOnWriteArrayList<ByteArray>()
+            val finished = CountDownLatch(1)
+            val capture = dev.redrain.cast.diagnostics.SenderTelemetrySession(false, { reports.add(it) },
+                storageExecutor = java.util.concurrent.Executor { it.run() }, onFinished = finished::countDown)
+            dev.redrain.cast.diagnostics.TelemetryRegistry.beginSender(session, capture)
+            dev.redrain.cast.diagnostics.TelemetryRegistry.event("sender", session,
+                DiagnosticKind.RECOVERY.ordinal + 1, DiagnosticStage.PRESSURE.ordinal, 1, 1,
+                detail = listOf(0, 0, 0, 0, 1), pressure = true)
+            val peer = CompletableFuture.runAsync {
+                controlHello(server, recovery = true).use { control ->
+                    Wire.read(control.inputStream)
+                    Wire.write(control.outputStream, accepted(false))
+                    server.accept().use { video ->
+                        video.soTimeout = 3000
+                        assertEquals("video", Wire.read(video.inputStream).json().getString("channel"))
+                        mediaWaiting.countDown()
+                        check(sendControl.await(3, TimeUnit.SECONDS))
+                        if (truncated) {
+                            val bytes = ByteArrayOutputStream().also { Wire.write(it, ready(1)) }.toByteArray()
+                            control.outputStream.write(bytes, 0, 20)
+                            control.outputStream.flush()
+                            control.shutdownOutput()
+                        } else Wire.write(control.outputStream, ready(1))
+                        Wire.write(video.outputStream, Wire.control(Wire.HELLO, session, Wire.obj("channel" to "video")))
+                        mediaHello(server, "audio").use { audio ->
+                            assertEquals(-1, audio.inputStream.read())
+                        }
+                    }
+                }
+            }
+            try {
+                ReceiverLink(ReceiverTarget("127.0.0.1", server.localPort)).use { link ->
+                    link.connect()
+                    link.send(Wire.control(Wire.SESSION_REQUEST, session, Settings().request()))
+                    val acceptance = link.receive()
+                    val attachment = CompletableFuture.runAsync {
+                        link.attach(session, acceptance, false) {
+                            val result = CompletableFuture<Wire.Message>()
+                            read.set(result)
+                            CompletableFuture.runAsync {
+                                try { result.complete(link.receive { readStarted.countDown() }) }
+                                catch (error: Exception) { result.completeExceptionally(error) }
+                            }
+                        }
+                    }
+                    assertTrue(readStarted.await(3, TimeUnit.SECONDS))
+                    assertTrue(mediaWaiting.await(3, TimeUnit.SECONDS))
+                    assertFalse(attachment.isDone)
+                    sendControl.countDown()
+                    if (truncated) {
+                        assertTrue(assertThrows(ExecutionException::class.java) {
+                            read.get().get(3, TimeUnit.SECONDS)
+                        }.cause is IOException)
+                    } else {
+                        assertEquals(Wire.STREAM_READY, read.get().get(3, TimeUnit.SECONDS).type)
+                    }
+                    attachment.get(3, TimeUnit.SECONDS)
+                }
+                peer.get(3, TimeUnit.SECONDS)
+                capture.finish()
+                assertTrue(finished.await(3, TimeUnit.SECONDS))
+                val report = org.screencopy.receiver.protocol.StrictJson.decode(reports.last())
+                val blocks = report.getJSONObject("sender").getJSONArray("blocks")
+                val rows = (0 until blocks.length()).flatMap { i ->
+                    val batch = blocks.getJSONArray(i).getJSONObject(1)
+                    val parsed = dev.redrain.cast.diagnostics.SessionTelemetryProtocol.parse(batch.toString().toByteArray())
+                    parsed.state + parsed.events
+                }
+                assertEquals(!truncated, rows.any {
+                    it.kind == dev.redrain.cast.diagnostics.TelemetryRow.EVIDENCE_KIND &&
+                        it.stage == IncidentEvidence.Stage.READY_RECEIVED.ordinal
+                })
+                assertEquals(truncated, rows.any {
+                    it.kind == DiagnosticKind.TRANSPORT_HEALTH.ordinal + 1 &&
+                        it.stage == DiagnosticStage.FAILED.ordinal
+                })
+            } finally {
+                sendControl.countDown()
+                dev.redrain.cast.diagnostics.TelemetryRegistry.end("sender", capture)
+                capture.finish()
+            }
+        }
+    }
+
     @Test fun malformedTokensTracksAndTransportOverridesCloseControlBeforeAnyAttachment() {
         val invalid = listOf(
             accepted(false, ""), accepted(false, "f".repeat(63)), accepted(false, "g".repeat(64)),
@@ -197,7 +429,14 @@ class SenderSocketTest {
                 }
             }
             ReceiverLink(ReceiverTarget("127.0.0.1", server.localPort)).use { link ->
-                assertThrows(Exception::class.java) { negotiate(link, false) }
+                link.connect()
+                link.send(Wire.control(Wire.SESSION_REQUEST, session, Settings().apply { audio = false }.request()))
+                val acceptance = link.receive()
+                var validated = false
+                assertThrows(Exception::class.java) {
+                    link.attach(session, acceptance, false) { validated = true }
+                }
+                assertFalse(validated)
             }
             peer.get(3, TimeUnit.SECONDS)
         }

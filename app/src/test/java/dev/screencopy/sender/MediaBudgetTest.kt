@@ -1,14 +1,162 @@
 package dev.screencopy.sender
 
+import dev.redrain.cast.diagnostics.*
+import org.json.JSONObject
 import org.junit.Assert.*
 import org.junit.Test
+import org.screencopy.receiver.protocol.AudioPacketTiming
+import org.screencopy.receiver.protocol.StrictJson
 import java.io.IOException
 import java.util.concurrent.CountDownLatch
+import java.util.concurrent.Executor
 import java.util.concurrent.Executors
+import java.util.concurrent.ScheduledFuture
+import java.util.concurrent.ScheduledThreadPoolExecutor
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicLong
+import java.util.concurrent.atomic.AtomicReference
+import kotlin.concurrent.thread
 
 class MediaBudgetTest {
+    private class TelemetryFixture : AutoCloseable {
+        private val worker = object : ScheduledThreadPoolExecutor(1, { action ->
+            Thread(action, "media-budget-telemetry-test").apply { isDaemon = true }
+        }) {
+            lateinit var periodic: Runnable
+            override fun scheduleWithFixedDelay(
+                command: Runnable, initialDelay: Long, delay: Long, unit: TimeUnit
+            ): ScheduledFuture<*> {
+                periodic = command
+                return super.scheduleWithFixedDelay(command, 1, 1, TimeUnit.DAYS)
+            }
+        }
+        private val writes = ArrayList<ByteArray>()
+        private val finished = CountDownLatch(1)
+        val now = AtomicLong(1_000_000_000L)
+        private val owner = SenderTelemetrySession(false, { writes.add(it) }, clock = now::get,
+            worker = worker, storageExecutor = Executor { it.run() }, onFinished = finished::countDown)
+        val mux = MediaBudget(true, now::get, 1).apply { diagnosticSession = 811 }
+
+        init {
+            TelemetryRegistry.beginSender(811, owner)
+            TelemetryRegistry.event("sender", 811, DiagnosticKind.RECOVERY.ordinal + 1,
+                DiagnosticStage.PRESSURE.ordinal, 1, 1, detail = listOf(0, 0, 0, 0, 1), pressure = true)
+        }
+
+        fun tick() { worker.submit(worker.periodic).get(2, TimeUnit.SECONDS) }
+
+        fun finish(): List<SessionTelemetryProtocol.Batch> {
+            TelemetryRegistry.end("sender", owner)
+            assertTrue(owner.finish())
+            assertTrue(finished.await(2, TimeUnit.SECONDS))
+            val blocks = StrictJson.decode(writes.last()).getJSONObject("sender").getJSONArray("blocks")
+            return (0 until blocks.length()).map {
+                SessionTelemetryProtocol.parse(blocks.getJSONArray(it).getJSONObject(1).toString().toByteArray(), "sender")
+            }
+        }
+
+        override fun close() {
+            TelemetryRegistry.end("sender", owner)
+            owner.finish()
+            worker.shutdown()
+        }
+    }
+
+    private fun queueEvidence(batch: SessionTelemetryProtocol.Batch, track: Int) =
+        batch.state.single { it.kind == TelemetryRow.EVIDENCE_KIND &&
+            it.stage == IncidentEvidence.Stage.QUEUE_STATE.ordinal && it.track == track }
+
+    private fun queueMetrics(batch: SessionTelemetryProtocol.Batch, track: Int) =
+        batch.state.single { it.kind == DiagnosticKind.entries.size + 1 &&
+            it.stage == DiagnosticStage.SAMPLE.ordinal && it.track == track }
+
+    @Test fun periodicAndFinalTelemetryTrackQueueAndWriterTransitionsWithinOneInterval() {
+        TelemetryFixture().use { telemetry ->
+            val mux = telemetry.mux
+            configure(mux, 1, 1)
+            val config = checkNotNull(mux.pollLane(1, 1))
+            mux.endWrite(config)
+            mux.ready(1, 1)
+            configure(mux, 2, 1)
+            mux.endWrite(checkNotNull(mux.pollLane(2, 1)))
+            mux.ready(2, 1)
+            val message = frame(1, 1, 10, 17)
+            mux.offer(message)
+            telemetry.tick()
+            assertSame(message, mux.pollLane(1, 1))
+            telemetry.tick()
+            telemetry.now.addAndGet(10_000_000)
+            mux.beginWrite(message)
+            telemetry.tick()
+            telemetry.now.addAndGet(20_000_000)
+            mux.endWrite(message)
+            telemetry.tick()
+            configure(mux, 1, 2)
+            telemetry.tick()
+            mux.endWrite(checkNotNull(mux.pollLane(1, 1)))
+            mux.ready(1, 2)
+            telemetry.tick()
+            val batches = telemetry.finish()
+            assertEquals(7, batches.size)
+            assertEquals(listOf(1L, 17L, 0L), queueEvidence(batches[0], 1).detail.take(3))
+            assertEquals(listOf(0L, 0L, 0L), queueEvidence(batches[1], 1).detail.take(3))
+            assertEquals(telemetry.now.get() - 20_000_000, queueEvidence(batches[2], 1).detail[5])
+            assertEquals(listOf(1L, 17L), queueMetrics(batches[2], 1).detail.subList(6, 8))
+            assertEquals(2, queueEvidence(batches[4], 1).generation)
+            assertEquals(0L, queueEvidence(batches[4], 1).detail[4])
+            for (batch in batches.takeLast(2)) {
+                val evidence = queueEvidence(batch, 1)
+                val metrics = queueMetrics(batch, 1)
+                assertEquals(2, evidence.generation)
+                assertEquals(listOf(0L, 0L, 0L, -1L, 1L, -1L, 20L), evidence.detail)
+                assertEquals(listOf(0L, 0L, -1L, 20L), metrics.detail.subList(6, 10))
+            }
+            assertTrue(batches.last().final)
+        }
+    }
+
+    @Test fun recoveryDiscardTrimAndTeardownPublishClearedQueuesAndWriter() {
+        TelemetryFixture().use { telemetry ->
+            val mux = telemetry.mux
+            for (track in 1..2) {
+                configure(mux, track, 1)
+                mux.endWrite(checkNotNull(mux.pollLane(track, 1)))
+                mux.ready(track, 1)
+            }
+            val timing = AudioPacketTiming("raw")
+            mux.discardMediaForRecovery(2)
+            assertNull(mux.holdRecoveryAudio(frame(2, 1, 0, 4), timing))
+            assertNull(mux.holdRecoveryAudio(frame(2, 1, 600_001, 4), timing))
+            telemetry.tick()
+            assertEquals(RecoveryAudioCoverage.WAITING, mux.releaseRecoveryAudio(700_000, timing))
+            telemetry.tick()
+            mux.offer(frame(2, 1, 700_001, 4))
+            mux.discardMediaForRecovery(2)
+            telemetry.tick()
+            val video = frame(1, 1, 0, 7)
+            mux.offer(video)
+            assertSame(video, mux.pollLane(1, 1))
+            mux.beginWrite(video)
+            mux.offer(frame(1, 1, 1, 3))
+            mux.offer(frame(2, 1, 700_002, 4))
+            mux.finish(Wire.control(Wire.SESSION_END, 1, Wire.obj("reason" to "test")))
+            telemetry.tick()
+            telemetry.now.addAndGet(5_000_000)
+            mux.endWrite(video)
+            val batches = telemetry.finish()
+            assertEquals(5, batches.size)
+            assertEquals(listOf(1L, 4L), queueEvidence(batches[0], 2).detail.take(2))
+            for (batch in batches.subList(1, 3))
+                assertEquals(listOf(0L, 0L, 0L, -1L), queueEvidence(batch, 2).detail.take(4))
+            assertEquals(0L, queueEvidence(batches[3], 1).detail[0])
+            assertEquals(1L, queueMetrics(batches[3], 1).detail[6])
+            assertEquals(0L, queueEvidence(batches[3], 2).detail[0])
+            assertEquals(-1L, queueEvidence(batches.last(), 1).detail[5])
+            assertEquals(listOf(0L, 0L, -1L, 5L), queueMetrics(batches.last(), 1).detail.subList(6, 10))
+            assertEquals(listOf(0L, 0L, 0L, -1L), queueEvidence(batches.last(), 2).detail.take(4))
+        }
+    }
+
     @Test fun orderlyTerminalWaitsForBothSelectedMediaFramesAndDropsUnsentFrames() {
         val mux = MediaBudget(true)
         val started = (1..2).map { track ->

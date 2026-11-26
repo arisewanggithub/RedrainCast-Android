@@ -11,6 +11,150 @@ import java.util.concurrent.atomic.AtomicLong
 import dev.redrain.cast.diagnostics.*
 
 class AudioWriteProgressPipelineTest {
+    @Test fun audioStartDecisionIsPublishedDuringControlledWaitAndResetForNewGeneration() {
+        val entered = CountDownLatch(1)
+        val release = CountDownLatch(1)
+        val blockedPublished = CountDownLatch(1)
+        val readyPublished = CountDownLatch(1)
+        val blocked = java.util.concurrent.atomic.AtomicReference<TelemetryRow>()
+        val ready = java.util.concurrent.atomic.AtomicReference<SessionTelemetryProtocol.Batch>()
+        val fixture = Fixture(waitTick = { now, ms ->
+            if (entered.count > 0) {
+                entered.countDown()
+                check(release.await(5, TimeUnit.SECONDS))
+            }
+            now.addAndGet(ms * 1_000_000)
+        }) { _, count, _ -> count }
+        val telemetry = ReceiverTelemetrySession({ bytes ->
+            val batch = SessionTelemetryProtocol.parse(bytes)
+            batch.state.firstOrNull { it.kind == DiagnosticKind.AUDIO_OUTPUT.ordinal + 1 &&
+                it.stage == DiagnosticStage.SAMPLE.ordinal && it.detail.size == 20 }?.let {
+                if (it.detail[2] == 1L) { blocked.set(it); blockedPublished.countDown() }
+                if (it.detail[2] == 4L) { ready.set(batch); readyPublished.countDown() }
+            }
+            true
+        })
+        TelemetryRegistry.beginReceiver(503, telemetry)
+        fixture.player.diagnosticSession = 503
+        fixture.player.diagnosticGeneration = 3
+        try {
+            fixture.start()
+            assertTrue(entered.await(2, TimeUnit.SECONDS))
+            assertTrue(blockedPublished.await(3, TimeUnit.SECONDS))
+            val row = blocked.get()
+            assertEquals(3, row.generation)
+            assertEquals(1_000_000L, row.value)
+            assertEquals(950_000L, row.detail[4])
+            assertEquals(50_000L, row.detail[5])
+            assertTrue(row.detail[1] > 0)
+            assertEquals(-1L, row.detail[11])
+            assertEquals("Waiting must not query an output that has not started", 0, fixture.track.timingCalls)
+            release.countDown()
+            assertTrue(readyPublished.await(3, TimeUnit.SECONDS))
+            val progressed = ready.get()
+            val state = progressed.state.single { it.kind == TelemetryRow.EVIDENCE_KIND &&
+                it.stage == IncidentEvidence.Stage.AUDIO_STATE.ordinal }
+            assertEquals(3, state.generation)
+            assertTrue("The normal output worker supplies real cached timing", state.detail[2] > 0)
+            assertTrue(state.detail[3] <= state.detail[2])
+            assertTrue(fixture.track.timingCalls > 0)
+            assertFalse(progressed.state.any { it.stage == DiagnosticStage.BEGIN.ordinal &&
+                it.kind == DiagnosticKind.AUDIO_OUTPUT.ordinal + 1 &&
+                it.detail[3] == DiagnosticPoint.AUDIO_START_WAIT.ordinal.toLong() })
+            fixture.close()
+            fixture.player.diagnosticGeneration = 4
+            fixture.player.resetAudioStartEvidence()
+            TelemetryRegistry.end("receiver", telemetry)
+            val final = SessionTelemetryProtocol.parse(checkNotNull(
+                telemetry.requestFinal(true, System.nanoTime() + 1_000_000_000L)).payload)
+            val reset = final.state.single { it.kind == DiagnosticKind.AUDIO_OUTPUT.ordinal + 1 &&
+                it.stage == DiagnosticStage.SAMPLE.ordinal && it.detail.size == 20 }
+            assertEquals(4, reset.generation)
+            assertEquals(0L, reset.detail[2])
+            assertEquals(-1L, reset.detail[11])
+        } finally {
+            release.countDown()
+            fixture.close()
+            TelemetryRegistry.end("receiver", telemetry)
+            telemetry.requestFinal(false, System.nanoTime())
+        }
+    }
+
+    @Test fun blockedWriteAppearsInPeriodicTelemetryAndClearsAfterCompletion() {
+        val entered = CountDownLatch(1)
+        val release = CountDownLatch(1)
+        val published = CountDownLatch(1)
+        val periodic = java.util.concurrent.atomic.AtomicReference<ByteArray>()
+        val fixture = Fixture { _, count, _ -> entered.countDown(); release.await(); count }
+        val telemetry = ReceiverTelemetrySession({ bytes -> periodic.set(bytes); published.countDown(); true })
+        TelemetryRegistry.beginReceiver(502, telemetry)
+        fixture.player.diagnosticSession = 502
+        fixture.player.diagnosticGeneration = 3
+        try {
+            fixture.start()
+            assertTrue(entered.await(2, TimeUnit.SECONDS))
+            assertTrue(published.await(3, TimeUnit.SECONDS))
+            val blocked = SessionTelemetryProtocol.parse(periodic.get()).state.single {
+                it.kind == DiagnosticKind.AUDIO_OUTPUT.ordinal + 1 &&
+                    it.stage == DiagnosticStage.BEGIN.ordinal &&
+                    it.detail[3] == DiagnosticPoint.WRITE.ordinal.toLong()
+            }
+            assertEquals(3, blocked.generation)
+            assertTrue(blocked.atNs > 0)
+            assertTrue(blocked.detail[4] > 0)
+            release.countDown()
+            await { fixture.player.sourceSubmittedFrames > 0 || fixture.errors.isNotEmpty() }
+            assertTrue(fixture.errors.toString(), fixture.errors.isEmpty())
+            fixture.close()
+            TelemetryRegistry.end("receiver", telemetry)
+            val final = SessionTelemetryProtocol.parse(checkNotNull(
+                telemetry.requestFinal(true, System.nanoTime() + 1_000_000_000L)).payload)
+            assertFalse(final.state.any { it.kind == DiagnosticKind.AUDIO_OUTPUT.ordinal + 1 &&
+                it.stage == DiagnosticStage.BEGIN.ordinal &&
+                it.detail[3] == DiagnosticPoint.WRITE.ordinal.toLong() })
+        } finally {
+            release.countDown()
+            fixture.close()
+            TelemetryRegistry.end("receiver", telemetry)
+            telemetry.requestFinal(false, System.nanoTime() + 1_000_000_000L)
+        }
+    }
+
+    @Test fun realAudioWriteReportsPointPtsAndAcceptedPcmBytes() {
+        val written = CountDownLatch(1)
+        val fixture = Fixture { _, count, _ -> written.countDown(); count }
+        val telemetry = ReceiverTelemetrySession({ true })
+        TelemetryRegistry.beginReceiver(501, telemetry)
+        fixture.player.diagnosticSession = 501
+        fixture.player.diagnosticGeneration = 1
+        var closed = false
+        try {
+            fixture.start()
+            assertTrue(written.await(2, TimeUnit.SECONDS))
+            await { fixture.player.sourceSubmittedFrames > 0 || fixture.errors.isNotEmpty() }
+            assertTrue(fixture.errors.toString(), fixture.errors.isEmpty())
+            fixture.close()
+            closed = true
+            TelemetryRegistry.end("receiver", telemetry)
+            val final = checkNotNull(telemetry.requestFinal(true, System.nanoTime() + 1_000_000_000L))
+            val batch = SessionTelemetryProtocol.parse(final.payload)
+            assertTrue(batch.state.toString(), batch.state.any {
+                it.kind == dev.redrain.cast.diagnostics.DiagnosticKind.AUDIO_OUTPUT.ordinal + 1 &&
+                    it.stage == dev.redrain.cast.diagnostics.DiagnosticStage.COMPLETE.ordinal &&
+                    it.detail[3] == dev.redrain.cast.diagnostics.DiagnosticPoint.WRITE.ordinal.toLong() &&
+                    it.atNs >= 0 && it.value >= 1_000_000L && it.detail[0] > 0
+            })
+            assertTrue(batch.state.toString(), batch.state.any {
+                it.kind == dev.redrain.cast.diagnostics.DiagnosticKind.AUDIO_OUTPUT.ordinal + 1 &&
+                    it.detail[3] == dev.redrain.cast.diagnostics.DiagnosticPoint.TIMING.ordinal.toLong()
+            })
+        } finally {
+            if (!closed) fixture.close()
+            TelemetryRegistry.end("receiver", telemetry)
+            telemetry.requestFinal(false, System.nanoTime() + 1_000_000_000L)
+        }
+    }
+
     @Test fun audioStartWaitHasItsOwnTypedOperationSummaries() {
         val diagnostics = RemoteDiagnostics.recorder
         diagnostics.grantConsent()
@@ -244,7 +388,8 @@ class AudioWriteProgressPipelineTest {
         }
     }
 
-    private class Fixture(write: (TraceTrack, Int, Int) -> Int) : AutoCloseable {
+    private class Fixture(waitTick: ((AtomicLong, Long) -> Unit)? = null,
+                          write: (TraceTrack, Int, Int) -> Int) : AutoCloseable {
         val now = AtomicLong(1_000_000_000)
         val errors = ConcurrentLinkedQueue<String>()
         val format = AudioFormat("pcm", 48000, 2, byteArrayOf())
@@ -257,7 +402,9 @@ class AudioWriteProgressPipelineTest {
                     return track
                 }
             })
-        val clock = PlaybackClock(now::get) { now.addAndGet(it * 1_000_000) }
+        val clock = PlaybackClock(now::get) {
+            if (waitTick == null) now.addAndGet(it * 1_000_000) else waitTick(now, it)
+        }
             .apply { audioExpected = true; anchorVideo(1_000_000) }
         val player = testAudioPlayer(format, clock,
             { code, detail -> errors.add("$code: $detail") }, { output })
@@ -286,6 +433,7 @@ class AudioWriteProgressPipelineTest {
         val accepted = ConcurrentLinkedQueue<Short>()
         private val submitted = AtomicLong()
         @Volatile var calls = 0
+        @Volatile var timingCalls = 0
         @Volatile var closed = false
         var maximumQueued = 0L
         private var startNs = 0L
@@ -306,7 +454,7 @@ class AudioWriteProgressPipelineTest {
             return result
         }
         override fun positionUs() = position.current().presentedUs
-        override fun timing() = position.current()
+        override fun timing() = position.current().also { timingCalls++ }
         override fun setSpeed(speed: Float) { actualSpeed = speed }
         override fun close() { closed = true }
     }
