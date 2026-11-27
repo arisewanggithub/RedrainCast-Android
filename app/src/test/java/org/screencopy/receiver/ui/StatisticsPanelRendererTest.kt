@@ -565,7 +565,6 @@ class StatisticsPanelRendererTest {
         val controller = protectedActivity()
         val drawing = CountDownLatch(1)
         val release = CountDownLatch(1)
-        val executor = Executors.newFixedThreadPool(2)
         val outputs = mutableListOf<BitmapTarget>()
         val targets = object : StatisticsSurfaceTargets {
             override val supported = true
@@ -592,7 +591,6 @@ class StatisticsPanelRendererTest {
             view.surfaceChanged(view.holder, 0, 800, 900)
             val old = renderer(view)
             val oldLooper = old.looper
-            val draw = executor.submit { shadowOf(oldLooper).idle() }
             assertTrue(drawing.await(2, TimeUnit.SECONDS))
             val beforeClose = System.nanoTime()
             if (recreate) view.surfaceDestroyed(view.holder) else view.stop()
@@ -618,7 +616,7 @@ class StatisticsPanelRendererTest {
             assertFalse("A hung retired producer must never authorize window declassification",
                 StatisticsWindowProtection.forWindow(controller.get().window).clearSecureFlag())
             release.countDown()
-            draw.get(2, TimeUnit.SECONDS)
+            awaitWorkerTermination(oldLooper)
             assertEquals(1, outputs[0].releases)
             assertSame(oldLooper, outputs[0].releaseLooper)
             assertEquals("Detached content cannot be presented", 0, outputs[0].presentations)
@@ -631,8 +629,6 @@ class StatisticsPanelRendererTest {
             release.countDown()
             view.stop()
             outputs.forEach { assertTrue(it.released.await(2, TimeUnit.SECONDS)) }
-            executor.shutdownNow()
-            assertTrue(executor.awaitTermination(2, TimeUnit.SECONDS))
             outputs.forEach { it.bitmap.recycle() }
             controller.pause().stop().destroy()
         }
@@ -692,6 +688,12 @@ class StatisticsPanelRendererTest {
 
     private fun renderer(view: PlaybackStatisticsSurface) =
         checkNotNull(ReflectionHelpers.getField<StatisticsPanelRenderer?>(view, "renderer"))
+
+    private fun awaitWorkerTermination(looper: Looper) {
+        // HandlerThread loopers run independently; idle() can race with their shutdown.
+        looper.thread.join(2000)
+        assertFalse("The retired renderer worker must terminate", looper.thread.isAlive)
+    }
 
     private class BitmapTargets(
         private val duringCreation: (BitmapTarget) -> Unit = {}
@@ -828,7 +830,7 @@ class StatisticsPanelRendererTest {
         val frames = AtomicInteger()
         val disposals = AtomicInteger()
         val disposalLooper = AtomicReference<Looper>()
-        val executor = Executors.newFixedThreadPool(2)
+        val executor = Executors.newSingleThreadExecutor()
         val renderer = StatisticsPanelRenderer({ snapshot() }, dispose = {
             disposals.incrementAndGet()
             disposalLooper.set(Looper.myLooper())
@@ -840,7 +842,6 @@ class StatisticsPanelRendererTest {
         try {
             renderer.start()
             val looper = renderer.looper
-            val draw = executor.submit { shadowOf(looper).idle() }
             assertTrue(drawing.await(2, TimeUnit.SECONDS))
             executor.submit { renderer.close() }.get(500, TimeUnit.MILLISECONDS)
             assertFalse(renderer.running)
@@ -849,7 +850,7 @@ class StatisticsPanelRendererTest {
             renderer.frame.run()
             assertEquals(0, disposals.get())
             release.countDown()
-            draw.get(2, TimeUnit.SECONDS)
+            awaitWorkerTermination(looper)
             assertEquals(1, disposals.get())
             assertSame(looper, disposalLooper.get())
             renderer.close()
@@ -869,23 +870,30 @@ class StatisticsPanelRendererTest {
         val release = CountDownLatch(1)
         val frames = AtomicInteger()
         val disposals = AtomicInteger()
-        val executor = Executors.newFixedThreadPool(2)
+        val disposalLooper = AtomicReference<Looper>()
+        val executor = Executors.newSingleThreadExecutor()
         val renderer = StatisticsPanelRenderer({
             sampling.countDown()
             check(release.await(3, TimeUnit.SECONDS))
             snapshot()
-        }, dispose = { disposals.incrementAndGet() }) { frames.incrementAndGet() }
+        }, dispose = {
+            disposals.incrementAndGet()
+            disposalLooper.set(Looper.myLooper())
+        }) { frames.incrementAndGet() }
         try {
             renderer.start()
             val looper = renderer.looper
-            val sample = executor.submit { shadowOf(looper).idle() }
             assertTrue(sampling.await(2, TimeUnit.SECONDS))
             executor.submit { renderer.close() }.get(500, TimeUnit.MILLISECONDS)
+            assertFalse(renderer.running)
+            renderer.frame.run()
+            assertEquals(0, frames.get())
             assertEquals(0, disposals.get())
             release.countDown()
-            sample.get(2, TimeUnit.SECONDS)
+            awaitWorkerTermination(looper)
             assertEquals(0, frames.get())
             assertEquals(1, disposals.get())
+            assertSame(looper, disposalLooper.get())
             renderer.frame.run()
             assertEquals(0, frames.get())
             assertEquals(1, disposals.get())
