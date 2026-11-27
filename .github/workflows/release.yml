@@ -62,7 +62,7 @@ jobs:
           packages: platform-tools
       - uses: gradle/actions/setup-gradle@v4
       - name: Install build tools
-        run: sdkmanager "platforms;android-37.0" "build-tools;37.0.0" "ndk;27.2.12479018" "cmake;3.22.1"
+        run: sdkmanager "platforms;android-37.0" "build-tools;37.0.0" "ndk;30.0.16248370" "cmake;3.22.1"
       - name: Validate and assemble optimized unsigned APK
         env:
           JAVA_TOOL_OPTIONS: -Djava.util.concurrent.ForkJoinPool.common.parallelism=3
@@ -120,7 +120,7 @@ jobs:
         run: |
           set -euo pipefail
           python3 -B tools/release-kit.py \
-            --ndk "$ANDROID_HOME/ndk/27.2.12479018" \
+            --ndk "$ANDROID_HOME/ndk/30.0.16248370" \
             --apk "$RELEASE_WORK/public-assets/RedrainCast-${RELEASE_TAG#v}.apk" \
             --version "${RELEASE_TAG#v}" --cache "$RELEASE_WORK/native-assets" \
             --output "$RELEASE_WORK/public-assets/android-lgpl-relink.tar.gz"
