@@ -72,9 +72,8 @@ class DelegatedDiagnosticsTest {
             assertEquals(1, status.getJSONArray("sessions").length())
             assertEquals("77", status.getJSONArray("sessions").getJSONObject(0).getString("session"))
             val hello = DiagnosticProtocol(f.recorder).handle(
-                """{"v":1,"id":"hello","op":"HELLO","args":{}}""".toByteArray()).getJSONObject("result")
-            assertEquals(0, hello.getJSONObject("capabilities").getJSONArray("sender").length())
-            assertEquals("77", hello.getJSONObject("scope").getString("session"))
+                """{"v":1,"id":"hello","op":"HELLO","args":{}}""".toByteArray())
+            assertEquals("UNSUPPORTED_VERSION", hello.getJSONObject("error").getString("code"))
         } finally { f.manager.reset() }
     }
 

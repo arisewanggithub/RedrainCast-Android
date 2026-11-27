@@ -16,6 +16,8 @@ import org.screencopy.receiver.protocol.StreamRecoveryProtocol
 import org.screencopy.receiver.protocol.ReceiverOptionProtocol
 import org.screencopy.receiver.protocol.ReceiverOptionCapabilities
 import dev.redrain.cast.diagnostics.SessionTelemetryProtocol
+import dev.redrain.cast.diagnostics.DiagnosticArmRegistry
+import org.screencopy.receiver.protocol.DiagnosticProxyNegotiation
 import org.json.JSONObject
 
 /** Three plain TCP connections on a trusted LAN; the media token binds them to one session. */
@@ -35,8 +37,6 @@ class ReceiverLink(private val target: ReceiverTarget) : Closeable {
     var uncappedFps: Boolean = false
         private set
     var receiverOptions = ReceiverOptionCapabilities()
-        private set
-    var delegatedDiagnostics = false
         private set
     internal var sessionTelemetry = false
         private set
@@ -97,16 +97,35 @@ class ReceiverLink(private val target: ReceiverTarget) : Closeable {
         }
     }
 
-    fun connect(timeoutMillis: Long = 10_000) {
+    fun connect(timeoutMillis: Long = 10_000) = connectInternal(timeoutMillis, null, null)
+
+    internal fun connectArmed(timeoutMillis: Long, claim: DiagnosticArmRegistry.Claim,
+                              remainingMs: () -> Int) {
+        val leaseMillis = (claim.expiresNs - System.nanoTime()) / 1_000_000L
+        if (leaseMillis <= 0) throw SocketTimeoutException("TIMEOUT: diagnostic arm expired")
+        connectInternal(minOf(timeoutMillis, leaseMillis), claim, remainingMs)
+    }
+
+    private fun connectInternal(timeoutMillis: Long, claim: DiagnosticArmRegistry.Claim?,
+                                remainingMs: (() -> Int)?) {
         try {
             deadline(timeoutMillis) {
                 connectSocket(sockets[0])
+                val proxy = DiagnosticProxyNegotiation.capability()
+                if (claim != null) {
+                    val remaining = checkNotNull(remainingMs).invoke()
+                    if (remaining !in 1..180_000) throw IOException("TIMEOUT: diagnostic arm expired")
+                    proxy.put("offer", JSONObject().put("session", claim.session.toString())
+                        .put("pairId", claim.pairId).put("armGeneration", claim.generation.toString())
+                        .put("receiverFlags", JSONArray(claim.receiverFlags.sorted()))
+                        .put("durationMs", remaining).put("samplePeriodMs", claim.samplePeriodMs))
+                }
                 send(Wire.control(Wire.HELLO, 0, Wire.obj(
                     "role" to "sender", "versions" to JSONArray().put(3),
                     "name" to "RedrainCast", "videoRotation" to true, "streamRecovery" to true, "uncappedFps" to true,
                     "streamRecoveryVersion" to StreamRecoveryProtocol.VERSION,
                     "receiverOptions" to ReceiverOptionProtocol.IMPLEMENTED.wireValue(),
-                    "diagnostics" to org.screencopy.receiver.protocol.DiagnosticDelegation.capability(),
+                    "diagProxy" to proxy,
                     "sessionTelemetry" to SessionTelemetryProtocol.capability()
                 )))
                 val hello = receive()
@@ -114,8 +133,15 @@ class ReceiverLink(private val target: ReceiverTarget) : Closeable {
                 if (hello.type != Wire.HELLO || hello.session != 0L)
                     throw IOException("PROTOCOL: receiver HELLO session zero required")
                 val json = hello.json()
-                delegatedDiagnostics = org.screencopy.receiver.protocol.DiagnosticDelegation.supported(
-                    org.screencopy.receiver.protocol.StrictJson.decode(hello.payload))
+                if (claim != null) {
+                    val supported = try {
+                        DiagnosticProxyNegotiation.supportsReceiver(
+                            org.screencopy.receiver.protocol.StrictJson.decode(hello.payload), claim.receiverFlags)
+                    } catch (error: org.screencopy.receiver.protocol.ProtocolException) {
+                        throw IOException("PROTOCOL: ${error.message}", error)
+                    }
+                    if (!supported) throw IOException("UNSUPPORTED_CONFIG: receiver does not support requested diagnostics")
+                }
                 sessionTelemetry = telemetrySupported(org.screencopy.receiver.protocol.StrictJson.decode(hello.payload))
                 receiverOptions = try {
                     ReceiverOptionProtocol.capabilities(org.screencopy.receiver.protocol.StrictJson.decode(hello.payload))
@@ -152,6 +178,19 @@ class ReceiverLink(private val target: ReceiverTarget) : Closeable {
 
     internal fun selectSessionTelemetry(request: JSONObject) {
         if (sessionTelemetry) request.put("sessionTelemetry", SessionTelemetryProtocol.capability())
+    }
+
+    internal fun selectDiagnosticProxy(request: JSONObject, claim: DiagnosticArmRegistry.Claim) {
+        request.put("diagProxy", JSONObject().put("version", DiagnosticProxyNegotiation.VERSION)
+            .put("pairId", claim.pairId).put("armGeneration", claim.generation.toString()))
+    }
+
+    internal fun acceptedDiagnosticProxy(acceptance: JSONObject, claim: DiagnosticArmRegistry.Claim):
+        DiagnosticProxyNegotiation.Accepted = try {
+        DiagnosticProxyNegotiation.accepted(acceptance, DiagnosticProxyNegotiation.Offer(
+            claim.session, claim.pairId, claim.generation, claim.receiverFlags, claim.expiresNs, claim.samplePeriodMs))
+    } catch (error: org.screencopy.receiver.protocol.ProtocolException) {
+        throw IOException("PROTOCOL: ${error.message}", error)
     }
 
     internal fun acceptedSessionTelemetry(acceptance: JSONObject): Boolean {
@@ -321,6 +360,6 @@ class ReceiverLink(private val target: ReceiverTarget) : Closeable {
 
     private fun reject(message: Wire.Message) {
         if (message.type == Wire.REJECT || message.type == Wire.ERROR)
-            throw IOException("${Json.string(message.json(), "code")}: ${Json.string(message.json(), "message")}")
+            throw ReceiverReportedFailure(Json.string(message.json(), "code"), Json.string(message.json(), "message"))
     }
 }

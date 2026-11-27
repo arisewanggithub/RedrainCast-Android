@@ -24,7 +24,8 @@ internal class ControlWriter(
     private val failed: (String) -> Unit,
     private val writeFrame: (Socket, Message) -> Unit = { target, message -> Wire.write(target.outputStream, message) },
     private val clock: () -> Long = { System.nanoTime() / 1_000_000 },
-    private val observed: (Message, Boundary, Int, Int, Long) -> Unit = { _, _, _, _, _ -> }
+    private val observed: (Message, Boundary, Int, Int, Long) -> Unit = { _, _, _, _, _ -> },
+    private val closeTransport: () -> Unit = { socket.close() }
 ) : AutoCloseable {
     enum class Boundary { ENQUEUED, WRITING, WRITTEN, CANCELLED, FAILED }
     enum class TelemetryAdmission { ACCEPTED, REPLACED, REJECTED }
@@ -160,14 +161,14 @@ internal class ControlWriter(
             terminalReservation = null
             val finished = AtomicBoolean()
             val watchdog = if (bounded) deadlines.schedule({
-                if (finished.compareAndSet(false, true)) socket.close()
+                if (finished.compareAndSet(false, true)) closeTransport()
             }, minOf(TelemetryTerminalBudget.FINAL_WRITE_MS, (deadlineMs - clock()).coerceAtLeast(0)), TimeUnit.MILLISECONDS) else null
             transaction = TerminalTransaction(type, prepared?.copy(payload = prepared.payload.copyOf()), deadlineMs,
                 terminalMessage, finalResult, bounded, finished, watchdog)
             telemetryInFlight.get()?.let { current ->
                 val waitMs = minOf(TelemetryTerminalBudget.FINAL_WRITE_MS, (deadlineMs - clock()).coerceAtLeast(0))
                 deadlines.schedule({
-                    if (telemetryInFlight.compareAndSet(current, null)) socket.close()
+                    if (telemetryInFlight.compareAndSet(current, null)) closeTransport()
                 }, waitMs, TimeUnit.MILLISECONDS)
             }
             true
@@ -193,7 +194,7 @@ internal class ControlWriter(
             val state = AtomicInteger()
             val waitMs = minOf(TelemetryTerminalBudget.FINAL_WRITE_MS, (writeDeadline - clock()).coerceAtLeast(0))
             val timeout = deadlines.schedule({
-                if (state.compareAndSet(0, 2)) socket.close()
+                if (state.compareAndSet(0, 2)) closeTransport()
             }, waitMs, TimeUnit.MILLISECONDS)
             try {
                 writingSince = clock()
@@ -221,12 +222,12 @@ internal class ControlWriter(
         if (synchronized(this) { terminal != item.type }) return
         val remaining = writeDeadline - clock()
         if (item.bounded && remaining <= 0) {
-            socket.close()
+            closeTransport()
             throw java.net.SocketTimeoutException("Terminal write deadline expired")
         }
         val state = AtomicInteger()
         val timeout = if (item.bounded) deadlines.schedule({
-            if (state.compareAndSet(0, 2)) socket.close()
+            if (state.compareAndSet(0, 2)) closeTransport()
         }, remaining, TimeUnit.MILLISECONDS) else null
         writingSince = clock()
         observed(message, Boundary.WRITING, -1, -1, -1)
@@ -337,7 +338,7 @@ internal class ControlWriter(
         if (thread !== Thread.currentThread()) {
             thread.join(1500)
             if (thread.isAlive) {
-                socket.close()
+                closeTransport()
                 thread.interrupt()
                 thread.join(500)
             }

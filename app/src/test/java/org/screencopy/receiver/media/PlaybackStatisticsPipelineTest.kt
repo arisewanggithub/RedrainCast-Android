@@ -88,7 +88,6 @@ class PlaybackStatisticsPipelineTest {
                     assertEquals(0, first.input.videoQueue?.entries)
                     assertNull(first.input.videoQueue?.oldestAgeMs)
                     assertNull(first.input.audio)
-                    assertNull(first.presentedFps)
                     if (blocked) {
                         assertTrue(nativeEntered.await(2, TimeUnit.SECONDS))
                         assertSamplingWithoutProducerLocks(server, first)

@@ -55,6 +55,10 @@ class AudioPlayer(
     private var lastOutputProgressNs = 0L
     private var lastConsumedFrames = 0L
     private var stage = "STARTUP_CHECK"
+        set(value) {
+            field = value
+            causalPhase(CausalEvidence.phases.indexOf(value).toLong())
+        }
     private var lastClockEventNs: Long? = null
     private var lastLoggedOffsetUs = 0L
     private var pendingClockCorrection: AudioClockCorrection? = null
@@ -73,25 +77,100 @@ class AudioPlayer(
     private var cachedOutputTiming: AudioOutputTiming? = null
     private var cachedOutputAtNs = -1L
     private var cachedUnderruns = -1L
+    private var outputOperation = 0L
+    private var outputPoint = 0L
+    private var outputCallAt = -1L
+    private var outputActive = false
+    private var outputCompleteAt = -1L
+    private var outputDuration = -1L
+    private var maxOutputDuration = -1L
+    private var zeroWrites = 0L
+    private var partialWrites = 0L
+    private var firstZeroAt = -1L
+    private var firstPartialAt = -1L
+    private var lastCompletePoint = -1L
+    private var trimPublished = false
+    private fun recordTrim(reason: Long, before: TrimmedAudio, after: TrimmedAudio, cutoff: Long, position: Long) {
+        if (trimPublished && before.audiblePtsUs == after.audiblePtsUs && before.frames == after.frames) return
+        trimPublished = true
+        TelemetryRegistry.causal(diagnosticSession, CausalEvidence.Stage.TRIM, diagnosticGeneration,
+            reason, before.audiblePtsUs, after.audiblePtsUs, cutoff, position,
+            before.frames.toLong(), after.frames.toLong(), atNs = clock.monotonicNs())
+    }
+    private fun outputCheckpoint(boundary: Int) {
+        if (!TelemetryRegistry.has("receiver", diagnosticSession)) return
+        val timing = cachedOutputTiming
+        TelemetryRegistry.causal(diagnosticSession, CausalEvidence.Stage.OUTPUT, diagnosticGeneration,
+            boundary.toLong(), outputOperation, outputPoint, outputCallAt, outputCompleteAt,
+            outputDuration, maxOutputDuration, zeroWrites, partialWrites, firstZeroAt, firstPartialAt,
+            cachedOutputAtNs, timing?.submittedFrames ?: -1, timing?.consumedFrames ?: -1,
+            timing?.presentedFrames ?: -1, timing?.timestampAgeUs ?: -1,
+            timing?.clockSource?.ordinal?.toLong() ?: -1, cachedUnderruns,
+            lastOutputProgressNs.takeIf { it > 0 } ?: -1, lastCompletePoint, atNs = clock.monotonicNs())
+    }
+    private fun observedUnderrunCount(): Int = diagnosticCall(DiagnosticPoint.TIMING) {
+        outputCheckpoint(CausalEvidence.Output.UNDERRUN_BEGIN.ordinal)
+        val count = output.underrunCount
+        outputCheckpoint(CausalEvidence.Output.UNDERRUN_END.ordinal)
+        count
+    }
     internal fun resetAudioStartEvidence() {
         TelemetryRegistry.state("receiver", diagnosticSession, 60,
             DiagnosticKind.AUDIO_OUTPUT.ordinal + 1, DiagnosticStage.SAMPLE.ordinal,
             2, diagnosticGeneration, -1, listOf(DiagnosticPoint.AUDIO_START_WAIT.ordinal.toLong(),
                 0, 0, 0, -1, Long.MIN_VALUE, -1, -1, 0, -1, 0, -1, -1, -1, -1, -1, -1, -1, -1, -1))
     }
-    private inline fun <T> diagnosticCall(point: DiagnosticPoint, pts: Long = -1, count: Long = -1, call: (Long) -> T): T {
+    internal inline fun <T> diagnosticCall(point: DiagnosticPoint, pts: Long = -1, count: Long = -1,
+                                         requestedSamples: Long = -1, call: (Long) -> T): T {
         val diagnostics = RemoteDiagnostics.recorder
         val session = diagnosticSession
         val detailed = diagnostics.enabled("receiver", session, DiagnosticKind.AUDIO_OUTPUT)
         if (!detailed && !TelemetryRegistry.has("receiver", session)) return call(0)
         val operation = diagnostics.operation("receiver", session, DiagnosticKind.AUDIO_OUTPUT)
-        diagnostics.observe("receiver", session, DiagnosticKind.AUDIO_OUTPUT, DiagnosticStage.BEGIN,
-            2, diagnosticGeneration, operation, pts, count = count, point = point)
+        val outputCall = point != DiagnosticPoint.AUDIO_START_WAIT
+        val parentActive = outputActive
+        val parentOperation = outputOperation
+        val parentPoint = outputPoint
+        val parentCallAt = outputCallAt
+        val callAt = if (outputCall) clock.monotonicNs() else -1
+        if (outputCall) {
+            outputOperation = operation
+            outputPoint = point.ordinal.toLong()
+            outputCallAt = callAt
+            outputActive = true
+            outputCheckpoint(CausalEvidence.Output.CALL_BEGIN.ordinal)
+        }
+        var restored = false
         try {
+            diagnostics.observe("receiver", session, DiagnosticKind.AUDIO_OUTPUT, DiagnosticStage.BEGIN,
+                2, diagnosticGeneration, operation, pts, count = count, point = point)
             val result = call(operation)
             if (result is AudioOutputTiming) {
                 cachedOutputTiming = result
                 cachedOutputAtNs = clock.monotonicNs()
+            }
+            if (outputCall) {
+                outputCompleteAt = clock.monotonicNs()
+                lastCompletePoint = point.ordinal.toLong()
+                outputDuration = outputCompleteAt - callAt
+                maxOutputDuration = maxOf(maxOutputDuration, outputDuration)
+                if (point == DiagnosticPoint.WRITE && result is Int) {
+                    if (result == 0) {
+                        zeroWrites++
+                        if (firstZeroAt < 0) firstZeroAt = outputCompleteAt
+                    } else if (result > 0 && result < requestedSamples) {
+                        partialWrites++
+                        if (firstPartialAt < 0) firstPartialAt = outputCompleteAt
+                    }
+                }
+                if (parentActive) {
+                    outputOperation = parentOperation
+                    outputPoint = parentPoint
+                    outputCallAt = parentCallAt
+                    restored = true
+                }
+                outputCheckpoint(if (parentActive) CausalEvidence.Output.CALL_BEGIN.ordinal
+                    else CausalEvidence.Output.CALL_END.ordinal)
             }
             diagnostics.observe("receiver", session, DiagnosticKind.AUDIO_OUTPUT, DiagnosticStage.COMPLETE,
                 2, diagnosticGeneration, operation, pts, count = if (result is Int) result.toLong() else count, point = point,
@@ -100,13 +179,30 @@ class AudioPlayer(
                     result.presentedFrames, result.timestampAgeUs, result.clockSource) else null)
             return result
         } catch (e: Exception) {
+            if (outputCall) {
+                outputOperation = operation
+                outputPoint = point.ordinal.toLong()
+                outputCallAt = callAt
+                restored = false
+                outputCheckpoint(CausalEvidence.Output.CALL_FAILED.ordinal)
+            }
             diagnostics.observe("receiver", session, DiagnosticKind.AUDIO_OUTPUT, DiagnosticStage.FAILED,
                 2, diagnosticGeneration, operation, pts, reason = DiagnosticReason.FAILURE, point = point)
             throw e
+        } finally {
+            if (outputCall) {
+                outputActive = parentActive
+                if (parentActive && !restored) {
+                    outputOperation = parentOperation
+                    outputPoint = parentPoint
+                    outputCallAt = parentCallAt
+                    outputCheckpoint(CausalEvidence.Output.CALL_BEGIN.ordinal)
+                }
+            }
         }
     }
 
-    private val serviceDiagnostic = onServiceDiagnostic?.let { AudioServiceDiagnostic(format.sampleRate) }
+    private val serviceDiagnostic = AudioServiceDiagnostic(format.sampleRate)
     private val eventHistory = onServiceDiagnostic?.let { AudioEventHistory() }
 
     internal fun packetReceived(ptsUs: Long, bytes: Int) {
@@ -130,6 +226,7 @@ class AudioPlayer(
         require(format.codec in listOf("opus", "aac", "pcm")) { "Unsupported audio codec ${format.codec}" }
         require(format.codec != "opus" || format.sampleRate == 48000) { "Opus output clock must be 48000 Hz" }
         output = outputFactory()
+        (output as? AudioTimingDiagnostic)?.timingCheckpoint = ::outputCheckpoint
         var createdResampler: PcmResampler? = null
         var createdOpus: OpusPacketDecoder? = null
         try {
@@ -150,22 +247,28 @@ class AudioPlayer(
         measured("step") { serviceStep() }
         reportService()
     }
+    override fun causalNowNs(): Long = clock.monotonicNs()
 
     private fun reportService(final: Boolean = false) {
-        serviceDiagnostic?.report(clock.monotonicNs(), regulator.discardedFrames, final)?.let {
+        serviceDiagnostic.report(clock.monotonicNs(), regulator.discardedFrames, final)?.let {
             onServiceDiagnostic?.invoke(it)
         }
     }
 
     private inline fun <T> measured(operation: String, block: () -> T): T {
         val diagnostic = serviceDiagnostic
-        if (diagnostic == null || !diagnostic.started) return block()
+        if (!diagnostic.started && !TelemetryRegistry.has("receiver", diagnosticSession)) return block()
         val start = clock.monotonicNs()
-        val cpu = threadCpuNs()
+        val cpu = if (onServiceDiagnostic != null && diagnostic.started) threadCpuNs() else -1
         try {
             return block()
         } finally {
-            diagnostic.duration(operation, clock.monotonicNs() - start, threadCpuNs() - cpu)
+            val end = clock.monotonicNs()
+            val usedCpu = if (cpu >= 0) threadCpuNs() - cpu else -1
+            diagnostic.duration(operation, end - start, usedCpu.coerceAtLeast(0))
+            causalInterval(start, end, usedCpu, when (operation) {
+                "step" -> 0; "input" -> 1; "decode" -> 2; else -> 3
+            })
         }
     }
 
@@ -252,14 +355,24 @@ class AudioPlayer(
         clock.noteAudioPacket()
         require(samples.size % format.channels == 0) { "PCM packet is not frame aligned" }
         var slice = startup.apply(samples.size / format.channels, ptsUs)
+        var trimReason = if (slice.audiblePtsUs != ptsUs) 0L else -1L
+        var trimCutoff = if (trimReason == 0L) slice.audiblePtsUs else -1L
+        recordTrim(0, TrimmedAudio(0, samples.size / format.channels, ptsUs), slice, -1, -1)
         recoveryCutoffUs?.let { cutoff ->
-            slice = trimRecoveryAudio(slice, if (firstPtsUs == null) maxOf(cutoff, clock.currentUs() ?: cutoff) else cutoff,
-                format.sampleRate)
+            val position = if (firstPtsUs == null) clock.currentUs() else null
+            val before = slice
+            val effectiveCutoff = if (firstPtsUs == null) maxOf(cutoff, position ?: cutoff) else cutoff
+            slice = trimRecoveryAudio(slice, effectiveCutoff, format.sampleRate)
+            if (slice != before) {
+                trimReason = 1
+                trimCutoff = effectiveCutoff
+            }
+            recordTrim(1, before, slice, cutoff, position ?: -1)
         }
         if (slice.frames == 0) return
         if (firstPtsUs == null) {
             // Until the first video packet, retain only the latest decoded preroll packet.
-            pending = DecodedAudio(samples, slice)
+            pending = DecodedAudio(samples, slice, ptsUs, trimCutoff, trimReason)
             flushPending()
         } else queueResampled(samples, slice)
     }
@@ -268,13 +381,29 @@ class AudioPlayer(
         stage = "STARTUP_SYNC"
         val decoded = pending ?: return
         while (running.get()) {
+            var gateCutoff = decoded.cutoffUs
+            var gateTrimReason = decoded.trimReason
             val fresh = recoveryCutoffUs?.let { cutoff ->
-                trimRecoveryAudio(decoded.slice, maxOf(cutoff, clock.currentUs() ?: cutoff), format.sampleRate)
+                val position = clock.currentUs()
+                val effectiveCutoff = maxOf(cutoff, position ?: cutoff)
+                trimRecoveryAudio(decoded.slice, effectiveCutoff, format.sampleRate).also {
+                    if (it != decoded.slice) {
+                        gateCutoff = effectiveCutoff
+                        gateTrimReason = 2
+                    }
+                    recordTrim(2, decoded.slice, it, cutoff, position ?: -1)
+                }
             } ?: decoded.slice
             if (fresh.frames == 0) { pending = null; return }
             val slice = clock.prepareAudio(fresh, format.sampleRate) ?: return
+            if (slice != fresh) {
+                gateCutoff = slice.audiblePtsUs
+                gateTrimReason = 3
+                recordTrim(3, fresh, slice, recoveryCutoffUs ?: -1, -1)
+            }
             if (slice.frames == 0) { pending = null; return }
             if (!diagnosticCall(DiagnosticPoint.AUDIO_START_WAIT, slice.audiblePtsUs) { operation ->
+                    var previous: List<Long>? = null
                     clock.awaitAudioStartObserved(slice.audiblePtsUs, { decision ->
                         val timing = cachedOutputTiming
                         TelemetryRegistry.state("receiver", diagnosticSession, 60,
@@ -288,6 +417,17 @@ class AudioPlayer(
                                 timing?.presentedFrames ?: -1, timing?.timestampAgeUs ?: -1,
                                 timing?.clockSource?.ordinal?.toLong() ?: -1, cachedUnderruns,
                                 lastOutputProgressNs.takeIf { it > 0 } ?: -1, queuedPackets().toLong()))
+                        val transition = listOf(decision.reason.toLong(), decision.mode.toLong(),
+                            decision.targetUs, decision.revision, decision.flags)
+                        if (transition != previous) {
+                            previous = transition
+                            TelemetryRegistry.causal(diagnosticSession, CausalEvidence.Stage.START, diagnosticGeneration,
+                                operation, decision.reason.toLong(), decision.mode.toLong(), decision.targetUs,
+                                decision.positionUs ?: -1, decision.delayUs ?: Long.MIN_VALUE, decision.revision,
+                                decision.flags, decision.waitedUs, decision.releasedVideoUs ?: -1,
+                                decoded.rawPtsUs, gateCutoff, gateTrimReason,
+                                atNs = clock.monotonicNs())
+                        }
                     }) { running.get() }
                 }) continue
             pending = null
@@ -312,10 +452,10 @@ class AudioPlayer(
             regulator.startAfterPreroll()
             output.play()
             lastOutputProgressNs = clock.monotonicNs()
-            val count = output.underrunCount
+            val count = observedUnderrunCount()
             cachedUnderruns = count.toLong()
             underruns.start(count)
-            serviceDiagnostic?.start(lastOutputProgressNs, count)
+            serviceDiagnostic.start(lastOutputProgressNs, count)
             eventHistory?.start(count)
         }
     }
@@ -331,7 +471,7 @@ class AudioPlayer(
         val now = clock.monotonicNs()
         observePresentation(timing, now)
         eventHistory?.refill(now, timing.bufferedUs, regulator.bufferedFrames)
-        serviceDiagnostic?.beforeRefill(now,
+        serviceDiagnostic.beforeRefill(now,
             (timing.submittedFrames - timing.consumedFrames) * 1_000_000 / format.sampleRate,
             regulator.bufferedFrames, lastAudioAdmissionNs?.let { (now - it).coerceAtLeast(0) / 1000 })
         if (statisticsEnabled && (statisticsAtNs == Long.MIN_VALUE || now - statisticsAtNs >= 100_000_000)) {
@@ -359,16 +499,17 @@ class AudioPlayer(
             stage = "OUTPUT_WRITE"
             val written = presentation.write(chunk != null, format.channels, frames,
                 sourceUnits = { regulator.sourceUnits(it) }) {
-                diagnosticCall(DiagnosticPoint.WRITE, chunk?.ptsUs ?: -1, frames.toLong()) {
+                diagnosticCall(DiagnosticPoint.WRITE, chunk?.ptsUs ?: -1, frames.toLong(),
+                    requestedSamples = frames.toLong() * format.channels) {
                     output.write(chunk?.samples ?: silence, chunk?.offset ?: 0, frames * format.channels)
                 }
             }
             if (written == 0) {
-                serviceDiagnostic?.wrote(0, chunk != null)
+                serviceDiagnostic.wrote(0, chunk != null)
                 break
             }
             val accepted = written / format.channels
-            serviceDiagnostic?.wrote(accepted, chunk != null)
+            serviceDiagnostic.wrote(accepted, chunk != null)
             if (chunk != null) {
                 sourcePacket(chunk.ptsUs)
                 sourceWrittenUnits = Math.addExact(sourceWrittenUnits, regulator.sourceUnits(accepted))
@@ -422,7 +563,7 @@ class AudioPlayer(
             diagnosticCall(DiagnosticPoint.COMPENSATE, count = compensation.distance.toLong()) {
                 resampler.compensate(compensation.samples, compensation.distance)
             }
-            onOutputTiming(output.timing())
+            onOutputTiming(diagnosticCall(DiagnosticPoint.TIMING) { output.timing() })
             onRegulation(regulator.diagnostic())
         }
         processedSourceFrames = Math.addExact(processedSourceFrames, slice.frames.toLong())
@@ -450,7 +591,7 @@ class AudioPlayer(
         if (lastUnderrunObservationNs?.let { now - it < 20_000_000L } == true) return
         stage = "UNDERRUN_CHECK"
         lastUnderrunObservationNs = now
-        val count = output.underrunCount
+        val count = observedUnderrunCount()
         val timing = diagnosticCall(DiagnosticPoint.TIMING) { output.timing() }
         val queued = queuedPackets()
         TelemetryRegistry.evidence("receiver", diagnosticSession, 2, diagnosticGeneration,
@@ -460,8 +601,11 @@ class AudioPlayer(
             if (pending != null) 1 else 0, if (waiting != null) 1 else 0, lastOutputProgressNs)
         eventHistory?.record(now, "observe", count.toLong(), queued.toLong())
         eventHistory?.dump(now, count)?.forEach { onServiceDiagnostic?.invoke(it) }
-        serviceDiagnostic?.observe(count, timing.submittedFrames - timing.consumedFrames,
+        serviceDiagnostic.observe(count, timing.submittedFrames - timing.consumedFrames,
             regulator.bufferedFrames, queued, pending != null || waiting != null)
+        cachedUnderruns = count.toLong()
+        TelemetryRegistry.causal(diagnosticSession, CausalEvidence.Stage.SERVICE, diagnosticGeneration,
+            *serviceDiagnostic.snapshot(), atNs = clock.monotonicNs())
         underruns.observe(now, count, timing, queued,
             pending != null || waiting != null, output.playbackActive)?.let {
             onUnderrunRecovery(it)
@@ -482,7 +626,7 @@ class AudioPlayer(
         try {
             sourceClock?.let { source ->
                 try {
-                    observePresentation(output.timing(), clock.monotonicNs())
+                    observePresentation(diagnosticCall(DiagnosticPoint.TIMING) { output.timing() }, clock.monotonicNs())
                 } finally {
                     clock.detachObservedAudio(source)
                 }
@@ -521,7 +665,8 @@ class AudioPlayer(
             throw PlaybackException("Decoded audio packet exceeds 120 ms budget; sender must use smaller packets", "CONGESTION")
     }
 
-    private data class DecodedAudio(val samples: ShortArray, val slice: TrimmedAudio)
+    private data class DecodedAudio(val samples: ShortArray, val slice: TrimmedAudio,
+                                   val rawPtsUs: Long, val cutoffUs: Long, val trimReason: Long)
 
     companion object {
         internal fun trimRecoveryAudio(slice: TrimmedAudio, cutoff: Long, rate: Int): TrimmedAudio {

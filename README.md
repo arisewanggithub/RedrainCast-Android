@@ -36,38 +36,29 @@ while enabled. Traffic is unencrypted and unauthenticated; use a trusted LAN.**
 There is no pairing, certificate, or secret; the collector requires explicit
 `--lan` and sends HELLO. Only an explicit bounded START enables this live
 diagnostic capture; automatic session telemetry is separate.
-When this device sends a cast, consent also requests session-scoped diagnostics
-on compatible receivers **without requiring projector settings or receiver
-statistics**. Normal cast admission is required; unsupported/unavailable access
-is reported instead of failing the cast. Use the exact receiver session shown
-in diagnostics status (also returned in receiver HELLO `scope`); delegated mode
-rejects `nextSession`. Flag-off/cast end freezes collection; retrieval remains
-available for at most 120 seconds. New owners revoke the previous scope/history.
-The PC collector's `--discover` finds consenting receiver endpoints from existing
-UDP discovery advertisements without ADB. Discovery never connects automatically.
+An explicit v2 START arms the next cast, requesting diagnostics on its compatible
+receiver without changing receiver preferences. The receiver records admission
+before media and sends evidence through a separate lane on its cast listener;
+there is no receiver diagnostics listener or receiver discovery advertisement.
+An armed cast fails before media if its required diagnostic bootstrap fails;
+ordinary unarmed casts do not wait for diagnostics. Frozen pair evidence is
+retained for at most 120 seconds.
 Settings are unavailable during an active cast. To find the sender after its
 startup log is gone, use `--discover-sender PHONE_PRIVATE_IPV4`: one read-only
 unicast query to UDP 27184 returns the live consent-gated TCP endpoint without
 restarting/toggling consent or scanning ports. This requires the updated build;
 it cannot recover an unknown endpoint in an already-running older process.
-For an active cast, `--lan --sender PHONE_HOST:PHONE_PORT --follow-receiver`
-instead reads the owning receiver endpoint/session from sender process memory
-over diagnostic TCP and captures both devices, without receiver UDP discovery,
-a manual projector endpoint or opening settings during the cast.
-Disabling either setting closes local access and clears local capture history;
-delegated receiver collection freezes with bounded retrieval. Sender
-backgrounding does not revoke local consent.
+Run `--lan --sender PHONE_HOST:PHONE_PORT --output DIRECTORY` **before** starting
+the cast. The collector uses one sender connection for both sources. Disabling
+sender access clears the in-memory pair; backgrounding alone does not revoke consent.
 See the [protocol and supported schemas](protocol/REMOTE_DIAGNOSTICS.md) and
 [paired PC collector](tools/REMOTE_DIAGNOSTICS.md). Select supported role flags
 explicitly: receiver `video.progress,video.timing` includes bounded PTS-keyed scheduling
 and callback evidence, with cached audio observation age and clock-map context,
-independently of the statistics panel. Sender `video.progress` and kernel TCP
-metrics are not implemented. These clock estimates do not prove physical scanout.
-No media contents or unrestricted logs are collected. A 180-second paired LAN
-capture with the latest debug build completed without disconnect, recovery or a
-sustained freeze. This single run is not broad LAN/lifetime acceptance or a
-physical display/overhead measurement; do not treat a diagnostic capture as a
-fix for audio failure.
+independently of the statistics panel. Kernel TCP metrics are not implemented.
+These clock estimates do not prove physical scanout. No media contents or
+unrestricted logs are collected. Device overhead, bootstrap and final-flush
+timings have not been established by JVM tests.
 
 **Playback statistics (default off):** Settings on the sending Android device
 has **Show playback statistics on receiver (next cast)** at the bottom of

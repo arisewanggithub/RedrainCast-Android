@@ -4,26 +4,16 @@ Authority: current RedrainCast Windows `ScrcpySend.Core/SenderSession.cs`,
 `ScrcpyReceive.Core/ReceiverServer.cs`, `Protocol.cs`, and `Discovery.cs`.
 The sibling checkout is not modified by the Android build or protocol probe.
 
-Optional Android [remote diagnostics v1](REMOTE_DIAGNOSTICS.md) uses a separate
-locally enabled, unauthenticated plain LAN TCP listener; it does not extend SCPY framing.
-Receiver UDP advertisements may add root `diagnostic:{"version":1,"port":43210,"access":"lan"}`
-only while local consent or admitted delegation is valid and that listener is live. This is an
-untrusted endpoint hint. Anyone on the LAN can read bounded metadata and control
-diagnostic captures; no media or casting controls are exposed. Collector `--lan`
-is mandatory for this mode, with HELLO rather than AUTH and no fallback.
-The existing 1024-byte advertisement limit and all media capabilities are unchanged.
-Optional SCPY HELLO `diagnostics:{version:1,sessionDelegation:true}` negotiates an
-admitted sender's SESSION_REQUEST `diagnostic:{version:1,enabled:true}`. It opens
-receiver diagnostics only for that cast without receiver preference changes;
-exact-session START is required. Revocation/teardown freezes it for up to120s.
-This intentionally permits reachable LAN clients to access bounded receiver
-metadata after normal cast admission; it does not bypass Android LAN permission.
-Admitted-owner diagnostic STATUS carries the live diagnostic port/version/access
-and exact session. The sender retains this only in process memory, deriving the
-host from its connected cast peer. Diagnostic HELLO/STATUS/CONNECTIONS expose
-that receiver hint and the sender's actual listener endpoint. Collector
-`--lan --sender HOST:PORT --follow-receiver` attaches both exact-session captures
-without a receiver endpoint argument or UDP reception; no capture starts at HELLO.
+Optional Android [remote diagnostics v2](REMOTE_DIAGNOSTICS.md) uses one locally
+enabled, unauthenticated plain LAN collector listener on the sender. Explicit
+START arms the next cast. SCPY HELLO negotiates the distinct optional proxy
+capability; after normal admission a token-bound fourth connection uses the
+receiver's existing cast listener to carry diagnostic records to the sender.
+The receiver has no diagnostic listener or diagnostic discovery advertisement.
+An armed cast requires validated receiver bootstrap before media; unarmed casts
+remain independent. Anyone on the LAN can read bounded metadata or control
+captures while enabled: `--lan` is mandatory and there is no authentication.
+Neither diagnostic consent nor this capability changes media permissions.
 
 The implemented replacement for automatic incident diagnostics is
 [sender-owned session telemetry](PRESSURE_INCIDENTS.md). Compatible Android

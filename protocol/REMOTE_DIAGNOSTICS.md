@@ -1,4 +1,85 @@
-# Remote diagnostics control contract v1
+# Remote diagnostics control contract v2
+
+The live collector connects **only to the sender**, over a locally opted-in,
+plaintext and unauthenticated LAN listener. Use a trusted LAN. START arms the
+next cast; it cannot attach to an existing cast. The receiver supplies evidence
+through a token-bound diagnostic lane on its existing cast listener, not a
+separate diagnostic listener or advertised endpoint. Peers must implement the
+proxy capability; there is no v1 fallback. A failed bootstrap stops the armed
+attempt before media. Ordinary, unarmed casts do not wait for diagnostics.
+
+The collector uses UTF-8 JSON lines, `v:2`, a 16,384-byte line limit and
+canonical nonnegative decimal strings for int64 values. Requests are limited to
+depth 8; paired FETCH responses to depth 11. A source-record subtree is limited
+to depth 7, and receiver lane frames to depth 8. Normal source records are at
+most 2,048 bytes; selected `video.timing` records at most 12,000 bytes.
+All encoded responses, including errors and their newline, share the rolling
+256-record/128-KiB-per-second delivery budget. Duplicate IDs also consume the
+20-command-per-second request budget. Capacity is reserved for an explicit
+sanitized error; if no error fits, the listener closes the connection.
+Unknown operation names are not reflected in the response `op` field (null).
+
+| Operation | Arguments | Purpose |
+|---|---|---|
+| `HELLO` | none | Acquire the single collector slot and return role flag capabilities. |
+| `START` | `target:{"nextSession":true}`, `senderFlags`, `receiverFlags`, `durationMs`, `samplePeriodMs` | Arm one new cast, with one lease of at most 180 seconds. |
+| `STATUS` | optional `pairId` | Return pair state, identity and coverage. |
+| `CONNECTIONS` | none | Return bounded local connection information. |
+| `CLOCK` | `role`, `clientSendNs`, and for receiver `pairId` | Sample the corresponding clock; receiver samples require the proxy lane. |
+| `FETCH` | `pairId`, `afterSenderSeq`, `afterReceiverSeq`, `limit` | Fetch up to 32 fairly interleaved source envelopes and per-role cursors/loss. |
+| `END` / `CLEAR` | `pairId` | Freeze / clear the pair. |
+| `PING` | none | Check liveness without extending any lease. |
+
+Each FETCH record wraps the unchanged source record with `role`, source
+`session` (null when unbound), `captureId` and `clockId`. Pair state and
+bootstrap are separate from source records. FETCH has only bootstrap and
+terminal summaries; complete bootstrap, selected flags and detailed receiver
+outcomes are in STATUS. For a failed setup, STATUS may retain `setupFailure`
+with bounded `code`, `provenance` (`receiver_control` or `sender_local`) and
+`reason` (`receiver_reported`, `timeout`, `eof`, `connect`, or `setup`).
+These fields never contain peer messages or addresses. FETCH reports only
+`setupFailureAvailable`; the collector saves full STATUS at final freeze,
+before any CLEAR, and also when bootstrap appears. Source loss is
+`["compact1",publishedSeq,oldestRetainedSeq,latestRetainedSeq,admissionTotal,admissionReasons,retentionReasons]`.
+It retains the same values: each admission reason is
+`[count,firstMonoNs,lastMonoNs]`, each retention reason is
+`[count,firstSeq,lastSeq,exactRange]`. Admission `reasons` is ordered
+`routine_capacity`, `critical_capacity`, `closed_capture`, `expired`,
+`oversized_record`; retention is ordered `routine`, `critical`, `oversized`.
+Preserve source, intake and
+retention loss and terminal/truncation information; missing evidence is not
+proof that no loss occurred. Frozen pair data is retained for up to 120 seconds
+while consent remains enabled. Consent revocation clears it.
+
+When an admitted receiver ends without a validated lane ENDED, STATUS retains
+a sender-reconstructed receiver outcome with `confirmed:false`, null `reason`
+and `endedNs`, unknown retirement and ownership, and a truncated, incomplete
+`captureEnd` with null time and reason. This is not a receiver-sourced event.
+An unadmitted receiver remains unavailable with no outcome. FETCH retains only
+its existing compact terminal confirmation; unconfirmed or truncated coverage
+is a collection failure.
+
+After successful normal STOP retirement, the receiver opportunistically flushes
+ENDED asynchronously within the existing maximum 100 ms retirement window;
+control acknowledgement and ownership cleanup do not wait for this flush.
+If the lane cannot deliver in that window, it closes and the outcome remains
+unconfirmed and truncated.
+
+After a validated receiver ENDED or lane closure starts the ordered intake
+cutoff, STATUS reports the receiver role as `finishing` until that cutoff is
+accounted and the outcome is published. FETCH's intake state may advance
+independently while that final publication is pending. The receiver-role state
+in STATUS and FETCH is `unavailable`, `active`, `finishing`, or `finished`.
+
+The following archived v1 material is retained only as historical background
+and for its event/metric schema descriptions. Its transport, API commands,
+examples, endpoint discovery, validation claims and capture workflows do
+**not** describe the v2 implementation above.
+
+<details>
+<summary>Archived v1 material (not the current live protocol)</summary>
+
+# Remote diagnostics control contract v1 (archived)
 
 Status: implemented in the Android source and available starting in v0.5.0.
 One 180-second paired LAN capture with the latest debug build completed without
@@ -433,7 +514,7 @@ synchronously (and closes local access); the receiver independently applies its
 existing frozen grace. New ownership replaces all old hints. Local receiver mode
 is not assumed to survive cast teardown. A stale/new receiver scope is checked
 again at receiver HELLO/START; a hint never authorizes another cast or enables
-collection. `--follow-receiver` refuses frozen hints for new captures.
+collection. That historical hint-based attachment is no longer supported.
 
 The first sender endpoint can be obtained with the bounded unicast query below,
 without settings access or retained startup logs. Successful Android listener startup also logs the controlled local event
@@ -497,14 +578,13 @@ until explicitly revoked or the process/network/permission changes. If UDP
 27184 is occupied, the listener logs discovery unavailability but preserves the
 already-working TCP path/casting; it never evicts another socket or changes port.
 
-CLI: `--discover-sender PRIVATE_IPV4 --discover-seconds 5`, separate from
-capture/receiver discovery. It only prints the untrusted endpoint. Then use
-`--lan --sender HOST:PORT --follow-receiver ...` for explicit collection.
+The historical second-listener collection workflow is retired. Use the v2
+single-sender procedure at the top of this document.
 Old running builds without this responder cannot be recovered by source changes:
 with settings gated, no known port and no retained log, there is no supported
 non-disruptive bootstrap. Do not restart/toggle consent or scan during a cast.
 
-### Optional receiver endpoint discovery
+### Historical receiver endpoint discovery (removed in v2)
 
 The existing receiver discovery advertisement on UDP **27183** may include the
 optional root field `"diagnostic":{"version":1,"port":43210,"access":"lan"}`. `port` is an exact
@@ -975,82 +1055,7 @@ evidence. Synthetic fixtures use the app build directory and are removed after
 testing. These are not Wi-Fi, acoustic
 output or real-device overhead acceptance results.
 
-### Reproducible branch validation
-
-The sender-memory connection follow-up passed **192 targeted JVM tests with
-zero failures/errors/skips**, including
-`DiagnosticListenerTest.pythonCollectorCapturesBothActualJvmLanListenersWithoutPairing`.
-That integration launches the Python collector against two instances of
-the actual app `DiagnosticListener`/`DiagnosticProtocol`/`DiagnosticRecorder`,
-using CLI `--lan --sender <actual endpoint> --follow-receiver` with no
-receiver endpoint/session, certificate or secret inputs. It verifies
-paired unauthenticated LAN capture, exact signed-int64 maximum session identities,
-with a locally consented sender listener and a scoped delegated receiver listener.
-The sender TCP CONNECTIONS response supplies the exact current receiver endpoint
-and session; the collector validates the receiver HELLO scope before START.
-It also verifies
-distinct process clock IDs, ten CLOCK observations per device, retained
-START/binding/END events and frozen state. It uses no phone/ADB/install and writes
-only self-cleaning synthetic fixtures under `app/build`. Set
-`DIAGNOSTICS_TEST_PYTHON` to an installed Python executable if needed; Windows
-also discovers the existing shared Python 3.13.9 ARM64 toolchain, and other hosts
-default to `python3`. Nothing is downloaded or installed.
-
-Exact Windows commands, from the isolated worktree:
-
-```powershell
-Set-Location 'E:\gitpersonal\RedrainCast-Android-remote-diagnostics'
-$env:JAVA_HOME = "$env:LOCALAPPDATA\Copilot\Toolchains\jdk-21.0.13-x64"
-$env:PATH = "$env:JAVA_HOME\bin;$env:PATH"
-$env:ANDROID_HOME = "$env:LOCALAPPDATA\Android\Sdk"
-$env:ANDROID_SDK_ROOT = $env:ANDROID_HOME
-.\gradlew.bat :app:testDebugUnitTest `
-  --tests '*Diagnostic*' `
-  --tests '*SharingSettingsTest' `
-  --tests '*ReceiverOptions*' `
-  --tests '*Configuration*' `
-  --tests '*SenderSession*' `
-  --tests '*StreamRecoverySenderTest' `
-  --tests '*AudioWriteProgressPipelineTest' `
-  --console=plain
-
-$env:JAVA_HOME = "$env:USERPROFILE\.gradle\jdks\jetbrains_s_r_o_-21-aarch64-windows.2"
-$env:PATH = "$env:JAVA_HOME\bin;$env:PATH"
-.\gradlew.bat :app:assembleDebug :app:lintDebug --console=plain --quiet
-git --no-pager diff --check
-```
-
-For only cross-language integration, replace the `--tests` selectors with
-`--tests 'dev.redrain.cast.diagnostics.DiagnosticListenerTest.pythonCollectorCapturesBothActualJvmLanListenersWithoutPairing'`.
-Reports are overwritten by the next run of the same Gradle task:
-
-- `app/build/reports/tests/testDebugUnitTest/index.html`: consolidated JVM report.
-- `app/build/test-results/testDebugUnitTest/TEST-*.xml`: machine-readable counts.
-- `app/build/test-results/testDebugUnitTest/TEST-dev.redrain.cast.diagnostics.DiagnosticListenerTest.xml`:
-  named Python/JVM integration case.
-- `app/build/reports/lint-results-debug.html` and `lint-results-debug.txt`:
-  native ARM64 lint, zero errors and 17 existing warnings; none in diagnostics code.
-- `app/build/outputs/apk/debug/app-debug.apk`: successfully built debug APK,
-  not installed or released. Follow-up SHA-256:
-  `D4C2A26CC157607FF16475D6CA3B07A3B4C840C1529D8D5A9E11778092817338`.
-
-App changes comprise diagnostics implementation/lifecycle and deterministic
-test files, statistics consent/warning/status UI (`SharingSettings`, `MainActivity`),
-sender capture/session/recovery/queue hooks (`ProjectionCapture`, `SenderSession`,
-`StreamRecoverySender`, `MediaBudget`), receiver admission/queue/output hooks
-(`ReceiverServer`, `TrackWorker`, `AudioPlayer`), additive delegation negotiation
-(`DiagnosticDelegation`, `Request`, `ReceiverLink`, `SenderSession`), optional independent StrictJson
-depth/size tracking controls, and focused UI/recovery/blocked-output regressions.
-Related README/protocol docs and the existing Android workflow are updated;
-the workflow runs the Python collector suite. Its **31 tests passed**, including
-delegated HELLO scope selection, strict request/response validation and paired
-loopback collection. The collector guide documents sender-only activation and
-the different session selection needed for delegated versus standalone access.
-
-Remaining device acceptance: sender-delegated activation without projector settings,
-same-session freeze/grace/new-owner revocation; local consent/LAN
-permission loss, UI recreation and background sender lifetime; actual Wi-Fi
-endpoint reachability/discovery; paired live audio-failure reproduction and controlled
-metadata inspection; disabled/enabled CPU, memory, audio timing and frame/recovery
-overhead on a real sender/projector pair. No physical root-cause or nonperturbing
-performance conclusion is established by loopback success.
+The historical v1 validation and two-listener collection workflow are retired.
+Current tests and collection instructions use the v2 single-sender contract above.
+Loopback tests do not establish device overhead or display timing.
+</details>

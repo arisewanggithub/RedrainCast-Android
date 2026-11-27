@@ -14,6 +14,56 @@ import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
 
 class DiagnosticAdmissionTest {
+    @Test fun productionReceiverDoesNotAdvertiseOrNegotiateLegacyDiagnostics() {
+        org.mockito.Mockito.mockStatic(android.util.Log::class.java).use {
+            ReceiverServer("Receiver", org.mockito.Mockito.mock(android.view.Surface::class.java),
+                { _, _ -> }, { _, _ -> }, {}, port = 0).use { server ->
+                server.start()
+                assertFalse(JSONObject(String(server.advertisement())).has("diagnostic"))
+                connect(server).use { peer ->
+                    assertFalse(hello(peer).json().has("diagnostics"))
+                }
+            }
+        }
+    }
+
+    @Test fun armedOfferAdvertisesCapabilitiesWithoutCapturingBeforeAdmission() {
+        val recorder = dev.redrain.cast.diagnostics.DiagnosticRecorder()
+        ReceiverServer.forProtocolTests("Receiver", proxyRecorder = recorder).use { server ->
+            server.start()
+            connect(server).use { peer ->
+                val offer = JSONObject().put("session", "77").put("pairId", "pair")
+                    .put("armGeneration", "1").put("receiverFlags", JSONArray().put("session"))
+                    .put("durationMs", 1000).put("samplePeriodMs", 100)
+                send(peer, Type.HELLO, JSONObject().put("role", "sender").put("versions", JSONArray().put(3))
+                    .put("name", "Phone").put("diagProxy", JSONObject().put("version", 2).put("offer", offer)))
+                val response = read(peer)
+                assertEquals(Type.HELLO, response.type)
+                assertEquals(2, response.json().getJSONObject("diagProxy").getInt("version"))
+                assertEquals("idle", recorder.status().getString("state"))
+            }
+        }
+    }
+
+    @Test fun unsolicitedProxyRequestCannotAcquireReceiverOwnership() {
+        ReceiverServer.forProtocolTests("Receiver").use { server ->
+            server.start()
+            connect(server).use { peer ->
+                assertEquals(Type.HELLO, hello(peer, null).type)
+                send(peer, Type.SESSION_REQUEST, settings(null).put("diagProxy",
+                    JSONObject().put("version", 2).put("pairId", "pair").put("armGeneration", "1")), 77)
+                assertEquals(Type.REJECT, read(peer).type)
+            }
+            connect(server).use { peer ->
+                assertEquals(Type.HELLO, hello(peer, null).type)
+                send(peer, Type.SESSION_REQUEST, settings(null), 78)
+                assertEquals(Type.SESSION_ACCEPT, read(peer).type)
+                send(peer, Type.STOP, JSONObject().put("reason", "done"), 78)
+                assertEquals(Type.SESSION_END, read(peer).type)
+            }
+        }
+    }
+
     @Test(timeout = 15_000) fun ordinaryControlReadsDoNotCountDuplicateOperationsWithLiveRecorderOnOrOff() {
         val recorder = dev.redrain.cast.diagnostics.RemoteDiagnostics.recorder
         recorder.unrestricted()
@@ -260,13 +310,24 @@ class DiagnosticAdmissionTest {
         }
     }
 
-    @Test fun senderReceiverLinkRecognizesSupportAndLegacyAbsenceWithoutRequiringIt() {
+    @Test fun senderReceiverLinkDoesNotNegotiateLegacyReceiverEndpoint() {
         for (access in listOf<Access?>(null, Access())) {
             ReceiverServer.forProtocolTests("Receiver", diagnosticSessionAccess = access).use { server ->
                 server.start()
                 ReceiverLink(ReceiverTarget("127.0.0.1", server.listeningPort, "Receiver")).use { link ->
                     link.connect()
-                    assertEquals(access != null, link.delegatedDiagnostics)
+                    link.send(dev.screencopy.sender.Wire.control(dev.screencopy.sender.Wire.SESSION_REQUEST,
+                        77, settings(enabled = null)))
+                    val accepted = link.receive()
+                    assertEquals(dev.screencopy.sender.Wire.SESSION_ACCEPT, accepted.type)
+                    assertFalse(accepted.json().has("diagnostic"))
+                    if (access != null) {
+                        assertTrue(access.admitted.await(3, TimeUnit.SECONDS))
+                        assertEquals(listOf(77L to false), access.admissions)
+                    }
+                    link.send(dev.screencopy.sender.Wire.control(dev.screencopy.sender.Wire.STOP,
+                        77, JSONObject().put("reason", "done")))
+                    assertEquals(dev.screencopy.sender.Wire.SESSION_END, link.receive().type)
                 }
             }
         }

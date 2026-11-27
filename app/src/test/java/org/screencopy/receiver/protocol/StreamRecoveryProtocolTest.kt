@@ -34,25 +34,34 @@ class StreamRecoveryProtocolTest {
         for ((toc, duration) in listOf(0 to 10_000L, 8 to 20_000L, 16 to 40_000L, 24 to 60_000L,
             128 to 2_500L, 136 to 5_000L, 144 to 10_000L, 152 to 20_000L)) {
             assertEquals(1_000_000 + duration, opus.endPts(1_000_000, byteArrayOf(toc.toByte(), 1)))
+            assertEquals(duration, opus.diagnosticDurationUs(byteArrayOf(toc.toByte(), 1)))
         }
         assertEquals(1_120_000, opus.endPts(1_000_000, byteArrayOf(27, 2, 1, 1)))
+        assertEquals(120_000L, opus.diagnosticDurationUs(byteArrayOf(27, 2, 1, 1)))
         assertEquals(920_000, opus.windowStart(1_000_000))
         assertThrows(ProtocolException::class.java) { opus.endPts(0, byteArrayOf(27, 3)) }
         assertThrows(ProtocolException::class.java) { opus.endPts(0, byteArrayOf(3)) }
+        for (packet in listOf(byteArrayOf(27, 3), byteArrayOf(3), byteArrayOf(1, 1), byteArrayOf()))
+            assertNull(opus.diagnosticDurationUs(packet))
     }
 
     @Test fun pcmAndAacDurationAndOverflowAreValidated() {
         val pcm = AudioPacketTiming("raw")
         assertEquals(1_020_000, pcm.endPts(1_000_000, ByteArray(3840)))
+        assertEquals(20_000L, pcm.diagnosticDurationUs(ByteArray(3840)))
         assertEquals(1_000_000, pcm.windowStart(1_000_000))
         assertThrows(ProtocolException::class.java) { pcm.endPts(0, ByteArray(3)) }
         assertThrows(ProtocolException::class.java) { pcm.endPts(Long.MAX_VALUE, ByteArray(4)) }
         assertThrows(ProtocolException::class.java) { pcm.endPts(0, ByteArray(48000)) }
+        assertEquals(250_000L, pcm.diagnosticDurationUs(ByteArray(48000)))
+        assertNull(pcm.diagnosticDurationUs(ByteArray(3)))
+        assertNull(pcm.diagnosticDurationUs(byteArrayOf()))
         for ((asc, frames) in listOf(byteArrayOf(0x11, 0x90.toByte()) to 1024,
             byteArrayOf(0x11, 0x94.toByte()) to 960)) {
             val timing = AudioPacketTiming.fromConfig(JSONObject().put("codec", "aac").put("sampleRate", 48000)
                 .put("channels", 2).put("csd", org.json.JSONArray().put(java.util.Base64.getEncoder().encodeToString(asc))))
             assertEquals(1_000_000 + frames * 1_000_000L / 48000, timing.endPts(1_000_000, byteArrayOf(1)))
+            assertEquals(frames * 1_000_000L / 48000, timing.diagnosticDurationUs(byteArrayOf(1)))
             assertEquals((frames * 1_000_000L + 47999) / 48000, timing.prerollUs)
         }
     }

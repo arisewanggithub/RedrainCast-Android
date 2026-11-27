@@ -20,7 +20,9 @@ internal class DiagnosticListener(
     private val collectorClosed: () -> Unit = {},
     private val accessAllowed: () -> Boolean = { true },
     private val accessRevoked: () -> Unit = {},
-    private val discoveryPort: Int? = null
+    private val discoveryPort: Int? = null,
+    armRegistry: DiagnosticArmRegistry? = null,
+    private val protocolClock: () -> Long = System::nanoTime
 ) : AutoCloseable {
     constructor(context: Context, recorder: DiagnosticRecorder,
         identity: DiagnosticIdentity = DiagnosticIdentity.android(context), accessRevoked: () -> Unit) :
@@ -30,6 +32,8 @@ internal class DiagnosticListener(
     private val closed = AtomicBoolean()
     private val pending = AtomicInteger()
     private val connected = AtomicBoolean()
+    private val registry = armRegistry ?: if (recorder === RemoteDiagnostics.recorder) DiagnosticAccess.arms
+        else DiagnosticArmRegistry(recorder)
     private class Peer(val transport: Socket) { val reason = AtomicReference<String?>(null) }
     private val sockets = ConcurrentHashMap<Socket, Peer>()
     private val workers = Executors.newFixedThreadPool(3)
@@ -42,7 +46,7 @@ internal class DiagnosticListener(
         get() {
             val port = listener.localPort
             return if (port in 1..65535 && !closed.get() && !listener.isClosed && listener.isBound && allowed())
-                org.screencopy.receiver.protocol.DiagnosticDiscovery(port) else null
+                org.screencopy.receiver.protocol.DiagnosticDiscovery(port, 2) else null
         }
     fun discoveryFor(address: InetAddress) = if (address == identity.address) discovery else null
     val collectorConnected: Boolean get() = connected.get()
@@ -64,7 +68,10 @@ internal class DiagnosticListener(
             }
             timer.scheduleWithFixedDelay({
                 if (!closed.get()) {
-                    if (allowed()) recorder.tick() else accessRevoked()
+                    if (allowed()) {
+                        recorder.tick()
+                        registry.tick()
+                    } else accessRevoked()
                 }
             }, 100, 100, TimeUnit.MILLISECONDS)
             Thread(::accept, "remote-diagnostics-accept").apply { isDaemon = true; start() }
@@ -102,13 +109,14 @@ internal class DiagnosticListener(
             }
         }
     }
-    private fun deadline(socket: Socket, ms: Long, reason: String? = null): ScheduledFuture<*> {
-        val capture = recorder.captureIdentity
+    private fun deadline(socket: Socket, ms: Long, reason: String? = null,
+                         protocol: DiagnosticProtocol? = null): ScheduledFuture<*> {
+        val ownership = protocol?.ownership()
         return timer.schedule({
             val peer = sockets[socket]
             if (reason != null) peer?.reason?.compareAndSet(null, reason)
             try { peer?.transport?.close() } catch (_: java.io.IOException) {}
-            if (reason != null && !closed.get()) recorder.disconnectCapture(capture, reason)
+            if (reason != null && !closed.get()) protocol?.disconnected(ownership, reason)
         }, ms, TimeUnit.MILLISECONDS)
     }
 
@@ -116,48 +124,47 @@ internal class DiagnosticListener(
         var acquired = false
         var pendingReleased = false
         var watchdog: ScheduledFuture<*>? = null
+        var protocol: DiagnosticProtocol? = null
         try {
             socket.soTimeout = 5000
             socket.sendBufferSize = 16384
             watchdog = deadline(socket, 5000)
-            val protocol = DiagnosticProtocol(recorder, acquire = {
+            val current = DiagnosticProtocol(recorder, clock = protocolClock, acquire = {
                 val accepted = !closed.get() && allowed() && connected.compareAndSet(false, true)
                 if (accepted) acquired = true
                 accepted
-            }, connections = {
-                org.json.JSONObject().put("version", 1).put("self",
-                    discoveryFor(socket.localAddress)?.json()?.put("host", socket.localAddress.hostAddress)
-                        ?: org.json.JSONObject.NULL)
-                    .put("receiver", DiagnosticAccess.connections.snapshot())
-            })
+            }, registry = registry).also { protocol = it }
             while (!closed.get()) {
                 val bytes = DiagnosticProtocol.readLine(socket.inputStream) ?: break
                 if (!allowed()) { accessRevoked(); break }
-                val response = try { protocol.handle(bytes) } catch (e: IllegalArgumentException) {
+                val response = try { current.handle(bytes) } catch (e: IllegalArgumentException) {
+                    break
+                } catch (_: DiagnosticDeliveryExhausted) {
                     break
                 }
-                if (protocol.ready && !pendingReleased) {
+                if (current.ready && !pendingReleased) {
                     watchdog.cancel(false)
                     pending.decrementAndGet(); pendingReleased = true
                     socket.soTimeout = 0
                 }
-                val writeDeadline = deadline(socket, 2000, if (acquired) "slow_client" else null)
+                val writeDeadline = deadline(socket, 2000, if (acquired) "slow_client" else null, current)
                 try {
                     socket.outputStream.write((response.toString() + "\n").toByteArray(Charsets.UTF_8))
                     socket.outputStream.flush()
                 } finally { writeDeadline.cancel(false) }
-                if (protocol.closing) break
+                if (current.closing) break
             }
         } catch (_: java.io.IOException) {
             // A peer disconnect is expected and cannot affect casting.
         } catch (e: Exception) {
             if (!closed.get()) android.util.Log.e("RemoteDiagnostics", "Diagnostic listener failure", e)
-            if (acquired && !closed.get()) recorder.disconnect("internal_error")
+            if (acquired && !closed.get()) protocol?.disconnected(protocol?.ownership(), "internal_error")
         } finally {
             watchdog?.cancel(false)
             if (!pendingReleased) pending.decrementAndGet()
             if (acquired) {
-                if (!closed.get()) recorder.disconnect(sockets[socket]?.reason?.get() ?: "client_disconnected")
+                if (!closed.get()) protocol?.disconnected(protocol?.ownership(),
+                    sockets[socket]?.reason?.get() ?: "client_disconnected")
                 connected.set(false)
                 collectorClosed()
             }
@@ -168,7 +175,7 @@ internal class DiagnosticListener(
 
     fun revokeNetwork() {
         if (!closed.compareAndSet(false, true)) return
-        recorder.revoke()
+        registry.revoke()
         endpointResponder?.close()
         try { listener.close() } catch (_: java.io.IOException) {}
         sockets.values.forEach { try { it.transport.close() } catch (_: java.io.IOException) {} }
@@ -183,35 +190,14 @@ internal class DiagnosticListener(
 
 /** Consent is process-only and independent of Activity/overlay lifetime. */
 object DiagnosticAccess {
-    val connections = DiagnosticConnections()
+    internal val arms = DiagnosticArmRegistry(RemoteDiagnostics.recorder)
     private val worker = Executors.newSingleThreadExecutor()
-    @Volatile private var delegated: DelegatedDiagnostics? = null
-    @Volatile var receiverStatus = "Not requested"
-        private set
-    @Volatile var receiverSession: Long? = null
-        private set
-    fun receiverSession(session: Long?) { receiverSession = session }
-    fun receiverStatus(state: String) { receiverStatus = state }
+    internal fun dispatch(action: () -> Unit) { worker.execute(action) }
     private val disableObservers = java.util.concurrent.CopyOnWriteArrayList<() -> Unit>()
     fun onDisabled(generation: Long, observer: () -> Unit): AutoCloseable {
         disableObservers.add(observer)
         if (!enabled || generation != epoch) observer()
         return AutoCloseable { disableObservers.remove(observer) }
-    }
-    @Synchronized fun sessionAccess(context: Context): org.screencopy.receiver.protocol.DiagnosticSessionAccess {
-        delegated?.let { return it }
-        val application = context.applicationContext
-        return DelegatedDiagnostics(RemoteDiagnostics.recorder, worker,
-            { LocalNetworkPermission.granted(application) }, { enabled },
-            { allowed, maintenance ->
-                DiagnosticListener(RemoteDiagnostics.recorder, DiagnosticIdentity.android(application),
-                    accessAllowed = allowed, accessRevoked = maintenance,
-                    discoveryPort = DiagnosticEndpointResponder.PORT).also {
-                    android.util.Log.i("RemoteDiagnostics",
-                        "event=DIAGNOSTIC_LISTENER_STARTED endpoint=${it.endpoint} version=1 access=lan role=receiver")
-                }
-            }, localReady = { listener?.discovery != null },
-            localGeneration = { epoch }).also { delegated = it }
     }
     @Volatile private var listener: DiagnosticListener? = null
     @Volatile var enabled = false
@@ -219,17 +205,13 @@ object DiagnosticAccess {
     @Volatile var state = "Disabled"
         private set
     val discovery: org.screencopy.receiver.protocol.DiagnosticDiscovery?
-        get() = if (enabled) listener?.discovery else delegated?.discovery
-    fun discoveryFor(address: InetAddress): org.screencopy.receiver.protocol.DiagnosticDiscovery? =
-        if (enabled) listener?.discoveryFor(address) else delegated?.discoveryFor(address)
-    const val warning = "Enabling diagnostics also opens session-scoped LAN diagnostics on a compatible receiver when this device sends a cast, without a receiver settings change. Anyone on this LAN can read bounded diagnostic metadata and start, end or clear diagnostic captures while enabled (or frozen for up to 120 seconds after that cast ends). Traffic is unencrypted and unauthenticated. No media contents or casting controls are exposed. Enable only on a trusted LAN; disable after use."
-    val status: String get() = if (!enabled) delegated?.status ?: (state +
-        receiverSession?.let { "\nReceiver session: $it\nReceiver diagnostics: $receiverStatus" }.orEmpty()) else listener?.let {
+        get() = if (enabled) listener?.discovery else null
+    const val warning = "Anyone on this LAN can read bounded diagnostic metadata and start, end or clear diagnostic captures while enabled (or frozen for up to 120 seconds after a capture ends). An explicitly armed cast collects receiver evidence through the sender without a receiver settings change. Traffic is unencrypted and unauthenticated. No media contents or casting controls are exposed. Enable only on a trusted LAN; disable after use."
+    val status: String get() = if (!enabled) state else listener?.let {
         "LAN TCP endpoint: ${it.endpoint}\nAccess: no pairing or authentication\n" +
             "Unicast discovery: ${if (it.endpointDiscoveryPort != null) "available (UDP 27184)" else "unavailable"}\n" +
             "Collector: ${if (it.collectorConnected) "connected" else "not connected"}\n" +
-            "Capture: ${if (RemoteDiagnostics.recorder.collecting) "collecting" else "inactive/frozen"}\n" +
-            "Receiver diagnostics: $receiverStatus\nReceiver session: ${receiverSession ?: "none"}"
+            "Capture: ${if (RemoteDiagnostics.recorder.collecting) "collecting" else "inactive/frozen"}"
     } ?: state
     @Volatile private var epoch = 0L
     val consentGeneration: Long get() = epoch
@@ -250,19 +232,16 @@ object DiagnosticAccess {
                 return
             }
             ++epoch
-            if (next) delegated?.reset()
             enabled = next
             if (!next) {
-                connections.revoke()
                 // Gates close synchronously. Socket/key cleanup is independent of the UI/media lanes.
-                RemoteDiagnostics.recorder.revoke()
+                arms.revoke()
                 listener?.revokeNetwork()
                 state = "Disabled"
             } else state = "Starting LAN listener…"
             epoch
         }
         if (!next) disableObservers.forEach { it() }
-        delegated?.localListenerChanged()
         val application = context.applicationContext
         worker.execute {
             listener?.close(); listener = null
@@ -271,16 +250,14 @@ object DiagnosticAccess {
                     val created = DiagnosticListener(application, RemoteDiagnostics.recorder, identity(), accessRevoked = {
                         setEnabled(application, false, generation) { DiagnosticIdentity.android(application) }
                     })
-                    val published = synchronized(this) {
+                    synchronized(this) {
                         if (enabled && generation == epoch) {
                             RemoteDiagnostics.recorder.grantConsent()
                             listener = created; state = "Enabled"
                             android.util.Log.i("RemoteDiagnostics",
-                                "event=DIAGNOSTIC_LISTENER_STARTED endpoint=${created.endpoint} version=1 access=lan role=local")
-                            true
-                        } else { created.close(); false }
+                                "event=DIAGNOSTIC_LISTENER_STARTED endpoint=${created.endpoint} version=2 access=lan role=local")
+                        } else created.close()
                     }
-                    if (published) delegated?.localListenerChanged()
                 } catch (e: Exception) {
                     android.util.Log.e("RemoteDiagnostics", "Could not enable diagnostic listener", e)
                     val failed = synchronized(this) {
@@ -290,7 +267,6 @@ object DiagnosticAccess {
                         } else false
                     }
                     if (failed) disableObservers.forEach { it() }
-                    delegated?.localListenerChanged()
                 }
             }
         }

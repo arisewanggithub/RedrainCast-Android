@@ -75,6 +75,7 @@ class ControlWriterEvidenceTest {
     @Test fun fatalFinalWriteTimeoutFailsClosedWithoutAppendingErrorToPartialFrame() {
         val closed = CountDownLatch(1)
         val failed = CountDownLatch(1)
+        val closeCallback = CountDownLatch(1)
         val results = CopyOnWriteArrayList<Boolean>()
         val writes = CopyOnWriteArrayList<Type>()
         val socket = object : Socket() {
@@ -86,6 +87,9 @@ class ControlWriterEvidenceTest {
                     check(closed.await(3, TimeUnit.SECONDS))
                     throw java.io.IOException("partial final write interrupted")
                 }
+            }, closeTransport = {
+                closeCallback.countDown()
+                socket.close()
             })
         try {
             assertTrue(writer.offerTerminalTransaction(Type.ERROR, Message(Type.STATUS, payload = byteArrayOf()),
@@ -93,6 +97,7 @@ class ControlWriterEvidenceTest {
                 { Message.json(Type.ERROR, JSONObject().put("code", "AUDIO_FAILED")
                     .put("message", "original failure").put("fatal", true), 7) }, results::add, bounded = true))
             assertTrue(failed.await(3, TimeUnit.SECONDS))
+            assertEquals(0L, closeCallback.count)
             assertEquals(listOf(false), results.toList())
             assertTrue(writes.isEmpty())
             assertTrue(socket.isClosed)

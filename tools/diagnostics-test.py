@@ -90,7 +90,7 @@ class SenderDiscoveryTests(unittest.TestCase):
 
     def response(self, **changes):
         value = dict(protocol=collector.ENDPOINT_QUERY_PROTOCOL, version=1, nonce=self.nonce,
-                     diagnostic=dict(version=1, port=41234, access="lan"))
+                     diagnostic=dict(version=2, port=41234, access="lan"))
         value.update(changes)
         return json.dumps(value).encode()
 
@@ -108,15 +108,15 @@ class SenderDiscoveryTests(unittest.TestCase):
         for port in (0, 65536, True, 1.5, "41234", None):
             with self.subTest(port=port), self.assertRaises(collector.DiagnosticError):
                 collector.sender_discovery_endpoint(self.response(diagnostic=dict(
-                    version=1, port=port, access="lan")), self.nonce, "192.168.1.135")
-        for changes in (dict(version=True), dict(version=2), dict(access="tls")):
-            hint = dict(version=1, port=41234, access="lan")
+                    version=2, port=port, access="lan")), self.nonce, "192.168.1.135")
+        for changes in (dict(version=True), dict(version=1), dict(access="tls")):
+            hint = dict(version=2, port=41234, access="lan")
             hint.update(changes)
             with self.assertRaises(collector.DiagnosticError):
                 collector.sender_discovery_endpoint(self.response(diagnostic=hint),
                                                    self.nonce, "192.168.1.135")
         self.assertEqual("192.168.1.135:41234", collector.sender_discovery_endpoint(
-            self.response(diagnostic=dict(version=1, port=41234, access="lan", host="evil")),
+            self.response(diagnostic=dict(version=2, port=41234, access="lan", host="evil")),
             self.nonce, "192.168.1.135"))
 
     def test_only_explicit_private_ipv4_hosts_can_be_queried(self):
@@ -148,7 +148,7 @@ class SenderDiscoveryIntegrationTests(unittest.IsolatedAsyncioTestCase):
                 query = json.loads(data)
                 response = dict(protocol=collector.ENDPOINT_QUERY_PROTOCOL, version=1,
                                 nonce="stale-process-response",
-                                diagnostic=dict(version=1, port=41234, access="lan"))
+                                diagnostic=dict(version=2, port=41234, access="lan"))
                 self.transport.sendto(json.dumps(response).encode(), peer)
                 response["nonce"] = query["nonce"]
                 self.transport.sendto(json.dumps(response).encode(), peer)
@@ -215,7 +215,7 @@ def stream(*messages):
 
 
 def reply(op="STATUS", result=None, **extra):
-    return dict(v=1, id="r1", op=op, ok=True,
+    return dict(v=2, id="r1", op=op, ok=True,
                 result={} if result is None else result, **extra)
 
 
@@ -236,6 +236,99 @@ def page(records=None, cursor="0", more=False, pending=0):
 
 def event(seq="1", capture="c1"):
     return dict(captureId=capture, seq=seq, monoNs="1000", kind="SAMPLE", data={})
+
+
+def sender_pair(source, capture="c1"):
+    source = dict(source)
+    records = source.pop("records")
+    return dict(pairId="pair", armGeneration="1", state="covered", session=None,
+                senderCaptureId=capture, senderClockId="clock", receiverCaptureId=None,
+                receiverClockId=None, senderFlags=["session"], receiverFlags=["session"],
+                sender=source, receiver=None,
+                records=[dict(role="sender", session=None, captureId=capture, clockId="clock", record=r)
+                         for r in records])
+
+
+def frozen_sender_pair(source):
+    value = sender_pair(source)
+    value["state"] = "frozen"
+    return value
+
+
+def receiver_pair(source, capture="c1", session=str(collector.MAX_INT64)):
+    source = dict(source)
+    records = source.pop("records")
+    loss = source.pop("lossWatermarks")
+    source.pop("droppedBeforeRetention")
+    source.pop("evictedAfterRetention")
+    sequence_loss = dict(count="0", firstSeq=None, lastSeq=None, exactRange=False)
+    source.update(sourceLoss=loss, intakeLoss=sequence_loss, forcedLoss=sequence_loss,
+                  retentionLoss=sequence_loss, endConfirmed=False)
+    sender = page()
+    sender.pop("records")
+    return dict(pairId="pair", armGeneration="1", state="covered", session=session,
+                senderCaptureId="sender", senderClockId="sender-clock",
+                receiverCaptureId=capture, receiverClockId="receiver-clock",
+                senderFlags=["session"], receiverFlags=["video.progress", "video.timing"],
+                sender=sender, receiver=source,
+                records=[dict(role="receiver", session=r.get("session"), captureId=capture,
+                              clockId="receiver-clock", record=r) for r in records])
+
+
+def completed_pair(source):
+    value = frozen_sender_pair(source)
+    receiver = receiver_pair(page())["receiver"]
+    receiver.update(endConfirmed=True, terminal={"reason": "receiver_retired_stop", "tailTruncated": False})
+    value.update(session="77", receiverCaptureId="receiver", receiverClockId="receiver-clock",
+                 receiver=receiver, bootstrap={"complete": True, "loss": False}, endReason="session_ended")
+    return value
+
+
+class FakePairClient:
+    def __init__(self, pages):
+        self.pages = iter(pages)
+        self.ops = []
+        self.closed = False
+        self.last_bytes = 0
+        self.last_page = None
+        self.setup_failure = None
+        self.receiver_outcome = None
+
+    async def request(self, op, args=None):
+        self.ops.append((op, args))
+        if op == "CLOCK":
+            now = str(collector.time.monotonic_ns())
+            return dict(clientSendNs=args["clientSendNs"], receiveNs=now, sendNs=now, clockId="clock")
+        if op == "START":
+            return dict(pairId="pair", armGeneration="1", state="armed", startedNs="100",
+                        expiresNs="200", senderCaptureId="c1", senderClockId="clock")
+        if op == "FETCH":
+            value = next(self.pages)
+            if isinstance(value, Exception):
+                raise value
+            self.last_bytes = len(json.dumps(value).encode()) + 256
+            self.last_page = value
+            return value
+        if op == "STATUS":
+            value = dict(self.last_page)
+            if self.setup_failure is not None:
+                value["setupFailure"] = self.setup_failure
+            if value.get("receiverCaptureId"):
+                stages = ("socket_accepted", "hello_received", "hello_validated", "hello_reply_queued",
+                          "request_received", "owner_admitted", "capture_started", "lane_admitted")
+                value["bootstrap"] = dict(session=value["session"], pairId=value["pairId"],
+                    captureId=value["receiverCaptureId"], clockId=value["receiverClockId"],
+                    complete=True, loss=False, stages=[dict(stage=s, monoNs=str(i)) for i, s in enumerate(stages)])
+                value["receiverRole"] = dict(state="finished", outcome=self.receiver_outcome or dict(
+                    confirmed=True, reason="receiver_retired_stop", endedNs="1", mediaRetirement="succeeded",
+                    ownershipCleanup="unknown", tailTruncated=False,
+                    captureEnd=dict(atNs="1", reason="receiver_retired_stop", complete=True, truncated=False)))
+            return value
+        raise AssertionError(op)
+
+    def close(self):
+        self.closed = True
+
 
 def timing_event(seq="1"):
     number = str(collector.MAX_INT64)
@@ -280,59 +373,43 @@ class ParsingTests(unittest.TestCase):
                 self.assertRaises(unittest.SkipTest):
             fixture_path("missing-fixture.json")
 
-    def test_sender_connections_validate_types_owner_state_and_exact_endpoint(self):
-        receiver = dict(available=True, host="192.0.2.10", port=34567, version=1,
-                        access="lan", session=str(2**63-1), state="enabled")
-        value = dict(version=1, receiver=receiver)
-        self.assertEqual((("192.0.2.10", 34567), str(2**63-1), "enabled"),
-                         collector.receiver_connection(value))
-        for field, invalid in (("port", True), ("port", 0), ("port", 65536),
-                               ("port", "34567"), ("version", True), ("version", 2),
-                               ("session", 123), ("host", "untrusted.example"), ("host", 123),
-                               ("state", "frozen"), ("access", "tls")):
-            with self.subTest(field=field, value=invalid), self.assertRaises(collector.DiagnosticError):
-                collector.receiver_connection(dict(value, receiver=dict(receiver, **{field: invalid})))
-        with self.assertRaises(collector.DiagnosticError):
-            collector.receiver_connection(value, "78")
-        for unavailable in ({}, {"version": 1}, {"version": True, "receiver": receiver},
-                            {"version": 1, "receiver": {"available": False, "reason": "grace_expired"}}):
-            with self.assertRaises(collector.DiagnosticError):
-                collector.receiver_connection(unavailable)
-    def test_delegated_target_binds_only_hello_scope(self):
-        scope = {"role": "receiver", "session": "797516823435589197", "active": True}
-        self.assertEqual({"role": "receiver", "session": scope["session"]},
-                         collector.capture_target("receiver", None, scope))
-        for role, session in (("sender", None), ("receiver", "78")):
-            with self.assertRaises(collector.DiagnosticError):
-                collector.capture_target(role, session, scope)
-        self.assertEqual({"role": "sender", "nextSession": True},
-                         collector.capture_target("sender", None, None))
+    def test_pair_identity_rejects_replaced_sender_or_generation(self):
+        value = sender_pair(page([event()], "1"))
+        for field in ("senderCaptureId", "senderClockId", "armGeneration"):
+            identity = {field: "different"}
+            with self.subTest(field=field), self.assertRaises(collector.DiagnosticError):
+                collector.validate_page(value, "pair", {"sender": 0, "receiver": 0}, identity)
 
-    def test_discovery_uses_udp_source_not_advertised_host(self):
-        value = dict(protocol="screencopy", version=3, name="Receiver", port=1234,
-                     state="busy", diagnostic={"version": 1, "port": 2345,
-                                               "host": "untrusted"})
-        self.assertEqual("192.0.2.1:2345", collector.discovery_endpoint(
-            json.dumps(value).encode(), "192.0.2.1"))
+    def test_direct_or_existing_session_capture_options_are_rejected(self):
+        for options in (["--receiver", "host:1234"], ["--follow-receiver"],
+                        ["--sender-session", "77"], ["--receiver-session", "77"]):
+            with patch("sys.stderr", new=io.StringIO()), self.assertRaises(SystemExit) as result:
+                collector.main(["--lan", "--sender", "host:1234", "--output", "unused"] + options)
+            self.assertEqual(2, result.exception.code)
+
+    def test_discovery_uses_queried_sender_not_advertised_host(self):
+        value = dict(protocol=collector.ENDPOINT_QUERY_PROTOCOL, version=1, nonce="nonce",
+                     diagnostic=dict(version=2, port=2345, access="lan", host="untrusted"))
+        self.assertEqual("192.168.1.1:2345", collector.sender_discovery_endpoint(
+            json.dumps(value).encode(), "nonce", "192.168.1.1"))
 
     def test_legacy_and_future_diagnostic_versions_are_not_endpoints(self):
-        base = dict(protocol="screencopy", version=3, name="Receiver", port=1234,
-                    state="available")
-        self.assertIsNone(collector.discovery_endpoint(json.dumps(base).encode(), "192.0.2.1"))
-        base["diagnostic"] = {"version": 2}
-        self.assertIsNone(collector.discovery_endpoint(json.dumps(base).encode(), "192.0.2.1"))
+        for version in (1, 3):
+            value = dict(protocol=collector.ENDPOINT_QUERY_PROTOCOL, version=1, nonce="n",
+                         diagnostic=dict(version=version, port=2345, access="lan"))
+            with self.subTest(version=version), self.assertRaises(collector.DiagnosticError):
+                collector.sender_discovery_endpoint(json.dumps(value).encode(), "n", "192.168.1.1")
 
     def test_invalid_diagnostic_advertisements_are_rejected(self):
-        base = dict(protocol="screencopy", version=3, name="Receiver", port=1234,
-                    state="available")
+        base = dict(protocol=collector.ENDPOINT_QUERY_PROTOCOL, version=1, nonce="n")
         for diagnostic in (None, {}, {"version": True, "port": 1234},
-                           {"version": 1, "port": True}, {"version": 1, "port": 0},
-                           {"version": 1, "port": 65536}, {"version": 1, "port": "1234"}):
+                           {"version": 2, "port": True}, {"version": 2, "port": 0},
+                           {"version": 2, "port": 65536}, {"version": 2, "port": "1234"}):
             with self.subTest(diagnostic=diagnostic), self.assertRaises(collector.DiagnosticError):
-                collector.discovery_endpoint(json.dumps(dict(base, diagnostic=diagnostic)).encode(),
-                                             "192.0.2.1")
+                collector.sender_discovery_endpoint(json.dumps(dict(base, diagnostic=diagnostic)).encode(),
+                                                    "n", "192.168.1.1")
         with self.assertRaises(collector.DiagnosticError):
-            collector.discovery_endpoint(b" " * 1025, "192.0.2.1")
+            collector.sender_discovery_endpoint(b" " * 257, "n", "192.168.1.1")
 
     def test_exact_int64_preserves_large_session(self):
         self.assertEqual(797516823435589197, collector.exact_long("797516823435589197"))
@@ -357,11 +434,11 @@ class ParsingTests(unittest.TestCase):
         with self.assertRaises(collector.DiagnosticError):
             collector.strict_json(json.dumps(value).encode())
 
-    def test_fingerprint_normalization(self):
-        self.assertEqual("ab" * 32, collector.fingerprint(":".join(["AB"] * 32)))
-        for value in ("", "ab" * 31, "gg" * 32, "ab" * 33):
-            with self.assertRaises(collector.DiagnosticError):
-                collector.fingerprint(value)
+    def test_tls_fingerprint_is_not_accepted_by_v2_lan_collector(self):
+        with patch("sys.stderr", new=io.StringIO()), self.assertRaises(SystemExit) as result:
+            collector.main(["--lan", "--sender", "host:1234", "--output", "unused",
+                            "--sender-fingerprint", "ab" * 32])
+        self.assertEqual(2, result.exception.code)
 
     def test_ipv4_hostname_and_bracketed_ipv6(self):
         self.assertEqual(("example.local", 1234), collector.endpoint("example.local:1234"))
@@ -378,9 +455,10 @@ class ParsingTests(unittest.TestCase):
 
     def test_fetch_retains_gaps_and_large_int64(self):
         sequence = "797516823435589197"
-        records, cursor = collector.validate_page(page([event(sequence)], sequence), "c1", 0)
-        self.assertEqual(int(sequence), cursor)
-        self.assertEqual(sequence, records[0]["seq"])
+        records, cursor = collector.validate_page(sender_pair(page([event(sequence)], sequence)), "pair",
+                                                   {"sender": 0, "receiver": 0})
+        self.assertEqual(int(sequence), cursor["sender"])
+        self.assertEqual(sequence, records[0]["record"]["seq"])
 
     def test_fetch_validates_exact_admission_and_retention_loss_ranges(self):
         value = page([event("3")], "3")
@@ -391,7 +469,7 @@ class ParsingTests(unittest.TestCase):
         loss["retention"]["routine"] = dict(
             count="2", firstSeq="1", lastSeq="4", exactRange=False)
         value["evictedAfterRetention"] = "2"
-        collector.validate_page(value, "c1", 0)
+        collector.validate_page(sender_pair(value), "pair", {"sender": 0, "receiver": 0})
         for mutate in (
                 lambda bad: bad["lossWatermarks"].update(publishedSeq="2"),
                 lambda bad: bad["lossWatermarks"]["admission"]["routine_capacity"].update(
@@ -405,7 +483,24 @@ class ParsingTests(unittest.TestCase):
             invalid = json.loads(json.dumps(value))
             mutate(invalid)
             with self.assertRaises(collector.DiagnosticError):
-                collector.validate_page(invalid, "c1", 0)
+                collector.validate_page(sender_pair(invalid), "pair", {"sender": 0, "receiver": 0})
+
+    def test_compact_source_loss_preserves_ranges_and_rejects_malformed_arrays(self):
+        source = page([event("3")], "3")
+        source["lossWatermarks"] = ["compact1", "3", "3", "3", "2",
+            [["2", "1000", "2000"]] + [["0", None, None] for _ in range(4)],
+            [["2", "1", "4", False]] + [["0", None, None, False] for _ in range(2)]]
+        source["droppedBeforeRetention"] = "2"
+        source["evictedAfterRetention"] = "2"
+        collector.validate_page(sender_pair(source), "pair", {"sender": 0, "receiver": 0})
+        for invalid in (
+                lambda bad: bad["lossWatermarks"][5].pop(),
+                lambda bad: bad["lossWatermarks"][6][0].__setitem__(3, True),
+                lambda bad: bad["lossWatermarks"].__setitem__(0, "unknown")):
+            value = json.loads(json.dumps(source))
+            invalid(value)
+            with self.assertRaises(collector.DiagnosticError):
+                collector.validate_page(sender_pair(value), "pair", {"sender": 0, "receiver": 0})
 
     def test_fetch_rejects_wrong_capture_rewind_and_false_progress(self):
         cases = [
@@ -422,13 +517,13 @@ class ParsingTests(unittest.TestCase):
         ]
         for value in cases:
             with self.subTest(value=value), self.assertRaises(collector.DiagnosticError):
-                collector.validate_page(value, "c1", 0)
+                collector.validate_page(sender_pair(value), "pair", {"sender": 0, "receiver": 0})
 
 
 class ProtocolTests(unittest.IsolatedAsyncioTestCase):
     async def test_fully_populated_timing_fetch_passes_client_and_page_validation(self):
         record = timing_event()
-        response = reply("FETCH", page([record], "1"))
+        response = reply("FETCH", receiver_pair(page([record], "1")))
         encoded = json.dumps(response).encode()
         self.assertLessEqual(len(encoded), collector.MAX_LINE)
         self.assertEqual(response, collector.strict_json(encoded))
@@ -437,11 +532,12 @@ class ProtocolTests(unittest.IsolatedAsyncioTestCase):
             with self.assertRaisesRegex(old.DiagnosticError, "nesting exceeds"):
                 old.strict_json(encoded)
         client = collector.Client(stream(response), Writer())
-        result = await client.request("FETCH", {"captureId": "c1", "afterSeq": "0", "limit": 32})
-        records, cursor = collector.validate_page(result, "c1", 0)
-        self.assertEqual([record], records)
-        self.assertEqual(1, cursor)
-        correction = result["records"][0]["data"]["metrics"]["minimumDeadlineCadenceExample"][
+        result = await client.request("FETCH", {"pairId": "pair", "afterSenderSeq": "0",
+                                                "afterReceiverSeq": "0", "limit": 32})
+        records, cursor = collector.validate_page(result, "pair", {"sender": 0, "receiver": 0})
+        self.assertEqual([record], [item["record"] for item in records])
+        self.assertEqual(1, cursor["receiver"])
+        correction = result["records"][0]["record"]["data"]["metrics"]["minimumDeadlineCadenceExample"][
             "previous"]["clock"]["lastPacketCorrection"]
         correction["sequence"] = {"tooDeep": "1"}
         response["result"] = result
@@ -453,117 +549,91 @@ class ProtocolTests(unittest.IsolatedAsyncioTestCase):
         response = collector.strict_json(fixture.read_bytes())
         response["id"] = "r1"
         client = collector.Client(stream(response), Writer())
-        capture_id = response["result"]["records"][0]["captureId"]
-        result = await client.request("FETCH", {"captureId": capture_id, "afterSeq": "0", "limit": 32})
-        records, _ = collector.validate_page(result, capture_id, 0)
-        metrics = next(record["data"]["metrics"] for record in records
-                       if record["data"].get("metrics", {}).get("schema") == "video_frame_timing")
+        pair_id = response["result"]["pairId"]
+        result = await client.request("FETCH", {"pairId": pair_id, "afterSenderSeq": str(collector.MAX_INT64),
+                                                "afterReceiverSeq": "0", "limit": 32})
+        cursors = {"sender": collector.MAX_INT64, "receiver": 0}
+        with self.assertRaisesRegex(collector.DiagnosticError, "Oversized source record"):
+            collector.validate_page(result, pair_id, cursors, flags={"sender": [], "receiver": []})
+        records, _ = collector.validate_page(result, pair_id, cursors,
+                                             flags={"sender": [], "receiver": ["video.timing"]})
+        metrics = next(item["record"]["data"]["metrics"] for item in records
+                       if item["record"]["data"].get("metrics", {}).get("schema") == "video_frame_timing")
         for pair in ("minimumDeadlineCadenceExample", "maximumDeadlineCadenceExample"):
             for side in ("previous", "current"):
                 self.assertEqual("2", metrics[pair][side]["clock"]["lastPacketCorrection"]["sequence"])
 
-    async def test_generated_legacy_receiver_capture_drains(self):
+    async def test_generated_legacy_receiver_capture_is_explicitly_rejected(self):
         fixture = json.loads(fixture_path("receiver-legacy-capture.json").read_bytes())
-        hello, start, end, fetch = (fixture[key] for key in ("hello", "start", "end", "fetch"))
-        for index, response in enumerate((hello, start, end, fetch), 1):
-            response["id"] = "r" + str(index)
-        capture_id = fetch["result"]["records"][0]["captureId"]
-        for implementation in filter(None, (collector, legacy_collector())):
-            with self.subTest(implementation=implementation.__name__):
-                for response in (hello, start, end, fetch):
-                    encoded = json.dumps(response, separators=(",", ":")).encode()
-                    self.assertLessEqual(len(encoded), implementation.MAX_LINE)
-                    implementation.strict_json(encoded)
-                    def depth(value):
-                        if isinstance(value, dict):
-                            return 1 + max((depth(v) for v in value.values()), default=-1)
-                        if isinstance(value, list):
-                            return 1 + max((depth(v) for v in value), default=-1)
-                        return 0
-                    self.assertLessEqual(depth(response), 8)
-                records = fetch["result"]["records"]
-                self.assertTrue(any(r["data"].get("metrics", {}).get("schema") == "video_progress"
-                                    for r in records))
-                self.assertTrue(all(len(json.dumps(r, separators=(",", ":")).encode()) <= 2048
-                                    for r in records))
-                self.assertFalse(any(r["data"].get("metrics", {}).get("schema") == "video_frame_timing"
-                                     for r in records))
-                client = implementation.Client(stream(hello, start, end, fetch), Writer())
-                capabilities = await client.request("HELLO")
-                flags = implementation.select_flags("receiver", None, capabilities["capabilities"]["receiver"])
-                if implementation is not collector:
-                    self.assertEqual(fixture["flags"], flags)
-                else:
-                    flags = fixture["flags"]
-                started = await client.request("START", {"target": {"role": "receiver", "session": "91"},
-                    "flags": flags, "durationMs": 1000, "samplePeriodMs": 100})
-                self.assertEqual(capture_id, started["captureId"])
-                await client.request("END", {"captureId": capture_id})
-                output = io.StringIO()
-                await implementation.drain_frozen(client, capture_id, 0, implementation.FetchBudget(),
-                    asyncio.get_running_loop().time() + 120, output)
-                self.assertEqual(len(records), sum('"type":"event"' in line
-                    for line in output.getvalue().splitlines()))
+        hello = fixture["hello"]
+        hello["id"] = "r1"
+        records = fixture["fetch"]["result"]["records"]
+        self.assertTrue(any(r["data"].get("metrics", {}).get("schema") == "video_progress" for r in records))
+        writer = Writer()
+        client = collector.Client(stream(hello), writer)
+        with self.assertRaises(collector.DiagnosticError):
+            await client.request("HELLO")
+        self.assertEqual(["HELLO"], [json.loads(data)["op"] for data in writer.data])
 
     async def test_legacy_sized_delayed_tail_stays_within_old_frozen_limit(self):
         pages = []
         total = 0
         retained = 2 * 1024 * 1024 // 2048
-        for start in range(0, retained + 1024, 32):
-            records = []
-            for index in range(start, start + 32):
-                record = event(str(index + 1))
-                record["data"]["padding"] = ""
-                size = len(json.dumps(record, separators=(",", ":")).encode())
-                record["data"]["padding"] = "x" * (2048 - size)
-                total += 2048
-                records.append(record)
-            pending = 1024 if start + 32 == retained else 0
-            pages.append(page(records, str(start + 32),
-                              start + 32 < retained or start + 32 < retained + 1024 and not pending,
-                              pending))
+        for begin, end in ((0, retained), (retained, retained + 1024)):
+            for start in range(begin, end, 6):
+                records = []
+                stop = min(start + 6, end)
+                for index in range(start, stop):
+                    record = event(str(index + 1))
+                    record["data"]["padding"] = ""
+                    size = len(json.dumps(record, separators=(",", ":")).encode())
+                    record["data"]["padding"] = "x" * (2048 - size)
+                    total += 2048
+                    records.append(record)
+                pending = 1024 if stop == retained else 0
+                pages.append(frozen_sender_pair(page(records, str(stop), stop < end, pending)))
         self.assertEqual(2 * 1024 * 1024 + 1024 * 2048, total)
-        for implementation in filter(None, (collector, legacy_collector())):
-            with self.subTest(implementation=implementation.__name__), \
-                    patch.object(implementation, "fetch_page", AsyncMock(side_effect=pages)), \
-                    patch.object(implementation.asyncio, "sleep", AsyncMock()):
-                output = io.StringIO()
-                await implementation.drain_frozen(None, "c1", 0, None,
-                    asyncio.get_running_loop().time() + 120, output)
-                self.assertEqual(retained + 1024, sum('"type":"event"' in line
-                    for line in output.getvalue().splitlines()))
+        with patch.object(collector, "fetch_page", AsyncMock(side_effect=pages)), \
+                patch.object(collector.asyncio, "sleep", AsyncMock()):
+            output = io.StringIO()
+            await collector.drain_frozen(None, "pair", {"sender": 0, "receiver": 0}, None,
+                asyncio.get_running_loop().time() + 120, output)
+            self.assertEqual(retained + 1024, sum('"type":"event"' in line
+                for line in output.getvalue().splitlines()))
 
     async def test_delayed_full_size_timing_staging_tail_respects_new_frozen_bound(self):
-        self.assertEqual(2 * 1024 * 1024 + 1024 * 12000, collector.MAX_FROZEN_BYTES)
         pages = []
         record_bytes = 0
         retained = (2 * 1024 * 1024) // 12000
-        for index in range(retained + 1024):
+        for index in range(retained + 64):
             record = timing_event(str(index + 1))
             record["data"]["padding"] = ""
             size = len(json.dumps(record, separators=(",", ":")).encode())
             record["data"]["padding"] = "x" * (12000 - size)
             self.assertEqual(12000, len(json.dumps(record, separators=(",", ":")).encode()))
             record_bytes += 12000
-            pages.append(page([record], str(index + 1), index + 1 < retained + 1024))
+            item = receiver_pair(page([record], str(index + 1), index + 1 < retained + 64))
+            item["state"] = "frozen"
+            pages.append(item)
             if index + 1 == retained:
-                pages[-1]["hasMore"] = False
-                pages[-1]["pendingRecords"] = 1024
-                pages.append(page(cursor=str(index + 1), pending=1024))
-        self.assertGreater(record_bytes, 2 * 1024 * 1024 + 1024 * 2048)
+                pages[-1]["receiver"]["hasMore"] = False
+                pages[-1]["receiver"]["pendingRecords"] = 64
+                empty = receiver_pair(page(cursor=str(index + 1), pending=64))
+                empty["state"] = "frozen"
+                pages.append(empty)
         self.assertLessEqual(record_bytes, collector.MAX_FROZEN_BYTES)
         output = io.StringIO()
         with patch.object(collector, "fetch_page", AsyncMock(side_effect=pages)), \
                 patch.object(collector.asyncio, "sleep", AsyncMock()) as sleeping:
-            await collector.drain_frozen(None, "c1", 0, None,
+            await collector.drain_frozen(None, "pair", {"sender": 0, "receiver": 0}, None,
                                          asyncio.get_running_loop().time() + 120, output)
         self.assertEqual(2, sleeping.await_count)
-        self.assertEqual(retained + 1024, sum('"type":"event"' in line for line in output.getvalue().splitlines()))
+        self.assertEqual(retained + 64, sum('"type":"event"' in line for line in output.getvalue().splitlines()))
         with patch.object(collector, "MAX_FROZEN_BYTES", record_bytes - 1), \
                 patch.object(collector, "fetch_page", AsyncMock(side_effect=pages)), \
                 patch.object(collector.asyncio, "sleep", AsyncMock()):
             with self.assertRaisesRegex(collector.DiagnosticError, "exceeds bounded retention"):
-                await collector.drain_frozen(None, "c1", 0, None,
+                await collector.drain_frozen(None, "pair", {"sender": 0, "receiver": 0}, None,
                                              asyncio.get_running_loop().time() + 120, io.StringIO())
 
     async def test_byte_limited_frozen_backlog_exceeds_old_page_bound(self):
@@ -593,56 +663,58 @@ class ProtocolTests(unittest.IsolatedAsyncioTestCase):
                 batch.append(record)
                 size += encoded_size
                 index += 1
-            pages.append(page(batch, batch[-1]["seq"], index < len(backlog)))
+            pages.append(frozen_sender_pair(page(batch, batch[-1]["seq"], index < len(backlog))))
         self.assertGreater(len(pages), 129)
         output = io.StringIO()
         fetching = AsyncMock(side_effect=pages)
         with patch.object(collector, "fetch_page", fetching):
-            await collector.drain_frozen(None, "c1", 0, None,
+            await collector.drain_frozen(None, "pair", {"sender": 0, "receiver": 0}, None,
                                          asyncio.get_running_loop().time() + 120, output)
-        events = [json.loads(line)["value"] for line in output.getvalue().splitlines()
+        events = [json.loads(line)["value"]["record"] for line in output.getvalue().splitlines()
                   if json.loads(line)["type"] == "event"]
         self.assertEqual(backlog, events)
         self.assertEqual(len(pages), fetching.await_count)
         self.assertEqual([str(sum(len(p["records"]) for p in pages[:index]))
                           for index in range(len(pages))],
-                         [call.args[1]["afterSeq"] for call in fetching.await_args_list])
+                         [call.args[1]["afterSenderSeq"] for call in fetching.await_args_list])
 
     async def test_pending_frozen_publication_waits_for_terminal_tail(self):
         tail = event("1")
         tail["kind"] = "CAPTURE_ENDED"
         output = io.StringIO()
         with patch.object(collector, "fetch_page", AsyncMock(side_effect=[
-                page(pending=1), page([tail], "1")])), \
+                frozen_sender_pair(page(pending=1)), frozen_sender_pair(page([tail], "1"))])), \
                 patch.object(collector.asyncio, "sleep", AsyncMock()) as sleeping:
-            await collector.drain_frozen(None, "c1", 0, None,
+            await collector.drain_frozen(None, "pair", {"sender": 0, "receiver": 0}, None,
                                          asyncio.get_running_loop().time() + 120, output)
         sleeping.assert_awaited_once()
         self.assertIn('"kind":"CAPTURE_ENDED"', output.getvalue())
 
     async def test_stalled_frozen_publication_fails_explicitly_at_deadline(self):
         with patch.object(collector, "fetch_page", AsyncMock(side_effect=[
-                page(pending=1), None])) as fetching, \
+                frozen_sender_pair(page(pending=1)), None])) as fetching, \
                 patch.object(collector.asyncio, "sleep", AsyncMock()) as sleeping:
             with self.assertRaisesRegex(collector.DiagnosticError, "exceeded its deadline"):
-                await collector.drain_frozen(None, "c1", 0, None,
+                await collector.drain_frozen(None, "pair", {"sender": 0, "receiver": 0}, None,
                                              asyncio.get_running_loop().time() + 120, io.StringIO())
         self.assertEqual(2, fetching.await_count)
         sleeping.assert_awaited_once()
 
     async def test_fetch_reservations_stay_within_rolling_record_and_byte_caps(self):
         budget = collector.FetchBudget()
+        loop = asyncio.get_running_loop()
         for _ in range(8):
-            self.assertIsNotNone(await budget.reserve())
+            self.assertTrue(await budget.reserve(loop.time() + 1))
+            budget.commit(32, 15360)
         self.assertEqual(256, sum(item[1] for item in budget.deliveries))
         self.assertEqual(122880, sum(item[2] for item in budget.deliveries))
-        loop = asyncio.get_running_loop()
-        self.assertIsNone(await budget.reserve(deadline=loop.time() + 0.01))
+        self.assertFalse(await budget.reserve(deadline=loop.time() + 0.01))
         self.assertEqual(8, len(budget.deliveries))
 
     async def test_lan_hello_requires_no_secret_or_tls(self):
         writer = Writer()
-        reader = stream(reply("HELLO", {"clockId": "c", "capabilities": {}}))
+        reader = stream(reply("HELLO", {"clockId": "c", "pairedNextCast": 1,
+                                        "senderFlags": ["session"], "receiverFlags": ["session"]}))
         with patch.object(collector.asyncio, "open_connection",
                           AsyncMock(return_value=(reader, writer))) as opening:
             client, result = await collector.Client.connect_lan(("host", 1234))
@@ -661,37 +733,38 @@ class ProtocolTests(unittest.IsolatedAsyncioTestCase):
                 await collector.Client.connect_lan(("host", 1234))
         self.assertTrue(writer.closed)
 
-    async def test_pinned_connection_authenticates_only_after_match(self):
+    async def test_legacy_version_response_is_rejected_without_auth(self):
         writer = Writer()
-        reader = stream(reply("AUTH"))
-        digest = hashlib.sha256(writer.certificate).hexdigest()
-        with patch.object(collector.asyncio, "open_connection", AsyncMock(return_value=(reader, writer))):
-            client, _ = await collector.Client.connect(("host", 1234), digest, "private-secret")
-        self.assertEqual("AUTH", json.loads(writer.data[0])["op"])
-        client.close()
+        reader = stream(dict(v=1, id="r1", op="HELLO", ok=True, result={}))
+        with patch.object(collector.asyncio, "open_connection", AsyncMock(return_value=(reader, writer))), \
+                self.assertRaises(collector.DiagnosticError):
+            await collector.Client.connect_lan(("host", 1234))
+        self.assertEqual(["HELLO"], [json.loads(data)["op"] for data in writer.data])
         self.assertTrue(writer.closed)
 
-    async def test_wrong_pin_sends_no_auth_or_other_bytes(self):
+    async def test_missing_paired_capability_fails_without_capture(self):
         writer = Writer()
         with patch.object(collector.asyncio, "open_connection",
-                          AsyncMock(return_value=(stream(), writer))):
-            with self.assertRaisesRegex(collector.DiagnosticError, "fingerprint mismatch"):
-                await collector.Client.connect(("host", 1234), "00" * 32, "private-secret")
-        self.assertEqual([], writer.data)
-        self.assertTrue(writer.closed)
-
-    async def test_missing_certificate_fails_closed(self):
-        writer = Writer(None)
-        with patch.object(collector.asyncio, "open_connection",
-                          AsyncMock(return_value=(stream(), writer))):
+                          AsyncMock(return_value=(stream(reply("HELLO", {"clockId": "c"})), writer))):
             with self.assertRaises(collector.DiagnosticError):
-                await collector.Client.connect(("host", 1234), "00" * 32, "secret")
-        self.assertEqual([], writer.data)
+                await collector.Client.connect_lan(("host", 1234))
+        self.assertEqual(["HELLO"], [json.loads(data)["op"] for data in writer.data])
+        self.assertTrue(writer.closed)
 
-    async def test_live_events_do_not_confuse_command_responses(self):
-        reader = stream({"v": 1, "event": event()}, reply(result={"state": "idle"}))
+    async def test_missing_clock_identity_fails_closed(self):
+        writer = Writer()
+        with patch.object(collector.asyncio, "open_connection",
+                          AsyncMock(return_value=(stream(reply("HELLO", {"pairedNextCast": 1})), writer))):
+            with self.assertRaises(collector.DiagnosticError):
+                await collector.Client.connect_lan(("host", 1234))
+        self.assertEqual(["HELLO"], [json.loads(data)["op"] for data in writer.data])
+        self.assertTrue(writer.closed)
+
+    async def test_unsolicited_events_are_rejected_in_fetch_only_protocol(self):
+        reader = stream({"v": 2, "event": event()}, reply(result={"state": "idle"}))
         client = collector.Client(reader, Writer())
-        self.assertEqual({"state": "idle"}, await client.request("STATUS"))
+        with self.assertRaises(collector.DiagnosticError):
+            await client.request("STATUS")
 
     async def test_mismatched_response_identity_fails(self):
         value = reply()
@@ -701,14 +774,14 @@ class ProtocolTests(unittest.IsolatedAsyncioTestCase):
             await client.request("STATUS")
 
     async def test_remote_errors_do_not_echo_arbitrary_text(self):
-        value = dict(v=1, id="r1", op="START", ok=False,
+        value = dict(v=2, id="r1", op="START", ok=False,
                      error={"code": "CAPTURE_ACTIVE", "message": "secret-sensitive-text"})
         client = collector.Client(stream(value), Writer())
         with self.assertRaisesRegex(collector.DiagnosticError, "^START rejected: CAPTURE_ACTIVE$"):
             await client.request("START")
 
     async def test_invalid_success_and_version_are_rejected(self):
-        for changes in ({"v": True}, {"v": 2}, {"ok": 1},
+        for changes in ({"v": True}, {"v": 1}, {"ok": 1},
                         {"result": []}, {"error": {}}):
             value = reply()
             value.update(changes)
@@ -732,252 +805,241 @@ class ProtocolTests(unittest.IsolatedAsyncioTestCase):
                 await collector.Client(reader, Writer()).request("STATUS")
 
     async def test_complete_capture_stops_and_drains_without_exporting_secret(self):
-        class Fake:
-            def __init__(self):
-                self.ops = []
-                self.closed = False
-
-            async def request(self, op, args=None):
-                self.ops.append(op)
-                if op == "CLOCK":
-                    now = str(collector.time.monotonic_ns())
-                    return dict(clientSendNs=args["clientSendNs"], receiveNs=now, sendNs=now)
-                if op == "START":
-                    return dict(captureId="c1", startedNs="100", expiresNs="200")
-                if op == "FETCH":
-                    return page()
-                if op == "STATUS":
-                    return {"state": "frozen", "connections": {"self": {"host": "private-host"}}}
-                if op == "END":
-                    return {"captureId": "c1"}
-                raise AssertionError(op)
-
-            def close(self):
-                self.closed = True
-
-        fake = Fake()
+        fake = FakePairClient([completed_pair(page())])
         with test_workspace("collect-complete") as directory:
             output = Path(directory) / "sender.jsonl"
-            with patch.object(collector.Client, "connect",
-                              AsyncMock(return_value=(fake, {
-                                  "clockId": "clock1", "capabilities": {"sender": ["recovery"]}}))):
-                await collector.collect("sender", ("host", 1234), "00" * 32,
-                                        "private-secret", ["recovery"], 1, None, output)
+            with patch.object(collector.Client, "connect_lan", AsyncMock(return_value=(fake, {
+                    "clockId": "clock", "senderFlags": ["session"], "receiverFlags": ["session"]}))):
+                await collector.collect_pair(("private-host", 1234), ["session"], ["session"], 1, output)
             text = output.read_text()
-            self.assertNotIn("private-secret", text)
-            self.assertNotIn("host", text)
-            self.assertNotIn("connections", text)
-            self.assertEqual(1, fake.ops.count("END"))
-            self.assertEqual(10, fake.ops.count("CLOCK"))
+            self.assertNotIn("private-host", text)
+            self.assertNotIn("token", text)
+            self.assertEqual(0, sum(op == "END" for op, _ in fake.ops))
+            self.assertEqual(1, sum(op == "CLOCK" for op, _ in fake.ops))
             self.assertTrue(fake.closed)
             self.assertIn('"type":"ended"', text)
+            self.assertIn('"stage":"socket_accepted"', text)
+            self.assertIn('"outcome":', text)
+
+    async def test_capture_uses_start_flags_for_timing_without_fetch_flags(self):
+        response = collector.strict_json(fixture_path("receiver-timing-fetch.json").read_bytes())
+        page = response["result"]
+        page.update(pairId="pair", state="frozen", senderCaptureId="c1", senderClockId="clock",
+                    endReason="session_ended")
+        page["sender"]["nextAfterSeq"] = "0"
+        page["receiver"].update(endConfirmed=True,
+                                terminal={"reason": "receiver_retired_stop", "tailTruncated": False})
+        page.pop("senderFlags", None)
+        page.pop("receiverFlags", None)
+        fake = FakePairClient([page])
+        with test_workspace("collect-timing-flags") as directory, \
+                patch.object(collector.Client, "connect_lan", AsyncMock(return_value=(fake, {
+                    "clockId": "clock", "senderFlags": ["session"],
+                    "receiverFlags": ["session", "video.progress", "video.timing"]}))):
+            output = Path(directory) / "pair.jsonl"
+            await collector.collect_pair(("host", 1234), ["session"],
+                                         ["session", "video.progress", "video.timing"], 1, output)
+            self.assertIn("video_frame_timing", output.read_text())
 
     async def test_backlogged_fetches_run_without_fixed_poll_sleep(self):
-        class Fake:
-            def __init__(self):
-                self.fetches = 0
-
-            async def request(self, op, args=None):
-                if op == "CLOCK":
-                    now = str(collector.time.monotonic_ns())
-                    return dict(clientSendNs=args["clientSendNs"], receiveNs=now, sendNs=now)
-                if op == "START":
-                    return dict(captureId="c1", startedNs="100", expiresNs="200")
-                if op == "FETCH":
-                    self.fetches += 1
-                    if args["afterSeq"] == "0":
-                        return page([event("1")], "1", True)
-                    if args["afterSeq"] == "1":
-                        return page([event("2")], "2")
-                if op == "STATUS":
-                    return {"state": "frozen"}
-                if op == "END":
-                    return {"captureId": "c1"}
-                raise AssertionError(op)
-
-            def close(self):
-                pass
-
-        fake = Fake()
+        fake = FakePairClient([completed_pair(page([event("1")], "1", True)),
+                               completed_pair(page([event("2")], "2"))])
         with test_workspace("collect-backlog") as directory, \
-                patch.object(collector.Client, "connect",
-                             AsyncMock(return_value=(fake, {
-                                 "clockId": "clock1", "capabilities": {"sender": ["recovery"]}}))), \
+                patch.object(collector.Client, "connect_lan",
+                             AsyncMock(return_value=(fake, {"clockId": "clock",
+                                 "senderFlags": ["session"], "receiverFlags": ["session"]}))), \
                 patch.object(collector.asyncio, "sleep", AsyncMock()) as sleeping:
-            await collector.collect("sender", ("host", 1234), "00" * 32, "unused",
-                                    ["recovery"], 1, None, Path(directory) / "sender.jsonl")
+            await collector.collect_pair(("host", 1234), ["session"], ["session"], 1,
+                                         Path(directory) / "pair.jsonl")
             sleeping.assert_not_awaited()
-            self.assertEqual(2, fake.fetches)
+            self.assertEqual(["0", "1"], [args["afterSenderSeq"] for op, args in fake.ops if op == "FETCH"])
 
     async def test_unsupported_requested_flags_never_start_capture(self):
         fake = AsyncMock()
         fake.close = lambda: None
         with test_workspace("collect-unsupported") as directory:
-            with patch.object(collector.Client, "connect", AsyncMock(return_value=(
-                    fake, {"clockId": "clock1", "capabilities": {"sender": ["session"]}}))):
+            with patch.object(collector.Client, "connect_lan", AsyncMock(return_value=(
+                    fake, {"clockId": "clock1", "senderFlags": ["session"], "receiverFlags": ["session"]}))):
                 with self.assertRaisesRegex(collector.DiagnosticError, "Unsupported requested flags"):
-                    await collector.collect("sender", ("host", 1), "00" * 32,
-                                            "secret", ["audio.capture"], 1, None,
-                                            Path(directory) / "sender.jsonl")
+                    await collector.collect_pair(("host", 1), ["audio.capture"], ["session"], 1,
+                                                 Path(directory) / "pair.jsonl")
         fake.request.assert_not_called()
 
-    async def test_paired_failure_cancels_other_collector(self):
-        cleaned = asyncio.Event()
-
-        async def fake_collect(**device):
-            if device["role"] == "receiver":
-                raise collector.DiagnosticError("receiver failed")
-            try:
-                await asyncio.Event().wait()
-            finally:
-                cleaned.set()
-
-        with patch.object(collector, "collect", fake_collect):
+    async def test_paired_failure_closes_single_connection_and_preserves_partial_output(self):
+        fake = FakePairClient([collector.DiagnosticError("receiver failed")])
+        with test_workspace("paired-failure") as directory, \
+                patch.object(collector.Client, "connect_lan", AsyncMock(return_value=(fake, {
+                    "clockId": "clock", "senderFlags": ["session"], "receiverFlags": ["session"]}))) as connect:
+            output = Path(directory) / "pair.jsonl"
             with self.assertRaises(collector.DiagnosticError):
-                await collector.run([{"role": "sender"}, {"role": "receiver"}])
-        self.assertTrue(cleaned.is_set())
+                await collector.collect_pair(("host", 1), ["session"], ["session"], 1, output)
+            self.assertTrue(fake.closed)
+            self.assertEqual(1, connect.await_count)
+            self.assertNotIn('"type":"ended"', output.read_text())
 
-    async def test_follow_receiver_rejects_unavailable_or_stale_scope_before_any_start(self):
-        sender = AsyncMock()
-        sender.close = lambda: None
-        receiver = AsyncMock()
-        receiver.close = lambda: None
-        sender.request.return_value = {"version": 1, "receiver": dict(
-            available=True, host="192.0.2.10", port=34567, version=1,
-            access="lan", session="77", state="enabled")}
-        with test_workspace("follow-scope") as directory:
-            device = dict(role="sender", address=("192.0.2.1", 1234), session=None,
-                          duration=1, output_path=Path(directory) / "sender.jsonl")
-            for scope in ({"role": "receiver", "session": "78", "active": True},
-                          {"role": "receiver", "session": "77", "active": False}, None):
-                with patch.object(collector.Client, "connect_lan", AsyncMock(side_effect=[
-                        (sender, {}), (receiver, {"scope": scope})])), \
-                        patch.object(collector, "collect", AsyncMock()) as capture:
-                    with self.assertRaises(collector.DiagnosticError):
-                        await collector.run([dict(device)], follow_receiver=True)
-                    capture.assert_not_called()
-            for reason in ("unsupported", "endpoint_unavailable"):
-                sender.request.return_value = {"version": 1, "receiver": {
-                    "available": False, "reason": reason}}
-                with patch.object(collector.Client, "connect_lan",
-                                  AsyncMock(return_value=(sender, {}))) as connect, \
-                        patch.object(collector, "collect", AsyncMock()) as capture:
-                    with self.assertRaisesRegex(collector.DiagnosticError, reason):
-                        await collector.run([dict(device)], follow_receiver=True)
-                    self.assertEqual(1, connect.await_count)
-                    capture.assert_not_called()
+    async def test_missing_receiver_coverage_is_not_reported_as_success(self):
+        incomplete = frozen_sender_pair(page())
+        incomplete.update(endReason="setup_failed")
+        fake = FakePairClient([incomplete])
+        with test_workspace("missing-receiver") as directory, \
+                patch.object(collector.Client, "connect_lan", AsyncMock(return_value=(fake, {
+                    "clockId": "clock", "senderFlags": ["session"], "receiverFlags": ["session"]}))) as connect:
+            with self.assertRaisesRegex(collector.DiagnosticError, "without confirmed receiver coverage"):
+                await collector.collect_pair(("host", 1), ["session"], ["session"], 1,
+                                             Path(directory) / "pair.jsonl")
+            self.assertEqual(1, connect.await_count)
+            self.assertTrue(fake.closed)
+
+    async def test_unconfirmed_receiver_status_is_saved_but_never_complete(self):
+        incomplete = completed_pair(page())
+        incomplete["receiver"].update(endConfirmed=False, terminal=None)
+        fake = FakePairClient([incomplete])
+        fake.receiver_outcome = dict(confirmed=False, reason=None, endedNs=None, mediaRetirement="unknown",
+            ownershipCleanup="unknown", tailTruncated=True,
+            captureEnd=dict(atNs=None, reason=None, complete=False, truncated=True))
+        with test_workspace("unconfirmed-receiver") as directory, \
+                patch.object(collector.Client, "connect_lan", AsyncMock(return_value=(fake, {
+                    "clockId": "clock", "senderFlags": ["session"], "receiverFlags": ["session"]}))):
+            output = Path(directory) / "pair.jsonl"
+            with self.assertRaisesRegex(collector.DiagnosticError, "without confirmed receiver coverage"):
+                await collector.collect_pair(("host", 1), ["session"], ["session"], 1, output)
+            lines = [json.loads(line) for line in output.read_text().splitlines()]
+            statuses = [line["value"] for line in lines if line["type"] == "status"]
+            self.assertEqual(fake.receiver_outcome, statuses[-1]["receiverRole"]["outcome"])
+            self.assertTrue(fake.closed)
+
+    async def test_confirmed_receiver_status_is_saved(self):
+        fake = FakePairClient([])
+        fake.last_page = completed_pair(page())
+        fake.receiver_outcome = dict(confirmed=True, reason="receiver_retired_fatal", endedNs="2",
+            mediaRetirement="failed", ownershipCleanup="unknown", tailTruncated=True,
+            captureEnd=dict(atNs="3", reason="receiver_retired_fatal", complete=False, truncated=True))
+        for outcome in (fake.receiver_outcome,
+                        {key: value for key, value in fake.receiver_outcome.items() if key != "confirmed"}):
+            with self.subTest(outcome=outcome):
+                fake.receiver_outcome = outcome
+                output = io.StringIO()
+                await collector.record_status(fake, output, "pair", {},
+                    asyncio.get_running_loop().time() + 2, collector.FetchBudget())
+                self.assertEqual(outcome, json.loads(output.getvalue())["value"]["receiverRole"]["outcome"])
+
+    async def test_confirmed_receiver_status_rejects_malformed_outcomes(self):
+        base = dict(confirmed=True, reason="receiver_retired_stop", endedNs="1",
+                    mediaRetirement="succeeded", ownershipCleanup="unknown", tailTruncated=False,
+                    captureEnd=dict(atNs="1", reason="receiver_retired_stop", complete=True, truncated=False))
+        variants = [
+            dict(base, confirmed=False), dict(base, confirmed=1), dict(base, confirmed="true"),
+            dict(base, confirmed=None),
+            dict(base, extra=True), {key: value for key, value in base.items() if key != "endedNs"},
+            dict(base, reason="other"), dict(base, endedNs=1), dict(base, endedNs="-1"),
+            dict(base, mediaRetirement="unknown"), dict(base, ownershipCleanup="succeeded"),
+            dict(base, tailTruncated=0),
+            dict(base, captureEnd=dict(base["captureEnd"], atNs=1)),
+            dict(base, captureEnd=dict(base["captureEnd"], reason="receiver_retired_fatal")),
+            dict(base, captureEnd=dict(base["captureEnd"], complete=1)),
+            dict(base, captureEnd=dict(base["captureEnd"], truncated=0)),
+            dict(base, captureEnd=dict(base["captureEnd"], truncated=True)),
+            dict(base, captureEnd=dict(base["captureEnd"], complete=False)),
+            dict(base, captureEnd=dict(base["captureEnd"], extra=True)),
+            dict(base, captureEnd={key: value for key, value in base["captureEnd"].items() if key != "atNs"}),
+        ]
+        for outcome in variants:
+            fake = FakePairClient([])
+            fake.last_page = completed_pair(page())
+            fake.receiver_outcome = outcome
+            with self.subTest(outcome=outcome), self.assertRaises(collector.DiagnosticError):
+                await collector.record_status(fake, io.StringIO(), "pair", {},
+                    asyncio.get_running_loop().time() + 2, collector.FetchBudget())
+
+    async def test_unconfirmed_receiver_status_rejects_fabricated_or_untyped_fields(self):
+        import io
+        base = dict(confirmed=False, reason=None, endedNs=None, mediaRetirement="unknown",
+                    ownershipCleanup="unknown", tailTruncated=True,
+                    captureEnd=dict(atNs=None, reason=None, complete=False, truncated=True))
+        for update in (dict(confirmed=0), dict(reason="receiver_retired_stop"), dict(endedNs="1"),
+                       dict(mediaRetirement="succeeded"), dict(ownershipCleanup="succeeded"),
+                       dict(tailTruncated=1), dict(tailTruncated=False), dict(extra=True),
+                       dict(captureEnd=dict(atNs=None, reason=None, complete=0, truncated=True)),
+                       dict(captureEnd=dict(atNs=None, reason=None, complete=False, truncated=1)),
+                       dict(captureEnd=dict(atNs=None, reason=None, complete=False, truncated=True, extra=True))):
+            fake = FakePairClient([])
+            fake.last_page = completed_pair(page())
+            fake.receiver_outcome = dict(base, **update)
+            with self.subTest(update=update), self.assertRaises(collector.DiagnosticError):
+                await collector.record_status(fake, io.StringIO(), "pair", {},
+                    asyncio.get_running_loop().time() + 2, collector.FetchBudget())
+
+    async def test_setup_failure_is_saved_from_status_without_inventing_coverage(self):
+        incomplete = frozen_sender_pair(page())
+        incomplete.update(endReason="setup_failed", setupFailureAvailable=True)
+        fake = FakePairClient([incomplete])
+        fake.setup_failure = dict(code="PROTOCOL", provenance="receiver_control", reason="receiver_reported")
+        with test_workspace("setup-failure") as directory, \
+                patch.object(collector.Client, "connect_lan", AsyncMock(return_value=(fake, {
+                    "clockId": "clock", "senderFlags": ["session"], "receiverFlags": ["session"]}))):
+            output = Path(directory) / "pair.jsonl"
+            with self.assertRaisesRegex(collector.DiagnosticError, "without confirmed receiver coverage"):
+                await collector.collect_pair(("host", 1), ["session"], ["session"], 1, output)
+            lines = [json.loads(line) for line in output.read_text().splitlines()]
+            statuses = [line["value"] for line in lines if line["type"] == "status"]
+            self.assertEqual(fake.setup_failure, statuses[-1]["setupFailure"])
+            self.assertNotIn("setupFailure", next(line["value"] for line in lines if line["type"] == "ended"))
+
+    async def test_setup_failure_status_rejects_unsanitized_or_inconsistent_fields(self):
+        import io
+        for failure in (dict(code="PROTOCOL", provenance="receiver_control", reason="receiver_reported",
+                             message="private"),
+                        dict(code="PROTOCOL", provenance="receiver_control", reason="timeout"),
+                        dict(code="private", provenance="sender_local", reason="setup")):
+            fake = FakePairClient([])
+            fake.last_page = dict(pairId="pair", state="frozen", endReason="setup_failed")
+            fake.setup_failure = failure
+            with self.subTest(failure=failure), self.assertRaises(collector.DiagnosticError):
+                await collector.record_status(fake, io.StringIO(), "pair", {},
+                    asyncio.get_running_loop().time() + 2, collector.FetchBudget())
 
 
-class TlsIntegrationTests(unittest.IsolatedAsyncioTestCase):
-    @classmethod
-    def setUpClass(cls):
-        executable = shutil.which("openssl")
-        git_openssl = Path(r"C:\Program Files\Git\usr\bin\openssl.exe")
-        if not executable and git_openssl.is_file():
-            executable = str(git_openssl)
-        if not executable:
-            raise unittest.SkipTest("TLS loopback tests require an existing OpenSSL executable")
-        directory = TEST_ROOT / "tls"
-        if directory.exists():
-            shutil.rmtree(directory)
-        directory.mkdir(parents=True)
-        cls.addClassCleanup(shutil.rmtree, directory, True)
-        cls.key = directory / "ephemeral-key.pem"
-        cls.cert = directory / "ephemeral-cert.pem"
-        subprocess.run(
-            [executable, "req", "-x509", "-newkey", "ec",
-             "-pkeyopt", "ec_paramgen_curve:prime256v1", "-nodes", "-days", "1",
-             "-subj", "/CN=diagnostic-test", "-keyout", str(cls.key),
-             "-out", str(cls.cert)], check=True, capture_output=True)
-        der = ssl.PEM_cert_to_DER_cert(cls.cert.read_text())
-        cls.pin = hashlib.sha256(der).hexdigest()
-
-    def tls_context(self):
-        context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-        context.minimum_version = ssl.TLSVersion.TLSv1_2
-        context.load_cert_chain(self.cert, self.key)
-        return context
-
-    async def test_real_tls_pair_collects_and_closes(self):
-        operations = []
-        failures = []
-
-        async def handler(reader, writer):
-            try:
-                while line := await reader.readline():
-                    request = collector.strict_json(line)
-                    op, args = request["op"], request["args"]
-                    operations.append(op)
-                    result = {}
-                    if op == "AUTH":
-                        self.assertEqual("ephemeral-pairing-secret", args["secret"])
-                        result = {"clockId": "test-process-clock",
-                                  "capabilities": {"sender": ["recovery"],
-                                                   "receiver": ["recovery"]}}
-                    elif op == "CLOCK":
-                        now = str(collector.time.monotonic_ns())
-                        result = {"clientSendNs": args["clientSendNs"],
-                                  "receiveNs": now, "sendNs": now}
-                    elif op == "START":
-                        result = {"captureId": "c1", "startedNs": "100", "expiresNs": "200"}
-                    elif op == "FETCH":
-                        result = page([event()], "1") if args["afterSeq"] == "0" else page(cursor="1")
-                    elif op == "STATUS":
-                        result = {"state": "frozen", "captureId": "c1"}
-                    elif op == "END":
-                        result = {"captureId": "c1"}
-                    else:
-                        self.fail("Unexpected operation " + op)
-                    writer.write(json.dumps(dict(v=1, id=request["id"], op=op,
-                                                 ok=True, result=result)).encode() + b"\n")
-                    await writer.drain()
-            except Exception as error:
-                failures.append(error)
-            finally:
-                writer.close()
-
-        server = await asyncio.start_server(handler, "127.0.0.1", 0, ssl=self.tls_context())
-        try:
-            address = ("127.0.0.1", server.sockets[0].getsockname()[1])
-            with test_workspace("tls-pair") as directory:
-                devices = [dict(role=role, address=address, pin=self.pin,
-                                secret="ephemeral-pairing-secret", selected_flags=["recovery"],
-                                duration=1, session=None,
-                                output_path=Path(directory) / (role + ".jsonl"))
-                           for role in ("sender", "receiver")]
-                await collector.run(devices)
-                for device in devices:
-                    records = [json.loads(line) for line in device["output_path"].read_text().splitlines()]
-                    self.assertEqual(1, sum(row["type"] == "event" for row in records))
-                    self.assertNotIn("ephemeral-pairing-secret", device["output_path"].read_text())
-            self.assertEqual([], failures)
-            self.assertEqual(2, operations.count("AUTH"))
-            self.assertEqual(2, operations.count("END"))
-        finally:
-            server.close()
-            await server.wait_closed()
-
-    async def test_real_tls_mismatch_discloses_no_auth(self):
+class LanIntegrationTests(unittest.IsolatedAsyncioTestCase):
+    async def exchange(self, version):
         observed = []
         finished = asyncio.Event()
 
         async def handler(reader, writer):
             try:
+                request = collector.strict_json(await reader.readline())
+                observed.append(request)
+                response = dict(v=version, id=request["id"], op="HELLO", ok=True,
+                                result=dict(pairedNextCast=1, clockId="clock"))
+                writer.write(json.dumps(response).encode() + b"\n")
+                await writer.drain()
                 observed.append(await reader.readline())
             finally:
                 writer.close()
                 finished.set()
 
-        server = await asyncio.start_server(handler, "127.0.0.1", 0, ssl=self.tls_context())
+        server = await asyncio.start_server(handler, "127.0.0.1", 0)
         try:
             address = ("127.0.0.1", server.sockets[0].getsockname()[1])
-            with self.assertRaisesRegex(collector.DiagnosticError, "fingerprint mismatch"):
-                await collector.Client.connect(address, "00" * 32, "must-never-send")
+            if version == 2:
+                client, hello = await collector.Client.connect_lan(address)
+                self.assertEqual("clock", hello["clockId"])
+                client.close()
+            else:
+                with self.assertRaises(collector.DiagnosticError):
+                    await collector.Client.connect_lan(address)
             await asyncio.wait_for(finished.wait(), 2)
-            self.assertEqual([b""], observed)
+            self.assertEqual("HELLO", observed[0]["op"])
+            self.assertEqual(2, observed[0]["v"])
+            self.assertEqual(b"", observed[1])
         finally:
             server.close()
             await server.wait_closed()
+
+    async def test_real_lan_v2_handshake_closes(self):
+        await self.exchange(2)
+
+    async def test_real_legacy_peer_is_rejected_without_capture(self):
+        await self.exchange(1)
 
 
 if __name__ == "__main__":

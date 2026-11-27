@@ -6,8 +6,82 @@ import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
+import dev.redrain.cast.diagnostics.*
 
 class PlaybackClockTest {
+    @Test fun automaticFinalPreservesPreRecoveryMappingAndFirstAndLatestRecoveryTransitions() {
+        val now = java.util.concurrent.atomic.AtomicLong(1_000_000_000)
+        val telemetry = ReceiverTelemetrySession({ true })
+        TelemetryRegistry.beginReceiver(9702, telemetry)
+        val transitions = ArrayList<LongArray>()
+        val clock = PlaybackClock(now::get) { now.addAndGet(it * 1_000_000) }
+        clock.diagnosticSession = 9702
+        clock.diagnosticGeneration = 1
+        clock.mappingObserved = { values, at, generation ->
+            assertFalse("Publishing cannot run under the clock monitor", Thread.holdsLock(clock))
+            transitions.add(values)
+            TelemetryRegistry.causal(9702, CausalEvidence.Stage.MAPPING, generation, *values, atNs = at)
+        }
+        try {
+            clock.audioExpected = true
+            clock.anchorVideo(1_000_000)
+            clock.prepareAudio(TrimmedAudio(0, 960, 1_000_000), 48000)
+            now.addAndGet(50_000_000)
+            val source = clock.anchorObservedAudio(1_000_000, 48000)
+            clock.audioWritten(40_000)
+            clock.observeAudio(source, 20_000, now.get())
+            val before = transitions.last().toList()
+            TelemetryRegistry.freezeReceiver(9702, 1)
+            clock.beginAudioRecovery()
+            now.incrementAndGet()
+            clock.detachObservedAudio(source)
+            val detached = transitions.last()
+            assertEquals(CausalEvidence.Mapping.DETACH.ordinal.toLong(), detached[0])
+            assertEquals(4L, detached[7])
+            assertEquals(1L, detached[8])
+            assertEquals(1_000_000L, detached[3])
+            assertEquals(1_020_000L, detached[5])
+            assertEquals(now.get(), detached[6])
+            assertEquals(1_020_000L, detached[15])
+            now.incrementAndGet()
+            clock.videoPresented(1_990_000)
+            var calls = 0
+            assertFalse(clock.awaitAudioStartObserved(2_100_000, { decision ->
+                TelemetryRegistry.causal(9702, CausalEvidence.Stage.START, 1,
+                    55, decision.reason.toLong(), decision.mode.toLong(), decision.targetUs,
+                    decision.positionUs ?: -1, decision.delayUs ?: Long.MIN_VALUE, decision.revision,
+                    decision.flags, decision.waitedUs, decision.releasedVideoUs ?: -1,
+                    2_100_000, -1, -1, atNs = now.get())
+            }) { calls++ == 0 })
+            telemetry.event(TelemetryRow(DiagnosticKind.RECOVERY.ordinal + 1, DiagnosticStage.PRESSURE.ordinal,
+                2, 1, now.get(), 260000, listOf(2, 13, 49920, 14, 53760, 48, 524288, 250000, 0)), pressure = true)
+            val final = checkNotNull(telemetry.requestFinal(true, System.nanoTime() + 1_000_000_000))
+            val history = TelemetryHistory(true)
+            history.accept(TelemetryHistory.Endpoint.RECEIVER, final.payload, 1)
+            history.terminal(TelemetryHistory.Endpoint.RECEIVER, final.sequence, true, 1)
+            val report = org.screencopy.receiver.protocol.StrictJson.decode(
+                TelemetryReport.encode(checkNotNull(history.finish(1))))
+            assertTrue(TelemetryReport.validate(report))
+            val rows = SessionTelemetryProtocol.parse(report.getJSONObject("receiver").getJSONArray("blocks")
+                .getJSONArray(0).getJSONObject(1).toString().toByteArray(), "receiver").events
+            assertEquals(before, rows.single { it.kind == CausalEvidence.KIND &&
+                it.stage == CausalEvidence.Stage.MAPPING.ordinal && it.value == 1L }.detail)
+            val later = rows.filter { it.kind == CausalEvidence.KIND && it.value == 2L }
+            assertEquals(listOf(CausalEvidence.Mapping.RECOVERY_BEGIN.ordinal.toLong(),
+                CausalEvidence.Mapping.DETACH.ordinal.toLong(), CausalEvidence.Mapping.VIDEO_RELEASE.ordinal.toLong()),
+                later.filter { it.stage == CausalEvidence.Stage.MAPPING.ordinal }.map { it.detail[0] })
+            assertEquals(detached.toList(), later.single { it.stage == CausalEvidence.Stage.MAPPING.ordinal &&
+                it.detail[0] == CausalEvidence.Mapping.DETACH.ordinal.toLong() }.detail)
+            assertEquals(listOf(1L, 5L), later.filter { it.stage == CausalEvidence.Stage.START.ordinal }.map { it.detail[1] })
+            assertTrue(later.filter { it.stage == CausalEvidence.Stage.START.ordinal }.all {
+                it.detail[3] == 2_100_000L && it.detail[9] == 1_990_000L
+            })
+        } finally {
+            TelemetryRegistry.end("receiver", telemetry)
+            telemetry.requestFinal(false, System.nanoTime())
+        }
+    }
+
     @Test fun audioStartDecisionSamplesPinnedClockWhileBlockedAndTransitionsOnSourceProgress() {
         val now = java.util.concurrent.atomic.AtomicLong(1_000_000_000)
         val decisions = ArrayList<AudioStartDecision>()

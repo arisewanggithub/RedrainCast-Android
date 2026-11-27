@@ -23,6 +23,17 @@ internal object IncidentSummary {
                 "RETRY_STALE_RECOVERY", "READY", "CANCELLED", "FAILED")))
             .put("audioStartClockModes", JSONArray(listOf("UNAVAILABLE", "MONOTONIC",
                 "AUDIO_INITIAL", "CALLBACK_AUDIO", "CACHED_AUDIO")))
+            .put("telemetryCausalLayouts", JSONArray().apply {
+                CausalEvidence.Stage.entries.forEach { stage ->
+                    put(JSONObject().put("kind", CausalEvidence.KIND).put("stage", stage.ordinal)
+                        .put("name", stage.name).put("details", JSONArray(CausalEvidence.fields(stage.ordinal))))
+                }
+            })
+            .put("causalProvenance", "value:0 current checkpoint,1 frozen first fault,2 bounded transition published after the latch,3 capture accounting,4 first gate decision of the checkpoint generation (also frozen at first fault). Each row has its own original observation time/generation; publication after the latch does not prove the mutation occurred after it. Not an atomic media-resource snapshot. -1 unavailable except signed START delay (int64-min unavailable) and signed packet offsets (valid only when packetCorrectionSequence>0). Wall-minus-CPU includes waits, locks and GC, not proof of scheduler starvation. Boundary entry is not proof of a blocked native call.")
+            .put("causalWorkerPhases", JSONArray(CausalEvidence.phases))
+            .put("causalIntervalKinds", JSONArray(listOf("STEP", "INPUT", "DECODE", "REFILL")))
+            .put("causalMappingReasons", JSONArray(CausalEvidence.Mapping.entries.map { it.name }))
+            .put("causalOutputBoundaries", JSONArray(CausalEvidence.Output.entries.map { it.name }))
             .put("telemetryAudioStartLayout", JSONObject().put("role", "receiver")
                 .put("kind", DiagnosticKind.AUDIO_OUTPUT.ordinal + 1).put("stage", DiagnosticStage.SAMPLE.ordinal)
                 .put("value", "targetSourcePtsUs;-1 before first wait")
@@ -67,6 +78,7 @@ internal object IncidentSummary {
             .put("operationRecord", "[kind,track,point,inflightId,beginNs,lastSuccessNs,generation,ptsUs,bytes]")
             .put("telemetryRow", "[eventKind,stage,track,generation,localNs,value,details]; " +
                 "eventKind ${TelemetryRow.EVIDENCE_KIND} uses lifecycleStages; 0 uses videoStages, " +
+                "eventKind ${CausalEvidence.KIND} uses telemetryCausalLayouts (telemetry v2 only); " +
                 "other kinds use stages. Each report block is [senderArrivalNs,batch]. " +
                 "Sender SESSION SETTLED state: value is terminalCauses; details are senderPhases,senderOrigins. " +
                 "It is the authoritative retained outcome, distinct from firstFailure.")
@@ -198,11 +210,49 @@ internal object IncidentSummary {
                     "phase=${dev.screencopy.sender.SessionStopTrace.Phase.entries.getOrNull(details?.optString(0)?.toIntOrNull() ?: -1)?.name ?: "unknown"}, " +
                     "origin=${dev.screencopy.sender.SessionOutcome.Origin.entries.getOrNull(details?.optString(1)?.toIntOrNull() ?: -1)?.name ?: "unknown"}.")
             }
+            if (side == "receiver") {
+                val events = latest?.optJSONArray("events")
+                for (i in 0 until (events?.length() ?: 0)) {
+                    val row = events?.optJSONArray(i) ?: continue
+                    if (row.optInt(0) != CausalEvidence.KIND) continue
+                    val stage = CausalEvidence.Stage.entries.getOrNull(row.optInt(1)) ?: continue
+                    val values = row.optJSONArray(6) ?: continue
+                    val fields = CausalEvidence.fields(stage.ordinal)
+                    if (values.length() != fields.size) continue
+                    appendLine("Causal ${stage.name} provenance=${row.optString(5)} " +
+                        "generation=${row.optInt(3)} localNs=${row.optString(4)}: " +
+                        fields.mapIndexed { index, field ->
+                            "$field=${causalValue(stage, index, values.optString(index))}"
+                        }.joinToString(", ") + ".")
+                }
+            }
             appendLine("Final sequence=${source.optString("finalSequence")}, terminal sequence=" +
                 "${source.optString("terminalSequence")}, cleanup=${source.opt("cleanupSucceeded")}, " +
                 "final skip reason=${source.optString("finalSkipReason", "unknown")}.")
         }
         appendLine("Sequence gaps count publications, not media loss. $UNKNOWNS")
+    }
+
+    private fun causalValue(stage: CausalEvidence.Stage, index: Int, raw: String): String {
+        val trimReason = stage == CausalEvidence.Stage.TRIM && index == 0 ||
+            stage == CausalEvidence.Stage.START && index == 12
+        if (trimReason && raw == "-1") return "NONE(-1)"
+        val dictionary = when {
+            trimReason -> listOf("STARTUP", "RECOVERY", "RECOVERY_REFRESH", "CLOCK_PREPARE")
+            stage == CausalEvidence.Stage.MAPPING && index == 0 -> CausalEvidence.Mapping.entries.map { it.name }
+            stage == CausalEvidence.Stage.OUTPUT && index == 0 -> CausalEvidence.Output.entries.map { it.name }
+            stage == CausalEvidence.Stage.OUTPUT && index in listOf(2, 19) -> DiagnosticPoint.entries.map { it.name }
+            stage == CausalEvidence.Stage.WORKER && index == 0 -> CausalEvidence.phases
+            stage == CausalEvidence.Stage.WORKER && index in listOf(10, 15) ->
+                listOf("STEP", "INPUT", "DECODE", "REFILL")
+            stage == CausalEvidence.Stage.START && index == 1 ->
+                listOf("NOT_WAITING", "WAIT_TARGET", "RETRY_PREROLL", "RETRY_STALE_RECOVERY", "READY", "CANCELLED", "FAILED")
+            stage == CausalEvidence.Stage.START && index == 2 ||
+                stage == CausalEvidence.Stage.MAPPING && index in listOf(7, 8) ->
+                listOf("UNAVAILABLE", "MONOTONIC", "AUDIO_INITIAL", "CALLBACK_AUDIO", "CACHED_AUDIO")
+            else -> return raw
+        }
+        return dictionary.getOrNull(raw.toIntOrNull() ?: -1)?.let { "$it($raw)" } ?: "UNKNOWN($raw)"
     }
 
     fun text(bundle: JSONObject): String = if (bundle.opt("version") == 2) telemetryText(bundle) else buildString {

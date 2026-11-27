@@ -14,6 +14,22 @@ class ProtocolTest {
     private fun hex(text: String) = text.trim().chunked(2).map { it.toInt(16).toByte() }.toByteArray()
     private fun json(text: String) = StrictJson.decode(text.toByteArray())
 
+    @Test fun receivedCallbackPrecedesJsonValidationButFollowsCompletePayload() {
+        val bytes = ByteArrayOutputStream().also {
+            Wire.write(it, Message(Type.HELLO, payload = """{"broken":}""".toByteArray()))
+        }.toByteArray()
+        var received: Type? = null
+        assertThrows(ProtocolException::class.java) {
+            Wire.read(ByteArrayInputStream(bytes), {}, { received = it })
+        }
+        assertEquals(Type.HELLO, received)
+        received = null
+        assertThrows(EOFException::class.java) {
+            Wire.read(ByteArrayInputStream(bytes.copyOf(bytes.size - 1)), {}, { received = it })
+        }
+        assertNull(received)
+    }
+
     @Test fun exactSharedWireFixtures() {
         val cases = StrictJson.decode(fixture("v3.json")).array("cases")
         for (index in 0 until cases.length()) {

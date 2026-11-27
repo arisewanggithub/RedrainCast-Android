@@ -19,6 +19,57 @@ import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicReference
 
 class SenderSocketTest {
+    @Test fun armedHelloSendsRemainingLeaseAndRequiresReceiverCapability() {
+        for (supported in listOf(false, true)) ServerSocket(0).use { server ->
+            val peer = CompletableFuture.runAsync {
+                server.accept().use { control ->
+                    control.soTimeout = 3000
+                    val offer = Wire.read(control.inputStream).json().getJSONObject("diagProxy")
+                        .getJSONObject("offer")
+                    assertEquals("71", offer.getString("session"))
+                    assertEquals("pair", offer.getString("pairId"))
+                    assertEquals("9", offer.getString("armGeneration"))
+                    assertEquals(1378, offer.getInt("durationMs"))
+                    assertEquals("[\"session\"]", offer.getJSONArray("receiverFlags").toString())
+                    val response = hello().json()
+                    if (supported) response.put("diagProxy",
+                        org.screencopy.receiver.protocol.DiagnosticProxyNegotiation.receiverCapability())
+                    Wire.write(control.outputStream, Wire.control(Wire.HELLO, 0, response))
+                }
+            }
+            ReceiverLink(ReceiverTarget("127.0.0.1", server.localPort)).use { link ->
+                val claim = dev.redrain.cast.diagnostics.DiagnosticArmRegistry.Claim(
+                    "pair", 9, 71, "sender-capture", setOf("session"), 100, Long.MAX_VALUE)
+                if (supported) link.connectArmed(3000, claim) { 1378 }
+                else assertTrue(assertThrows(IOException::class.java) {
+                    link.connectArmed(3000, claim) { 1378 }
+                }.message!!.contains("UNSUPPORTED_CONFIG"))
+            }
+            peer.get(3, TimeUnit.SECONDS)
+        }
+    }
+
+    @Test fun armedRequestAndAcceptancePreservePairIdentity() {
+        ReceiverLink(ReceiverTarget("127.0.0.1", 1)).use { link ->
+            val claim = dev.redrain.cast.diagnostics.DiagnosticArmRegistry.Claim(
+                "pair", 9, 71, "sender-capture", setOf("session"), 100, Long.MAX_VALUE)
+            val request = org.json.JSONObject()
+            link.selectDiagnosticProxy(request, claim)
+            val selected = request.getJSONObject("diagProxy")
+            assertEquals(3, selected.length())
+            assertEquals(2, selected.getInt("version"))
+            assertEquals("pair", selected.getString("pairId"))
+            assertEquals("9", selected.getString("armGeneration"))
+            val proxy = org.json.JSONObject().put("version", 2).put("pairId", "pair")
+                .put("armGeneration", "9").put("laneToken", "a".repeat(64))
+                .put("captureId", "receiver-capture").put("clockId", "receiver-clock")
+            val acceptance = org.json.JSONObject().put("diagProxy", proxy)
+            assertEquals("receiver-capture", link.acceptedDiagnosticProxy(acceptance, claim).captureId)
+            proxy.put("armGeneration", "10")
+            assertThrows(IOException::class.java) { link.acceptedDiagnosticProxy(acceptance, claim) }
+        }
+    }
+
     @Test fun localCloseRetiresBothMediaSocketsBeforeControl() {
         val link = ReceiverLink(ReceiverTarget("127.0.0.1", 1))
         val sockets = ReceiverLink::class.java.getDeclaredField("sockets").apply { isAccessible = true }
@@ -55,6 +106,10 @@ class SenderSocketTest {
         assertEquals("RedrainCast", request.json().getString("name"))
         assertEquals("[3]", request.json().getJSONArray("versions").toString())
         assertTrue(request.json().getBoolean("videoRotation"))
+        val proxy = request.json().getJSONObject("diagProxy")
+        assertEquals(2, proxy.getInt("version"))
+        assertFalse(proxy.has("offer"))
+        assertFalse(request.json().has("diagnostics"))
         val response = hello()
         if (recovery) Wire.write(control.outputStream, Wire.control(Wire.HELLO, 0,
             response.json().put("streamRecovery", true).put("streamRecoveryVersion",
@@ -89,7 +144,7 @@ class SenderSocketTest {
                     control.soTimeout = 3000
                     val offered = Wire.read(control.inputStream).json()
                     assertTrue(offered.getBoolean("uncappedFps"))
-                    assertEquals(1, offered.getJSONObject("sessionTelemetry").getInt("version"))
+                    assertEquals(2, offered.getJSONObject("sessionTelemetry").getInt("version"))
                     Wire.write(control.outputStream, hello(uncapped = supported))
                 }
             }
@@ -112,7 +167,7 @@ class SenderSocketTest {
     @Test fun sessionTelemetryHelloRequestAndAcceptSelectOnlyExactCapability() {
         val capability = dev.redrain.cast.diagnostics.SessionTelemetryProtocol.capability()
         for (offered in listOf<org.json.JSONObject?>(capability, null,
-            dev.redrain.cast.diagnostics.SessionTelemetryProtocol.capability().put("version", 2),
+            dev.redrain.cast.diagnostics.SessionTelemetryProtocol.capability().put("version", 1),
             dev.redrain.cast.diagnostics.SessionTelemetryProtocol.capability().put("intervalMs", 2000),
             dev.redrain.cast.diagnostics.SessionTelemetryProtocol.capability().put("maxBatchBytes", 8191))) {
             ServerSocket(0).use { server ->
@@ -122,7 +177,7 @@ class SenderSocketTest {
                         control.soTimeout = 3000
                         val helloRequest = Wire.read(control.inputStream).json()
                         val advertised = helloRequest.getJSONObject("sessionTelemetry")
-                        assertEquals(1, advertised.getInt("version"))
+                        assertEquals(2, advertised.getInt("version"))
                         assertEquals(1000, advertised.getInt("intervalMs"))
                         assertEquals(8192, advertised.getInt("maxBatchBytes"))
                         val response = hello().json()
@@ -149,12 +204,12 @@ class SenderSocketTest {
     }
 
     @Test fun futureTelemetryHelloStillAttachesAndRoutesSessionWithoutTelemetry() {
-        ServerSocket(0).use { server ->
+        for (version in listOf(1, 3)) ServerSocket(0).use { server ->
             val peer = CompletableFuture.runAsync {
                 server.accept().use { control ->
                     control.soTimeout = 3000
                     assertEquals(Wire.HELLO, Wire.read(control.inputStream).type)
-                    val future = org.json.JSONObject().put("version", 2)
+                    val future = org.json.JSONObject().put("version", version)
                         .put("batching", org.json.JSONObject().put("mode", "new"))
                     Wire.write(control.outputStream, Wire.control(Wire.HELLO, 0,
                         hello().json().put("sessionTelemetry", future)))

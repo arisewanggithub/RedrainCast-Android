@@ -1,5 +1,8 @@
 package org.screencopy.receiver.media
 
+import dev.redrain.cast.diagnostics.CausalEvidence
+import dev.redrain.cast.diagnostics.TelemetryRegistry
+
 internal data class VideoSchedulingClock(
     val delayUs: Long?, val readAtNs: Long, val mappingRevision: Long,
     val mode: String, val positionUs: Long?, val sourcePositionUs: Long?,
@@ -45,10 +48,53 @@ class PlaybackClock(
     private var prerollEpochUs: Long? = null
     private var videoPrerollEnded = false
     private var mappingRevision = 0L
+    @Volatile internal var diagnosticSession = 0L
+    @Volatile internal var diagnosticGeneration = 0
+    internal var mappingObserved: (LongArray, Long, Int) -> Unit = { values, at, generation ->
+        TelemetryRegistry.causal(diagnosticSession, CausalEvidence.Stage.MAPPING,
+            generation, *values, atNs = at)
+    }
+    private fun modeLocked(): Long = when {
+        audioSource == null -> if (basePtsUs < 0) 0 else 1
+        observedAudio == null -> 2
+        audioPositionUs != null -> 3
+        else -> 4
+    }
+    private fun flagsLocked(): Long = (if (audioExpected) 1L else 0L) +
+        (if (audioStarted) 2L else 0L) + (if (resumingAudio) 4L else 0L) + (if (recoveringAudio) 8L else 0L)
+    private inline fun <T> mapped(reason: CausalEvidence.Mapping, block: () -> T): T {
+        var transition: LongArray? = null
+        var atNs = 0L
+        var generation = 0
+        try {
+            return synchronized(this) {
+                val oldRevision = mappingRevision
+                val oldBase = basePtsUs
+                val oldNs = baseNs
+                val oldMode = modeLocked()
+                val oldFloor = lastPositionUs
+                val oldObservation = observedAudio
+                try { block() } finally {
+                    if (mappingRevision != oldRevision) {
+                        atNs = nanoTime()
+                        generation = diagnosticGeneration
+                        transition = longArrayOf(reason.ordinal.toLong(), oldRevision, mappingRevision,
+                            oldBase, oldNs, basePtsUs, baseNs, oldMode, modeLocked(), oldFloor ?: -1,
+                            lastPositionUs ?: -1, observedAudio?.ptsUs ?: -1, observedAudio?.observedAtNs ?: -1,
+                            flagsLocked(), audioObservationSequence,
+                            oldObservation?.ptsUs ?: -1, oldObservation?.observedAtNs ?: -1,
+                            lastPacketCorrection?.beforeOffsetUs ?: -1, lastPacketCorrection?.afterOffsetUs ?: -1,
+                            lastPacketCorrection?.sequence ?: 0)
+                    }
+                }
+            }
+        } finally {
+            transition?.let { mappingObserved(it, atNs, generation) }
+        }
+    }
     @Synchronized internal fun mappingRevision(): Long = mappingRevision
 
-    @Synchronized
-    fun anchorVideo(ptsUs: Long) {
+    fun anchorVideo(ptsUs: Long) = mapped(CausalEvidence.Mapping.VIDEO_ANCHOR) {
         if (firstVideoPtsUs == null) {
             firstVideoPtsUs = ptsUs
             firstVideoAtNs = nanoTime()
@@ -72,19 +118,18 @@ class PlaybackClock(
             throw PlaybackException("Audio/video startup did not complete within three seconds")
     }
 
-    @Synchronized
-    fun prepareAudio(slice: TrimmedAudio, rate: Int): TrimmedAudio? {
-        if (!audioExpected || audioStarted) return slice
+    fun prepareAudio(slice: TrimmedAudio, rate: Int): TrimmedAudio? = mapped(CausalEvidence.Mapping.PREPARE) {
+        if (!audioExpected || audioStarted) return@mapped slice
         if (resumingAudio) {
             if (basePtsUs < 0) {
                 basePtsUs = slice.audiblePtsUs
                 baseNs = nanoTime() + 50_000_000L
                 mappingRevision++
             }
-            return slice
+            return@mapped slice
         }
         checkStartup()
-        val videoPts = firstVideoPtsUs ?: return null
+        val videoPts = firstVideoPtsUs ?: return@mapped null
         val epoch = maxOf(videoPts, slice.audiblePtsUs)
         if (epoch - minOf(videoPts, slice.audiblePtsUs) > 3_000_000)
             throw PlaybackException("Initial track timestamps exceed the three-second synchronization budget")
@@ -96,14 +141,13 @@ class PlaybackClock(
             baseNs = nanoTime() + 50_000_000L
             mappingRevision++
         }
-        return result
+        result
     }
 
     @Synchronized
     fun canPrepareAudio(): Boolean = !audioExpected || firstVideoPtsUs != null || audioStarted || resumingAudio
 
-    @Synchronized
-    internal fun beginAudioRecovery() {
+    internal fun beginAudioRecovery() = mapped(CausalEvidence.Mapping.RECOVERY_BEGIN) {
         audioProjection = null
         mappingRevision++
         recoveringAudio = true
@@ -114,19 +158,17 @@ class PlaybackClock(
         }
     }
 
-    @Synchronized
-    internal fun endAudioRecovery() {
+    internal fun endAudioRecovery() = mapped(CausalEvidence.Mapping.RECOVERY_END) {
         audioProjection = null
         mappingRevision++
         recoveringAudio = false
         resumingAudio = false
     }
 
-    @Synchronized
-    internal fun videoPresented(ptsUs: Long, presentationAtNs: Long = nanoTime()) {
+    internal fun videoPresented(ptsUs: Long, presentationAtNs: Long = nanoTime()) = mapped(CausalEvidence.Mapping.VIDEO_RELEASE) {
         require(ptsUs >= 0) { "Negative video presentation timestamp" }
         releasedVideoUs = ptsUs
-        if (!recoveringAudio || audioSource != null) return
+        if (!recoveringAudio || audioSource != null) return@mapped
         val current = positionLocked()
         if (current == null || ptsUs > current) {
             basePtsUs = ptsUs
@@ -148,7 +190,7 @@ class PlaybackClock(
 
     fun audioStartDelayUs(ptsUs: Long): Long {
         observeCallback()
-        return synchronized(this) { audioStartDelayLocked(ptsUs) }
+        return mapped(CausalEvidence.Mapping.ANCHOR) { audioStartDelayLocked(ptsUs) }
     }
 
     private fun audioStartDelayLocked(ptsUs: Long): Long {
@@ -198,8 +240,8 @@ class PlaybackClock(
                 }
                 if (preroll != null) { observed(preroll); return false }
                 observeCallback()
-                var reason: Int
-                val snapshot = synchronized(this) {
+                var reason = 0
+                val snapshot = mapped(CausalEvidence.Mapping.ANCHOR) {
                     val delay = audioStartDelayLocked(ptsUs)
                     reason = when {
                         resumingAudio && delay < -250_000 -> 3
@@ -227,15 +269,14 @@ class PlaybackClock(
 
     internal fun anchorAudio(ptsUs: Long, sampleRate: Int = 48000, positionUs: () -> Long) {
         observeCallback()
-        synchronized(this) {
+        mapped(CausalEvidence.Mapping.AUDIO_ATTACH) {
             attachAudio(ptsUs, sampleRate)
             audioPositionUs = positionUs
         }
     }
 
-    @Synchronized
     internal fun anchorObservedAudio(ptsUs: Long, sampleRate: Int): AudioSourceClock =
-        attachAudio(ptsUs, sampleRate)
+        mapped(CausalEvidence.Mapping.AUDIO_ATTACH) { attachAudio(ptsUs, sampleRate) }
 
     private fun attachAudio(ptsUs: Long, sampleRate: Int): AudioSourceClock {
         check(audioStartDelayLocked(ptsUs) <= 0) { "Audio cannot start before its source presentation time" }
@@ -290,7 +331,7 @@ class PlaybackClock(
     internal fun audioPacket(sampleUs: Long, ptsUs: Long): AudioClockCorrection? {
         val source = synchronized(this) { checkNotNull(audioSource) }
         observeCallback()
-        return synchronized(this) {
+        return mapped(CausalEvidence.Mapping.PACKET) {
             check(audioSource === source) { "Audio source changed during packet observation" }
             source.packet(sampleUs, ptsUs).also {
                 if (it != null) {
@@ -320,7 +361,7 @@ class PlaybackClock(
     }
 
     private fun detachAudioIfCurrent(source: AudioSourceClock?) {
-        synchronized(this) {
+        mapped(CausalEvidence.Mapping.DETACH) {
             if (audioSource !== source) return
             if (source != null) {
                 basePtsUs = checkNotNull(positionLocked())
