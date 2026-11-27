@@ -2,7 +2,8 @@
 
 Status: implemented in the current Android source. This document describes
 the wire and retention contract, not a deployment or performance measurement.
-The filename remains for existing links.
+For symptom-led collection and interpretation, see the
+[troubleshooting runbook](../TROUBLESHOOTING.md). The filename remains for existing links.
 
 Automatic telemetry is bounded metadata from one cast, independent of the
 playback statistics panel and the separately consented
@@ -42,6 +43,12 @@ admission; they do not encode JSON, perform socket or storage I/O, or inspect
 live media resources on a producer hot path. Admission does not wait for a
 consumer. Repeated observations may be coalesced, with explicit counts.
 Queue caches are refreshed on every queue change; publication remains periodic.
+Encoded queue rows continue to describe encoded packets only. During a future
+audio recovery start, decoded source slices can be retained while that queue
+drains; admission-pressure byte totals include both retained decoded input and
+encoded packets under the same 512 KiB cap. A future audio-start wait with a
+draining encoded queue is therefore not evidence of a blocked decoder. Recovery
+checks keep the original wait start/deadline across bounded worker steps.
 In-flight operation rows contain the begin time and operation ID until the
 matching generation and operation completes. Receiver recovery retirement and
 construction share one sequential operation slot per track. The sender's SESSION SETTLED
@@ -57,6 +64,7 @@ same payload limit applies to the final batch. Per endpoint:
 | Individual event | 512 encoded bytes and at most 20 numeric details |
 | Event ingress | 128 events and 64 KiB |
 | Current state | 64 role-relevant rows, including up to 16 operations |
+| Receiver build identity | one additional state slot, within the 64-row publication limit |
 | Pending events | 64 events and 32 KiB |
 | Additional causal checkpoint cache | 8 rows plus first gate decision, at most 4.5 KiB |
 | Frozen first-fault context | 8 rows plus first gate decision, at most 4.5 KiB |
@@ -69,6 +77,14 @@ first-failure anchors or make the minimum essential cause/outcome invalid.
 Peers validate original UTF-8 byte lengths and JSON types and reject
 duplicate keys, malformed UTF-8 and excessive nesting using strict JSON
 validation; they do not coerce malformed values.
+
+The receiver publishes its full APK version name as a prioritized current
+`SESSION/SAMPLE` row (track/generation 0, value `-20261126`): details are
+version code, UTF-8 byte length, then big-endian integers containing up to
+seven bytes apiece. Names are limited to 112 bytes. Older readers accept the
+numeric row; newer summaries decode it. The existing causal BUILD row and
+its unavailable source revision remain unchanged. As with all current state,
+missing or omitted publications are not evidence of a particular build.
 
 ## Control priority and terminal transaction
 
@@ -139,6 +155,25 @@ final sequence is sent; older peers may omit it. It is not arbitrary text.
 The sender retains the typed reason in the report without treating a missing
 reason from an older peer as a specific failure.
 
+On a preparation timeout the receiver also emits one local
+`TELEMETRY_FINAL_PREPARATION_TIMEOUT` diagnostic with the best-effort phase
+(`NOT_STARTED`, `QUEUED`, `QUIESCING`, `PUBLISHING`, `VALIDATING`, or `COMPLETE`),
+elapsed nanoseconds and active producer count. A concurrent phase transition may
+race the observation; a phase is not proof of a blocked particular call. This
+local diagnostic is not a new wire field and requires receiver logs to retain it.
+Batch size accounting encodes each candidate row once rather than repeatedly
+serializing the whole growing batch; the existing size and time limits are unchanged.
+
+The receiver audio-start retention state also carries the decision and queue
+sample times, observation sequence/time/PTS, output clock source, native
+timestamp time/frame, applied source offset and last correction sequence. It
+shares the existing slot and publication bounds. The samples are not atomic
+across the clock and queue; the output observation may reuse an unchanged
+native timestamp even when its receiver observation sequence advances. The
+live paired record exposes the same fields. Neither telemetry path guarantees
+that a terminal batch or enough observations will be delivered. See the
+[live diagnostic contract](REMOTE_DIAGNOSTICS.md) for correlation and loss.
+
 The sender continues reading telemetry while stopping. Sender-initiated,
 receiver-initiated and crossed stops preserve the existing media-drain and
 terminal arbitration semantics. Receiver completeness requires receipt of
@@ -187,6 +222,17 @@ the latch if publication was delayed after releasing the clock monitor.
 Obsolete out-of-order transitions rejected from the checkpoint cache are
 also counted as omitted. Mapping generation is captured with the primitive
 transition under the clock monitor, not read again during publication.
+
+The first audio admission rejection is also pinned as a current `AUDIO_QUEUE`
+`REJECTED` row: its timestamp is detection time, value is incoming PTS, and
+details are encoded bytes, retained-decoded bytes, queued packets, attempted
+bytes, queue span and limit code. These queue values are captured together under
+the admission monitor; separately timestamped causal checkpoints are not a
+globally atomic snapshot. Retained-decoded bytes count actual retained PCM,
+not the unused portion of an in-flight decode reservation. Attempted bytes
+include encoded bytes, retained PCM, any unused reservation, and the incoming
+packet; queued bytes in pressure reports likewise include the reservation.
+Thus attempted bytes need not equal encoded plus retained-decoded plus incoming.
 
 The export's `telemetryCausalLayouts` dictionary gives the exact ordered numeric
 fields; `causalWorkerPhases`, `causalMappingReasons` and `causalOutputBoundaries`
@@ -285,6 +331,48 @@ generation's measurements. No extra AudioTrack queries or sampling thread are
 added. Queue rows provide the existing count/bytes/PTS context. A pinned clock,
 old output progress, or recovery flags are causal evidence, not proof of
 acoustic output or network failure.
+
+Receiver current slot 63 also carries `AUDIO_OUTPUT` / `SAMPLE` track 2, with
+target source PTS in microseconds in `value` (-1 before the first wait). Match
+role, kind, stage and detail count using the export vocabulary:
+
+- Current `telemetryAudioStartRetentionLayout` has 17 details, in order:
+  `point, operationId, audioObservationAgeUs, retainedDecodedBytes,
+  retainedDecodedPackets, encodedQueueBytes, encodedQueuePackets,
+  decisionSampledNs, queueSampledNs, audioObservationSequence,
+  audioObservationNs, audioObservationPtsUs, audioOutputSource,
+  nativeTimestampNs, nativeTimestampFrame, appliedOffsetUs, correctionSequence`.
+- `telemetryAudioStartRetentionLegacyLayout` has seven details, in order:
+  `point, operationId, audioObservationAgeUs, retainedDecodedBytes,
+  retainedDecodedPackets,
+  encodedQueueBytes, encodedQueuePackets`.
+
+`point` is the `AUDIO_START_WAIT` ordinal; `operationId` is 0 when unavailable.
+Age is in microseconds and is -1 without a source observation. The byte and
+packet fields are counts. Retained decoded counts cover only recovery PCM
+arrays charged to the shared input byte cap, excluding unused decode reservations.
+The `Ns` times are local monotonic nanoseconds, PTS and signed applied offset
+are microseconds, and native timestamp frame is a frame position.
+The decision and queue timestamps mark their respective samples; observation
+sequence, time and PTS identify the cached audio observation. Native timestamp
+time/frame describe its output timing; `correctionSequence` identifies the last
+packet correction. `audioOutputSource` indexes `audioClockSources`.
+Numeric telemetry uses -1
+for unavailable values except `appliedOffsetUs` (signed int64 minimum) and
+`correctionSequence` (0). Unlike these telemetry sentinels, the corresponding
+nullable fields in the live diagnostic record use JSON null.
+
+Queue values are sampled after the clock decision, not atomically with it; join
+by generation and operation ID. The sender's slot 63 remains cleanup-failure
+evidence. The snapshot resets on generation installation. Unchanged observations
+are limited to one every 250 ms per player; changes in generation, decision,
+clock mode, flags, mapping revision, target or capture can publish immediately.
+
+During audio recovery, a detached clock may be anchored to a future scheduled
+video release. Earlier audio still waits for its source presentation time; it
+must not move that video anchor backward as initial preroll can. Repeated
+backward anchor changes while `baseNs` is in the future can pin the clock,
+fill the audio queue, and cause successive recoveries to miss their deadline.
 
 ## Sender history and reports
 

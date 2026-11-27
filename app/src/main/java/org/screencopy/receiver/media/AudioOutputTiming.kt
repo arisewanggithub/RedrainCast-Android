@@ -14,7 +14,8 @@ data class AudioOutputTiming(
     internal val positionAtNs: Long? = null,
     internal val playbackSpeed: Float = 1f,
     internal val timestampAtNs: Long? = null,
-    internal val timestampEstimateFrames: Long? = null
+    internal val timestampEstimateFrames: Long? = null,
+    internal val timestampFramePosition: Long? = null
 ) {
     val bufferedUs: Long get() = framesToUs((submittedFrames - consumedFrames).coerceAtLeast(0))
     val presentedUs: Long get() = framesToUs(presentedFrames)
@@ -146,7 +147,8 @@ internal class AudioPosition(
         // On timestamp loss/staleness, keep the learned hardware transit instead of jumping to head.
         presented = maxOf(presented, estimate).coerceAtMost(consumed)
         return timing().copy(positionAtNs = now, playbackSpeed = speed, timestampAtNs = stamp?.nanoTime,
-            timestampEstimateFrames = if (source == AudioClockSource.TIMESTAMP) estimate else null)
+            timestampEstimateFrames = if (source == AudioClockSource.TIMESTAMP) estimate else null,
+            timestampFramePosition = stamp?.frames)
     }
 
     private fun timing(head: Long = consumed) =

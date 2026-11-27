@@ -19,9 +19,10 @@ internal class DiagnosticDeliveryBudget {
     private var lastTime: Long? = null
 
     @Synchronized fun tryAcquire(now: Long, recordCount: Int, byteCount: Int,
-                                 reserveBytes: Int = 0, reserveSlots: Int = 0): Boolean {
+                                 reserveBytes: Int = 0, reserveSlots: Int = 0, reserveRecords: Int = 0): Boolean {
         require(recordCount in 0..RECORDS_PER_SECOND && byteCount in 1..BYTES_PER_SECOND)
         require(reserveBytes in 0..BYTES_PER_SECOND && reserveSlots in 0..SLOTS)
+        require(reserveRecords in 0..RECORDS_PER_SECOND)
         val previous = lastTime
         require(previous == null || now >= previous)
         lastTime = now
@@ -34,7 +35,7 @@ internal class DiagnosticDeliveryBudget {
             head = (head + 1) % SLOTS
             size--
         }
-        if (size + 1 + reserveSlots > SLOTS || records + recordCount > RECORDS_PER_SECOND ||
+        if (size + 1 + reserveSlots > SLOTS || records + recordCount + reserveRecords > RECORDS_PER_SECOND ||
             bytes + byteCount + reserveBytes > BYTES_PER_SECOND) return false
         val index = (head + size) % SLOTS
         times[index] = now

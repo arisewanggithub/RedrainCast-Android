@@ -9,13 +9,28 @@ internal data class VideoSchedulingClock(
     val audioObservationSequence: Long?, val audioObservationAtNs: Long?,
     val audioOutputSource: AudioClockSource?, val audioTimestampAgeUs: Long?,
     val observedAppliedOffsetUs: Long?, val lastPacketCorrection: AudioClockCorrection?,
-    val recoveringAudio: Boolean
+    val recoveringAudio: Boolean,
+    val audioObservation: AudioClockObservation? = null
+)
+
+internal data class AudioClockObservation(
+    val sequence: Long, val atNs: Long, val sampleUs: Long, val sourcePtsUs: Long,
+    val timing: AudioOutputTiming?, val appliedOffsetUs: Long
 )
 
 internal data class AudioStartDecision(
     val reason: Int, val mode: Int, val targetUs: Long, val positionUs: Long?,
     val delayUs: Long?, val firstVideoUs: Long?, val releasedVideoUs: Long?,
-    val waitedUs: Long, val revision: Long, val flags: Long
+    val waitedUs: Long, val revision: Long, val flags: Long,
+    val observationAgeUs: Long? = null,
+    val retainedDecodedBytes: Int = 0, val retainedDecodedPackets: Int = 0,
+    val encodedQueueBytes: Int = 0, val encodedQueuePackets: Int = 0,
+    val sampledAtNs: Long? = null, val queueSampledAtNs: Long? = null,
+    val observationSequence: Long? = null, val observationAtNs: Long? = null,
+    val observationPtsUs: Long? = null, val outputSource: AudioClockSource? = null,
+    val nativeTimestampAtNs: Long? = null, val nativeTimestampFrame: Long? = null,
+    val appliedOffsetUs: Long? = null, val correctionSequence: Long? = null,
+    val omittedRepeats: Long = 0
 )
 
 class PlaybackClock(
@@ -31,6 +46,7 @@ class PlaybackClock(
     private var audioObservationSequence = 0L
     private var observedOutputTiming: AudioOutputTiming? = null
     private var observedAppliedOffsetUs: Long? = null
+    private var coherentObservation: AudioClockObservation? = null
     private var lastPacketCorrection: AudioClockCorrection? = null
     private var audioProjection: ((Long) -> Long?)? = null
     private var lastVideoPositionUs: Long? = null
@@ -202,11 +218,12 @@ class PlaybackClock(
     }
 
     fun awaitAudioStart(ptsUs: Long, running: () -> Boolean): Boolean =
-        awaitAudioStartObserved(ptsUs, {}, running)
+        awaitAudioStartObserved(ptsUs, {}, running = running)
 
     internal fun awaitAudioStartObserved(ptsUs: Long, observed: (AudioStartDecision) -> Unit,
+                                         waitForFuture: Boolean = true, startedAtNs: Long? = null,
                                          running: () -> Boolean): Boolean {
-        val started = nanoTime()
+        val started = startedAtNs ?: nanoTime()
         var publishedAt: Long? = null
         var publishedReason = -1
         var publishedRevision = -1L
@@ -229,7 +246,14 @@ class PlaybackClock(
                 delay?.let { ptsUs - it } ?: positionLocked(), delay, firstVideoPtsUs, releasedVideoUs,
                 (now - started).coerceAtLeast(0) / 1000, mappingRevision,
                 (if (audioExpected) 1L else 0L) + (if (audioStarted) 2L else 0L) +
-                    (if (resumingAudio) 4L else 0L) + (if (recoveringAudio) 8L else 0L))
+                    (if (resumingAudio) 4L else 0L) + (if (recoveringAudio) 8L else 0L),
+                observedAudio?.observedAtNs?.let { (now - it).coerceAtLeast(0) / 1000 },
+                sampledAtNs = now, observationSequence = observedAudio?.let { audioObservationSequence },
+                observationAtNs = observedAudio?.observedAtNs, observationPtsUs = observedAudio?.ptsUs,
+                outputSource = observedOutputTiming?.clockSource,
+                nativeTimestampAtNs = observedOutputTiming?.timestampAtNs,
+                nativeTimestampFrame = observedOutputTiming?.timestampFramePosition,
+                appliedOffsetUs = observedAppliedOffsetUs, correctionSequence = lastPacketCorrection?.sequence)
         }
         try {
             while (running()) {
@@ -258,6 +282,7 @@ class PlaybackClock(
                         else "Audio startup did not complete within three seconds",
                         if (resumingAudio) "AUDIO_FAILED" else "DECODER_FAILED")
                 sleepMs(2)
+                if (!waitForFuture) return false
             }
             synchronized(this) { snapshotLocked(5) }?.let(observed)
             return false
@@ -288,6 +313,7 @@ class PlaybackClock(
             audioProjection = null
             observedOutputTiming = null
             observedAppliedOffsetUs = null
+            coherentObservation = null
             lastPacketCorrection = null
             audioStarted = true
             resumingAudio = recoveringAudio
@@ -297,14 +323,17 @@ class PlaybackClock(
     @Synchronized
     internal fun observeAudio(source: AudioSourceClock, sampleUs: Long, observedAtNs: Long,
                               timing: AudioOutputTiming? = null,
-                              presentedSourceAtFrame: ((Long) -> Long)? = null) {
-        if (audioSource !== source) return
+                              retainEvidence: Boolean = true,
+                              presentedSourceAtFrame: ((Long) -> Long)? = null): AudioClockObservation? {
+        if (audioSource !== source) return null
         val positionAtNs = timing?.positionAtNs ?: observedAtNs
-        if (observedAudio?.let { positionAtNs < it.observedAtNs } == true) return
+        if (observedAudio?.let { positionAtNs < it.observedAtNs } == true) return null
         observedAudio = SourceTimestampObservation(source.current(sampleUs), positionAtNs)
         audioObservationSequence++
         observedOutputTiming = timing
         observedAppliedOffsetUs = source.appliedOffsetUs()
+        coherentObservation = if (retainEvidence) AudioClockObservation(audioObservationSequence, positionAtNs, sampleUs,
+            checkNotNull(observedAudio).ptsUs, timing, checkNotNull(observedAppliedOffsetUs)) else null
         audioProjection = if (!recoveringAudio && timing?.clockSource == AudioClockSource.TIMESTAMP &&
             timing.positionAtNs != null && timing.timestampAtNs != null && timing.timestampEstimateFrames != null &&
             timing.positionAtNs <= observedAtNs && timing.sampleRate > 0 &&
@@ -326,6 +355,7 @@ class PlaybackClock(
             }
             prediction
         } else null
+        return coherentObservation
     }
 
     internal fun audioPacket(sampleUs: Long, ptsUs: Long): AudioClockCorrection? {
@@ -374,6 +404,7 @@ class PlaybackClock(
             audioProjection = null
             observedOutputTiming = null
             observedAppliedOffsetUs = null
+            coherentObservation = null
             lastPacketCorrection = null
             mappingRevision++
         }
@@ -422,7 +453,7 @@ class PlaybackClock(
                 }, position, raw,
                 observedAudio?.let { audioObservationSequence }, observedAudio?.observedAtNs,
                 observedOutputTiming?.clockSource, observedOutputTiming?.timestampAgeUs,
-                observedAppliedOffsetUs, lastPacketCorrection, recoveringAudio)
+                observedAppliedOffsetUs, lastPacketCorrection, recoveringAudio, coherentObservation)
         }
     }
 
@@ -449,7 +480,9 @@ class PlaybackClock(
             basePtsUs = ptsUs
             baseNs = now
             mappingRevision++
-        } else if (audioSource == null && now < baseNs && ptsUs < basePtsUs) {
+        } else if (audioSource == null && !resumingAudio && now < baseNs && ptsUs < basePtsUs) {
+            // Only initial preroll may move a future anchor to an earlier audio PTS.
+            // During recovery baseNs can be a scheduled video deadline on a running timeline.
             basePtsUs = ptsUs
             mappingRevision++
         }

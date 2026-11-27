@@ -1,6 +1,7 @@
 package dev.redrain.cast.diagnostics
 
 import org.json.JSONObject
+import dev.redrain.cast.BuildConfig
 import org.junit.Assert.*
 import org.junit.Test
 import org.screencopy.receiver.media.AudioCausalProgress
@@ -20,6 +21,27 @@ import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
 
 class CausalTelemetryTest {
+    @Test fun receiverBuildIdentifierSurvivesTelemetryAndReport() {
+        val telemetry = ReceiverTelemetrySession({ true })
+        TelemetryRegistry.beginReceiver(9709, telemetry)
+        try {
+            telemetry.event(pressure(), pressure = true)
+            val final = checkNotNull(telemetry.requestFinal(true, System.nanoTime() + 1_000_000_000))
+            val batch = SessionTelemetryProtocol.parse(final.payload, "receiver")
+            val row = batch.state.single { DiagnosticBuild.version(it) != null }
+            assertEquals(BuildConfig.VERSION_NAME, DiagnosticBuild.version(row))
+            assertEquals(BuildConfig.VERSION_CODE.toLong(), row.detail[0])
+            assertNull(DiagnosticBuild.version(row.copy(detail = row.detail.dropLast(1))))
+            val stored = report(final.payload)
+            assertTrue(TelemetryReport.validate(stored))
+            assertTrue(IncidentSummary.text(stored).contains("Receiver build: ${BuildConfig.VERSION_NAME}"))
+            assertEquals(BuildConfig.VERSION_NAME,
+                DiagnosticBuild.version(finalBatch(stored).state.single { it.value == DiagnosticBuild.MARKER }))
+        } finally {
+            TelemetryRegistry.end("receiver", telemetry)
+            telemetry.requestFinal(false, System.nanoTime())
+        }
+    }
     @Test fun nestedAudioCallsRestoreActiveParentAndKeepEachDuration() {
         for (freezeInsideParent in listOf(true, false)) {
             val now = AtomicLong(100)

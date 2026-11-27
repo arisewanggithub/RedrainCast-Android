@@ -64,6 +64,29 @@ class DiagnosticProxyIntakeTest {
         assertEquals("receiver_retired_stop", intake.terminalValue()!!.getString("reason"))
     }
 
+    @Test fun routineSaturationPreservesBoundIdentityAndFailureInCriticalReserve() {
+        val intake = intake()
+        val bound = record(1).put("kind", "SESSION_BOUND")
+        assertTrue(intake.record(bound, 256))
+        for (seq in 2..56) {
+            assertTrue(intake.record(record(seq).put("kind", "AUDIO_OUTPUT")
+                .put("data", JSONObject().put("stage", "sample")), 256))
+        }
+        assertFalse(intake.record(record(57).put("kind", "AUDIO_OUTPUT")
+            .put("data", JSONObject().put("stage", "sample")), 256))
+        assertTrue(intake.record(record(58).put("kind", "AUDIO_OUTPUT")
+            .put("data", JSONObject().put("stage", "failed")), 256))
+        intake.consume()
+        val first = intake.fetch(0, 32)
+        val tail = intake.fetch(32, 32)
+        assertEquals("SESSION_BOUND", first.getJSONArray("records").getJSONObject(0)
+            .getJSONObject("record").getString("kind"))
+        assertEquals("failed", tail.getJSONArray("records").getJSONObject(24)
+            .getJSONObject("record").getJSONObject("data").getString("stage"))
+        assertEquals("57", tail.getJSONObject("intakeLoss").getString("firstSeq"))
+        assertEquals("0", tail.getJSONObject("retentionLoss").getString("count"))
+    }
+
     @Test fun eofDiscardCountsQueuedRecordsAndNeverInventsUnknownTail() {
         val intake = intake()
         assertTrue(intake.record(record(3), 256))

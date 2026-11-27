@@ -43,13 +43,16 @@ internal class AudioRegulator(private val rate: Int, private val channels: Int) 
 
     init { require(rate in 1..96000 && channels in 1..2) }
     fun offer(samples: ShortArray, slice: TrimmedAudio,
-        sourceUnits: Long = slice.frames * 1_000_000L, observe: Boolean = true) {
+        sourceUnits: Long = slice.frames * 1_000_000L, observe: Boolean = true, preserve: Boolean = false) {
         require(slice.skipFrames >= 0 && slice.frames > 0 &&
             (slice.skipFrames.toLong() + slice.frames) * channels <= samples.size)
         require(sourceUnits >= 0)
+        if (preserve) check(bufferedFrames + slice.frames <= targetFrames + rate * 120 / 1000 + 256) {
+            "Preserved audio exceeded its bounded converted-frame window"
+        }
         queue.addLast(Entry(samples, slice, sourceUnits))
         bufferedFrames += slice.frames
-        val excess = (bufferedFrames - limit()).coerceAtLeast(0)
+        val excess = if (preserve) 0 else (bufferedFrames - limit()).coerceAtLeast(0)
         if (excess > 0) {
             discard(excess)
             dropped += excess

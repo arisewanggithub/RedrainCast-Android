@@ -14,7 +14,7 @@ import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicReference
 
-/** Separate plain LAN TCP socket and budgets; never uses a casting executor, timer or socket. */
+/** Separate plain TCP sockets and budgets; never uses a casting executor, timer or socket. */
 internal class DiagnosticListener(
     private val recorder: DiagnosticRecorder, private val identity: DiagnosticIdentity,
     private val collectorClosed: () -> Unit = {},
@@ -30,6 +30,7 @@ internal class DiagnosticListener(
             LocalNetworkPermission.granted(context.applicationContext)
         }, accessRevoked = accessRevoked, discoveryPort = DiagnosticEndpointResponder.PORT)
     private val closed = AtomicBoolean()
+    private val ready = AtomicBoolean()
     private val pending = AtomicInteger()
     private val connected = AtomicBoolean()
     private val registry = armRegistry ?: if (recorder === RemoteDiagnostics.recorder) DiagnosticAccess.arms
@@ -38,34 +39,44 @@ internal class DiagnosticListener(
     private val sockets = ConcurrentHashMap<Socket, Peer>()
     private val workers = Executors.newFixedThreadPool(3)
     private val timer = Executors.newScheduledThreadPool(2)
-    private val listener: ServerSocket
-    private var endpointResponder: DiagnosticEndpointResponder? = null
-    internal val endpointDiscoveryPort: Int? get() = endpointResponder?.localPort?.takeIf { it > 0 }
+    private val listeners = mutableListOf<ServerSocket>()
+    private val endpointResponders = mutableMapOf<InetAddress, DiagnosticEndpointResponder>()
+    internal val endpointDiscoveryPort: Int? get() =
+        endpointResponders.values.firstOrNull()?.localPort?.takeIf { it > 0 }
+    val discoveryStatus: String get() = identity.endpoints.joinToString(", ") {
+        "${it.address.hostAddress}: ${if ((endpointResponders[it.address]?.localPort ?: -1) > 0) "available" else "unavailable"}"
+    } + " (UDP 27184)"
     val endpoint: String
     val discovery: org.screencopy.receiver.protocol.DiagnosticDiscovery?
         get() {
+            val listener = listeners.firstOrNull() ?: return null
             val port = listener.localPort
-            return if (port in 1..65535 && !closed.get() && !listener.isClosed && listener.isBound && allowed())
+            return if (port in 1..65535 && ready.get() && !closed.get() &&
+                listeners.all { !it.isClosed && it.isBound } && allowed())
                 org.screencopy.receiver.protocol.DiagnosticDiscovery(port, 2) else null
         }
-    fun discoveryFor(address: InetAddress) = if (address == identity.address) discovery else null
+    fun discoveryFor(address: InetAddress) = if (identity.endpoints.any { it.address == address }) discovery else null
     val collectorConnected: Boolean get() = connected.get()
     private fun allowed() = accessAllowed() && identity.valid()
 
     init {
-        var opened: ServerSocket? = null
         try {
-            listener = ServerSocket()
-            opened = listener
-            listener.bind(InetSocketAddress(identity.address, 0), 3)
-            endpoint = "${identity.address.hostAddress}:${listener.localPort}"
-            if (discoveryPort != null) {
-                try {
-                    endpointResponder = DiagnosticEndpointResponder(identity.address, discoveryPort, { discovery })
-                } catch (e: java.io.IOException) {
-                    android.util.Log.w("RemoteDiagnostics", "Unicast diagnostic discovery unavailable", e)
+            require(identity.endpoints.isNotEmpty())
+            for (binding in identity.endpoints) {
+                val listener = ServerSocket()
+                listeners.add(listener)
+                listener.bind(InetSocketAddress(binding.address, listeners.first().localPort.coerceAtLeast(0)), 3)
+                if (discoveryPort != null) {
+                    try {
+                        endpointResponders[binding.address] = DiagnosticEndpointResponder(
+                            binding.address, discoveryPort, { discovery }, vpn = binding.vpn)
+                    } catch (e: java.io.IOException) {
+                        android.util.Log.w("RemoteDiagnostics", "Unicast diagnostic discovery unavailable", e)
+                    }
                 }
             }
+            endpoint = identity.endpoints.joinToString(", ") { "${it.address.hostAddress}:${listeners.first().localPort}" }
+            ready.set(true)
             timer.scheduleWithFixedDelay({
                 if (!closed.get()) {
                     if (allowed()) {
@@ -74,17 +85,19 @@ internal class DiagnosticListener(
                     } else accessRevoked()
                 }
             }, 100, 100, TimeUnit.MILLISECONDS)
-            Thread(::accept, "remote-diagnostics-accept").apply { isDaemon = true; start() }
+            listeners.forEach { listener ->
+                Thread({ accept(listener) }, "remote-diagnostics-accept").apply { isDaemon = true; start() }
+            }
         } catch (e: Exception) {
             workers.shutdownNow(); timer.shutdownNow()
-            try { opened?.close() } catch (_: java.io.IOException) {}
-            endpointResponder?.close()
+            listeners.forEach { try { it.close() } catch (_: java.io.IOException) {} }
+            endpointResponders.values.forEach { it.close() }
             identity.close()
             throw e
         }
     }
 
-    private fun accept() {
+    private fun accept(listener: ServerSocket) {
         while (!closed.get()) {
             val transport = try { listener.accept() } catch (_: java.io.IOException) {
                 val failed = !closed.get()
@@ -176,8 +189,8 @@ internal class DiagnosticListener(
     fun revokeNetwork() {
         if (!closed.compareAndSet(false, true)) return
         registry.revoke()
-        endpointResponder?.close()
-        try { listener.close() } catch (_: java.io.IOException) {}
+        endpointResponders.values.forEach { it.close() }
+        listeners.forEach { try { it.close() } catch (_: java.io.IOException) {} }
         sockets.values.forEach { try { it.transport.close() } catch (_: java.io.IOException) {} }
         workers.shutdownNow(); timer.shutdownNow()
     }
@@ -206,10 +219,10 @@ object DiagnosticAccess {
         private set
     val discovery: org.screencopy.receiver.protocol.DiagnosticDiscovery?
         get() = if (enabled) listener?.discovery else null
-    const val warning = "Anyone on this LAN can read bounded diagnostic metadata and start, end or clear diagnostic captures while enabled (or frozen for up to 120 seconds after a capture ends). An explicitly armed cast collects receiver evidence through the sender without a receiver settings change. Traffic is unencrypted and unauthenticated. No media contents or casting controls are exposed. Enable only on a trusted LAN; disable after use."
+    const val warning = "Anyone who can reach these LAN or VPN endpoints can read bounded diagnostic metadata and start, end or clear diagnostic captures while enabled (or frozen for up to 120 seconds after a capture ends). An explicitly armed cast collects receiver evidence through the sender without a receiver settings change. Traffic is unencrypted and unauthenticated. No media contents or casting controls are exposed. Enable only on trusted networks; disable after use."
     val status: String get() = if (!enabled) state else listener?.let {
-        "LAN TCP endpoint: ${it.endpoint}\nAccess: no pairing or authentication\n" +
-            "Unicast discovery: ${if (it.endpointDiscoveryPort != null) "available (UDP 27184)" else "unavailable"}\n" +
+        "LAN / VPN TCP endpoints:\n${it.endpoint}\nAccess: no pairing or authentication\n" +
+            "Unicast discovery: ${it.discoveryStatus}\n" +
             "Collector: ${if (it.collectorConnected) "connected" else "not connected"}\n" +
             "Capture: ${if (RemoteDiagnostics.recorder.collecting) "collecting" else "inactive/frozen"}"
     } ?: state
@@ -238,7 +251,7 @@ object DiagnosticAccess {
                 arms.revoke()
                 listener?.revokeNetwork()
                 state = "Disabled"
-            } else state = "Starting LAN listener…"
+            } else state = "Starting diagnostic listeners…"
             epoch
         }
         if (!next) disableObservers.forEach { it() }
@@ -262,7 +275,7 @@ object DiagnosticAccess {
                     android.util.Log.e("RemoteDiagnostics", "Could not enable diagnostic listener", e)
                     val failed = synchronized(this) {
                         if (generation == epoch) {
-                            enabled = false; state = "Unavailable: check LAN permission and local IPv4 network"
+                            enabled = false; state = "Unavailable: check local network permission and LAN / VPN IPv4 interfaces"
                             true
                         } else false
                     }

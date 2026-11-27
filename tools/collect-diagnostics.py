@@ -26,7 +26,7 @@ FLAGS = {
     "sender": ["session", "recovery", "audio.capture", "audio.transport",
                "audio.queue", "video.progress", "transport.health"],
     "receiver": ["session", "recovery", "audio.transport", "audio.queue",
-                 "audio.output", "video.progress", "video.timing", "transport.health"],
+                 "audio.output", "video.progress", "video.timing", "transport.health", "tail.details"],
 }
 
 
@@ -63,6 +63,8 @@ def select_flags(role, requested, supported):
     if not isinstance(supported, list) or any(not isinstance(flag, str) for flag in supported):
         raise DiagnosticError("Missing role capabilities")
     selected = [flag for flag in FLAGS[role] if flag in supported] if requested is None else requested
+    if requested is None and "tail.details" in selected:
+        selected.remove("tail.details")
     if requested is None and "video.timing" in selected and "video.progress" not in selected:
         selected.remove("video.timing")
     if not selected or any(flag not in supported for flag in selected):
@@ -184,6 +186,25 @@ def validate_receiver_role_state(role):
         raise DiagnosticError("Invalid receiver role state")
 
 
+def validate_tail_details(details, truncated):
+    if not isinstance(details, dict) or set(details) != {
+            "cause", "stage", "unsentFirstSeq", "unsentLastSeq", "observedUnsentCount"}:
+        raise DiagnosticError("Invalid terminal tail details")
+    cause, stage = details["cause"], details["stage"]
+    if truncated:
+        if cause not in ("deadline", "budget", "source_pending") or \
+                stage != ("source" if cause == "source_pending" else "delivery"):
+            raise DiagnosticError("Invalid terminal tail cause")
+    elif cause is not None or stage is not None:
+        raise DiagnosticError("Unexpected terminal tail cause")
+    first, last = details["unsentFirstSeq"], details["unsentLastSeq"]
+    count = exact_long(details["observedUnsentCount"])
+    if (first is None) != (last is None) or (first is not None and
+            (exact_long(first) == 0 or exact_long(first) > exact_long(last))) or \
+            (count and first is None) or (not truncated and (first is not None or count)):
+        raise DiagnosticError("Invalid terminal tail range")
+
+
 def validate_page(page, pair_id, cursors, identity=None, flags=None):
     if not isinstance(page, dict) or page.get("pairId") != pair_id:
         raise DiagnosticError("FETCH pair identity mismatch")
@@ -234,6 +255,9 @@ def validate_page(page, pair_id, cursors, identity=None, flags=None):
                 validate_source_loss(source["sourceLoss"])
             if type(source.get("endConfirmed")) is not bool:
                 raise DiagnosticError("Malformed receiver terminal state")
+            terminal = source.get("terminal")
+            if isinstance(terminal, dict) and "tailDetails" in terminal:
+                validate_tail_details(terminal["tailDetails"], terminal.get("tailTruncated"))
     for item in records:
         if not isinstance(item, dict) or set(item) != {"role", "session", "captureId", "clockId", "record"}:
             raise DiagnosticError("Malformed FETCH envelope")
@@ -400,8 +424,54 @@ def emit(output, kind, value):
     output.flush()
 
 
+class SequenceCompleteness:
+    """Track gaps in delivered source tickets, not source retention evictions."""
+
+    def __init__(self):
+        self.last = {role: 0 for role in FLAGS}
+        self.missing = {role: 0 for role in FLAGS}
+        self.ranges = {role: [] for role in FLAGS}
+        self.omitted_ranges = {role: 0 for role in FLAGS}
+
+    def gap(self, role, first, last):
+        if first > last:
+            return
+        self.missing[role] += last - first + 1
+        if len(self.ranges[role]) < 32:
+            self.ranges[role].append([str(first), str(last)])
+        else:
+            self.omitted_ranges[role] += 1
+
+    def observe(self, records):
+        for item in records:
+            role = item["role"]
+            seq = exact_long(item["record"]["seq"])
+            self.gap(role, self.last[role] + 1, seq - 1)
+            self.last[role] = seq
+
+    def finish(self, page):
+        result = {}
+        for role in FLAGS:
+            source = page.get(role)
+            if source is None:
+                result[role] = None
+                continue
+            latest = exact_long(source["latestSeq"])
+            if role == "receiver" and source.get("sourceLoss") is not None:
+                loss = source["sourceLoss"]
+                published = loss[1] if isinstance(loss, list) else loss["publishedSeq"]
+                latest = max(latest, exact_long(published))
+            self.gap(role, self.last[role] + 1, latest)
+            self.last[role] = max(self.last[role], latest)
+            result[role] = dict(sequenceComplete=self.missing[role] == 0,
+                                missingCount=str(self.missing[role]),
+                                missingRanges=self.ranges[role],
+                                omittedRanges=self.omitted_ranges[role])
+        return result
+
+
 async def drain_frozen(client, pair_id, cursors, budget, deadline, output, identity=None, first_page=None,
-                       flags=None):
+                       flags=None, completeness=None):
     count = 0
     size = 0
     page = first_page
@@ -414,6 +484,8 @@ async def drain_frozen(client, pair_id, cursors, budget, deadline, output, ident
         if page.get("state") != "frozen":
             raise DiagnosticError("Frozen pair changed state")
         records, cursors = validate_page(page, pair_id, cursors, identity, flags)
+        if completeness is not None:
+            completeness.observe(records)
         count += len(records)
         size += sum(len(json.dumps(item, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
                     for item in records)
@@ -531,7 +603,9 @@ async def record_status(client, output, pair_id, identity, deadline, budget):
             else:
                 confirmed_fields = {"reason", "endedNs", "mediaRetirement", "ownershipCleanup",
                                     "tailTruncated", "captureEnd"}
-                if set(outcome) not in (confirmed_fields, confirmed_fields | {"confirmed"}) or \
+                if set(outcome) not in (confirmed_fields, confirmed_fields | {"confirmed"},
+                                        confirmed_fields | {"tailDetails"},
+                                        confirmed_fields | {"confirmed", "tailDetails"}) or \
                         outcome.get("confirmed", True) is not True or \
                         outcome["reason"] not in ("receiver_retired_stop", "receiver_retired_fatal") or \
                         outcome["mediaRetirement"] not in ("succeeded", "failed") or \
@@ -543,6 +617,8 @@ async def record_status(client, output, pair_id, identity, deadline, budget):
                     raise DiagnosticError("Invalid confirmed receiver outcome")
                 exact_long(outcome["endedNs"])
                 exact_long(capture_end["atNs"])
+                if "tailDetails" in outcome:
+                    validate_tail_details(outcome["tailDetails"], outcome["tailTruncated"])
     emit(output, "status", status)
     return status
 
@@ -583,6 +659,7 @@ async def collect_pair(address, sender_flags, receiver_flags, duration, output_p
             bootstrap_saved = False
             frozen_deadline = None
             budget = FetchBudget()
+            completeness = SequenceCompleteness()
             while True:
                 now = asyncio.get_running_loop().time()
                 if frozen_deadline is None and now >= deadline:
@@ -608,13 +685,14 @@ async def collect_pair(address, sender_flags, receiver_flags, duration, output_p
                     if frozen_deadline is None:
                         frozen_deadline = asyncio.get_running_loop().time() + 120
                     page, cursors = await drain_frozen(client, pair_id, cursors, budget, frozen_deadline,
-                                                       output, identity, page, flags)
+                                                       output, identity, page, flags, completeness)
                     final_status = await record_status(client, output, pair_id, identity, frozen_deadline, budget)
                     if final_status.get("state") != "frozen":
                         raise DiagnosticError("Final pair status is not frozen")
                     if "setupFailureAvailable" in page and \
                             page["setupFailureAvailable"] != (final_status.get("setupFailure") is not None):
                         raise DiagnosticError("Setup failure summary disagrees with final status")
+                    emit(output, "sequence_completeness", completeness.finish(page))
                     emit(output, "ended", page)
                     ended = True
                     bootstrap = final_status.get("bootstrap")
@@ -633,6 +711,7 @@ async def collect_pair(address, sender_flags, receiver_flags, duration, output_p
                                               str(page.get("endReason")))
                     return
                 records, cursors = validate_page(page, pair_id, cursors, identity, flags)
+                completeness.observe(records)
                 for record in records:
                     emit(output, "event", record)
                 emit(output, "retention", {key: value for key, value in page.items() if key != "records"})
@@ -657,14 +736,13 @@ async def collect_pair(address, sender_flags, receiver_flags, duration, output_p
                     client.close()
 
 
-def private_ipv4(value):
+def discovery_ipv4(value):
     try:
         address = ipaddress.IPv4Address(value)
     except ipaddress.AddressValueError as error:
-        raise argparse.ArgumentTypeError("Use the device's private LAN IPv4 address") from error
-    if not any(address in ipaddress.IPv4Network(network)
-               for network in ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16")):
-        raise argparse.ArgumentTypeError("Use the device's private LAN IPv4 address")
+        raise argparse.ArgumentTypeError("Use the device's unicast LAN or VPN IPv4 address") from error
+    if not 1 <= address.packed[0] <= 223 or address.is_loopback or address.is_link_local:
+        raise argparse.ArgumentTypeError("Use the device's unicast LAN or VPN IPv4 address")
     return str(address)
 
 
@@ -682,7 +760,7 @@ def sender_discovery_endpoint(data, nonce, host):
 
 
 async def discover_sender(host, seconds):
-    host = private_ipv4(host)
+    host = discovery_ipv4(host)
     nonce = secrets.token_hex(16)
     request = json.dumps(dict(protocol=ENDPOINT_QUERY_PROTOCOL, version=1, nonce=nonce),
                          separators=(",", ":")).encode().ljust(ENDPOINT_QUERY_SIZE, b" ")
@@ -703,7 +781,7 @@ async def discover_sender(host, seconds):
                 address = sender_discovery_endpoint(data, nonce, host)
             except DiagnosticError:
                 continue
-            print("Sender diagnostics: " + address + " (untrusted LAN hint)", flush=True)
+            print("Sender diagnostics: " + address + " (untrusted LAN/VPN hint)", flush=True)
             return address
     finally:
         transport.close()
@@ -717,9 +795,9 @@ def main(argv=None):
     parser.add_argument("--receiver-flags", type=parse_flags)
     parser.add_argument("--duration", type=int, default=180, help="seconds, 1..180")
     parser.add_argument("--output", type=Path, help="local evidence directory")
-    parser.add_argument("--discover-sender", type=private_ipv4, metavar="LAN_IPV4")
+    parser.add_argument("--discover-sender", type=discovery_ipv4, metavar="LAN_OR_VPN_IPV4")
     parser.add_argument("--discover-seconds", type=int, default=5)
-    parser.add_argument("--lan", action="store_true", help="accept unauthenticated plaintext on a trusted LAN")
+    parser.add_argument("--lan", action="store_true", help="accept unauthenticated plaintext on a trusted LAN or VPN")
     options = parser.parse_args(argv)
     if not 1 <= options.duration <= 180 or not 1 <= options.discover_seconds <= 30:
         parser.error("Invalid duration or discovery window")
@@ -732,7 +810,7 @@ def main(argv=None):
         if options.discover_sender:
             asyncio.run(discover_sender(options.discover_sender, options.discover_seconds))
         else:
-            print("WARNING: diagnostics is plaintext and unauthenticated; use a trusted LAN.", file=sys.stderr)
+            print("WARNING: diagnostics is plaintext and unauthenticated; use a trusted LAN or VPN.", file=sys.stderr)
             options.output.mkdir(parents=True, exist_ok=True)
             asyncio.run(collect_pair(options.sender, options.sender_flags, options.receiver_flags,
                                      options.duration, options.output / "paired.jsonl"))

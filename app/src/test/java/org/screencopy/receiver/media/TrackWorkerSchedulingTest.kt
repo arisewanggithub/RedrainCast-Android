@@ -12,6 +12,67 @@ import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicReference
 
 class TrackWorkerSchedulingTest {
+    @Test fun retainedDecodedInputSharesTheEncodedByteCapWithoutRelaxingItsPtsLimit() {
+        val worker = object : TrackWorker("retained-input", 10, { _, _ -> fail("not started") }, 2) {
+            fun retain(bytes: Int) = reserveInputBytes(bytes).also { if (it) retainDecodedInput(bytes) }
+            fun discard(bytes: Int) = releaseDecodedInput(bytes)
+            override fun step() {}
+            override fun release() {}
+        }
+        try {
+            assertTrue(worker.retain(8))
+            assertNull(worker.tryOffer(AccessUnit(0, ByteArray(2))))
+            assertFalse(worker.retain(1))
+            val pressure = checkNotNull(worker.tryOffer(AccessUnit(1, ByteArray(1))))
+            assertEquals(QueueLimit.BYTES, pressure.limit)
+            assertEquals(10, pressure.queuedBytes)
+            assertEquals(11L, pressure.attemptedBytes)
+            assertEquals(1L, pressure.incomingPtsUs)
+            assertEquals(2, pressure.encodedBytes)
+            assertEquals(8, pressure.retainedDecodedBytes)
+            assertTrue(pressure.detectedAtNs > 0)
+            worker.discard(8)
+            assertNull(worker.tryOffer(AccessUnit(250_000, ByteArray(1))))
+            assertEquals(QueueLimit.PTS, checkNotNull(
+                worker.tryOffer(AccessUnit(250_001, ByteArray(1)))).limit)
+        } finally { worker.close() }
+    }
+
+    @Test fun rejectionFreezesAlreadyPublishedCausalCheckpointsAtDetection() {
+        val telemetry = ReceiverTelemetrySession({ true })
+        TelemetryRegistry.beginReceiver(136, telemetry)
+        val worker = object : TrackWorker("reject-freeze", 1, { _, _ -> fail("not started") }, 2) {
+            override fun step() {}
+            override fun release() {}
+        }.also { it.diagnosticSession = 136; it.diagnosticGeneration = 3 }
+        try {
+            val old = LongArray(17) { 1 }
+            val newer = LongArray(17) { 2 }
+            TelemetryRegistry.causal(136, CausalEvidence.Stage.WORKER, 3, *old, atNs = 1)
+            assertNull(worker.tryOffer(AccessUnit(10, ByteArray(1))))
+            val rejected = checkNotNull(worker.tryOffer(AccessUnit(11, ByteArray(1))))
+            TelemetryRegistry.causal(136, CausalEvidence.Stage.WORKER, 3, *newer, atNs = rejected.detectedAtNs + 1)
+            TelemetryRegistry.end("receiver", telemetry)
+            val batch = SessionTelemetryProtocol.parse(checkNotNull(
+                telemetry.requestFinal(true, System.nanoTime() + 1_000_000_000L)).payload)
+            val frozen = batch.events.single { it.kind == CausalEvidence.KIND &&
+                it.stage == CausalEvidence.Stage.WORKER.ordinal && it.value == 1L }
+            assertEquals(old.toList(), frozen.detail)
+            val capture = batch.events.single { it.kind == CausalEvidence.KIND &&
+                it.stage == CausalEvidence.Stage.CAPTURE.ordinal }
+            assertEquals(rejected.detectedAtNs, capture.atNs)
+            val snapshot = batch.state.single { it.kind == DiagnosticKind.AUDIO_QUEUE.ordinal + 1 &&
+                it.stage == DiagnosticStage.REJECTED.ordinal }
+            assertEquals(rejected.detectedAtNs, snapshot.atNs)
+            assertEquals(11L, snapshot.value)
+            assertEquals(listOf(1L, 0L, 1L, 2L, 1L, QueueLimit.BYTES.ordinal.toLong()), snapshot.detail)
+        } finally {
+            worker.close()
+            TelemetryRegistry.end("receiver", telemetry)
+            telemetry.requestFinal(false, System.nanoTime())
+        }
+    }
+
     @Test fun queueAdmitThenDequeuePublishesEmptyDuringIdleAndFinal() {
         val published = CountDownLatch(1)
         val periodic = AtomicReference<ByteArray>()

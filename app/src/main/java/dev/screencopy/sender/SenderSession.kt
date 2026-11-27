@@ -33,11 +33,13 @@ internal fun setupFailure(error: Exception, setupTimedOut: Boolean): DiagnosticA
 
 internal fun finishSenderDiagnostic(
     recorder: DiagnosticRecorder, arms: DiagnosticArmRegistry, claim: DiagnosticArmRegistry.Claim?,
-    session: Long, failed: Boolean, retire: () -> Unit, dispatch: (() -> Unit) -> Unit
+    session: Long, failed: Boolean, retire: () -> Unit, dispatch: (() -> Unit) -> Unit,
+    failureCode: String? = null
 ) {
     recorder.observe("sender", session, DiagnosticKind.SESSION,
         if (failed) DiagnosticStage.FAILED else DiagnosticStage.ENDED,
-        reason = if (failed) DiagnosticReason.FAILURE else DiagnosticReason.STOPPED)
+        reason = if (failed) DiagnosticReason.FAILURE else DiagnosticReason.STOPPED,
+        metadata = if (failed) DiagnosticTerminalFailure(IncidentEvidence.cause(failureCode ?: ""), null) else null)
     recorder.sessionEnded("sender", session)
     if (claim != null) {
         claim.senderFinished.set(true)
@@ -423,7 +425,8 @@ class SenderSession internal constructor(
             trace.mark(SessionStopTrace.Stage.FINISHED)
             cleanupComplete = true
             finishSenderDiagnostic(RemoteDiagnostics.recorder, DiagnosticAccess.arms, proxyClaim, session,
-                outcome.failure != null, { proxyClient?.retire() }, DiagnosticAccess::dispatch)
+                outcome.failure != null, { proxyClient?.retire() }, DiagnosticAccess::dispatch,
+                outcome.failure?.let { SessionOutcome.errorCode(it) })
             TelemetryRegistry.end("sender", telemetry)
             telemetry?.finish(cleanupSucceeded)
             finished()
@@ -616,7 +619,24 @@ class SenderSession internal constructor(
         }
         if (sequence != null && skip != null)
             throw IOException("PROTOCOL: final telemetry cannot be both sent and skipped")
+        val rawPreparation = json.opt("preparationTimeout")
+        val preparation = if (rawPreparation == null) null else {
+            if (skip != ReceiverTelemetrySession.FinalSkipReason.PREPARATION_TIMEOUT ||
+                rawPreparation !is JSONObject || rawPreparation.keys().asSequence().toSet() !=
+                setOf("phase", "elapsedNs", "activeProducers"))
+                throw IOException("PROTOCOL: invalid final preparation details")
+            val phase = ReceiverTelemetrySession.PreparationPhase.entries.firstOrNull {
+                it.name == rawPreparation.opt("phase")
+            } ?: throw IOException("PROTOCOL: invalid final preparation phase")
+            val elapsed = SessionTelemetryProtocol.number(rawPreparation.opt("elapsedNs"))
+            val producers = rawPreparation.opt("activeProducers") as? Int
+                ?: throw IOException("PROTOCOL: invalid producer count")
+            if (elapsed < 0 || producers < 0) throw IOException("PROTOCOL: invalid preparation duration")
+            DiagnosticPreparationTimeout(phase, elapsed, producers)
+        }
         telemetry?.terminal(sequence, cleanup == true, skipReason = skip)
+        RemoteDiagnostics.recorder.observe("sender", session, DiagnosticKind.SESSION, DiagnosticStage.SAMPLE,
+            metadata = DiagnosticTerminalCoverage(sequence, cleanup as Boolean?, skip, preparation))
     }
     private fun worker(name: String, action: () -> Unit) { threads.add(Thread(action, name).also { it.start() }) }
     private fun readLoop() {

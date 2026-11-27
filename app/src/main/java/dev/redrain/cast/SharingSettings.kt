@@ -364,7 +364,7 @@ object SharingSettings {
         }
         val remoteDiagnostics = CheckBox(activity).apply {
             tag = "allowRemoteDiagnostics"
-            text = "Allow unpaired LAN diagnostics (this process only)"
+            text = "Allow unpaired LAN / VPN diagnostics (this process only)"
             isChecked = dev.redrain.cast.diagnostics.DiagnosticAccess.enabled
             minimumHeight = dp(48)
             advanced.addView(this, spacing(8))
@@ -381,7 +381,7 @@ object SharingSettings {
         }
         Button(activity).apply {
             tag = "remoteDiagnosticsStatus"
-            text = "LAN diagnostics endpoint / status"
+            text = "LAN / VPN diagnostics endpoints / status"
             minimumHeight = dp(48)
             setOnClickListener {
                 val info = TextView(activity).apply {
@@ -391,7 +391,7 @@ object SharingSettings {
                     setTextIsSelectable(true)
                     setPadding(dp(16), dp(12), dp(16), dp(12))
                 }
-                val status = AlertDialog.Builder(activity).setTitle("LAN diagnostics").setView(info)
+                val status = AlertDialog.Builder(activity).setTitle("LAN / VPN diagnostics").setView(info)
                     .setPositiveButton(android.R.string.ok, null).create()
                 status.window?.addFlags(android.view.WindowManager.LayoutParams.FLAG_SECURE)
                 status.show()

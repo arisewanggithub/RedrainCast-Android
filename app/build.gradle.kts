@@ -1,8 +1,19 @@
 import java.security.MessageDigest
+import java.time.Instant
+import java.time.ZoneOffset
+import java.time.format.DateTimeFormatter
+import java.util.UUID
 
 plugins {
     id("com.android.application")
 }
+
+abstract class DebugBuildId : ValueSource<String, ValueSourceParameters.None> {
+    override fun obtain(): String = DateTimeFormatter.ofPattern("yyyyMMdd'T'HHmmssSSS'Z'")
+        .withZone(ZoneOffset.UTC).format(Instant.now()) + "-" + UUID.randomUUID().toString().take(8)
+}
+
+val debugBuildId = providers.of(DebugBuildId::class.java) {}.get()
 
 android {
     namespace = "dev.redrain.cast"
@@ -44,7 +55,7 @@ android {
     buildTypes {
         getByName("debug") {
             applicationIdSuffix = ".debug"
-            versionNameSuffix = "-debug"
+            versionNameSuffix = "-debug-$debugBuildId"
         }
         getByName("release") {
             isDebuggable = false

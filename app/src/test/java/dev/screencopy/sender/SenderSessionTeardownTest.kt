@@ -605,6 +605,13 @@ class SenderSessionTeardownTest {
                     val worker = ScheduledThreadPoolExecutor(1)
                     worker.execute { entered.countDown(); release.await() }
                     val blocked = dev.redrain.cast.diagnostics.ReceiverTelemetrySession({ true }, worker = worker)
+                    val diagnostics = dev.redrain.cast.diagnostics.RemoteDiagnostics.recorder
+                    diagnostics.grantConsent()
+                    val arms = dev.redrain.cast.diagnostics.DiagnosticArmRegistry(diagnostics)
+                    val pair = arms.start("collector", setOf("session"), setOf("session"), 10_000, 100)
+                        .getString("pairId")
+                    val claim = checkNotNull(arms.claim(ID))
+                    claim.bootstrapAccepted.set(true)
                     try {
                         assertTrue(entered.await(2, TimeUnit.SECONDS))
                         link.connect()
@@ -629,6 +636,8 @@ class SenderSessionTeardownTest {
                             dev.redrain.cast.diagnostics.DiagnosticStage.PRESSURE.ordinal, 1, 1,
                             detail = listOf(0, 0, 0, 0, 1), pressure = true)
                         session.startWorkers()
+                        arms.receiverEnded(claim, expected = false)
+                        assertEquals("draining", arms.status("collector", pair).getString("state"))
                         if (fatal) link.send(Wire.control(Wire.ERROR, ID,
                             Wire.obj("code" to "AUDIO_FAILED", "message" to "controlled failure", "fatal" to true)))
                         else session.sender.stop()
@@ -641,12 +650,26 @@ class SenderSessionTeardownTest {
                         assertEquals("PREPARATION_TIMEOUT", report.getJSONObject("receiver").getString("finalSkipReason"))
                         assertTrue(dev.redrain.cast.diagnostics.IncidentSummary.text(report).contains("PREPARATION_TIMEOUT"))
                         assertFalse(report.getBoolean("receiverComplete"))
+                        finishSenderDiagnostic(diagnostics, arms, claim, ID, fatal, {}, { it() })
+                        val frozen = arms.fetch("collector", pair, 0, 0, 32)
+                        assertEquals("frozen", frozen.getString("state"))
+                        val records = frozen.getJSONArray("records")
+                        val details = (0 until records.length()).map { records.getJSONObject(it) }
+                            .map { it.getJSONObject("record") }
+                            .mapNotNull { it.getJSONObject("data").optJSONObject("metrics") }
+                            .single { it.optString("schema") == "terminal_coverage" }
+                            .getJSONObject("preparationTimeout")
+                        assertEquals("QUEUED", details.getString("phase"))
+                        assertTrue(details.getString("elapsedNs").toLong() > 0)
+                        assertEquals(0, details.getInt("activeProducers"))
                     } finally {
                         release.countDown()
                         worker.shutdownNow()
                         dev.redrain.cast.diagnostics.TelemetryRegistry.end("sender", sender)
                         dev.redrain.cast.diagnostics.TelemetryRegistry.end("receiver", blocked)
                         sender.finish()
+                        arms.revoke()
+                        diagnostics.revoke()
                     }
                 }
             }

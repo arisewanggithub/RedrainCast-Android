@@ -64,6 +64,7 @@ internal class DiagnosticArmRegistry(
         val terminalDeadlineNs = AtomicLong()
         val senderFinished = AtomicBoolean()
         var receiverFinished = false
+        var receiverCoverageLost = false
         var receiverFinishing = false
         var receiver: DiagnosticProxyIntake? = null
         var receiverCaptureId: String? = null
@@ -291,7 +292,12 @@ internal class DiagnosticArmRegistry(
         if (!expected && !current.bootstrapAccepted.get()) {
             current.setupStage = "lane"
             freeze(current, "setup_failed")
-        } else if (!expected) freeze(current, "coverage_lost")
+        } else if (!expected) {
+            current.receiverCoverageLost = true
+            current.clockRequest = null
+            if (current.senderFinished.get()) freeze(current, "coverage_lost")
+            else current.state = "draining"
+        }
         else if (current.senderFinished.get()) freeze(current, "session_ended")
         else current.state = "draining"
     }
@@ -331,7 +337,8 @@ internal class DiagnosticArmRegistry(
         val current = requireClaim(claim)
         if (current.state == "frozen") return
         if (current.state == "binding") freeze(current, "setup_failed")
-        else if (current.receiverFinished) freeze(current, "session_ended")
+        else if (current.receiverFinished)
+            freeze(current, if (current.receiverCoverageLost) "coverage_lost" else "session_ended")
         else current.state = "draining"
     }
 

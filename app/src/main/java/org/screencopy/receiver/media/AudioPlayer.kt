@@ -10,6 +10,32 @@ import java.nio.ByteOrder
 import kotlin.math.abs
 import dev.redrain.cast.diagnostics.*
 
+internal fun aacPastRecoveryBoundary(boundaryUs: Long, ptsUs: Long, rate: Int): Boolean {
+    val guardUs = maxOf(120_000L, (1024 * 1_000_000L + rate - 1) / rate)
+    return ptsUs > boundaryUs && ptsUs - boundaryUs > guardUs
+}
+
+internal class AudioCausalStartGate {
+    private var previous: List<Long>? = null
+    private var capture: String? = null
+    private var generation = -1
+    private var session = -1L
+
+    @Synchronized fun reset() { previous = null }
+
+    @Synchronized fun take(session: Long, generation: Int, capture: String?, decision: AudioStartDecision): Boolean {
+        val transition = listOf(decision.reason.toLong(), decision.mode.toLong(),
+            decision.targetUs, decision.revision, decision.flags)
+        if (this.session == session && this.generation == generation && this.capture == capture &&
+            previous == transition) return false
+        this.session = session
+        this.generation = generation
+        this.capture = capture
+        previous = transition
+        return true
+    }
+}
+
 class AudioPlayer(
     private val format: AudioFormat,
     private val clock: PlaybackClock,
@@ -23,7 +49,8 @@ class AudioPlayer(
     resamplerFactory: (Int, Int) -> PcmResampler = ::FfmpegPcmResampler,
     private val onServiceDiagnostic: ((String) -> Unit)? = null,
     private val threadCpuNs: () -> Long = android.os.Debug::threadCpuTimeNanos,
-    prepareThread: () -> Unit = { MediaThreadDiagnostic.report(MediaThreadRole.AUDIO) }
+    prepareThread: () -> Unit = { MediaThreadDiagnostic.report(MediaThreadRole.AUDIO) },
+    aacFactory: ((AudioFormat) -> MediaCodec)? = null
 ) : TrackWorker("ScreenCopy-audio", 512 * 1024, { code, detail -> failure(if (code == "DECODER_FAILED") "AUDIO_FAILED" else code, detail) },
     track = 2, prepareThread = prepareThread) {
     private val output: AudioOutput
@@ -34,6 +61,9 @@ class AudioPlayer(
     private val info = if (format.codec == "aac") MediaCodec.BufferInfo() else null
     private var waiting: AccessUnit? = null
     private var pending: DecodedAudio? = null
+    private val recoveryAudio = ArrayDeque<DecodedAudio>()
+    private var decodeReservation = 0
+    private var recoveryStartAtNs: Long? = null
     private val startup = StartupTrim(format.preSkip, format.sampleRate)
     @Volatile private var totalFrames = 0L
     @Volatile private var sourceWrittenUnits = 0L
@@ -65,6 +95,8 @@ class AudioPlayer(
     private var lastDecodedPtsUs: Long? = null
     @Volatile internal var recoveryCutoffUs: Long? = null
     internal var onFirstSubmitted: (Long) -> Unit = {}
+    internal var onRecoveryPressure: (QueuePressure) -> Unit = {}
+    private var recoveryPressureReported = false
     private var submittedReported = false
     @Volatile private var audioObservation: Pair<Long, AudioStatistics>? = null
     internal val audioStatistics: AudioStatistics? get() = audioObservation?.second
@@ -74,6 +106,14 @@ class AudioPlayer(
     }
     private var statisticsAtNs = Long.MIN_VALUE
     private var startupCatchup = true
+    @Volatile internal var preservingRecovery = false
+        private set
+    @Volatile internal var recoverySourceBoundary: Long? = null
+        private set
+    @Volatile internal var aacRecoveryInputBoundaryUs: Long? = null
+        private set
+    private var latestAacInputPtsUs: Long? = null
+    private var aacInputPastBoundary = false
     private var cachedOutputTiming: AudioOutputTiming? = null
     private var cachedOutputAtNs = -1L
     private var cachedUnderruns = -1L
@@ -90,6 +130,8 @@ class AudioPlayer(
     private var firstPartialAt = -1L
     private var lastCompletePoint = -1L
     private var trimPublished = false
+    private val startEvidenceGate = AudioStartEvidenceGate()
+    private val causalStartGate = AudioCausalStartGate()
     private fun recordTrim(reason: Long, before: TrimmedAudio, after: TrimmedAudio, cutoff: Long, position: Long) {
         if (trimPublished && before.audiblePtsUs == after.audiblePtsUs && before.frames == after.frames) return
         trimPublished = true
@@ -115,10 +157,16 @@ class AudioPlayer(
         count
     }
     internal fun resetAudioStartEvidence() {
+        synchronized(startEvidenceGate) { startEvidenceGate.reset() }
+        causalStartGate.reset()
         TelemetryRegistry.state("receiver", diagnosticSession, 60,
             DiagnosticKind.AUDIO_OUTPUT.ordinal + 1, DiagnosticStage.SAMPLE.ordinal,
             2, diagnosticGeneration, -1, listOf(DiagnosticPoint.AUDIO_START_WAIT.ordinal.toLong(),
                 0, 0, 0, -1, Long.MIN_VALUE, -1, -1, 0, -1, 0, -1, -1, -1, -1, -1, -1, -1, -1, -1))
+        TelemetryRegistry.state("receiver", diagnosticSession, 63,
+            DiagnosticKind.AUDIO_OUTPUT.ordinal + 1, DiagnosticStage.SAMPLE.ordinal,
+            2, diagnosticGeneration, -1, listOf(DiagnosticPoint.AUDIO_START_WAIT.ordinal.toLong(),
+                0, -1, 0, 0, 0, 0, -1, -1, -1, -1, -1, -1, -1, -1, Long.MIN_VALUE, 0))
     }
     internal inline fun <T> diagnosticCall(point: DiagnosticPoint, pts: Long = -1, count: Long = -1,
                                          requestedSamples: Long = -1, call: (Long) -> T): T {
@@ -234,7 +282,7 @@ class AudioPlayer(
             resampler = createdResampler
             createdOpus = if (format.codec == "opus") opusFactory(format) else null
             opus = createdOpus
-            aac = if (format.codec == "aac") createAac(format) else null
+            aac = if (format.codec == "aac") (aacFactory ?: ::createAac)(format) else null
         } catch (e: Exception) {
             try { createdOpus?.close() } catch (cleanup: Exception) { e.addSuppressed(cleanup) }
             try { createdResampler?.close() } catch (cleanup: Exception) { e.addSuppressed(cleanup) }
@@ -259,7 +307,8 @@ class AudioPlayer(
         val diagnostic = serviceDiagnostic
         if (!diagnostic.started && !TelemetryRegistry.has("receiver", diagnosticSession)) return block()
         val start = clock.monotonicNs()
-        val cpu = if (onServiceDiagnostic != null && diagnostic.started) threadCpuNs() else -1
+        val cpu = if (onServiceDiagnostic != null || TelemetryRegistry.has("receiver", diagnosticSession))
+            threadCpuNs() else -1
         try {
             return block()
         } finally {
@@ -275,23 +324,56 @@ class AudioPlayer(
     private fun serviceStep() {
         stage = "STARTUP_CHECK"
         clock.checkStartup()
-        if (pending != null && clock.canPrepareAudio()) {
+        if ((pending != null || firstPtsUs == null && recoveryAudio.isNotEmpty()) && clock.canPrepareAudio()) {
             flushPending()
         }
         measured("refill") { pumpOutput(allowSilence = false) }
-        if (startupCatchup && regulator.bufferedFrames >= regulator.targetFrames) {
+        if (firstPtsUs != null && recoveryAudio.isNotEmpty() &&
+            regulator.bufferedFrames < regulator.targetFrames) {
+            val decoded = recoveryAudio.removeFirst()
+            releaseDecodedInput(decoded.samples.size * 2)
+            queueResampled(decoded.samples, decoded.slice)
+        }
+        if ((startupCatchup || preservingRecovery) && regulator.bufferedFrames >= regulator.targetFrames) {
             stage = "STARTUP_OUTPUT_WAIT"
             Thread.sleep(2)
-        } else if (format.codec == "aac") diagnosticCall(DiagnosticPoint.DECODE) { stepAac() }
-        else measured("input") { next() }?.let { packet ->
-            measured("decode") {
-                eventHistory?.record(clock.monotonicNs(), "decode_begin", packet.ptsUs, packet.bytes.size.toLong())
-                stage = if (opus != null) "OPUS_DECODE" else "PCM_DECODE"
-                val samples = diagnosticCall(DiagnosticPoint.DECODE, packet.ptsUs) {
-                    opus?.decode(packet.bytes) ?: pcm16(packet.bytes)
+        } else {
+            val retaining = recoveryCutoffUs != null && (firstPtsUs == null || recoveryAudio.isNotEmpty())
+            val maxDecodedBytes = format.sampleRate * format.channels * 2 * 120 / 1000
+            val capacity = !retaining || (recoveryAudio.size + (if (pending != null) 1 else 0) < 256 &&
+                reserveInputBytes(maxDecodedBytes))
+            if (!capacity) {
+                // Leave encoded dependencies in arrival order for admission pressure to
+                // request a track-local reset, or for the source deadline to free space.
+                if (!recoveryPressureReported && firstPtsUs == null && pending == null && recoveryAudio.isEmpty()) {
+                    reservationPressure(maxDecodedBytes)?.let {
+                        recoveryPressureReported = true
+                        onRecoveryPressure(it)
+                    }
                 }
-                write(samples, packet.ptsUs)
-                eventHistory?.record(clock.monotonicNs(), "decode_end", packet.ptsUs, regulator.bufferedFrames.toLong())
+                Thread.sleep(2)
+            } else {
+                if (retaining) decodeReservation = maxDecodedBytes
+                try {
+                    if (format.codec == "aac") diagnosticCall(DiagnosticPoint.DECODE) { stepAac() }
+                    else measured("input") {
+                        next { recoveryQueueEmpty() }
+                    }?.let { packet ->
+                        measured("decode") {
+                            eventHistory?.record(clock.monotonicNs(), "decode_begin", packet.ptsUs, packet.bytes.size.toLong())
+                            stage = if (opus != null) "OPUS_DECODE" else "PCM_DECODE"
+                            val samples = diagnosticCall(DiagnosticPoint.DECODE, packet.ptsUs) {
+                                opus?.decode(packet.bytes) ?: pcm16(packet.bytes)
+                            }
+                            validatePcmLength(samples.size * 2)
+                            write(samples, packet.ptsUs)
+                            eventHistory?.record(clock.monotonicNs(), "decode_end", packet.ptsUs, regulator.bufferedFrames.toLong())
+                        }
+                    }
+                } finally {
+                    if (decodeReservation > 0) releaseInputReservation(decodeReservation)
+                    decodeReservation = 0
+                }
             }
         }
         measured("refill") { pumpOutput() }
@@ -300,8 +382,29 @@ class AudioPlayer(
 
     private fun stepAac() {
         stage = "AAC_INPUT"
-        if (waiting == null) waiting = measured("input") { next() }
+        if (waiting == null) waiting = measured("input") { next { recoveryQueueEmpty() } }
         measured("decode") { pumpAac() }
+    }
+
+    // Called with the admission lock held, so packets admitted after this boundary
+    // cannot accidentally be included in the already-drained recovery backlog.
+    private fun recoveryQueueEmpty() {
+        if (!preservingRecovery || pending != null || recoveryAudio.isNotEmpty()) return
+        if (format.codec == "aac") {
+            if (aacRecoveryInputBoundaryUs == null)
+                aacRecoveryInputBoundaryUs = latestAacInputPtsUs
+        } else if (recoverySourceBoundary == null) {
+            recoverySourceBoundary = resampledTimeline.acceptedFrames
+        }
+        finishRecoveryPreservation()
+    }
+
+    private fun finishRecoveryPreservation() {
+        val boundary = recoverySourceBoundary ?: return
+        // Submitted source units include neither silence nor newer FIFO samples that
+        // have not yet reached AudioTrack. Filter-held samples remain unmapped.
+        if (sourceWrittenUnits / 1_000_000 >= boundary)
+            preservingRecovery = false
     }
 
     private fun pumpAac() {
@@ -316,6 +419,11 @@ class AudioPlayer(
                 input.clear()
                 input.put(packet.bytes)
                 decoder.queueInputBuffer(index, 0, packet.bytes.size, packet.ptsUs, 0)
+                latestAacInputPtsUs = maxOf(latestAacInputPtsUs ?: packet.ptsUs, packet.ptsUs)
+                aacRecoveryInputBoundaryUs?.let { boundary ->
+                    if (aacPastRecoveryBoundary(boundary, packet.ptsUs, format.sampleRate))
+                        aacInputPastBoundary = true
+                }
                 waiting = null
             }
         }
@@ -333,6 +441,19 @@ class AudioPlayer(
             try {
                 if (info.size > 0 && info.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG == 0) {
                     validatePcmLength(info.size)
+                    val boundary = aacRecoveryInputBoundaryUs
+                    // A later input AND later output are required: TRY_AGAIN_LATER
+                    // says nothing about buffers held by MediaCodec. AAC-LC input
+                    // AUs cover at most 1024 samples; the 120 ms minimum also
+                    // covers a maximum-sized decoded output buffer.
+                    if (preservingRecovery && recoverySourceBoundary == null && boundary != null &&
+                        aacInputPastBoundary &&
+                        aacPastRecoveryBoundary(boundary, info.presentationTimeUs, format.sampleRate)) {
+                        recoverySourceBoundary = recoveryAudio.fold(resampledTimeline.acceptedFrames) { total, audio ->
+                            Math.addExact(total, audio.slice.frames.toLong())
+                        }
+                        finishRecoveryPreservation()
+                    }
                     val buffer = checkNotNull(decoder.getOutputBuffer(index))
                     buffer.position(info.offset)
                     buffer.limit(info.offset + info.size)
@@ -372,13 +493,40 @@ class AudioPlayer(
         if (slice.frames == 0) return
         if (firstPtsUs == null) {
             // Until the first video packet, retain only the latest decoded preroll packet.
-            pending = DecodedAudio(samples, slice, ptsUs, trimCutoff, trimReason)
-            flushPending()
+            val decoded = DecodedAudio(samples, slice, ptsUs, trimCutoff, trimReason)
+            if (recoveryCutoffUs != null) {
+                val wasPending = pending != null || recoveryAudio.isNotEmpty()
+                retainRecoveryAudio(decoded)
+                if (!wasPending) flushPending()
+            } else {
+                if (pending != null) causalStartGate.reset()
+                pending = decoded
+                flushPending()
+            }
+        } else if (recoveryAudio.isNotEmpty()) {
+            retainRecoveryAudio(DecodedAudio(samples, slice, ptsUs, trimCutoff, trimReason))
         } else queueResampled(samples, slice)
+    }
+
+    private fun retainRecoveryAudio(decoded: DecodedAudio) {
+        val bytes = decoded.samples.size * 2
+        check(bytes <= decodeReservation) { "Decoded recovery audio exceeded its reservation" }
+        retainDecodedInput(bytes)
+        decodeReservation -= bytes
+        if (firstPtsUs == null && pending == null && recoveryAudio.isEmpty()) pending = decoded
+        else recoveryAudio.addLast(decoded)
+    }
+
+    private fun clearPending() {
+        pending?.let { if (recoveryCutoffUs != null) releaseDecodedInput(it.samples.size * 2) }
+        pending = null
+        causalStartGate.reset()
     }
 
     private fun flushPending() {
         stage = "STARTUP_SYNC"
+        if (pending == null && firstPtsUs == null && recoveryAudio.isNotEmpty())
+            pending = recoveryAudio.removeFirst()
         val decoded = pending ?: return
         while (running.get()) {
             var gateCutoff = decoded.cutoffUs
@@ -394,17 +542,44 @@ class AudioPlayer(
                     recordTrim(2, decoded.slice, it, cutoff, position ?: -1)
                 }
             } ?: decoded.slice
-            if (fresh.frames == 0) { pending = null; return }
+            if (fresh.frames == 0) { clearPending(); return }
             val slice = clock.prepareAudio(fresh, format.sampleRate) ?: return
             if (slice != fresh) {
                 gateCutoff = slice.audiblePtsUs
                 gateTrimReason = 3
                 recordTrim(3, fresh, slice, recoveryCutoffUs ?: -1, -1)
             }
-            if (slice.frames == 0) { pending = null; return }
+            if (slice.frames == 0) { clearPending(); return }
+            val recovering = recoveryCutoffUs != null
+            if (recovering && recoveryStartAtNs == null) recoveryStartAtNs = clock.monotonicNs()
             if (!diagnosticCall(DiagnosticPoint.AUDIO_START_WAIT, slice.audiblePtsUs) { operation ->
-                    var previous: List<Long>? = null
                     clock.awaitAudioStartObserved(slice.audiblePtsUs, { decision ->
+                        val evidenceAt = clock.monotonicNs()
+                        val capture = RemoteDiagnostics.recorder.captureIdentity
+                        val omissions = synchronized(startEvidenceGate) {
+                            startEvidenceGate.take(diagnosticGeneration, decision, evidenceAt, capture)
+                        }
+                        omissions?.let { omitted ->
+                            val snapshot = retentionSnapshot()
+                            val observed = decision.copy(retainedDecodedBytes = snapshot.decodedBytes,
+                                retainedDecodedPackets = snapshot.decodedPackets,
+                                encodedQueueBytes = snapshot.encodedBytes, encodedQueuePackets = snapshot.encodedPackets,
+                                queueSampledAtNs = clock.monotonicNs(), omittedRepeats = omitted)
+                            RemoteDiagnostics.recorder.audioStartDecision(diagnosticSession, diagnosticGeneration,
+                                operation, observed)
+                            TelemetryRegistry.state("receiver", diagnosticSession, 63,
+                                DiagnosticKind.AUDIO_OUTPUT.ordinal + 1, DiagnosticStage.SAMPLE.ordinal,
+                                2, diagnosticGeneration, decision.targetUs, listOf(
+                                    DiagnosticPoint.AUDIO_START_WAIT.ordinal.toLong(), operation,
+                                    decision.observationAgeUs ?: -1, snapshot.decodedBytes.toLong(),
+                                    observed.retainedDecodedPackets.toLong(), snapshot.encodedBytes.toLong(),
+                                    observed.encodedQueuePackets.toLong(), decision.sampledAtNs ?: -1,
+                                    observed.queueSampledAtNs ?: -1, decision.observationSequence ?: -1,
+                                    decision.observationAtNs ?: -1, decision.observationPtsUs ?: -1,
+                                    decision.outputSource?.ordinal?.toLong() ?: -1,
+                                    decision.nativeTimestampAtNs ?: -1, decision.nativeTimestampFrame ?: -1,
+                                    decision.appliedOffsetUs ?: Long.MIN_VALUE, decision.correctionSequence ?: 0))
+                        }
                         val timing = cachedOutputTiming
                         TelemetryRegistry.state("receiver", diagnosticSession, 60,
                             DiagnosticKind.AUDIO_OUTPUT.ordinal + 1, DiagnosticStage.SAMPLE.ordinal,
@@ -417,10 +592,8 @@ class AudioPlayer(
                                 timing?.presentedFrames ?: -1, timing?.timestampAgeUs ?: -1,
                                 timing?.clockSource?.ordinal?.toLong() ?: -1, cachedUnderruns,
                                 lastOutputProgressNs.takeIf { it > 0 } ?: -1, queuedPackets().toLong()))
-                        val transition = listOf(decision.reason.toLong(), decision.mode.toLong(),
-                            decision.targetUs, decision.revision, decision.flags)
-                        if (transition != previous) {
-                            previous = transition
+                        if (TelemetryRegistry.has("receiver", diagnosticSession) &&
+                            causalStartGate.take(diagnosticSession, diagnosticGeneration, capture, decision)) {
                             TelemetryRegistry.causal(diagnosticSession, CausalEvidence.Stage.START, diagnosticGeneration,
                                 operation, decision.reason.toLong(), decision.mode.toLong(), decision.targetUs,
                                 decision.positionUs ?: -1, decision.delayUs ?: Long.MIN_VALUE, decision.revision,
@@ -428,9 +601,12 @@ class AudioPlayer(
                                 decoded.rawPtsUs, gateCutoff, gateTrimReason,
                                 atNs = clock.monotonicNs())
                         }
-                    }) { running.get() }
-                }) continue
-            pending = null
+                    }, waitForFuture = !recovering, startedAtNs = recoveryStartAtNs) { running.get() }
+                }) {
+                if (recovering && clock.audioStartDelayUs(slice.audiblePtsUs) > 0) return
+                continue
+            }
+            clearPending()
             writePcm(decoded.samples, slice)
             return
         }
@@ -444,6 +620,7 @@ class AudioPlayer(
             stage = "OUTPUT_START"
             firstPtsUs = audiblePtsUs
             sourceClock = clock.anchorObservedAudio(audiblePtsUs, format.sampleRate)
+            preservingRecovery = recoveryCutoffUs != null
         }
         stage = "SOURCE_MAP"
         queueResampled(samples, slice)
@@ -514,6 +691,7 @@ class AudioPlayer(
                 sourcePacket(chunk.ptsUs)
                 sourceWrittenUnits = Math.addExact(sourceWrittenUnits, regulator.sourceUnits(accepted))
                 regulator.consumed(accepted)
+                finishRecoveryPreservation()
                 totalFrames += accepted
                 clock.audioWritten(sourceWrittenUnits / format.sampleRate)
             } else regulator.insertedSilence(accepted)
@@ -556,7 +734,8 @@ class AudioPlayer(
         if (frames > format.sampleRate * 120 / 1000 + 256)
             throw PlaybackException("Resampler output exceeded its converted-frame bound", "CONGESTION")
         for (span in resampledTimeline.output(frames, resampler.delayFrames)) {
-            regulator.offer(converted, TrimmedAudio(span.offsetFrames, span.frames, span.ptsUs), span.sourceUnits, false)
+            regulator.offer(converted, TrimmedAudio(span.offsetFrames, span.frames, span.ptsUs), span.sourceUnits,
+                observe = false, preserve = preservingRecovery)
         }
         regulator.converted(slice.frames, frames)?.let { compensation ->
             stage = "PCM_COMPENSATION"
@@ -637,6 +816,8 @@ class AudioPlayer(
             } finally {
                 try { opus?.close() } finally {
                     pending = null
+                    recoveryAudio.clear()
+                    clearInputRetention()
                     reportService(final = true)
                     regulator.clear()
                     presentation.clear()
@@ -649,9 +830,15 @@ class AudioPlayer(
     private fun observePresentation(timing: AudioOutputTiming, observedAtNs: Long) {
         val sampleUs = presentation.presentedUs(timing.presentedFrames)
         presentedSourceUs = sampleUs
-        sourceClock?.let { clock.observeAudio(it, sampleUs, observedAtNs, timing,
-            if (output.playbackActive == true && timing.clockSource == AudioClockSource.TIMESTAMP)
-                presentation.projection() else null) }
+        sourceClock?.let {
+            clock.observeAudio(it, sampleUs, observedAtNs, timing,
+                retainEvidence = RemoteDiagnostics.recorder.collecting,
+                presentedSourceAtFrame =
+                    if (output.playbackActive == true && timing.clockSource == AudioClockSource.TIMESTAMP)
+                        presentation.projection() else null)?.let { observation ->
+                RemoteDiagnostics.recorder.audioClockObservation(diagnosticSession, diagnosticGeneration, observation)
+            }
+        }
     }
 
     private fun pcm16(bytes: ByteArray): ShortArray {

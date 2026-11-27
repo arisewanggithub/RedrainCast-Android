@@ -98,7 +98,11 @@ class ReceiverServer private constructor(
     private val proxyBeforeFetch: () -> Unit = {},
     private val proxyAfterRetirement: () -> Unit = {},
     private val proxyBeforeRetirementFlush: () -> Unit = {},
+    private val proxyAfterFatalError: () -> Unit = {},
+    private val proxyRetirementNow: () -> Long = System::nanoTime,
+    private val proxyBudgetFactory: () -> DiagnosticDeliveryBudget = ::DiagnosticDeliveryBudget,
     private val proxyAfterOrdinaryCleanupFence: () -> Unit = {},
+    private val proxyTerminalWritten: ((Long) -> Unit)? = null,
     private val incidentSave: () -> ((String, JSONObject) -> Unit) = { { _, _ -> } }
 ) : AutoCloseable {
     private fun now() = timeMilliseconds()
@@ -684,6 +688,10 @@ class ReceiverServer private constructor(
                 .put("session", offer.session.toString()).put("armGeneration", offer.generation.toString())
                 .put("captureId", capture)
 
+        private fun terminalFailureProxyRecord(record: JSONObject): Boolean =
+            record.optString("kind") == "SESSION" &&
+                record.optJSONObject("data")?.optString("stage") == "failed"
+
         private fun writeProxy(owner: Connection, offer: DiagnosticProxyNegotiation.Offer, capture: String,
                                expiry: Long, ready: JSONObject) {
             val deadline = minOf(expiry, owner.requestReceivedNs + 5_000_000_000L)
@@ -704,7 +712,7 @@ class ReceiverServer private constructor(
                 try { socket.close() } catch (_: IOException) {}
             }, (expiry - System.nanoTime()).coerceAtLeast(0), TimeUnit.NANOSECONDS)
             val wake = timer.scheduleWithFixedDelay({ proxyWake.offer(Unit) }, 0, 100, TimeUnit.MILLISECONDS)
-            val budget = DiagnosticDeliveryBudget()
+            val budget = proxyBudgetFactory()
             var cursor = 0L
             try {
                 while (owner.proxyGate.get() && !socket.isClosed) {
@@ -719,7 +727,10 @@ class ReceiverServer private constructor(
                         val control = proxyControls.poll() ?: break
                         control.put("sendNs", System.nanoTime().toString())
                         val controlBytes = control.toString().toByteArray(Charsets.UTF_8).size + 4
-                        if (!budget.tryAcquire(System.nanoTime(), 0, controlBytes)) {
+                        val protect = "tail.details" in offer.flags
+                        if (!budget.tryAcquire(System.nanoTime(), 0, controlBytes,
+                                reserveBytes = DiagnosticProxyWire.FRAME_BYTES + 4 + if (protect) 4096 else 0,
+                                reserveSlots = if (protect) 2 else 1, reserveRecords = if (protect) 1 else 0)) {
                             protocolRequire(proxyControls.offer(control), "Diagnostic control queue full")
                             break
                         }
@@ -729,7 +740,11 @@ class ReceiverServer private constructor(
                     val page = proxyRecorder.fetch(capture, cursor, 32)
                     val loss = proxyFrame(offer, capture, "LOSS").put("watermarks", page.getJSONObject("lossWatermarks"))
                     val lossBytes = loss.toString().toByteArray(Charsets.UTF_8).size + 4
-                    if (budget.tryAcquire(System.nanoTime(), 0, lossBytes)) writeProxyFrame(loss)
+                    val protect = "tail.details" in offer.flags
+                    if (budget.tryAcquire(System.nanoTime(), 0, lossBytes,
+                            reserveBytes = DiagnosticProxyWire.FRAME_BYTES + 4 + if (protect) 4096 else 0,
+                            reserveSlots = if (protect) 2 else 1, reserveRecords = if (protect) 1 else 0))
+                        writeProxyFrame(loss)
                     val records = page.getJSONArray("records")
                     for (index in 0 until records.length()) {
                         val record = records.getJSONObject(index)
@@ -738,7 +753,10 @@ class ReceiverServer private constructor(
                         val frame = proxyFrame(offer, capture, "RECORD").put("record", record)
                         val bytes = frame.toString().toByteArray(Charsets.UTF_8).size + 4
                         protocolRequire(bytes <= DiagnosticProxyWire.FRAME_BYTES + 4, "Oversized diagnostic record frame")
-                        if (!budget.tryAcquire(System.nanoTime(), 1, bytes)) break
+                        val protect = "tail.details" in offer.flags && !terminalFailureProxyRecord(record)
+                        if (!budget.tryAcquire(System.nanoTime(), 1, bytes,
+                                reserveBytes = DiagnosticProxyWire.FRAME_BYTES + 4 + if (protect) 4096 else 0,
+                                reserveSlots = if (protect) 2 else 1, reserveRecords = if (protect) 1 else 0)) break
                         writeProxyFrame(frame)
                         cursor = DiagnosticProxyWire.decimal(record.opt("seq"))
                     }
@@ -759,7 +777,7 @@ class ReceiverServer private constructor(
                                          capture: String, expiry: Long, after: Long,
                                          retirement: ProxyRetirement, budget: DiagnosticDeliveryBudget) {
             val deadline = minOf(expiry, retirement.fenceNs + 100_000_000L)
-            val remaining = deadline - System.nanoTime()
+            val remaining = deadline - proxyRetirementNow()
             if (remaining <= 0 || !owner.proxyGate.get() || socket.isClosed) return
             val timeout = timer.schedule({ socket.close() }, remaining, TimeUnit.NANOSECONDS)
             try {
@@ -767,31 +785,56 @@ class ReceiverServer private constructor(
                 var cursor = after
                 var truncated = true
                 var finalLoss: JSONObject? = null
-                while (System.nanoTime() < deadline && owner.proxyGate.get() && !socket.isClosed) {
+                var cause: String? = null
+                var unsentFirst: Long? = null
+                var unsentLast: Long? = null
+                var unsentCount = 0L
+                val detailedTail = "tail.details" in offer.flags
+                fun omitted(sequence: Long) {
+                    if (unsentFirst == null) unsentFirst = sequence
+                    unsentLast = sequence
+                    unsentCount++
+                }
+                while (proxyRetirementNow() < deadline && owner.proxyGate.get() && !socket.isClosed) {
                     val page = proxyRecorder.fetch(capture, cursor, 32)
                     finalLoss = page.getJSONObject("lossWatermarks")
                     val records = page.getJSONArray("records")
                     var sent = 0
                     for (index in 0 until records.length()) {
                         val record = records.getJSONObject(index)
+                        val sequence = DiagnosticProxyWire.decimal(record.opt("seq"))
                         DiagnosticProxyWire.validateSource(record, "receiver", offer.session.toString(),
                             capture, "video.timing" in offer.flags)
                         val frame = proxyFrame(offer, capture, "RECORD").put("record", record)
                         val bytes = frame.toString().toByteArray(Charsets.UTF_8).size + 4
-                        if (System.nanoTime() >= deadline || !budget.tryAcquire(System.nanoTime(), 1, bytes)) break
+                        val critical = terminalFailureProxyRecord(record)
+                        if (proxyRetirementNow() >= deadline - if (detailedTail) 5_000_000L else 0L) {
+                            cause = "deadline"
+                            break
+                        }
+                        val protect = detailedTail && !critical
+                        if (!budget.tryAcquire(System.nanoTime(), 1, bytes,
+                                reserveBytes = DiagnosticProxyWire.FRAME_BYTES + 4 + if (protect) 4096 else 0,
+                                reserveSlots = if (protect) 2 else 1, reserveRecords = if (protect) 1 else 0)) {
+                            if (!detailedTail) break
+                            cause = "budget"
+                            omitted(sequence)
+                            cursor = sequence
+                            continue
+                        }
                         DiagnosticProxyWire.writeFrame(socket.outputStream, frame)
-                        cursor = DiagnosticProxyWire.decimal(record.opt("seq"))
+                        cursor = sequence
                         sent++
                     }
-                    if (sent != records.length()) break
+                    if (cause == "deadline" || !detailedTail && sent != records.length()) break
                     if (!page.getBoolean("hasMore") && page.getInt("pendingRecords") == 0) {
-                        truncated = false
+                        truncated = cause != null
                         break
                     }
-                    if (records.length() == 0) break
+                    if (records.length() == 0) { cause = "source_pending"; break }
                 }
                 val loss = finalLoss ?: return
-                if (System.nanoTime() >= deadline || !owner.proxyGate.get() || socket.isClosed) return
+                if (proxyRetirementNow() >= deadline || !owner.proxyGate.get() || socket.isClosed) return
                 val terminal = proxyFrame(offer, capture, "ENDED").put("clockId", proxyRecorder.clockId)
                     .put("reason", retirement.reason).put("endedNs", ended.getString("endedNs"))
                     .put("mediaRetirement", if (retirement.succeeded) "succeeded" else "failed")
@@ -799,16 +842,31 @@ class ReceiverServer private constructor(
                     .put("captureEnd", JSONObject().put("atNs", retirement.fenceNs.toString())
                         .put("reason", retirement.reason).put("complete", !truncated).put("truncated", truncated))
                     .put("sourceLoss", loss)
+                if (detailedTail) {
+                    val published = DiagnosticProxyWire.decimal(loss.opt("publishedSeq"))
+                    if (cause == "deadline" && cursor < published) {
+                        if (unsentFirst == null) unsentFirst = cursor + 1
+                        unsentLast = published
+                    }
+                    terminal.put("tailDetails", JSONObject()
+                        .put("cause", cause ?: JSONObject.NULL)
+                        .put("stage", if (cause == "source_pending") "source" else if (cause != null) "delivery" else JSONObject.NULL)
+                        .put("unsentFirstSeq", unsentFirst?.toString() ?: JSONObject.NULL)
+                        .put("unsentLastSeq", unsentLast?.toString() ?: JSONObject.NULL)
+                        .put("observedUnsentCount", "$unsentCount"))
+                }
                 val bytes = terminal.toString().toByteArray(Charsets.UTF_8).size + 4
-                if (budget.tryAcquire(System.nanoTime(), 0, bytes))
+                if (budget.tryAcquire(System.nanoTime(), 0, bytes)) {
                     DiagnosticProxyWire.writeFrame(socket.outputStream, terminal)
+                    proxyTerminalWritten?.invoke(System.nanoTime())
+                }
             } finally { timeout.cancel(false) }
         }
 
         private fun proxyRetired(succeeded: Boolean, fatal: Boolean) {
             if (proxyOffer == null) return
             val reason = if (fatal) "receiver_retired_fatal" else "receiver_retired_stop"
-            val retired = ProxyRetirement(reason, succeeded, System.nanoTime())
+            val retired = ProxyRetirement(reason, succeeded, proxyRetirementNow())
             if (proxyRetirement.compareAndSet(null, retired)) {
                 proxyCaptureGate.set(false)
                 proxyLane?.proxyWake?.offer(Unit)
@@ -819,7 +877,7 @@ class ReceiverServer private constructor(
         private fun completeLocalProxyRetirement() {
             val retirement = proxyRetirement.get() ?: return
             if (!receiverStopRequested || stopWrittenAt == null) return
-            if (retirement.reason == "receiver_retired_stop" && retirement.succeeded &&
+            if (retirement.reason == "receiver_retired_stop" &&
                 !terminalError && !proxyControlClosed.get()) proxyOrdinaryRetirementComplete = true
             // Legacy STOP can be written before media retirement; publish both before releasing its ACK.
             stopWritten.countDown()
@@ -867,13 +925,13 @@ class ReceiverServer private constructor(
         private fun closeProxyAfterOrdinaryRetirement() {
             val retirement = proxyRetirement.get()
             if (!proxyOrdinaryRetirementComplete || retirement?.reason != "receiver_retired_stop" ||
-                !retirement.succeeded ||
                 proxyLane == null || !proxyGate.get()) {
                 closeProxy()
                 return
             }
+
             if (!proxyRetirementCloseScheduled.compareAndSet(false, true)) return
-            val remaining = retirement.fenceNs + 100_000_000L - System.nanoTime()
+            val remaining = retirement.fenceNs + 100_000_000L - proxyRetirementNow()
             if (remaining <= 0) {
                 closeProxy()
                 return
@@ -883,6 +941,22 @@ class ReceiverServer private constructor(
             } catch (_: java.util.concurrent.RejectedExecutionException) {
                 closeProxy()
             }
+        }
+
+        private fun closeProxyAfterFatalRetirement() {
+            val retirement = proxyRetirement.get()
+            if (retirement?.reason != "receiver_retired_fatal" || proxyLane == null || !proxyGate.get()) {
+                closeProxy()
+                return
+            }
+            if (!proxyRetirementCloseScheduled.compareAndSet(false, true)) return
+            val remaining = retirement.fenceNs + 100_000_000L - proxyRetirementNow()
+            if (remaining <= 0) {
+                closeProxy()
+                return
+            }
+            try { timer.schedule({ closeProxy() }, remaining, TimeUnit.NANOSECONDS) }
+            catch (_: java.util.concurrent.RejectedExecutionException) { closeProxy() }
         }
 
         private fun fenceProxyControl() {
@@ -1066,10 +1140,12 @@ class ReceiverServer private constructor(
             }
         }
 
-        private fun requestRecovery(pressure: QueuePressure) {
+        private fun requestRecovery(pressure: QueuePressure, expectedAudioEpoch: Long? = null) {
             val track = pressure.track
             val generation = synchronized(playbackLock) {
                 if (!accepted || stopping.get() || !tracksReady) return
+                if (expectedAudioEpoch != null && (track != 2 || expectedAudioEpoch != audioEpoch ||
+                        expectedAudioEpoch <= retiredAudioThrough)) return
                 if (track == 1) {
                     if (videoRecovering) return
                     videoRecovering = true
@@ -1177,7 +1253,10 @@ class ReceiverServer private constructor(
         private fun createControlWriter() = ControlWriter(socket, { message ->
                     lastWrite = now()
                     if (message.type == Type.ERROR && fatalTerminalClaimed.get()) {
-                        closeTransport()
+                        proxyControlClosed.set(true)
+                        closeProxyAfterFatalRetirement()
+                        socket.close()
+                        proxyAfterFatalError()
                         writer?.close()
                     }
                     if (message.type == Type.STOP) {
@@ -1493,7 +1572,9 @@ class ReceiverServer private constructor(
                     controlCleanupStarted = true
                     fatalWork.get() != FatalWork.NOT_STARTED
                 }
-                if (!fatalWorker || !telemetryNegotiated || socket.isClosed) closeProxyAfterOrdinaryRetirement()
+                if (fatalWorker && telemetryNegotiated && proxyRetirement.get()?.reason == "receiver_retired_fatal")
+                    closeProxyAfterFatalRetirement()
+                else if (!fatalWorker || !telemetryNegotiated || socket.isClosed) closeProxyAfterOrdinaryRetirement()
                 if (proxyOrdinaryRetirementComplete) proxyAfterOrdinaryCleanupFence()
                 recoveryScheduler.shutdown()
                 recoveryExecutor.shutdown()
@@ -1563,7 +1644,12 @@ class ReceiverServer private constructor(
                         point = DiagnosticPoint.READ)
                 }
             } catch (error: Exception) {
-                if (!diagnosticLane && mediaOwner == null) fenceProxyControl()
+                if (!diagnosticLane && mediaOwner == null) {
+                    if (proxyRetirement.get()?.reason == "receiver_retired_fatal") {
+                        proxyControlClosed.set(true)
+                        closeProxyAfterFatalRetirement()
+                    } else fenceProxyControl()
+                }
                 if (observed) RemoteDiagnostics.recorder.observe("receiver", session, DiagnosticKind.TRANSPORT_HEALTH,
                     DiagnosticStage.FAILED, operation = operation, reason = DiagnosticReason.FAILURE,
                     point = DiagnosticPoint.READ)
@@ -1955,6 +2041,7 @@ class ReceiverServer private constructor(
                     DiagnosticStage.CONFIG, 2, generation.toInt(), cutoff = cutoff ?: -1,
                     count = format.preSkip.toLong())
                 it.onFirstSubmitted = { pts -> completeAudio(epoch, pts) }
+                if (streamRecovery) it.onRecoveryPressure = { pressure -> requestRecovery(pressure, epoch) }
                 it.start()
             }
         }
@@ -2070,6 +2157,11 @@ class ReceiverServer private constructor(
                                 (result?.reason ?: if (result?.batch != null)
                                     ReceiverTelemetrySession.FinalSkipReason.WRITE_SKIPPED
                                 else ReceiverTelemetrySession.FinalSkipReason.UNAVAILABLE).name)
+                            result?.takeIf { !sent && it.reason ==
+                                ReceiverTelemetrySession.FinalSkipReason.PREPARATION_TIMEOUT }?.let {
+                                put("preparationTimeout", DiagnosticPreparationTimeout(
+                                    it.phase, it.elapsedNs.coerceAtLeast(0), it.activeProducers.coerceAtLeast(0)).json())
+                            }
                         }
 
                     }, session) }, bounded = true, prepareFinal = { discardedTelemetry ->
@@ -2078,6 +2170,12 @@ class ReceiverServer private constructor(
                         result = if (skip == null) owner?.requestFinalResult(cleanupSucceeded, deadlineNs) else {
                             owner?.requestFinal(false, System.nanoTime())
                             ReceiverTelemetrySession.FinalResult(null, skip)
+                        }
+                        result?.takeIf { it.reason == ReceiverTelemetrySession.FinalSkipReason.PREPARATION_TIMEOUT }?.let {
+                            try {
+                                onDiscoveryDiagnostic("event=TELEMETRY_FINAL_PREPARATION_TIMEOUT phase=${it.phase}" +
+                                    " elapsed_ns=${it.elapsedNs} active_producers=${it.activeProducers}")
+                            } catch (_: Exception) { }
                         }
                         result?.batch?.let { Message(Type.STATUS, session = session, payload = it.payload) }
                     })
@@ -2130,7 +2228,8 @@ class ReceiverServer private constructor(
                 listOf(origin.ordinal.toLong()), failure = true, causalGeneration = causalGeneration)
             RemoteDiagnostics.recorder.observe("receiver", session, DiagnosticKind.SESSION, DiagnosticStage.FAILED,
                 track = when (origin) { FailureOrigin.AUDIO -> 2; FailureOrigin.VIDEO -> 1; else -> 0 },
-                reason = DiagnosticReason.FAILURE)
+                generation = causalGeneration, reason = DiagnosticReason.FAILURE,
+                metadata = DiagnosticTerminalFailure(IncidentEvidence.cause(code), origin.ordinal))
             onFailure(diagnostic)
             onScreenEvent(ReceiverScreenEvent.Problem(code, diagnostic.reason, diagnostic.pressure))
         }
@@ -2194,8 +2293,9 @@ class ReceiverServer private constructor(
                                 onStatus("Connection cleanup failed", error.message ?: error.javaClass.simpleName)
                             reportFailure("INTERNAL", "Connection cleanup failed", FailureOrigin.CLEANUP)
                         } finally {
-                            closeProxy()
-                            closeTransport()
+                            proxyControlClosed.set(true)
+                            closeProxyAfterFatalRetirement()
+                            socket.close()
                             finishFatalCleanup(control = false, failed = !cleanupSucceeded, retired = retired)
                             if (interrupted) Thread.currentThread().interrupt()
                         }
@@ -2642,7 +2742,11 @@ class ReceiverServer private constructor(
             proxyBeforeFetch: () -> Unit = {},
             proxyAfterRetirement: () -> Unit = {},
             proxyBeforeRetirementFlush: () -> Unit = {},
+            proxyAfterFatalError: () -> Unit = {},
+            proxyRetirementNow: () -> Long = System::nanoTime,
+            proxyBudgetFactory: () -> DiagnosticDeliveryBudget = ::DiagnosticDeliveryBudget,
             proxyAfterOrdinaryCleanupFence: () -> Unit = {},
+            proxyTerminalWritten: ((Long) -> Unit)? = null,
             incidentSave: () -> ((String, JSONObject) -> Unit) = { { _, _ -> } }) =
             ReceiverServer(name, null, onStatus, onVideoSize, onListener, port, videoOutput, validateRequest, onScreenEvent,
                 onFailure, onPresentationStart, videoFactory, audioFactory, clockFactory, onVideoRotation = onVideoRotation,
@@ -2653,7 +2757,11 @@ class ReceiverServer private constructor(
                 proxyLaneReceived = proxyLaneReceived, proxyBeforeRead = proxyBeforeRead, proxyBeforeReady = proxyBeforeReady,
                 proxyBeforeFetch = proxyBeforeFetch, proxyAfterRetirement = proxyAfterRetirement,
                 proxyBeforeRetirementFlush = proxyBeforeRetirementFlush,
-                proxyAfterOrdinaryCleanupFence = proxyAfterOrdinaryCleanupFence, incidentSave = incidentSave)
+                proxyAfterFatalError = proxyAfterFatalError,
+                proxyRetirementNow = proxyRetirementNow,
+                proxyBudgetFactory = proxyBudgetFactory,
+                proxyAfterOrdinaryCleanupFence = proxyAfterOrdinaryCleanupFence,
+                proxyTerminalWritten = proxyTerminalWritten, incidentSave = incidentSave)
 
         private fun validateCapabilities(settings: Request) {
             val types = MediaCodecList(MediaCodecList.REGULAR_CODECS).codecInfos.filter { !it.isEncoder }.flatMap { it.supportedTypes.toList() }

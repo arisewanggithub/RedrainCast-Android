@@ -28,6 +28,7 @@ internal object TelemetryRegistry {
 
     fun beginReceiver(session: Long, owner: ReceiverTelemetrySession) {
         receiver.set(Sink(session, owner, owner::state, owner::operation, owner::event))
+        DiagnosticBuild.row(System.nanoTime())?.let { owner.state(64, it) }
         causal(session, CausalEvidence.Stage.BUILD, 0,
             dev.redrain.cast.BuildConfig.VERSION_CODE.toLong(), -1, CausalEvidence.LAYOUT)
     }
@@ -40,9 +41,18 @@ internal object TelemetryRegistry {
             atNs.coerceAtLeast(0), 0, values.toList()))
     }
 
-    fun freezeReceiver(session: Long, generation: Int) {
+    fun freezeReceiver(session: Long, generation: Int, atNs: Long = System.nanoTime()) {
         (find("receiver", session)?.owner as? ReceiverTelemetrySession)
-            ?.freezeCausal(generation, System.nanoTime().coerceAtLeast(0))
+            ?.freezeCausal(generation, atNs.coerceAtLeast(0))
+    }
+
+    fun receiverRejection(session: Long, generation: Int, pressure: org.screencopy.receiver.media.QueuePressure) {
+        val owner = find("receiver", session)?.owner as? ReceiverTelemetrySession ?: return
+        owner.firstRejection(TelemetryRow(DiagnosticKind.AUDIO_QUEUE.ordinal + 1,
+            DiagnosticStage.REJECTED.ordinal, 2, generation, pressure.detectedAtNs.coerceAtLeast(0),
+            pressure.incomingPtsUs, listOf(pressure.encodedBytes.toLong(),
+                pressure.retainedDecodedBytes.toLong(), pressure.queuedPackets.toLong(),
+                pressure.attemptedBytes, pressure.spanUs, pressure.limit.ordinal.toLong())))
     }
 
     fun end(role: String, owner: Any?) {
@@ -184,7 +194,8 @@ internal object TelemetryRegistry {
     }
 
     // Slots 0..15 are video stages, 48..59 sampled evidence, 61..62 queue metrics,
-    // 60 is sender outcome / receiver audio-start decision, and 63 sender cleanup failure.
+    // 60 is sender outcome / receiver audio-start decision, and 63 sender cleanup failure /
+    // receiver audio-start retention snapshot.
     // Unknown sources are not sampled.
     private fun observationSlot(kind: DiagnosticKind, point: DiagnosticPoint, track: Int): Int? = when (kind) {
         DiagnosticKind.SESSION -> 16 + track

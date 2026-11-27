@@ -14,7 +14,8 @@ internal class DiagnosticEndpointResponder(
     address: InetAddress,
     port: Int = PORT,
     private val endpoint: () -> DiagnosticDiscovery?,
-    private val clock: () -> Long = System::nanoTime
+    private val clock: () -> Long = System::nanoTime,
+    private val vpn: Boolean = false
 ) : AutoCloseable {
     private val closed = AtomicBoolean()
     private val socket = DatagramSocket(null)
@@ -30,8 +31,7 @@ internal class DiagnosticEndpointResponder(
                         val request = DatagramPacket(ByteArray(SIZE + 1), SIZE + 1)
                         socket.receive(request)
                         val source = request.address
-                        if (source !is Inet4Address ||
-                            !(source.isSiteLocalAddress || address.isLoopbackAddress && source.isLoopbackAddress)) continue
+                        if (!eligibleSource(source, address, vpn)) continue
                         val now = clock()
                         if (lastReply?.let { now - it < 250_000_000L } == true) continue
                         val nonce = nonce(request.data.copyOf(request.length)) ?: continue
@@ -64,6 +64,10 @@ internal class DiagnosticEndpointResponder(
         const val PORT = 27184
         const val SIZE = 256
         const val PROTOCOL = "redraincast-diagnostics"
+
+        internal fun eligibleSource(source: InetAddress, bound: InetAddress, vpn: Boolean): Boolean =
+            source is Inet4Address && (bound.isLoopbackAddress && source.isLoopbackAddress ||
+                DiagnosticIdentity.eligibleAddress(source, vpn))
 
         internal fun nonce(bytes: ByteArray): String? {
             if (bytes.size != SIZE) return null

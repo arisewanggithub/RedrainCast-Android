@@ -44,6 +44,21 @@ internal object IncidentSummary {
                     "outputObservedAtNs", "submittedFrames", "consumedFrames", "presentedFrames",
                     "timestampAgeUs", "outputClockSource(audioClockSources)", "underruns",
                     "lastOutputProgressNs", "queuedPackets"))))
+            .put("telemetryAudioStartRetentionLayout", JSONObject().put("role", "receiver")
+                .put("kind", DiagnosticKind.AUDIO_OUTPUT.ordinal + 1).put("stage", DiagnosticStage.SAMPLE.ordinal)
+                .put("value", "targetSourcePtsUs;-1 before first wait")
+                .put("details", JSONArray(listOf("point(AUDIO_START_WAIT)", "operationId;0 unavailable",
+                    "audioObservationAgeUs;-1 unavailable", "retainedDecodedBytes", "retainedDecodedPackets",
+                    "encodedQueueBytes", "encodedQueuePackets", "decisionSampledNs", "queueSampledNs",
+                    "audioObservationSequence", "audioObservationNs", "audioObservationPtsUs",
+                    "audioOutputSource(audioClockSources)", "nativeTimestampNs", "nativeTimestampFrame",
+                    "appliedOffsetUs;int64-min unavailable", "correctionSequence;0 unavailable"))))
+            .put("telemetryAudioStartRetentionLegacyLayout", JSONObject().put("role", "receiver")
+                .put("kind", DiagnosticKind.AUDIO_OUTPUT.ordinal + 1).put("stage", DiagnosticStage.SAMPLE.ordinal)
+                .put("value", "targetSourcePtsUs;-1 before first wait")
+                .put("details", JSONArray(listOf("point(AUDIO_START_WAIT)", "operationId;0 unavailable",
+                    "audioObservationAgeUs;-1 unavailable", "retainedDecodedBytes", "retainedDecodedPackets",
+                    "encodedQueueBytes", "encodedQueuePackets"))))
             .put("terminalCauses", JSONArray(IncidentEvidence.Cause.entries.map { it.name }))
             .put("senderLimits", JSONArray(dev.screencopy.sender.SenderLimit.entries.map { it.name }))
             .put("receiverLimits", JSONArray(org.screencopy.receiver.media.QueueLimit.entries.map { it.name }))
@@ -211,6 +226,16 @@ internal object IncidentSummary {
                     "origin=${dev.screencopy.sender.SessionOutcome.Origin.entries.getOrNull(details?.optString(1)?.toIntOrNull() ?: -1)?.name ?: "unknown"}.")
             }
             if (side == "receiver") {
+                val build = (blocks.length() - 1 downTo 0).firstNotNullOfOrNull { index ->
+                    val batch = blocks.optJSONArray(index)?.optJSONObject(1) ?: return@firstNotNullOfOrNull null
+                    runCatching {
+                        SessionTelemetryProtocol.parse(batch.toString().toByteArray(Charsets.UTF_8), "receiver")
+                            .state.firstNotNullOfOrNull { row ->
+                                DiagnosticBuild.version(row)?.let { it to row.detail[0] }
+                            }
+                    }.getOrNull()
+                }
+                if (build != null) appendLine("Receiver build: ${build.first} (versionCode ${build.second}).")
                 val events = latest?.optJSONArray("events")
                 for (i in 0 until (events?.length() ?: 0)) {
                     val row = events?.optJSONArray(i) ?: continue

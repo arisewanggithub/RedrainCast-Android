@@ -1,14 +1,33 @@
 package dev.redrain.cast.diagnostics
 
 import org.json.JSONObject
+import dev.redrain.cast.BuildConfig
 import org.junit.Assert.*
 import org.junit.Test
+import org.screencopy.receiver.media.AudioStartDecision
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicReference
 
 class DiagnosticRecorderTest {
+    @Test fun activeAudioObservationSamplesAreRateLimitedWithSequenceIdentity() {
+        val id = start()
+        val timing = org.screencopy.receiver.media.AudioOutputTiming(48000, 4800, 100, 90, 80, 5,
+            org.screencopy.receiver.media.AudioClockSource.TIMESTAMP, timestampAtNs = 900,
+            timestampFramePosition = 75)
+        val first = org.screencopy.receiver.media.AudioClockObservation(1, 1000, 10, 1010, timing, 2)
+        recorder.audioClockObservation(73, 1, first)
+        recorder.audioClockObservation(73, 1, first.copy(sequence = 2))
+        now += 250_000_000
+        recorder.audioClockObservation(73, 1, first.copy(sequence = 3))
+        val samples = allRecords(id).mapNotNull { it.getJSONObject("data").optJSONObject("metrics") }
+            .filter { it.optString("schema") == "audio_clock_observation" }
+        assertEquals(listOf("1", "3"), samples.map { it.getString("sequence") })
+        assertEquals("100", samples.first().getString("submittedFrames"))
+        assertEquals("75", samples.first().getString("nativeTimestampFrame"))
+    }
+
     private var now = 1_000_000_000L
     private val recorder = DiagnosticRecorder { now }
     private fun start(
@@ -83,6 +102,9 @@ class DiagnosticRecorderTest {
         recorder.sessionStarted("receiver", 77)
         val events = allRecords(id)
         assertEquals(1, events.count { it.getString("kind") == "SESSION_BOUND" })
+        val build = events.single { it.getString("kind") == "SESSION_BOUND" }.getJSONObject("data")
+        assertEquals(BuildConfig.VERSION_NAME, build.getString("versionName"))
+        assertEquals(BuildConfig.VERSION_CODE, build.getInt("versionCode"))
         assertEquals(1, events.count {
             it.getString("kind") == "SESSION" && it.getJSONObject("data").optString("stage") == "started"
         })
@@ -95,6 +117,107 @@ class DiagnosticRecorderTest {
         recorder.discardAdmittedReceiver(id)
         recorder.sessionEnded("receiver", 77)
         error("CAPTURE_NOT_FOUND") { recorder.fetch(id, 0, 32) }
+    }
+
+    @Test fun audioStartDecisionsAreCaptureScopedAndProxySafe() {
+        val id = start()
+        val decision = AudioStartDecision(1, 1, 1_000_000, 500_000, 500_000,
+            100_000, 900_000, 25_000, 7, 15, 123_000, 7680, 2, 3840, 1,
+            sampledAtNs = 1000, queueSampledAtNs = 1100, observationSequence = 8,
+            observationAtNs = 900, observationPtsUs = 500_000,
+            outputSource = org.screencopy.receiver.media.AudioClockSource.TIMESTAMP,
+            nativeTimestampAtNs = 800, nativeTimestampFrame = 100,
+            appliedOffsetUs = -10, correctionSequence = 3)
+        recorder.audioStartDecision(73, 2, 42, decision)
+        recorder.audioStartDecision(73, 2, 42, decision.copy(reason = 4, delayUs = -1))
+        val samples = allRecords(id).filter {
+            it.getJSONObject("data").optJSONObject("metrics")?.optString("schema") == "audio_start_decision"
+        }
+
+        assertEquals(2, samples.size)
+        val first = samples.first()
+        assertEquals("42", first.getJSONObject("data").getString("operationId"))
+        assertEquals("1000000", first.getJSONObject("data").getString("ptsUs"))
+        val metrics = first.getJSONObject("data").getJSONObject("metrics")
+        assertEquals(1, metrics.getInt("decision"))
+        assertEquals("500000", metrics.getString("delayUs"))
+        assertEquals("900000", metrics.getString("releasedVideoUs"))
+        assertEquals("123000", metrics.getString("observationAgeUs"))
+        assertEquals(7680, metrics.getInt("retainedDecodedBytes"))
+        assertEquals(2, metrics.getInt("retainedDecodedPackets"))
+        assertEquals(3840, metrics.getInt("encodedQueueBytes"))
+        assertEquals(1, metrics.getInt("encodedQueuePackets"))
+        assertEquals("1000", metrics.getString("sampledAtNs"))
+        assertEquals("1100", metrics.getString("queueSampledAtNs"))
+        assertEquals("8", metrics.getString("observationSequence"))
+        assertEquals("900", metrics.getString("observationAtNs"))
+        assertEquals("500000", metrics.getString("observationPtsUs"))
+        assertEquals("timestamp", metrics.getString("outputSource"))
+        assertEquals("800", metrics.getString("nativeTimestampAtNs"))
+        assertEquals("100", metrics.getString("nativeTimestampFrame"))
+        assertEquals("-10", metrics.getString("appliedOffsetUs"))
+        assertEquals("3", metrics.getString("correctionSequence"))
+        val fullBytes = first.toString().toByteArray(Charsets.UTF_8).size
+        val baseline = JSONObject(first.toString())
+        val baselineMetrics = baseline.getJSONObject("data").getJSONObject("metrics")
+        listOf("sampledAtNs", "queueSampledAtNs", "observationSequence", "observationAtNs",
+            "observationPtsUs", "outputSource", "nativeTimestampAtNs", "nativeTimestampFrame",
+            "appliedOffsetUs", "correctionSequence").forEach { baselineMetrics.remove(it) }
+        val baselineBytes = baseline.toString().toByteArray(Charsets.UTF_8).size
+        println("audio-start fixture: $baselineBytes -> $fullBytes bytes (+${fullBytes - baselineBytes})")
+        assertTrue(fullBytes <= DiagnosticRecorder.MAX_RECORD_BYTES)
+        samples.forEach {
+            DiagnosticProxyWire.validateSource(it, "receiver", "73", id, false)
+            DiagnosticProxyWire.writeFrame(java.io.ByteArrayOutputStream(),
+                JSONObject().put("v", 2).put("type", "RECORD").put("record", it))
+            val fetch = JSONObject().put("records", org.json.JSONArray().put(
+                JSONObject().put("role", "receiver").put("record", it)))
+            org.screencopy.receiver.protocol.StrictJson.decode(fetch.toString().toByteArray(),
+                maxDepth = DiagnosticProxyWire.FETCH_DEPTH, trackSizes = false)
+        }
+        recorder.end(id)
+        recorder.audioStartDecision(73, 2, 42, decision)
+        assertEquals(2, allRecords(id).count {
+            it.getJSONObject("data").optJSONObject("metrics")?.optString("schema") == "audio_start_decision"
+        })
+        recorder.clear(id)
+        val withoutOutput = recorder.start("receiver", 73, setOf("session"), 1000, 100).getString("captureId")
+        recorder.audioStartDecision(73, 2, 42, decision)
+        assertFalse(allRecords(withoutOutput).any {
+            it.getJSONObject("data").optJSONObject("metrics")?.optString("schema") == "audio_start_decision"
+        })
+    }
+
+    @Test fun terminalCoverageRetainsTypedSkipWithoutPeerText() {
+        val metrics = DiagnosticTerminalCoverage(null, false,
+            ReceiverTelemetrySession.FinalSkipReason.PREPARATION_TIMEOUT).json()
+        assertEquals("terminal_coverage", metrics.getString("schema"))
+        assertTrue(metrics.isNull("finalSeq"))
+        assertFalse(metrics.getBoolean("cleanupSucceeded"))
+        assertEquals("PREPARATION_TIMEOUT", metrics.getString("finalSkipReason"))
+        val detailed = DiagnosticTerminalCoverage(null, false,
+            ReceiverTelemetrySession.FinalSkipReason.PREPARATION_TIMEOUT,
+            DiagnosticPreparationTimeout(ReceiverTelemetrySession.PreparationPhase.PUBLISHING, 42, 2)).json()
+            .getJSONObject("preparationTimeout")
+        assertEquals("PUBLISHING", detailed.getString("phase"))
+        assertEquals("42", detailed.getString("elapsedNs"))
+        assertEquals(2, detailed.getInt("activeProducers"))
+        assertEquals("17", DiagnosticTerminalCoverage(17, true, null).json().getString("finalSeq"))
+    }
+
+    @Test fun terminalFailureSurvivesRecorderAndProxyValidation() {
+        val id = start(setOf("session"))
+        recorder.observe("receiver", 73, DiagnosticKind.SESSION, DiagnosticStage.FAILED,
+            track = 2, generation = 9, reason = DiagnosticReason.FAILURE,
+            metadata = DiagnosticTerminalFailure(IncidentEvidence.cause("AUDIO_FAILED"), 0))
+        val record = allRecords(id).single {
+            it.optString("kind") == "SESSION" && it.optJSONObject("data")?.optString("stage") == "failed"
+        }
+        val metrics = record.getJSONObject("data").getJSONObject("metrics")
+        assertEquals(IncidentEvidence.cause("AUDIO_FAILED"), metrics.getLong("cause"))
+        assertEquals(0, metrics.getInt("origin"))
+        assertEquals(9, record.getInt("generation"))
+        DiagnosticProxyWire.validateSource(record, "receiver", "73", id, false)
     }
 
     @Test fun invalidAdmittedReceiverStartDoesNotRegisterOrAllocate() {

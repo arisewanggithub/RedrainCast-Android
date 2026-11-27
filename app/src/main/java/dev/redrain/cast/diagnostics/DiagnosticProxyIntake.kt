@@ -23,6 +23,8 @@ internal class DiagnosticProxyIntake(
         const val TERMINAL_BYTES = DiagnosticProxyWire.FRAME_BYTES + 4
         const val BOOTSTRAP_BYTES = 4096
         const val SOURCE_LOSS_BYTES = 4096
+        private const val CRITICAL_RECORDS = 8
+        private const val CRITICAL_BYTES = 32 * 1024
     }
 
     private data class Item(
@@ -72,6 +74,11 @@ internal class DiagnosticProxyIntake(
         val sourceBytes = source.toByteArray(Charsets.UTF_8).size
         protocolRequire(frameBytes in 5..TERMINAL_BYTES, "Invalid source frame accounting")
         val sequence = DiagnosticProxyWire.decimal(record.opt("seq"))
+        val kind = record.optString("kind")
+        val stage = record.optJSONObject("data")?.optString("stage")
+        val critical = kind == "SESSION_BOUND" || kind == "CAPTURE_STARTED" || kind == "CAPTURE_ENDED" ||
+            kind == "SESSION" || kind == "RECOVERY" ||
+            stage == "failed" || stage == "rejected" || stage == "pressure" || stage == "evicted"
         val envelope = JSONObject().put("role", "receiver").put("session", sourceSession ?: JSONObject.NULL)
             .put("captureId", captureId).put("clockId", clockId).put("record", record)
         val retainedSize = envelope.toString().toByteArray(Charsets.UTF_8).size
@@ -83,7 +90,9 @@ internal class DiagnosticProxyIntake(
             lastSequence = sequence
             val staged = maxOf(frameBytes, sourceBytes + 4)
             val item = Item(++ordinal, sequence, sourceSession, source, staged, retainedSize)
-            if (queue.size >= QUEUE_RECORDS || queuedBytes + staged > QUEUE_BYTES - TERMINAL_BYTES) {
+            val recordLimit = QUEUE_RECORDS - if (critical) 0 else CRITICAL_RECORDS
+            val byteLimit = QUEUE_BYTES - TERMINAL_BYTES - if (critical) 0 else CRITICAL_BYTES
+            if (queue.size >= recordLimit || queuedBytes + staged > byteLimit) {
                 queueLoss.record(sequence)
                 return false
             }
@@ -247,6 +256,7 @@ internal class DiagnosticProxyIntake(
                     maxDepth = DiagnosticProxyWire.LANE_DEPTH, trackSizes = false).let { value ->
                     JSONObject().put("reason", value.opt("reason") ?: JSONObject.NULL)
                         .put("tailTruncated", value.opt("tailTruncated") ?: JSONObject.NULL)
+                        .apply { value.optJSONObject("tailDetails")?.let { put("tailDetails", it) } }
                 }
             } ?: JSONObject.NULL)
     }

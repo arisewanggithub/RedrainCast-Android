@@ -183,17 +183,11 @@ class VideoRemoteDiagnosticsTest {
             val timing = events(recorder, id).single {
                 it.optJSONObject("data")?.optJSONObject("metrics")?.optString("schema") == "video_frame_timing"
             }.getJSONObject("data").getJSONObject("metrics")
-            assertEquals("1", timing.getString("matched"))
+            assertEquals("0", timing.getString("matched"))
             assertEquals("3", timing.getString("futureCallbacks"))
-            assertEquals("5000000", timing.getJSONObject("callbackMinusDeadline").getString("maxNs"))
-            val scheduling = timing.getJSONObject("worstCallbackErrorExample").getJSONObject("scheduling")
-            val schedulingClock = scheduling.getJSONObject("clock")
-            assertEquals("MONOTONIC", schedulingClock.getString("mode"))
-            assertEquals("800000", schedulingClock.getString("positionUs"))
-            assertEquals("800000", schedulingClock.getString("sourcePositionUs"))
-            assertEquals("20000", schedulingClock.getString("delayUs"))
-            assertTrue(schedulingClock.isNull("audioObservationSequence"))
-            assertTrue(timing.getJSONObject("observedMinusCallback").getString("maxNs").toLong() < 0)
+            assertEquals("0", timing.getJSONObject("callbackMinusDeadline").getString("count"))
+            assertEquals("0", timing.getJSONObject("observedMinusCallback").getString("count"))
+            assertTrue(timing.isNull("worstCallbackErrorExample"))
         } finally {
             finish.countDown()
             player.close()

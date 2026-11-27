@@ -9,6 +9,8 @@ internal class ResampledAudioTimeline(private val rate: Int) {
     private val pending = ArrayDeque<Input>()
     private var accepted = 0L
     private var mapped = 0L
+    val acceptedFrames: Long get() = accepted
+    val mappedFrames: Long get() = mapped
     @Volatile var retainedFrames = 0
         private set
 

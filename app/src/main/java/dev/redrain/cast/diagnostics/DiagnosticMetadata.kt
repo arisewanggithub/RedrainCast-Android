@@ -2,6 +2,7 @@ package dev.redrain.cast.diagnostics
 
 import org.json.JSONObject
 import org.screencopy.receiver.media.AudioClockSource
+import org.screencopy.receiver.media.AudioStartDecision
 
 enum class DiagnosticCodec {
     PCM, OPUS, AAC, H264, H265, AV1, UNKNOWN;
@@ -17,6 +18,77 @@ enum class DiagnosticCodec {
 /** Only these immutable metadata schemas can cross from media hooks to diagnostic JSON. */
 sealed interface DiagnosticMetadata {
     fun json(): JSONObject
+}
+
+internal data class DiagnosticTerminalFailure(val cause: Long, val origin: Int?) : DiagnosticMetadata {
+    override fun json(): JSONObject = JSONObject().put("schema", "terminal_failure")
+        .put("cause", cause).put("origin", origin ?: JSONObject.NULL)
+}
+
+internal data class DiagnosticTerminalCoverage(
+    val finalSequence: Long?, val cleanupSucceeded: Boolean?,
+    val skip: ReceiverTelemetrySession.FinalSkipReason?,
+    val preparation: DiagnosticPreparationTimeout? = null
+) : DiagnosticMetadata {
+    override fun json(): JSONObject = JSONObject().put("schema", "terminal_coverage")
+        .put("finalSeq", finalSequence?.toString() ?: JSONObject.NULL)
+        .put("cleanupSucceeded", cleanupSucceeded ?: JSONObject.NULL)
+        .put("finalSkipReason", skip?.name ?: JSONObject.NULL)
+        .apply { preparation?.let { put("preparationTimeout", it.json()) } }
+}
+
+internal data class DiagnosticPreparationTimeout(
+    val phase: ReceiverTelemetrySession.PreparationPhase, val elapsedNs: Long, val activeProducers: Int
+) {
+    fun json() = JSONObject().put("phase", phase.name).put("elapsedNs", "$elapsedNs")
+        .put("activeProducers", activeProducers)
+}
+
+internal data class DiagnosticAudioStartDecision(val decision: AudioStartDecision) : DiagnosticMetadata {
+    override fun json(): JSONObject = JSONObject().put("schema", "audio_start_decision")
+        .put("decision", decision.reason).put("mode", decision.mode)
+        .put("positionUs", decision.positionUs?.toString() ?: JSONObject.NULL)
+        .put("delayUs", decision.delayUs?.toString() ?: JSONObject.NULL)
+        .put("firstVideoUs", decision.firstVideoUs?.toString() ?: JSONObject.NULL)
+        .put("releasedVideoUs", decision.releasedVideoUs?.toString() ?: JSONObject.NULL)
+        .put("waitedUs", "${decision.waitedUs}").put("revision", "${decision.revision}")
+        .put("flags", "${decision.flags}")
+        .put("observationAgeUs", decision.observationAgeUs?.toString() ?: JSONObject.NULL)
+        .put("retainedDecodedBytes", decision.retainedDecodedBytes)
+        .put("retainedDecodedPackets", decision.retainedDecodedPackets)
+        .put("encodedQueueBytes", decision.encodedQueueBytes)
+        .put("encodedQueuePackets", decision.encodedQueuePackets)
+        .put("sampledAtNs", decision.sampledAtNs?.toString() ?: JSONObject.NULL)
+        .put("queueSampledAtNs", decision.queueSampledAtNs?.toString() ?: JSONObject.NULL)
+        .put("observationSequence", decision.observationSequence?.toString() ?: JSONObject.NULL)
+        .put("observationAtNs", decision.observationAtNs?.toString() ?: JSONObject.NULL)
+        .put("observationPtsUs", decision.observationPtsUs?.toString() ?: JSONObject.NULL)
+        .put("outputSource", decision.outputSource?.name?.lowercase() ?: JSONObject.NULL)
+        .put("nativeTimestampAtNs", decision.nativeTimestampAtNs?.toString() ?: JSONObject.NULL)
+        .put("nativeTimestampFrame", decision.nativeTimestampFrame?.toString() ?: JSONObject.NULL)
+        .put("appliedOffsetUs", decision.appliedOffsetUs?.toString() ?: JSONObject.NULL)
+        .put("correctionSequence", decision.correctionSequence?.toString() ?: JSONObject.NULL)
+        .put("omittedRepeats", "${decision.omittedRepeats}")
+}
+
+internal data class DiagnosticAudioClockObservation(
+    val observation: org.screencopy.receiver.media.AudioClockObservation
+) : DiagnosticMetadata {
+    override fun json(): JSONObject = audioClockObservationJson(observation).put("schema", "audio_clock_observation")
+}
+
+internal fun audioClockObservationJson(value: org.screencopy.receiver.media.AudioClockObservation): JSONObject {
+    val timing = value.timing
+    fun number(value: Long?): Any = value?.toString() ?: JSONObject.NULL
+    return JSONObject().put("sequence", "${value.sequence}").put("atNs", "${value.atNs}")
+        .put("sampleUs", "${value.sampleUs}").put("sourcePtsUs", "${value.sourcePtsUs}")
+        .put("appliedOffsetUs", "${value.appliedOffsetUs}")
+        .put("submittedFrames", number(timing?.submittedFrames))
+        .put("consumedFrames", number(timing?.consumedFrames))
+        .put("presentedFrames", number(timing?.presentedFrames))
+        .put("nativeTimestampNs", number(timing?.timestampAtNs))
+        .put("nativeTimestampFrame", number(timing?.timestampFramePosition))
+        .put("clockSource", timing?.clockSource?.name ?: JSONObject.NULL)
 }
 
 data class DiagnosticConfiguration(

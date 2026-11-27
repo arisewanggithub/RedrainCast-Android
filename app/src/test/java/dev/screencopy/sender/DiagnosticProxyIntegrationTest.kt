@@ -366,6 +366,9 @@ class DiagnosticProxyIntegrationTest {
                         client.cancel("sender_finished")
                         resume.countDown()
                         assertTrue(closed.await(3, TimeUnit.SECONDS))
+                        assertEquals("draining", registry.status("collector", pair.getString("pairId")).getString("state"))
+                        claim.senderFinished.set(true)
+                        registry.senderEnded(claim)
                         val status = registry.status("collector", pair.getString("pairId"))
                         assertEquals("frozen", status.getString("state"))
                         assertEquals("coverage_lost", status.getString("endReason"))
@@ -1052,7 +1055,7 @@ class DiagnosticProxyIntegrationTest {
                         }
                         assertUnknown(draining)
                         finishSenderDiagnostic(sender, registry, claim, session, mode == "fatal",
-                            { client.cancel("sender_finished") }, { it() })
+                            { client.cancel("sender_finished") }, { it() }, "AUDIO_FAILED")
                         val frozen = registry.status("collector", claim.pairId)
                         assertEquals("frozen", frozen.getString("state"))
                         assertUnknown(frozen)
@@ -1062,6 +1065,15 @@ class DiagnosticProxyIntegrationTest {
                             records.getJSONObject(it).optJSONObject("data")?.optString("stage") ==
                                 if (mode == "fatal") "failed" else "ended"
                         })
+                        if (mode == "fatal") {
+                            val failure = (0 until records.length()).map { records.getJSONObject(it) }.single {
+                                it.optJSONObject("data")?.optString("stage") == "failed"
+                            }.getJSONObject("data").getJSONObject("metrics")
+                            assertEquals("terminal_failure", failure.getString("schema"))
+                            assertEquals(dev.redrain.cast.diagnostics.IncidentEvidence.cause("AUDIO_FAILED"),
+                                failure.getLong("cause"))
+                            assertTrue(failure.isNull("origin"))
+                        }
                         for (i in 0 until records.length()) {
                             val record = records.getJSONObject(i)
                             if (record.has("role")) {

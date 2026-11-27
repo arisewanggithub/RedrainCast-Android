@@ -234,7 +234,12 @@ class DiagnosticVideoTimingTest {
             val now = 1_000_000_000L + n * 100_000
             val c = VideoSchedulingClock(100, now - 100, 3, "CACHED_AUDIO", pts - 100, pts - 101,
                 n.toLong(), now - 10_000, AudioClockSource.TIMESTAMP, 10, 50,
-                AudioClockCorrection(2, 0, 100, 50), false)
+                AudioClockCorrection(2, 0, 100, 50), false,
+                audioObservation = org.screencopy.receiver.media.AudioClockObservation(
+                    n.toLong(), now - 10_000, 10, pts - 100,
+                    org.screencopy.receiver.media.AudioOutputTiming(48000, 4800, 100, 90, 80, 10,
+                        AudioClockSource.TIMESTAMP, timestampAtNs = now - 20_000, timestampFramePosition = 75),
+                    50))
             t.decoded(pts, 0)
             val deadline = now + if (n % 2 == 0) 10_000 else 20_000
             val token = t.begin(pts, deadline, now, 3, clock = c, scheduleAtNs = now)
@@ -288,6 +293,9 @@ class DiagnosticVideoTimingTest {
                     val correction = metrics.getJSONObject("minimumDeadlineCadenceExample")
                         .getJSONObject("previous").getJSONObject("clock").getJSONObject("lastPacketCorrection")
                     assertEquals("2", correction.getString("sequence"))
+                    assertEquals("75", metrics.getJSONObject("minimumDeadlineCadenceExample")
+                        .getJSONObject("previous").getJSONObject("clock").getJSONObject("audioObservation")
+                        .getString("nativeTimestampFrame"))
                     populated = reply
                 }
             }
@@ -401,7 +409,13 @@ class DiagnosticVideoTimingTest {
             val c = VideoSchedulingClock(100, now - 100, Long.MAX_VALUE, "CACHED_AUDIO", pts - 100, pts - 101,
                 Long.MAX_VALUE, 7_000_000_000_000_000_000L, AudioClockSource.TIMESTAMP, Long.MAX_VALUE,
                 Long.MIN_VALUE, AudioClockCorrection(Long.MAX_VALUE, 3_000_000_000_000_000_000L,
-                    4_000_000_000_000_000_000L, Long.MIN_VALUE), true)
+                    4_000_000_000_000_000_000L, Long.MIN_VALUE), true,
+                audioObservation = org.screencopy.receiver.media.AudioClockObservation(
+                    Long.MAX_VALUE, base, Long.MAX_VALUE, Long.MAX_VALUE,
+                    org.screencopy.receiver.media.AudioOutputTiming(48000, 4800, Long.MAX_VALUE,
+                        Long.MAX_VALUE, Long.MAX_VALUE, Long.MAX_VALUE, AudioClockSource.TIMESTAMP,
+                        timestampAtNs = Long.MAX_VALUE, timestampFramePosition = Long.MAX_VALUE),
+                    Long.MIN_VALUE))
             t.decoded(pts, 0)
             val deadline = now + if (n % 2 == 0) 10_000 else 20_000
             val token = t.begin(pts, deadline, now, Long.MAX_VALUE, clock = c, scheduleAtNs = now)
@@ -474,7 +488,7 @@ class DiagnosticVideoTimingTest {
         t.finish(token, success)
     }
 
-    @Test fun reentrantCallbacksRemainSignedAndCadenceUsesActualPts() {
+    @Test fun futureCallbacksAreExcludedFromRenderedCorrelationsAndCadence() {
         val t = DiagnosticVideoTiming(1)
         t.decoded(100, 10)
         t.decoded(200, 20)
@@ -483,12 +497,12 @@ class DiagnosticVideoTimingTest {
         release(t, 230, 1_030_000, 1_042_000, 1_043_000)
         t.decoded(270, 10)
         val json = t.snapshot(false).json()
-        assertEquals("2", json.getString("matched"))
+        assertEquals("1", json.getString("matched"))
         assertEquals("1", json.getString("futureCallbacks"))
-        assertEquals("-10000", json.getJSONObject("observedMinusCallback").getString("minNs"))
-        assertEquals("10000", json.getJSONObject("callbackMinusDeadline").getString("minNs"))
-        assertEquals("30000", json.getJSONObject("ptsCadence").getString("maxNs"))
-        assertEquals("2000", json.getJSONObject("callbackCadenceMinusPts").getString("maxNs"))
+        assertEquals("1000", json.getJSONObject("observedMinusCallback").getString("minNs"))
+        assertEquals("12000", json.getJSONObject("callbackMinusDeadline").getString("minNs"))
+        assertEquals("0", json.getJSONObject("ptsCadence").getString("count"))
+        assertEquals("0", json.getJSONObject("callbackCadenceMinusPts").getString("count"))
         assertEquals("-20000", json.getJSONObject("decodedMinusDeadline").getString("minNs"))
         assertEquals("5", json.getJSONObject("suppliedMinusDeadline").getString("maxNs"))
         val example = json.getJSONObject("worstCallbackErrorExample")
@@ -496,6 +510,7 @@ class DiagnosticVideoTimingTest {
         assertEquals("1030000", example.getString("deadlineNs"))
         assertEquals("1042000", example.getString("callbackNs"))
         assertEquals("5000", example.getString("decodedMinusDeadlineNs"))
+        assertEquals("1", t.snapshot(true).json().getString("matched"))
     }
 
     @Test fun duplicatePtsAndFailedReentrantReleaseNeverMatch() {

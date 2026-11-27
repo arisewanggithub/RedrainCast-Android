@@ -5,6 +5,23 @@ import org.junit.Test
 
 class AudioRegulatorTest {
     private val rate = 48000
+    @Test fun preservedRecoveryOutputIsOrderedAndHasAHardConvertedFrameBound() {
+        val fifo = AudioRegulator(rate, 2)
+        fifo.offer(ShortArray(2399 * 2) { 1 }, TrimmedAudio(0, 2399, 0), preserve = true)
+        fifo.offer(ShortArray(6016 * 2) { 2 }, TrimmedAudio(0, 6016, 50_000), preserve = true)
+        assertEquals(8415, fifo.bufferedFrames)
+        assertEquals(0L, fifo.diagnostic().droppedFrames)
+        assertThrows(IllegalStateException::class.java) {
+            fifo.offer(ShortArray(4), TrimmedAudio(0, 2, 200_000), preserve = true)
+        }
+        assertEquals(8415, fifo.bufferedFrames)
+        assertEquals(1.toShort(), checkNotNull(fifo.peek(2399)).samples[0])
+        fifo.consumed(2399)
+        assertEquals(2.toShort(), checkNotNull(fifo.peek(6016)).samples[0])
+        fifo.consumed(6016)
+        assertEquals(0, fifo.bufferedFrames)
+    }
+
     private fun packet(fifo: AudioRegulator, frames: Int, pts: Long = 0): AudioCompensation? {
         fifo.offer(ShortArray(frames * 2) { 7 }, TrimmedAudio(0, frames, pts), observe = false)
         return fifo.converted(frames, frames)

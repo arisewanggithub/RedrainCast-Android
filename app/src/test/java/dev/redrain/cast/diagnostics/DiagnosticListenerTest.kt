@@ -241,7 +241,7 @@ class DiagnosticListenerTest {
         }
         assertNull(DiagnosticAccess.discovery)
         assertFalse(DiagnosticAccess.enabled)
-        assertTrue(DiagnosticAccess.warning.contains("Anyone on this LAN"))
+        assertTrue(DiagnosticAccess.warning.contains("LAN or VPN"))
         assertTrue(DiagnosticAccess.warning.contains("unencrypted and unauthenticated"))
     }
 

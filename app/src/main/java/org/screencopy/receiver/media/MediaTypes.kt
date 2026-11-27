@@ -37,7 +37,11 @@ data class QueuePressure(
     val maxPackets: Int,
     val maxBytes: Int,
     val maxSpanUs: Long,
-    val waitedMs: Long = 0
+    val waitedMs: Long = 0,
+    val detectedAtNs: Long = -1,
+    val incomingPtsUs: Long = -1,
+    val encodedBytes: Int = -1,
+    val retainedDecodedBytes: Int = -1
 ) {
     fun logMessage(): String = "track=$track queue_limit=$limit queued_packets=$queuedPackets queued_bytes=$queuedBytes" +
         " attempted_packets=$attemptedPackets attempted_bytes=$attemptedBytes relative_pts_span_us=$spanUs" +
@@ -63,18 +67,20 @@ class PacketBudget(
     }
 
     @Synchronized
-    fun pressure(packet: AccessUnit, track: Int = 0, maxPackets: Int = Int.MAX_VALUE, waitedMs: Long = 0): QueuePressure? {
+    fun pressure(packet: AccessUnit, track: Int = 0, maxPackets: Int = Int.MAX_VALUE, waitedMs: Long = 0,
+                 retainedBytes: Int = 0): QueuePressure? {
         require(packet.ptsUs >= 0) { "Negative presentation timestamp" }
+        require(retainedBytes >= 0)
         val minimum = minOf(entries.minOfOrNull { it.first } ?: packet.ptsUs, packet.ptsUs)
         val maximum = maxOf(entries.maxOfOrNull { it.first } ?: packet.ptsUs, packet.ptsUs)
-        val attemptedBytes = bytes.toLong() + packet.bytes.size
+        val attemptedBytes = bytes.toLong() + retainedBytes + packet.bytes.size
         val limit = when {
             entries.size >= maxPackets -> QueueLimit.PACKETS
             attemptedBytes > maxBytes -> QueueLimit.BYTES
             maximum - minimum > maxDurationUs -> QueueLimit.PTS
             else -> return null
         }
-        return QueuePressure(track, limit, entries.size, bytes, entries.size + 1, attemptedBytes,
+        return QueuePressure(track, limit, entries.size, bytes + retainedBytes, entries.size + 1, attemptedBytes,
             maximum - minimum, maxPackets, maxBytes, maxDurationUs, waitedMs)
     }
 

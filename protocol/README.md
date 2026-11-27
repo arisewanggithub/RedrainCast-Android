@@ -789,6 +789,17 @@ clock and discard an obsolete complete prefix before that new preroll window.
 Once decoding begins, preserve compressed admission order. Pending decoded
 startup PCM is retrimmed against the current clock, so delayed startup never
 rewinds the healthy video timeline or fails merely because audio became stale.
+While a recovery start is future-dated, the Android receiver may retain decoded
+source slices and continue decoding in admission order. Before decoding another
+slice for retention, it reserves room for up to 120 ms of decoded PCM. Encoded
+queue bytes, retained decoded bytes and this temporary reservation share the
+existing 512 KiB audio input cap; the encoded packet-count/PTS limits and the
+256 retained-slice limit also remain in force. If there is no room, decoding
+pauses while output and startup/deadline checks continue. Subsequent admission
+pressure requests audio-only recovery rather than failing the session; if an
+encoded queue prevents a reservation and no retained slice can reach a start
+deadline, the receiver requests the same track-local recovery without waiting
+for another packet. A repeated request does not extend the unresolved deadline.
 Trim PCM on sample-frame
 boundaries, including packets straddling the cutoff. Initial pre-skip is not
 reapplied during resets. The preroll is intentionally inaudible (80 ms for Opus,
@@ -799,14 +810,29 @@ Filter lookahead and converted frame ratios retain their original source spans;
 completion/presentation use mapped source timestamps, not nominal output-frame
 counts. Each retired native audio epoch releases its resampler, and the next
 starts with fresh filter state at the new audio wire generation.
-During startup catch-up Android pauses decoding at its existing decoded-FIFO
-target while continuing output servicing and the no-progress check, including
-after the first source submission. A temporarily full native ring must not
-drain a held burst into source-dropping FIFO overflow; remaining packets stay
-in the bounded encoded queue. Catch-up ends after the encoded queue drains and
-one target's worth of original source audio has actually been presented.
-Steady-state low-latency decoded trimming and compensation remain unchanged;
-network admission and all caps stay bounded.
+During recovery draining and startup catch-up Android pauses decoding at its
+decoded-FIFO target while continuing output servicing and the no-progress check,
+including after the first source submission. Recovery samples that survive
+source-time trimming are not discarded to enforce the normal FIFO limit, even
+when a single 120 ms packet exceeds that limit. The temporary preserved FIFO is
+bounded separately to the 50 ms target plus at most 120 ms and 256 converted
+frames; input retention remains under the 512 KiB cap. Encoded dependencies and
+retained slices stay in order when the native ring is full. Catch-up ends after
+the encoded queue drains and one target's worth of original source audio has
+actually been presented. At an encoded-queue empty observation under the
+admission lock, Opus/PCM mark the end of the recovery source history. They
+return to normal trimming only once that history has been mapped through the
+resampler and its source units submitted. Newer decoded FIFO contents and filter
+lookahead need not become empty. AAC also marks the latest submitted
+input at such an observation, but an empty queue or unavailable output is not
+a codec drain proof. It waits for both a later input and a later decoded output
+past that input boundary by more than the greater of 120 ms and 1024 source
+samples (up to 128 ms at 8 kHz), then maps and submits all preceding source spans,
+including decoded slices still awaiting resampling, before returning to normal
+trimming. Decoded output remains
+timestamp ordered. If no such later audio arrives, preservation remains bounded
+and no drain is inferred. Compensation, network admission and their bounds
+remain in force.
 
 Audio COMPLETE proves actual source-audio sample submission (not inserted
 silence), with its sample-aligned original `audioPtsUs` at/after the audio cutoff.

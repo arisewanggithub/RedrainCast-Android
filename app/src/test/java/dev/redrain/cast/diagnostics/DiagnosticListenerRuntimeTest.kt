@@ -102,6 +102,7 @@ class DiagnosticListenerRuntimeTest {
         DiagnosticAccess.setEnabled(context, true) {
             DiagnosticIdentity(InetAddress.getLoopbackAddress(), isValid = valid::get)
         }
+
         drainControlWorker()
         val port = checkNotNull(DiagnosticAccess.discovery).port
         val observer = DiagnosticAccess.onDisabled(DiagnosticAccess.consentGeneration) { disabled.countDown() }
@@ -120,6 +121,34 @@ class DiagnosticListenerRuntimeTest {
         } finally {
             observer.close()
             disable()
+        }
+    }
+
+    @Test fun multipleAddressBindingsSharePortAndAllCloseOnNetworkChange() {
+        val first = InetAddress.getByName("127.0.0.1")
+        val second = InetAddress.getByName("127.0.0.2")
+        val valid = AtomicBoolean(true)
+        val revoked = CountDownLatch(1)
+        val disconnected = CountDownLatch(1)
+        val owner = java.util.concurrent.atomic.AtomicReference<DiagnosticListener>()
+        val identity = DiagnosticIdentity(first, isValid = valid::get, endpoints = listOf(
+            DiagnosticIdentity.Endpoint(first, false), DiagnosticIdentity.Endpoint(second, true)))
+        DiagnosticListener(DiagnosticRecorder(), identity, collectorClosed = { disconnected.countDown() }, accessRevoked = {
+            owner.get()?.revokeNetwork()
+            revoked.countDown()
+        }).use { server ->
+            owner.set(server)
+            val port = checkNotNull(server.discoveryFor(first)).port
+            assertEquals(port, checkNotNull(server.discoveryFor(second)).port)
+            Socket(first, port).use { it.soTimeout = 3000; command(it, "HELLO") }
+            assertTrue(disconnected.await(3, TimeUnit.SECONDS))
+            Socket(second, port).use { it.soTimeout = 3000; command(it, "HELLO") }
+            valid.set(false)
+            assertNull(server.discoveryFor(first))
+            assertNull(server.discoveryFor(second))
+            assertTrue(revoked.await(3, TimeUnit.SECONDS))
+            assertThrows(java.io.IOException::class.java) { Socket(first, port).close() }
+            assertThrows(java.io.IOException::class.java) { Socket(second, port).close() }
         }
     }
 

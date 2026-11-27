@@ -288,7 +288,7 @@ class MainActivity : Activity(), SurfaceHolder.Callback, TextureView.SurfaceText
         render()
         @Suppress("DEPRECATION")
         val retained = lastNonConfigurationInstance as? RetainedState
-        val installedVersion = if (BuildConfig.DEBUG) BuildConfig.VERSION_NAME.removeSuffix("-debug")
+        val installedVersion = if (BuildConfig.DEBUG) BuildConfig.VERSION_NAME.substringBefore("-debug")
             else BuildConfig.VERSION_NAME
         retainedState = retained ?: RetainedState(updateFactory(installedVersion))
         updateCheck = retainedState.updateCheck

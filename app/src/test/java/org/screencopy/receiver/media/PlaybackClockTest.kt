@@ -9,6 +9,28 @@ import java.util.concurrent.atomic.AtomicInteger
 import dev.redrain.cast.diagnostics.*
 
 class PlaybackClockTest {
+    @Test fun boundedRecoveryGateStepsKeepTheirOriginalTenSecondDeadline() {
+        val now = java.util.concurrent.atomic.AtomicLong()
+        val decisions = ArrayList<AudioStartDecision>()
+        val clock = PlaybackClock(now::get) { now.addAndGet(it * 1_000_000) }.apply {
+            anchorVideo(1_000_000)
+            beginAudioRecovery()
+        }
+        assertFalse(clock.awaitAudioStartObserved(21_000_000, decisions::add,
+            waitForFuture = false, startedAtNs = 0) { true })
+        assertEquals(2_000_000L, now.get())
+        now.set(9_999_000_000)
+        assertFalse(clock.awaitAudioStartObserved(21_000_000, decisions::add,
+            waitForFuture = false, startedAtNs = 0) { true })
+        val failure = assertThrows(PlaybackException::class.java) {
+            clock.awaitAudioStartObserved(21_000_000, decisions::add,
+                waitForFuture = false, startedAtNs = 0) { true }
+        }
+        assertEquals("AUDIO_FAILED", failure.code)
+        assertEquals(6, decisions.last().reason)
+        assertTrue(decisions.last().waitedUs >= 10_000_000)
+    }
+
     @Test fun automaticFinalPreservesPreRecoveryMappingAndFirstAndLatestRecoveryTransitions() {
         val now = java.util.concurrent.atomic.AtomicLong(1_000_000_000)
         val telemetry = ReceiverTelemetrySession({ true })
@@ -104,7 +126,81 @@ class PlaybackClockTest {
         assertEquals(listOf(0L, 1_000_000L, 2_000_000L), decisions.map { it.waitedUs })
         assertEquals(listOf(1_000_000L, 1_000_000L, 1_200_000L), decisions.map { it.positionUs })
         assertEquals(listOf(200_000L, 200_000L, 0L), decisions.map { it.delayUs })
+        assertEquals(listOf(null, null, 0L), decisions.map { it.observationAgeUs })
         assertTrue(decisions.all { it.flags and 12L == 12L })
+    }
+
+    @Test fun audioStartDecisionReportsAgeOfLastSourceObservation() {
+        val now = java.util.concurrent.atomic.AtomicLong(1_000_000_000)
+        val clock = PlaybackClock(now::get) {}
+        val source = clock.anchorObservedAudio(1_000_000, 48000)
+        clock.audioWritten(400_000)
+        clock.observeAudio(source, 100_000, now.get())
+        now.addAndGet(125_000_000)
+        val decisions = ArrayList<AudioStartDecision>()
+        clock.awaitAudioStartObserved(1_200_000, decisions::add, waitForFuture = false) { true }
+        assertEquals(125_000L, decisions.single().observationAgeUs)
+    }
+
+    @Test fun audioStartDecisionIdentifiesReusedAndNewObservationsAndNativeTimestamp() {
+        val now = java.util.concurrent.atomic.AtomicLong(1_000_000_000)
+        val clock = PlaybackClock(now::get) {}
+        val source = clock.anchorObservedAudio(1_000_000, 48000)
+        clock.audioWritten(400_000)
+        val decisions = ArrayList<AudioStartDecision>()
+        fun sample() {
+            clock.awaitAudioStartObserved(1_300_000, decisions::add, waitForFuture = false) { true }
+        }
+
+        sample()
+        assertNull(decisions.last().observationSequence)
+        val timing = AudioOutputTiming(48000, 4800, 4800, 4800, 2400, 10_000,
+            AudioClockSource.TIMESTAMP, positionAtNs = now.get(), timestampAtNs = 990_000_000,
+            timestampFramePosition = 2000)
+        clock.observeAudio(source, 50_000, now.get(), timing)
+        sample()
+        val first = decisions.last()
+        assertEquals(1L, first.observationSequence)
+        assertEquals(990_000_000L, first.nativeTimestampAtNs)
+        assertEquals(2000L, first.nativeTimestampFrame)
+        assertEquals(AudioClockSource.TIMESTAMP, first.outputSource)
+        now.addAndGet(125_000_000)
+        sample()
+        assertEquals(first.observationSequence, decisions.last().observationSequence)
+        assertEquals(125_000L, decisions.last().observationAgeUs)
+        clock.observeAudio(source, 50_000, now.get(), timing.copy(positionAtNs = now.get()))
+        sample()
+        assertEquals(2L, decisions.last().observationSequence)
+        assertEquals(first.nativeTimestampAtNs, decisions.last().nativeTimestampAtNs)
+        assertEquals(first.nativeTimestampFrame, decisions.last().nativeTimestampFrame)
+    }
+
+    @Test fun videoClockReferencesOneCoherentNativeAudioObservation() {
+        val now = java.util.concurrent.atomic.AtomicLong(1_000_000_000)
+        val clock = PlaybackClock(now::get) {}
+        val source = clock.anchorObservedAudio(1_000_000, 48000)
+        clock.audioWritten(400_000)
+        val timing = AudioOutputTiming(48000, 4800, 4800, 4400, 2400, 10_000,
+            AudioClockSource.TIMESTAMP, positionAtNs = now.get(), timestampAtNs = 990_000_000,
+            timestampFramePosition = 2000)
+        val observation = checkNotNull(clock.observeAudio(source, 50_000, now.get(), timing))
+        val video = clock.videoSchedulingClock(1_300_000)
+        assertEquals(observation.sequence, video.audioObservationSequence)
+        assertEquals(observation, video.audioObservation)
+        val json = dev.redrain.cast.diagnostics.DiagnosticAudioClockObservation(observation).json()
+        assertEquals("1", json.getString("sequence"))
+        assertEquals("50000", json.getString("sampleUs"))
+        assertEquals("1050000", json.getString("sourcePtsUs"))
+        assertEquals("4800", json.getString("submittedFrames"))
+        assertEquals("4400", json.getString("consumedFrames"))
+        assertEquals("2400", json.getString("presentedFrames"))
+        assertEquals("990000000", json.getString("nativeTimestampNs"))
+        assertEquals("2000", json.getString("nativeTimestampFrame"))
+        assertEquals("${observation.appliedOffsetUs}", json.getString("appliedOffsetUs"))
+        assertNull(clock.observeAudio(source, 60_000, now.get(), timing, retainEvidence = false))
+        val withoutEvidence = clock.videoSchedulingClock(1_300_000)
+        assertEquals(2L, withoutEvidence.audioObservationSequence)
+        assertNull(withoutEvidence.audioObservation)
     }
 
     @Test fun audioStartDecisionDistinguishesPrerollStaleRecoveryAndCancellation() {
@@ -141,7 +237,7 @@ class PlaybackClockTest {
         position.written(9600)
         fun publish(): AudioOutputTiming = position.current().also {
             clock.observeAudio(source, timeline.presentedUs(it.presentedFrames), time.ns, it,
-                timeline.projection())
+                presentedSourceAtFrame = timeline.projection())
         }
         assertEquals(AudioClockSource.HEAD_UNAVAILABLE, publish().clockSource)
         assertEquals(1_110_000L, clock.currentUs())
@@ -228,7 +324,7 @@ class PlaybackClockTest {
         clock.observeAudio(source, timeline.presentedUs(0), time.ns,
             AudioOutputTiming(48000, 2400, 2400, 2400, 0, 0, AudioClockSource.TIMESTAMP, time.ns,
                 timestampAtNs = time.ns, timestampEstimateFrames = 0),
-            timeline.projection())
+            presentedSourceAtFrame = timeline.projection())
         val anchors = source.pendingAnchors()
         time.advanceUs(20_000)
         assertEquals(1_021_016L, clock.videoSchedulingClock(1_100_000).sourcePositionUs)
@@ -721,6 +817,23 @@ class PlaybackClockTest {
         time.advanceUs(300_000)
         assertEquals(1_600_000L, clock.currentUs())
         assertEquals(0L, clock.audioStartDelayUs(1_600_000))
+    }
+
+    @Test fun recoveryAudioBeforeFutureVideoDoesNotMoveTheRunningClockBackward() {
+        val time = FakeTime()
+        val clock = time.clock().apply { audioExpected = true }
+        clock.anchorVideo(1_000_000)
+        clock.beginAudioRecovery()
+        clock.videoPresented(2_000_000, time.ns + 1_000_000_000)
+
+        assertEquals(500_000L, clock.audioStartDelayUs(1_500_000))
+        time.advanceUs(100_000)
+        clock.videoPresented(2_100_000, time.ns + 1_000_000_000)
+        assertEquals(400_000L, clock.audioStartDelayUs(1_500_000))
+        assertTrue(clock.awaitAudioStart(1_500_000) { true })
+        assertEquals(1_500_000L, clock.currentUs())
+        clock.anchorAudio(1_500_000) { 0 }
+        clock.endAudioRecovery()
     }
 
     private class FakeTime {

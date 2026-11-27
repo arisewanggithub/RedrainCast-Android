@@ -263,7 +263,7 @@ class SharingSettingsTest {
             val parent = remote.parent as LinearLayout
             assertSame(warning, parent.getChildAt(parent.indexOfChild(remote) + 1))
             assertTrue(warning.isShown)
-            assertTrue(warning.text.contains("Anyone on this LAN"))
+            assertTrue(warning.text.contains("LAN or VPN"))
             assertTrue(warning.text.contains("unencrypted and unauthenticated"))
             assertTrue(warning.text.contains("without a receiver settings change"))
             assertTrue(warning.text.contains("diagnostic captures"))
@@ -295,7 +295,7 @@ class SharingSettingsTest {
         val pairing = ShadowAlertDialog.getLatestAlertDialog()
         assertTrue(checkNotNull(pairing.window).attributes.flags and android.view.WindowManager.LayoutParams.FLAG_SECURE != 0)
         val status = pairing.findViewById<ViewGroup>(android.R.id.custom).getChildAt(0) as TextView
-        assertTrue(status.text.contains("Anyone on this LAN"))
+        assertTrue(status.text.contains("LAN or VPN"))
         assertTrue(status.text.contains("unencrypted and unauthenticated"))
         assertTrue(status.text.contains("without a receiver settings change"))
         assertFalse(saved)

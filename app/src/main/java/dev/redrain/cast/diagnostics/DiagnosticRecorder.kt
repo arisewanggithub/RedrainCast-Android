@@ -92,7 +92,7 @@ class DiagnosticRecorder(private val clock: () -> Long = System::nanoTime) {
 
         val capabilities = mapOf(
             "sender" to setOf("session", "recovery", "audio.capture", "audio.transport", "audio.queue", "video.progress", "transport.health"),
-            "receiver" to setOf("session", "recovery", "audio.transport", "audio.queue", "audio.output", "video.progress", "video.timing", "transport.health")
+            "receiver" to setOf("session", "recovery", "audio.transport", "audio.queue", "audio.output", "video.progress", "video.timing", "transport.health", "tail.details")
         )
 
         fun limits() = JSONObject().put("maxRecords", MAX_RECORDS).put("maxBytes", MAX_BYTES)
@@ -181,6 +181,7 @@ class DiagnosticRecorder(private val clock: () -> Long = System::nanoTime) {
         val videoTraceCandidates = AtomicLong()
         val videoTiming = AtomicReference<DiagnosticVideoTiming?>()
         val videoTimingContention = AtomicLong()
+        val audioClockObservationAt = AtomicLong(Long.MIN_VALUE)
 
         // Per-kind/point fixed counters: starts, completions, unnumbered calls,
         // bytes, units, four duration buckets, slow count and maximum duration.
@@ -460,6 +461,7 @@ class DiagnosticRecorder(private val clock: () -> Long = System::nanoTime) {
             drop(current, Drop.EXPIRED, ns)
             return
         }
+
         if (operation > 0 && (stage == DiagnosticStage.BEGIN || stage == DiagnosticStage.COMPLETE ||
                 stage == DiagnosticStage.FAILED)) {
             operationObservation(current, ns, kind, stage, track, generation, operation, bytes, point, reason,
@@ -475,6 +477,29 @@ class DiagnosticRecorder(private val clock: () -> Long = System::nanoTime) {
         }
         submit(current, observation(ns, kind, stage, role, session, track, generation, operation, pts,
             endPts, count, bytes, cutoff, reason, point, metadata), isCritical(kind, stage))
+    }
+
+    internal fun audioStartDecision(session: Long, generation: Int, operation: Long,
+                                    decision: org.screencopy.receiver.media.AudioStartDecision) {
+        if (!enabled("receiver", session, DiagnosticKind.AUDIO_OUTPUT)) return
+        observe("receiver", session, DiagnosticKind.AUDIO_OUTPUT, DiagnosticStage.SAMPLE,
+            2, generation, operation, pts = decision.targetUs, point = DiagnosticPoint.AUDIO_START_WAIT,
+            metadata = DiagnosticAudioStartDecision(decision))
+    }
+
+    internal fun audioClockObservation(session: Long, generation: Int,
+                                       observation: org.screencopy.receiver.media.AudioClockObservation) {
+        val current = gate ?: return
+        if (!enabled("receiver", session, DiagnosticKind.AUDIO_OUTPUT)) return
+        val now = clock()
+        while (true) {
+            val last = current.audioClockObservationAt.get()
+            if (last != Long.MIN_VALUE && now >= last && now - last < 250_000_000L) return
+            if (current.audioClockObservationAt.compareAndSet(last, now)) break
+        }
+        observe("receiver", session, DiagnosticKind.AUDIO_OUTPUT, DiagnosticStage.SAMPLE, 2, generation,
+            pts = observation.sourcePtsUs, point = DiagnosticPoint.TIMING,
+            metadata = DiagnosticAudioClockObservation(observation))
     }
 
     private fun operationObservation(
@@ -684,6 +709,9 @@ class DiagnosticRecorder(private val clock: () -> Long = System::nanoTime) {
         if (terminal) submitFinal(c, event) else submit(c, event, true)
     }
 
+    private fun buildInfo() = JSONObject().put("versionName", dev.redrain.cast.BuildConfig.VERSION_NAME)
+        .put("versionCode", dev.redrain.cast.BuildConfig.VERSION_CODE)
+
     @Synchronized fun sessionStarted(role: String, session: Long) {
         if (sessions.put(role, session) == session) return
         val c = capture ?: return
@@ -691,7 +719,7 @@ class DiagnosticRecorder(private val clock: () -> Long = System::nanoTime) {
         if (c.collecting && c.role == role && c.session == null) {
             gate = null
             c.session = session
-            lifecycle(c, "SESSION_BOUND", JSONObject())
+            lifecycle(c, "SESSION_BOUND", buildInfo())
             gate = c
         }
         observe(role, session, DiagnosticKind.SESSION, DiagnosticStage.STARTED)
@@ -747,7 +775,7 @@ class DiagnosticRecorder(private val clock: () -> Long = System::nanoTime) {
         proxyOwner = owner
         capture = c
         lifecycle(c, "CAPTURE_STARTED", JSONObject())
-        lifecycle(c, "SESSION_BOUND", JSONObject())
+        lifecycle(c, "SESSION_BOUND", buildInfo())
         gate = c
         observe("receiver", session, DiagnosticKind.SESSION, DiagnosticStage.STARTED)
         return JSONObject().put("captureId", c.id).put("clockId", clockId)
@@ -808,7 +836,7 @@ class DiagnosticRecorder(private val clock: () -> Long = System::nanoTime) {
             now + durationMs * 1_000_000L, periodMs * 1_000_000L, operations.get())
         capture = c
         lifecycle(c, "CAPTURE_STARTED", JSONObject())
-        if (session != null) lifecycle(c, "SESSION_BOUND", JSONObject())
+        if (session != null) lifecycle(c, "SESSION_BOUND", buildInfo())
         gate = c
         return limits().put("maxRecordBytes", if ("video.timing" in flags) MAX_VIDEO_TIMING_RECORD_BYTES else MAX_RECORD_BYTES)
             .put("captureId", c.id).put("startedNs", "$now").put("expiresNs", "${c.expires}")
