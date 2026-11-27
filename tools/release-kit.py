@@ -41,8 +41,21 @@ def link_metadata(ninja):
     if len(matches) != 1:
         raise ValueError("Expected one resampler link rule")
     values = dict(re.findall(r"^  (\w+) = (.*)$", matches[0], re.M))
+    link_flags = values["LINK_FLAGS"].split()
+    dep_file = "CMakeFiles/screencopy_resampler.dir/link.d"
+    if "-Xlinker" in link_flags or any(f.startswith("--dependency-file") for f in link_flags):
+        dep_flag = "--dependency-file=" + dep_file
+        if (link_flags.count("-Xlinker") != 1 or
+                [f for f in link_flags if f.startswith("--dependency-file")] != [dep_flag] or
+                values.get("DEP_FILE") != dep_file):
+            raise ValueError("Unexpected linker dependency file")
+        index = link_flags.index("-Xlinker")
+        if link_flags[index + 1:index + 2] != [dep_flag]:
+            raise ValueError("Unexpected linker dependency file")
+        # Ninja's dependency bookkeeping is not part of the portable relink.
+        del link_flags[index:index + 2]
     flags = relink.safe_flags(values["LANGUAGE_COMPILE_FLAGS"] + " " +
-                              values.get("ARCH_FLAGS", "") + " " + values["LINK_FLAGS"])
+                              values.get("ARCH_FLAGS", "") + " " + " ".join(link_flags))
     required = {"-static-libstdc++", "-Wl,--no-undefined", "-Wl,-z,max-page-size=16384",
                 "-Wl,--exclude-libs,ALL"}
     if not required.issubset(flags):

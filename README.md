@@ -526,9 +526,9 @@ presentation pixel checks must use a separate synthetic instrumentation fixture.
 
 ## Build and tests
 
-Uses the checked-in Gradle 9.8.1 wrapper, AGP 9.4.1 (built-in Kotlin), JDK 21,
+Uses the checked-in Gradle 9.9.2 wrapper, AGP 9.5.3 (built-in Kotlin), JDK 21,
 Android SDK/API 37 (`compileSdk` and `targetSdk`), Build-Tools 37.0.0,
-NDK 27.2.12479018 and CMake 3.22.1. Minimum Android remains API 30.
+NDK 30.0.16248370 and CMake 4.1.2. Minimum Android remains API 30.
 Set `JAVA_HOME` and `ANDROID_HOME` to your installed toolchains.
 FFmpeg's minimal LGPL-only `libavutil`/`libswresample` libraries are consumed
 as a pinned, SHA-256-verified public AAR/Prefab package. Fresh clones and cleared
