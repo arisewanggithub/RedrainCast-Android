@@ -137,6 +137,20 @@ class ReleaseTests(unittest.TestCase):
         _, flags, system = self.metadata(RULE.replace("/cache/", "C:/cache/"))
         kit.privacy_check((" ".join(flags + system)).encode())
 
+    def test_cmake4_ninja_link_dependency_is_not_published(self):
+        dep = "CMakeFiles/screencopy_resampler.dir/link.d"
+        rule = RULE.replace("  LINK_FLAGS =", "  DEP_FILE = " + dep + "\n  LINK_FLAGS =")
+        rule = rule.replace("-Wl,--exclude-libs,ALL", "-Wl,--exclude-libs,ALL -Xlinker --dependency-file=" + dep)
+        _, flags, _ = self.metadata(rule)
+        self.assertNotIn("-Xlinker", flags)
+        kit.privacy_check(" ".join(flags).encode())
+        for invalid in (rule.replace("DEP_FILE = " + dep, "DEP_FILE = other"),
+                        rule.replace("--dependency-file=" + dep, "--dependency-file=/private/link.d"),
+                        rule.replace("-Xlinker", "-Xlinker -Xlinker"),
+                        rule.replace("-Xlinker", "--dependency-file=other -Xlinker")):
+            with self.subTest(rule=invalid), self.assertRaises(ValueError):
+                self.metadata(invalid)
+
     def test_missing_no_undefined_rejected(self):
         with self.assertRaises(ValueError):
             self.metadata(RULE.replace("-Wl,--no-undefined ", ""))

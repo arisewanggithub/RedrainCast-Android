@@ -67,6 +67,8 @@ Key rotation requires explicit review and a signing-lineage/update plan.
   removing debug metadata and rejecting developer paths/credential-shaped data.
 - Preserve exact NDK/API/ABI, link flags, archive order, static C++ runtime,
   soname and 16 KiB alignment; reject unexpected dependencies.
+- Omit CMake's Ninja linker dependency-file bookkeeping from portable relink
+  flags; the producer validates its expected path before removing it.
 - Relink all ABIs, verify ELF machines/alignment and exact JNI exports, and
   reject unresolved symbols. This is a link/ELF smoke, not a device test.
 - Bind APK/object/source hashes and source commit in the manifest and checksums;
