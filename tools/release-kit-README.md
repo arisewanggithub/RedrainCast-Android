@@ -19,7 +19,7 @@ link flags and exported JNI symbols. It contains no local build paths.
 
 1. Verify the archive's published SHA-256, then extract it. Within the kit run
    `sha256sum --check SHA256SUMS` (or an equivalent SHA-256 verifier).
-2. Install Python 3.10+ and Android NDK **27.2.12479018**. The target is Android
+2. Install Python 3.10+ and Android NDK **30.0.16248370**. The target is Android
    API **30**, static C++ runtime, arm64-v8a/armeabi-v7a/x86_64, 16 KiB pages.
 3. Baseline smoke/relink, without compiling FFmpeg:
 

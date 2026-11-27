@@ -13,7 +13,7 @@ ABIS = {
     "armeabi-v7a": ("armv7-none-linux-androideabi30", "ARM"),
     "x86_64": ("x86_64-none-linux-android30", "Advanced Micro Devices X86-64"),
 }
-NDK_VERSION = "27.2.12479018"
+NDK_VERSION = "30.0.16248370"
 LIBRARY = "libscreencopy_resampler.so"
 
 

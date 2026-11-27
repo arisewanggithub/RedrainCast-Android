@@ -29,7 +29,9 @@ include third_party/ffmpeg-7.1.3.tar.xz and its checksum,
 third_party/build-ffmpeg.sh, third_party/FFMPEG.md, the JNI source
 app/src/main/cpp/resampler_jni.cpp and CMakeLists.txt, and any modifications.
 The archive preserves individual source-file copyrights/notices.
-Build: Android NDK 27.2.12479018, CMake 3.22.1, API 30, static libc++.
+Application build/relink: Android NDK 30.0.16248370, CMake 3.22.1,
+API 30, static libc++. The unchanged FFmpeg prebuilt package's own toolchain
+and configuration are documented in its release provenance.
 Supported ABIs: arm64-v8a, armeabi-v7a and x86_64.
 
 Release distributors must also accompany the binary with the matching

@@ -52,9 +52,11 @@ version with a floating `latest` dependency.
 ## Explicit native-package maintenance
 
 Update the source checksum/configuration and manually trigger the workflow in
-<https://github.com/arisewanggithub/RedrainCast-Native>. A change to FFmpeg,
-NDK, API floor, ABI set or compiler/configuration flags requires a new immutable
-package revision, followed by updating the consumer version and AAR checksum.
+<https://github.com/arisewanggithub/RedrainCast-Native>. A change to the package's
+FFmpeg, NDK, API floor, ABI set or compiler/configuration flags requires a new
+immutable package revision, followed by updating the consumer version and AAR
+checksum. The application's NDK pin controls the JNI/Opus build and relinking;
+changing it does not rebuild or alter the pinned FFmpeg package.
 Source builds are maintenance operations only; application builds never invoke
 `build-ffmpeg.sh`.
 
