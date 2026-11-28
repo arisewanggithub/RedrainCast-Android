@@ -263,7 +263,7 @@ class SharingSettingsTest {
             val parent = remote.parent as LinearLayout
             assertSame(warning, parent.getChildAt(parent.indexOfChild(remote) + 1))
             assertTrue(warning.isShown)
-            assertTrue(warning.text.contains("Anyone on this LAN"))
+            assertTrue(warning.text.contains("LAN or VPN"))
             assertTrue(warning.text.contains("unencrypted and unauthenticated"))
             assertTrue(warning.text.contains("without a receiver settings change"))
             assertTrue(warning.text.contains("diagnostic captures"))
@@ -274,6 +274,7 @@ class SharingSettingsTest {
             assertFalse(dev.redrain.cast.diagnostics.DiagnosticAccess.enabled)
             val generation = dev.redrain.cast.diagnostics.DiagnosticAccess.consentGeneration
             assertTrue(dialog.getButton(AlertDialog.BUTTON_POSITIVE).isEnabled)
+            assertTrue(dialog.getButton(AlertDialog.BUTTON_POSITIVE).hasOnClickListeners())
             click(dialog, AlertDialog.BUTTON_POSITIVE)
             assertNotNull(field<TextView>(dialog, "settingsError").text.toString(), saved)
             assertFalse(checkNotNull(saved).showPlaybackStatistics)
@@ -295,7 +296,7 @@ class SharingSettingsTest {
         val pairing = ShadowAlertDialog.getLatestAlertDialog()
         assertTrue(checkNotNull(pairing.window).attributes.flags and android.view.WindowManager.LayoutParams.FLAG_SECURE != 0)
         val status = pairing.findViewById<ViewGroup>(android.R.id.custom).getChildAt(0) as TextView
-        assertTrue(status.text.contains("Anyone on this LAN"))
+        assertTrue(status.text.contains("LAN or VPN"))
         assertTrue(status.text.contains("unencrypted and unauthenticated"))
         assertTrue(status.text.contains("without a receiver settings change"))
         assertFalse(saved)
@@ -405,6 +406,507 @@ class SharingSettingsTest {
         it.get().getSharedPreferences(SharingSettings.PREFERENCES, Context.MODE_PRIVATE).edit().clear().commit()
     }
 
+    @Test fun disablingAudioPersistsVideoOnlySelectionWithoutChangingOtherSettings() {
+        val controller = activity()
+        val current = Settings().apply {
+            audioCodec = "opus"
+            audioSource = "mic"
+            audioBitrate = 128_000
+            maxFps = 47
+            videoBitrate = 9_500_000
+            showPlaybackStatistics = true
+        }
+        var saved: Settings? = null
+        val dialog = show(controller.get(), current, { saved = it }, {})
+        try {
+            assertSame(dialog, latestDialog())
+            field<CheckBox>(dialog, "audio").performClick()
+            click(dialog, AlertDialog.BUTTON_POSITIVE)
+            assertNotNull(field<TextView>(dialog, "settingsError").text.toString(), saved)
+            val selected = checkNotNull(saved)
+            val storedAudio = selected.saved().getJSONObject("audio")
+            assertEquals("opus", storedAudio.getString("codec"))
+            assertEquals("mic", storedAudio.getString("source"))
+            assertEquals(128_000, storedAudio.getInt("bitrate"))
+            val inactiveAudio = selected.request().getJSONObject("audio")
+            assertFalse(inactiveAudio.getBoolean("enabled"))
+            assertEquals("raw", inactiveAudio.getString("codec"))
+            assertEquals("playback", inactiveAudio.getString("source"))
+            assertTrue(selected.showPlaybackStatistics)
+            assertTrue("Editing a draft must not mutate a prior session's settings", current.audio)
+            val loaded = SharingSettings.load(controller.get()) { throw it }
+            assertEquals(selected.saved().toString(), loaded.saved().toString())
+            val requests = SendRequests(RoleOwner())
+            val pending = requests.reserve(loaded.saved().toString(),
+                dev.screencopy.sender.ReceiverTarget("127.0.0.1", 7007))
+            val adopted = Settings.from(org.json.JSONObject(requests.adopt(pending.id).settings))
+            val effective = org.screencopy.receiver.protocol.Request.parse(adopted.request())
+            assertEquals(listOf(1), effective.tracks)
+            assertNull(effective.audioCodec)
+            assertTrue(requests.finish(pending.id))
+
+            var restored: Settings? = null
+            val reopened = show(controller.get(), loaded, { restored = it }, {})
+            assertSame(reopened, latestDialog())
+            field<CheckBox>(reopened, "audio").performClick()
+            click(reopened, AlertDialog.BUTTON_POSITIVE)
+            assertEquals(current.saved().toString(), checkNotNull(restored).saved().toString())
+        } finally {
+            dialog.dismiss()
+            controller.pause().stop().destroy()
+        }
+    }
+
+    @Test fun trackTogglesKeepOneUsableAndFullscreenPreservesDormantCrop() {
+        val controller = activity()
+        val current = Settings().apply {
+            cropWidth = 120
+            cropHeight = 80
+            cropX = 12
+            cropY = 8
+        }
+        var saved: Settings? = null
+        val dialog = show(controller.get(), current, { saved = it }, {})
+        try {
+            val video = field<CheckBox>(dialog, "videoEnabled")
+            val audio = field<CheckBox>(dialog, "audio")
+            assertEquals(video.id, field<TextView>(dialog, "videoDisabledHint").labelFor)
+            assertEquals(audio.id, field<TextView>(dialog, "audioDisabledHint").labelFor)
+            assertTrue(video.isChecked && audio.isChecked)
+            assertFalse(field<TextView>(dialog, "videoDisabledHint").isShown)
+            assertFalse(field<TextView>(dialog, "audioDisabledHint").isShown)
+            video.performClick()
+            assertFalse(video.isChecked)
+            assertFalse(field<Button>(dialog, "videoCodec").isShown)
+            assertFalse(field<TextView>(dialog, "videoDisabledHint").isShown)
+            assertTrue(field<TextView>(dialog, "audioDisabledHint").isShown)
+            assertEquals(controller.get().getString(R.string.rc_last_track_hint),
+                field<TextView>(dialog, "audioDisabledHint").text.toString())
+            assertFalse(audio.isEnabled)
+            assertTrue(video.isEnabled)
+            video.performClick()
+            assertTrue(audio.isEnabled)
+            audio.performClick()
+            assertTrue(field<TextView>(dialog, "videoDisabledHint").isShown)
+            assertFalse(field<TextView>(dialog, "audioDisabledHint").isShown)
+            assertEquals(controller.get().getString(R.string.rc_last_track_hint),
+                field<TextView>(dialog, "videoDisabledHint").text.toString())
+            audio.performClick()
+            field<Button>(dialog, "advancedToggle").performClick()
+            val fullscreen = field<CheckBox>(dialog, "fullscreen")
+            fullscreen.isChecked = true
+            assertFalse(field<EditText>(dialog, "cropWidth").isShown)
+            assertTrue(dialog.getButton(AlertDialog.BUTTON_POSITIVE).isEnabled)
+            click(dialog, AlertDialog.BUTTON_POSITIVE)
+            val result = checkNotNull(saved)
+            assertTrue(result.fullscreen)
+            assertEquals(120, result.cropWidth)
+            assertEquals(80, result.cropHeight)
+            assertEquals(12, result.cropX)
+            assertEquals(8, result.cropY)
+            assertTrue(result.saved().getJSONObject("video").getBoolean("enabled"))
+            assertTrue(result.saved().getJSONObject("video").getBoolean("fullscreen"))
+        } finally {
+            dialog.dismiss()
+            controller.pause().stop().destroy()
+        }
+    }
+
+    @Test fun editedTrackDraftsSurviveDisablingSavingAndReenabling() {
+            val controller = activity()
+            try {
+                var videoSaved: Settings? = null
+                val videoDialog = show(controller.get(), Settings(), { videoSaved = it }, {})
+                choose(videoDialog, "maxFps", 4)
+                choose(videoDialog, "receiverOrientation", 2)
+                field<CheckBox>(videoDialog, "videoEnabled").performClick()
+                click(videoDialog, AlertDialog.BUTTON_POSITIVE)
+                val videoOff = checkNotNull(videoSaved)
+                assertEquals(30, videoOff.maxFps)
+                assertEquals("portrait", videoOff.receiverOrientation)
+                assertEquals(0, videoOff.request().getJSONObject("video").getInt("maxFps"))
+                var videoRestored: Settings? = null
+                val reopenedVideo = show(controller.get(), SharingSettings.load(controller.get()) { throw it },
+                    { videoRestored = it }, {})
+                field<CheckBox>(reopenedVideo, "videoEnabled").performClick()
+                click(reopenedVideo, AlertDialog.BUTTON_POSITIVE)
+                assertEquals(30, checkNotNull(videoRestored).maxFps)
+                assertEquals("portrait", checkNotNull(videoRestored).receiverOrientation)
+
+                var audioSaved: Settings? = null
+                val audioDialog = show(controller.get(), Settings(), { audioSaved = it }, {})
+                choose(audioDialog, "audioCodec", 1)
+                choose(audioDialog, "audioSource", 1)
+                field<EditText>(audioDialog, "audioBitrate").setText("128")
+                field<CheckBox>(audioDialog, "audio").performClick()
+                click(audioDialog, AlertDialog.BUTTON_POSITIVE)
+                val audioOff = checkNotNull(audioSaved)
+                assertEquals("opus", audioOff.audioCodec)
+                assertEquals("mic", audioOff.audioSource)
+                assertEquals(128_000, audioOff.audioBitrate)
+                assertEquals("raw", audioOff.request().getJSONObject("audio").getString("codec"))
+                var audioRestored: Settings? = null
+                val reopenedAudio = show(controller.get(), SharingSettings.load(controller.get()) { throw it },
+                    { audioRestored = it }, {})
+                field<CheckBox>(reopenedAudio, "audio").performClick()
+                click(reopenedAudio, AlertDialog.BUTTON_POSITIVE)
+                assertEquals(128_000, checkNotNull(audioRestored).audioBitrate)
+                assertEquals("opus", checkNotNull(audioRestored).audioCodec)
+            } finally {
+                controller.pause().stop().destroy()
+            }
+        }
+
+        @Test fun invalidHiddenAudioDraftDoesNotReplacePriorValidBitrate() {
+            val controller = activity()
+            try {
+                var saved: Settings? = null
+                val dialog = show(controller.get(), Settings().apply {
+                    audioCodec = "opus"; audioBitrate = 128_000
+                }, { saved = it }, {})
+                field<EditText>(dialog, "audioBitrate").setText("unfinished")
+                field<CheckBox>(dialog, "audio").performClick()
+                click(dialog, AlertDialog.BUTTON_POSITIVE)
+                assertEquals(128_000, checkNotNull(saved).audioBitrate)
+            } finally { controller.pause().stop().destroy() }
+        }
+
+        @Test fun unsupportedDormantChoicesLoadAndFailValidationWhenReenabled() {
+            val controller = activity()
+            try {
+                val dormantVideo = Settings().apply { video = false; receiverOrientation = "sideways" }
+                val videoDialog = show(controller.get(), dormantVideo, {}, {})
+                assertTrue(field<Button>(videoDialog, "receiverOrientation").text.contains("sideways"))
+                field<CheckBox>(videoDialog, "videoEnabled").performClick()
+                click(videoDialog, AlertDialog.BUTTON_POSITIVE)
+                assertTrue(videoDialog.isShowing)
+                assertTrue(field<TextView>(videoDialog, "settingsError").text.contains("Invalid receiver orientation"))
+                videoDialog.dismiss()
+
+                val dormantAudio = Settings().apply {
+                    audio = false; audioCodec = "unknown-codec"; audioSource = "unknown-source"
+                }
+                val audioDialog = show(controller.get(), dormantAudio, {}, {})
+                assertTrue(field<Button>(audioDialog, "audioCodec").text.contains("unknown-codec"))
+                assertTrue(field<Button>(audioDialog, "audioSource").text.contains("unknown-source"))
+                field<CheckBox>(audioDialog, "audio").performClick()
+                click(audioDialog, AlertDialog.BUTTON_POSITIVE)
+                assertTrue(audioDialog.isShowing)
+                assertTrue(field<TextView>(audioDialog, "settingsError").text.contains("Unknown audio codec"))
+                audioDialog.dismiss()
+            } finally { controller.pause().stop().destroy() }
+        }
+
+        @Test fun summaryDescribesOnlyEnabledTracks() {
+            val controller = activity()
+            try {
+                SharingSettings.load(controller.get()) { throw it }
+                val settings = Settings().apply { audioCodec = "opus" }
+                assertTrue(SharingSettings.summary(settings).contains("H264"))
+                assertTrue(SharingSettings.summary(settings).contains("OPUS"))
+                settings.audio = false
+                assertTrue(SharingSettings.summary(settings).contains(controller.get().getString(R.string.rc_summary_audio_off)))
+                settings.video = false; settings.audio = true
+                val summary = SharingSettings.summary(settings)
+                assertTrue(summary.contains(controller.get().getString(R.string.rc_summary_video_off)))
+                assertTrue(summary.contains("OPUS"))
+                assertFalse(summary.contains("H264"))
+            } finally { controller.pause().stop().destroy() }
+        }
+    @Test fun sizePresetsAboveCurrentCaptureOrCropAreHiddenButSavedSelectionRemains() {
+        val presets = listOf(0, 1280, 1920, 2560, 3840)
+        assertEquals(listOf(0, 1280, 1920, 3840),
+            SharingSettings.sizePresetsWithinCapture(presets, 1920, 3840))
+        assertEquals(listOf(0, 1280, 3840),
+            SharingSettings.sizePresetsWithinCapture(presets, 1280, 3840))
+        assertEquals(presets, SharingSettings.sizePresetsWithinCapture(presets, null, 3840))
+
+        fun labels(dialog: AlertDialog): List<String> {
+            val picker = openChoice(dialog, "maxSize")
+            val values = (0 until picker.listView.count).map {
+                picker.listView.adapter.getItem(it).toString()
+            }
+            picker.dismiss()
+            shadowOf(Looper.getMainLooper()).idle()
+            return values
+        }
+        fun preset(label: String): Int? =
+            Regex("^(\\d+) px").find(label)?.groupValues?.get(1)?.toIntOrNull()
+
+        val controller = activity()
+        val current = Settings().apply { maxSize = 3840 }
+        val dialog = show(controller.get(), current, { fail("Cancel size selection") }, {})
+        try {
+            val naturalBounds = run {
+                field<Button>(dialog, "advancedToggle").performClick()
+                val helper = field<TextView>(dialog, "cropBoundsHint").text.toString()
+                val dimensions = Regex("\\((\\d+) × (\\d+) px\\)").find(helper)
+                    ?: throw AssertionError("Natural display dimensions missing from $helper")
+                maxOf(dimensions.groupValues[1].toInt(), dimensions.groupValues[2].toInt())
+            }
+            val fullScreenOptions = labels(dialog)
+            assertTrue(fullScreenOptions.any { preset(it) == current.maxSize })
+            assertFalse(fullScreenOptions.any {
+                val value = preset(it)
+                value != null && value > naturalBounds && value != current.maxSize
+            })
+
+            field<EditText>(dialog, "cropWidth").setText("640")
+            field<EditText>(dialog, "cropHeight").setText("480")
+            field<EditText>(dialog, "cropX").setText("0")
+            field<EditText>(dialog, "cropY").setText("0")
+            field<CheckBox>(dialog, "fullscreen").isChecked = false
+            val cropOptions = labels(dialog)
+            assertTrue(cropOptions.any { preset(it) == current.maxSize })
+            assertFalse(cropOptions.any { preset(it) != null && preset(it)!! > 640 && preset(it) != current.maxSize })
+        } finally {
+            dialog.dismiss()
+            controller.pause().stop().destroy()
+        }
+    }
+
+    @Test fun legacyNoCropRendersFullscreenAndInitialUncropUsesNaturalBounds() {
+        val controller = activity()
+        val current = Settings()
+        assertFalse(current.fullscreen)
+        assertTrue(current.request().getJSONObject("video").isNull("crop"))
+        var saved: Settings? = null
+        val dialog = show(controller.get(), current, { saved = it }, {})
+        try {
+            field<Button>(dialog, "advancedToggle").performClick()
+            assertNull(dialog.window!!.decorView.findViewWithTag<View>("clearCrop"))
+            val fullscreen = field<CheckBox>(dialog, "fullscreen")
+            assertTrue(fullscreen.isChecked)
+            assertEquals(View.GONE, field<EditText>(dialog, "cropWidth").visibility)
+            fullscreen.isChecked = false
+            val dimensions = Regex("\\((\\d+) × (\\d+) px\\)")
+                .find(field<TextView>(dialog, "cropBoundsHint").text.toString())
+                ?: throw AssertionError("Natural display bounds unavailable")
+            assertEquals(dimensions.groupValues[1], field<EditText>(dialog, "cropWidth").text.toString())
+            assertEquals(dimensions.groupValues[2], field<EditText>(dialog, "cropHeight").text.toString())
+            field<EditText>(dialog, "cropWidth").setText("123")
+            fullscreen.isChecked = true
+            fullscreen.isChecked = false
+            assertEquals("123", field<EditText>(dialog, "cropWidth").text.toString())
+            fullscreen.isChecked = true
+            click(dialog, AlertDialog.BUTTON_POSITIVE)
+            val result = checkNotNull(saved)
+            assertTrue(result.fullscreen)
+            assertTrue(result.request().getJSONObject("video").isNull("crop"))
+            assertEquals(123, result.cropWidth)
+        } finally {
+            dialog.dismiss()
+            controller.pause().stop().destroy()
+        }
+    }
+
+    @Test fun fullscreenAndVideoOffPreserveValidCropDraftsAndIgnoreInvalidHiddenText() {
+        for (hideByFullscreen in listOf(true, false)) {
+            val controller = activity()
+            val current = Settings().apply { cropWidth = 640; cropHeight = 480; cropX = 12; cropY = 8 }
+            var saved: Settings? = null
+            val dialog = show(controller.get(), current, { saved = it }, {})
+            try {
+                field<Button>(dialog, "advancedToggle").performClick()
+                val width = field<EditText>(dialog, "cropWidth")
+                width.setText("700")
+                if (hideByFullscreen) field<CheckBox>(dialog, "fullscreen").isChecked = true
+                else field<CheckBox>(dialog, "videoEnabled").performClick()
+                click(dialog, AlertDialog.BUTTON_POSITIVE)
+                val result = checkNotNull(saved)
+                assertEquals(700, result.cropWidth)
+                assertEquals(480, result.cropHeight)
+                assertEquals(12, result.cropX)
+                assertEquals(8, result.cropY)
+                assertEquals(hideByFullscreen, result.fullscreen)
+                assertEquals(hideByFullscreen, result.video)
+            } finally {
+                dialog.dismiss()
+                controller.pause().stop().destroy()
+            }
+        }
+
+        for (hideByFullscreen in listOf(true, false)) {
+            val controller = activity()
+            val current = Settings().apply { cropWidth = 640; cropHeight = 480; cropX = 12; cropY = 8 }
+            var saved: Settings? = null
+            val dialog = show(controller.get(), current, { saved = it }, {})
+            try {
+                field<Button>(dialog, "advancedToggle").performClick()
+                field<EditText>(dialog, "cropWidth").setText("unfinished")
+                if (hideByFullscreen) field<CheckBox>(dialog, "fullscreen").isChecked = true
+                else field<CheckBox>(dialog, "videoEnabled").performClick()
+                click(dialog, AlertDialog.BUTTON_POSITIVE)
+                val result = checkNotNull(saved)
+                assertEquals(640, result.cropWidth)
+                assertEquals(480, result.cropHeight)
+                assertEquals(12, result.cropX)
+                assertEquals(8, result.cropY)
+                assertEquals(hideByFullscreen, result.fullscreen)
+                assertEquals(hideByFullscreen, result.video)
+            } finally {
+                dialog.dismiss()
+                controller.pause().stop().destroy()
+            }
+        }
+    }
+
+    @Test fun activeCropBoundsErrorIsAttachedToFieldsAndUsesNaturalOrientationHelper() {
+        val controller = activity()
+        val current = Settings()
+        val dialog = show(controller.get(), current, { fail("Invalid active crop must not save") }, {})
+        try {
+            field<Button>(dialog, "advancedToggle").performClick()
+            val helper = field<TextView>(dialog, "cropBoundsHint")
+            val dimensions = Regex("\\((\\d+) × (\\d+) px\\)").find(helper.text.toString())
+                ?: throw AssertionError("Natural display bounds unavailable: ${helper.text}")
+            val naturalWidth = dimensions.groupValues[1].toInt()
+            field<CheckBox>(dialog, "fullscreen").isChecked = false
+            field<EditText>(dialog, "cropWidth").setText((naturalWidth + 1).toString())
+            field<EditText>(dialog, "cropHeight").setText("100")
+            field<EditText>(dialog, "cropX").setText("0")
+            field<EditText>(dialog, "cropY").setText("0")
+            click(dialog, AlertDialog.BUTTON_POSITIVE)
+            assertNotNull(field<EditText>(dialog, "cropWidth").error)
+            assertNotNull(field<EditText>(dialog, "cropX").error)
+            assertTrue(helper.text.toString().contains("natural screen orientation"))
+            assertFalse(field<TextView>(dialog, "settingsError").isShown)
+            assertTrue(dialog.isShowing)
+        } finally {
+            dialog.dismiss()
+            controller.pause().stop().destroy()
+        }
+    }
+
+    @Test fun audioOnlySaveEmitsStrictTrackFlagButKeepsVideoPreferences() {
+        val settings = Settings().apply {
+            video = false
+            audio = true
+            fullscreen = true
+            cropWidth = 480
+            cropHeight = 320
+            cropX = 10
+            cropY = 20
+        }
+        settings.validate()
+        val wire = settings.request()
+        val video = wire.getJSONObject("video")
+        assertEquals(false, video.get("enabled"))
+        assertTrue(video.isNull("crop"))
+        assertEquals(480, settings.saved().getJSONObject("video").getJSONObject("crop").getInt("width"))
+        val oldSchema = org.json.JSONObject(settings.saved().toString()).apply {
+            getJSONObject("video").remove("enabled")
+        }
+        assertTrue(Settings.from(oldSchema).video)
+        assertThrows(IllegalArgumentException::class.java) {
+            Settings().apply { this.video = false; audio = false }.validate()
+        }
+    }
+
+    @Test fun inactiveTrackAndFullscreenCropAreLosslesslySavedButCanonicalizedOnWire() {
+        val settings = Settings().apply {
+            video = false
+            audio = true
+            videoCodec = "retired-video-codec"
+            videoEncoder = "retired video encoder"
+            videoBitrate = -1
+            maxSize = -9
+            maxFps = 999
+            displayId = -7
+            orientation = "invalid"
+            receiverOrientation = "invalid"
+            videoOptions = "not=a valid option"
+            cropWidth = -40
+            cropHeight = 0
+            cropX = -1
+            cropY = 8
+        }
+        settings.validate()
+        val wire = settings.request()
+        val wireVideo = wire.getJSONObject("video")
+        assertEquals(false, wireVideo.getBoolean("enabled"))
+        assertEquals("h264", wireVideo.getString("codec"))
+        assertEquals(8_000_000, wireVideo.getInt("bitrate"))
+        assertEquals(1920, wireVideo.getInt("maxSize"))
+        assertEquals(0, wireVideo.getInt("maxFps"))
+        assertEquals(0, wireVideo.getInt("displayId"))
+        assertEquals("0", wireVideo.getString("orientation"))
+        assertEquals("", wireVideo.getString("codecOptions"))
+        assertTrue(wireVideo.isNull("crop"))
+        assertEquals("auto", wire.getString("receiverOrientation"))
+
+        val restored = Settings.from(settings.saved())
+        assertFalse(restored.video)
+        assertEquals("retired-video-codec", restored.videoCodec)
+        assertEquals(-1, restored.videoBitrate)
+        assertEquals(-40, restored.cropWidth)
+        assertEquals(0, restored.cropHeight)
+        assertEquals(-1, restored.cropX)
+        assertEquals(8, restored.cropY)
+        restored.validate()
+
+        val fullscreen = Settings().apply {
+            fullscreen = true
+            cropWidth = -40
+            cropHeight = 0
+            cropX = -1
+            cropY = 8
+        }
+        fullscreen.validate()
+        val fullscreenWire = fullscreen.request().getJSONObject("video")
+        assertTrue(fullscreenWire.isNull("crop"))
+        val fullscreenRestored = Settings.from(fullscreen.saved())
+        assertTrue(fullscreenRestored.fullscreen)
+        assertEquals(-40, fullscreenRestored.cropWidth)
+        assertEquals(-1, fullscreenRestored.cropX)
+    }
+
+    @Test fun persistedSettingsRejectWrongJsonTypesAndMissingCropInsteadOfCoercing() {
+        val valid = Settings().saved()
+        val invalid = listOf(
+            org.json.JSONObject(valid.toString()).apply { getJSONObject("video").put("bitrate", "8000000") },
+            org.json.JSONObject(valid.toString()).apply { getJSONObject("video").put("enabled", "false") },
+            org.json.JSONObject(valid.toString()).apply { getJSONObject("video").put("fullscreen", 1) },
+            org.json.JSONObject(valid.toString()).apply { getJSONObject("video").remove("crop") },
+            org.json.JSONObject(valid.toString()).apply {
+                getJSONObject("video").put("crop", org.json.JSONObject().put("width", "20")
+                    .put("height", 20).put("x", 0).put("y", 0))
+            },
+            org.json.JSONObject(valid.toString()).apply { getJSONObject("audio").put("enabled", 1) },
+            org.json.JSONObject(valid.toString()).apply { put("ShowPlaybackStatistics", "true") }
+        )
+        for (root in invalid)
+            assertThrows(IllegalArgumentException::class.java) { Settings.from(root) }
+        val legacy = org.json.JSONObject(valid.toString()).apply {
+            getJSONObject("video").remove("enabled")
+            getJSONObject("video").remove("fullscreen")
+        }
+        assertTrue(Settings.from(legacy).video)
+        assertFalse(Settings.from(legacy).fullscreen)
+    }
+
+    @Test fun audioOnlySettingsRemainSavableWithoutVideoEncoderHardware() {
+        val controller = activity()
+        var saved: Settings? = null
+        val dialog = show(controller.get(), Settings(), { saved = it }, {}, HardwareEncoders(emptyList()))
+        try {
+            val save = dialog.getButton(AlertDialog.BUTTON_POSITIVE)
+            assertFalse(save.isEnabled)
+            val video = field<CheckBox>(dialog, "videoEnabled")
+            video.performClick()
+            assertFalse(video.isChecked)
+            assertTrue(save.isEnabled)
+            assertFalse(field<Button>(dialog, "videoCodec").isShown)
+            assertFalse(field<TextView>(dialog, "settingsError").isShown)
+            click(dialog, AlertDialog.BUTTON_POSITIVE)
+            assertFalse(checkNotNull(saved).video)
+            assertTrue(saved!!.audio)
+        } finally {
+            dialog.dismiss()
+            controller.pause().stop().destroy()
+        }
+    }
+
     private fun <T : View> field(dialog: AlertDialog, tag: String): T = dialog.window!!.decorView.findViewWithTag(tag)
 
     private fun inventory(av1Hardware: Boolean = true) = HardwareEncoders(listOf(
@@ -473,7 +975,7 @@ class SharingSettingsTest {
         try {
             field<Button>(dialog, "advancedToggle").performClick()
             shadowOf(Looper.getMainLooper()).idle()
-            val keys = listOf("maxSize", "videoBitrate", "cropWidth", "cropHeight", "cropX", "cropY", "audioBitrate")
+            val keys = listOf("cropWidth", "cropHeight", "cropX", "cropY", "audioBitrate")
             for (key in keys) {
                 val input = field<EditText>(dialog, key)
                 assertTrue(key, input.requestFocus())
@@ -485,7 +987,7 @@ class SharingSettingsTest {
                 shadowOf(Looper.getMainLooper()).idle()
                 assertEquals(key, 1, input.selectionStart)
                 assertEquals(key, 1, input.selectionEnd)
-                assertTrue(field<EditText>(dialog, if (key == "maxSize") "videoBitrate" else "maxSize").requestFocus())
+                assertTrue(field<EditText>(dialog, if (key == "cropWidth") "cropHeight" else "cropWidth").requestFocus())
                 assertFalse(key, input.hasFocus())
                 assertTrue(input.requestFocus())
                 shadowOf(Looper.getMainLooper()).idle()
@@ -508,10 +1010,8 @@ class SharingSettingsTest {
         val dialog = show(activity, current, { fail("Cancel saved settings") }, {})
         latestDialog()
         try {
-            val input = field<EditText>(dialog, "maxSize")
-            assertTrue(input.requestFocus())
-            input.text.replace(input.selectionStart, input.selectionEnd, "1280")
-            assertEquals("1280", input.text.toString())
+            choose(dialog, "maxSize", 0)
+            assertTrue(field<Button>(dialog, "maxSize").text.toString().contains("Original"))
             assertEquals(1920, current.maxSize)
             click(dialog, AlertDialog.BUTTON_NEGATIVE)
             assertEquals(original, preferences.getString(SharingSettings.REQUEST, null))
@@ -663,9 +1163,9 @@ class SharingSettingsTest {
         val dialog = latestDialog()
         assertSame(shownDialog, dialog)
         try {
-            field<EditText>(dialog, "maxSize").setText("0")
+            choose(dialog, "maxSize", 0)
             choose(dialog, "maxFps", 8)
-            field<EditText>(dialog, "videoBitrate").setText("12.5")
+            choose(dialog, "videoBitrate", 11)
             choose(dialog, "videoCodec", 1)
             choose(dialog, "receiverOrientation", 2)
             click(dialog, AlertDialog.BUTTON_POSITIVE)
@@ -674,7 +1174,7 @@ class SharingSettingsTest {
             assertEquals("h265", result.videoCodec)
             assertEquals(0, result.maxSize)
             assertEquals(90, result.maxFps)
-            assertEquals(12_500_000, result.videoBitrate)
+            assertEquals(12_000_000, result.videoBitrate)
             assertEquals("portrait", result.receiverOrientation)
             assertEquals("@90", result.orientation)
             assertEquals(3, result.displayId)
@@ -690,7 +1190,7 @@ class SharingSettingsTest {
             assertEquals(original, current.request().toString())
             val loaded = SharingSettings.load(activity) { throw AssertionError(it) }
             assertEquals(result.request().toString(), loaded.request().toString())
-            assertTrue(SharingSettings.summary(loaded).contains("12.5"))
+            assertTrue(SharingSettings.summary(loaded).contains("12"))
         } finally {
             dialog.dismiss()
             controller.pause().stop().destroy()
@@ -817,18 +1317,17 @@ class SharingSettingsTest {
         show(activity, Settings(), { saves++ }, {})
         val dialog = latestDialog()
         try {
-            field<EditText>(dialog, "maxSize").setText("-1")
+            field<Button>(dialog, "advancedToggle").performClick()
+            field<CheckBox>(dialog, "fullscreen").isChecked = false
+            field<EditText>(dialog, "cropWidth").setText("-1")
+            field<EditText>(dialog, "cropHeight").setText("100")
             click(dialog, AlertDialog.BUTTON_POSITIVE)
             assertTrue(dialog.isShowing)
             assertEquals(0, saves)
-            assertEquals(View.VISIBLE, field<TextView>(dialog, "settingsError").visibility)
+            assertNotNull(field<EditText>(dialog, "cropWidth").error)
+            assertEquals(View.GONE, field<TextView>(dialog, "settingsError").visibility)
             assertFalse(activity.getSharedPreferences(SharingSettings.PREFERENCES, Context.MODE_PRIVATE).contains(SharingSettings.REQUEST))
-            field<EditText>(dialog, "maxSize").setText("1920")
-            field<EditText>(dialog, "videoBitrate").setText("not a number")
-            click(dialog, AlertDialog.BUTTON_POSITIVE)
-            assertTrue(dialog.isShowing)
-            assertNotNull(field<EditText>(dialog, "videoBitrate").error)
-            field<EditText>(dialog, "videoBitrate").setText("8")
+            field<CheckBox>(dialog, "fullscreen").isChecked = true
             click(dialog, AlertDialog.BUTTON_POSITIVE)
             assertFalse(dialog.isShowing)
             assertEquals(1, saves)
@@ -846,7 +1345,7 @@ class SharingSettingsTest {
         show(activity, current, { fail("Cancel saved settings") }, { notices++ })
         val dialog = latestDialog()
         try {
-            field<EditText>(dialog, "maxSize").setText("720")
+            choose(dialog, "maxSize", 0)
             choose(dialog, "videoCodec", 1)
             choose(dialog, "receiverOrientation", 2)
             choose(dialog, "audioCodec", 1)
@@ -914,9 +1413,9 @@ class SharingSettingsTest {
         val dialog = latestDialog()
         try {
             field<Button>(dialog, "advancedToggle").performClick()
-            field<CheckBox>(dialog, "clearCrop").isChecked = false
-            field<EditText>(dialog, "cropWidth").setText("800")
-            field<EditText>(dialog, "cropHeight").setText("600")
+            field<CheckBox>(dialog, "fullscreen").isChecked = false
+            field<EditText>(dialog, "cropWidth").setText("80")
+            field<EditText>(dialog, "cropHeight").setText("60")
             field<EditText>(dialog, "cropX").setText("10")
             field<EditText>(dialog, "cropY").setText("20")
             assertNull(dialog.window!!.decorView.findViewWithTag<View>("videoEncoder"))
@@ -927,8 +1426,8 @@ class SharingSettingsTest {
             click(dialog, AlertDialog.BUTTON_POSITIVE)
             assertFalse(dialog.isShowing)
             val result = checkNotNull(saved)
-            assertEquals(800, result.cropWidth)
-            assertEquals(600, result.cropHeight)
+            assertEquals(80, result.cropWidth)
+            assertEquals(60, result.cropHeight)
             assertEquals(10, result.cropX)
             assertEquals(20, result.cropY)
             assertEquals("", result.videoEncoder)
@@ -942,12 +1441,12 @@ class SharingSettingsTest {
         }
     }
 
-    @Test fun clearCropExplicitlyClearsAllFourCoordinatesAndRawBitrateIsPreserved() {
+    @Test fun fullscreenPreservesCropAndRawBitrateAcrossSaveAndReopen() {
         val controller = activity()
         val activity = controller.get()
         val current = Settings().apply {
-            cropWidth = 400
-            cropHeight = 300
+            cropWidth = 100
+            cropHeight = 100
             cropX = 10
             cropY = 20
             audioBitrate = 123456
@@ -956,15 +1455,31 @@ class SharingSettingsTest {
         show(activity, current, { saved = it }, {})
         val dialog = latestDialog()
         try {
-            field<CheckBox>(dialog, "clearCrop").isChecked = true
-            assertFalse(field<EditText>(dialog, "cropWidth").isEnabled)
+            field<Button>(dialog, "advancedToggle").performClick()
+            assertNull(dialog.window!!.decorView.findViewWithTag<View>("clearCrop"))
+            val fullscreen = field<CheckBox>(dialog, "fullscreen")
+            field<EditText>(dialog, "cropWidth").setText("120")
+            fullscreen.isChecked = true
+            fullscreen.isChecked = false
+            assertEquals("120", field<EditText>(dialog, "cropWidth").text.toString())
+            fullscreen.isChecked = true
             assertFalse(field<EditText>(dialog, "audioBitrate").isEnabled)
             assertEquals(View.GONE, field<View>(dialog, "audioBitrate").visibility)
             assertEquals(View.GONE, field<View>(dialog, "audioBitrateLabel").visibility)
             click(dialog, AlertDialog.BUTTON_POSITIVE)
             val result = checkNotNull(saved)
-            assertEquals(listOf(0, 0, 0, 0), listOf(result.cropWidth, result.cropHeight, result.cropX, result.cropY))
+            assertEquals(listOf(120, 100, 10, 20), listOf(result.cropWidth, result.cropHeight, result.cropX, result.cropY))
+            assertTrue(result.request().getJSONObject("video").isNull("crop"))
             assertEquals(123456, result.audioBitrate)
+            val reopened = show(activity, SharingSettings.load(activity) { throw it }, {}, {})
+            field<Button>(reopened, "advancedToggle").performClick()
+            assertTrue(field<CheckBox>(reopened, "fullscreen").isChecked)
+            field<CheckBox>(reopened, "fullscreen").isChecked = false
+            assertEquals("120", field<EditText>(reopened, "cropWidth").text.toString())
+            click(reopened, AlertDialog.BUTTON_POSITIVE)
+            val restored = SharingSettings.load(activity) { throw it }
+            assertFalse(restored.fullscreen)
+            assertEquals(120, restored.request().getJSONObject("video").getJSONObject("crop").getInt("width"))
         } finally {
             dialog.dismiss()
             controller.pause().stop().destroy()
@@ -1089,10 +1604,14 @@ class SharingSettingsTest {
             scroll.layout(0, 0, 400, 500)
             scroll.scrollTo(0, 200)
             assertTrue(scroll.scrollY > 0)
-            field<EditText>(dialog, "maxSize").setText("-1")
+            field<Button>(dialog, "advancedToggle").performClick()
+            field<CheckBox>(dialog, "fullscreen").isChecked = false
+            field<EditText>(dialog, "cropWidth").setText("-1")
+            field<EditText>(dialog, "cropHeight").setText("100")
             click(dialog, AlertDialog.BUTTON_POSITIVE)
-            assertEquals(View.VISIBLE, error.visibility)
-            assertEquals(0, scroll.scrollY)
+            assertNotNull(field<EditText>(dialog, "cropWidth").error)
+            assertEquals(View.GONE, error.visibility)
+            assertTrue(scroll.scrollY > 0)
             assertTrue(dialog.isShowing)
         } finally {
             dialog.dismiss()
@@ -1137,5 +1656,32 @@ class SharingSettingsTest {
         preferences.edit().clear().commit()
         val result = SharingSettings.load(context) { fail("New installation must not warn") }
         assertEquals(0, result.maxFps)
+    }
+
+    @Test fun unreadablePersistedSettingsBlockCastingUntilExplicitReplacement() {
+        val controller = activity()
+        val context = controller.get()
+        val preferences = context.getSharedPreferences(SharingSettings.PREFERENCES, Context.MODE_PRIVATE)
+        val corrupt = "{broken"
+        preferences.edit().putString(SharingSettings.REQUEST, corrupt).commit()
+        val current = SharingSettings.load(context) {}
+        assertThrows(IllegalArgumentException::class.java) { current.validate() }
+        var saved: Settings? = null
+        val dialog = show(context, current, { saved = it }, {})
+        try {
+            assertTrue(field<TextView>(dialog, "settingsError").isShown)
+            click(dialog, AlertDialog.BUTTON_POSITIVE)
+            assertNull(saved)
+            assertTrue(dialog.isShowing)
+            val confirmation = latestDialog()
+            click(confirmation, AlertDialog.BUTTON_POSITIVE)
+            assertNotNull(saved)
+            assertFalse(dialog.isShowing)
+            assertNotEquals(corrupt, preferences.getString(SharingSettings.REQUEST, null))
+        } finally {
+            preferences.edit().clear().commit()
+            dialog.dismiss()
+            controller.pause().stop().destroy()
+        }
     }
 }

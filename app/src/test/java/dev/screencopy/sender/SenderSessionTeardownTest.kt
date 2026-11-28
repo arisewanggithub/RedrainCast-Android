@@ -23,6 +23,60 @@ import java.util.concurrent.atomic.AtomicReference
 import kotlin.concurrent.thread
 
 class SenderSessionTeardownTest {
+    @Test fun streamingStatusRequiresBothTracksAndIsPublishedOnlyOnTransitions() {
+        val statuses = mutableListOf<String>()
+        val sender = SenderSession(Mockito.mock(Context::class.java), Settings(),
+            ReceiverTarget("127.0.0.1", 7007), statuses::add, {}, {})
+        fun field(name: String) = SenderSession::class.java.getDeclaredField(name).apply { isAccessible = true }
+        val diagnostics = SenderSession::class.java.getDeclaredMethod("recoveryDiagnostic", String::class.java)
+            .apply { isAccessible = true }
+        val written = SenderSession::class.java.getDeclaredMethod("writeCompleted", Wire.Message::class.java)
+            .apply { isAccessible = true }
+        val clock = AtomicLong(1_000_000_000)
+        val mux = field("mux").get(sender) as MediaBudget
+        val recovery = StreamRecoverySender(ID, mux, clock::get,
+            diagnostic = { diagnostics.invoke(sender, it) })
+        field("session").setLong(sender, ID)
+        field("recovery").set(sender, recovery)
+        fun finish(track: Int) {
+            val message = checkNotNull(mux.pollLane(track, 1))
+            mux.beginWrite(message)
+            written.invoke(sender, message)
+            mux.endWrite(message)
+        }
+        fun video(pts: Long) = Wire.Message(Wire.VIDEO_FRAME, 1, ID, 1, 1, pts,
+            byteArrayOf(0, 0, 0, 1, 0x65, 1))
+        fun audio(pts: Long) = Wire.Message(Wire.AUDIO_PACKET, 0, ID, 2, 1, pts, ByteArray(3840))
+        try {
+            recovery.config(1, 1, Wire.obj("codec" to "h264"))
+            recovery.config(2, 1, Wire.obj("codec" to "raw", "sampleRate" to 48000, "channels" to 2))
+            for (track in 1..2) { finish(track); mux.ready(track, 1) }
+            recovery.ready()
+            recovery.packet(audio(1_000_000))
+            recovery.packet(video(1_000_000))
+            finish(1)
+            recovery.keyProved(1, 1_000_000)
+            recovery.completed(1, 1, 1_000_000)
+            assertEquals(0, statuses.count { it == "Streaming" })
+            finish(2)
+            assertEquals(1, statuses.count { it == "Streaming" })
+            recovery.packet(audio(1_020_000)); finish(2)
+            recovery.packet(video(1_020_000)); finish(1)
+            assertEquals(1, statuses.count { it == "Streaming" })
+
+            recovery.request(1, 1)
+            finish(1); mux.ready(1, 2); recovery.ready()
+            recovery.packet(video(1_030_000)); finish(1)
+            recovery.keyProved(2, 1_030_000)
+            recovery.completed(1, 2, 1_030_000)
+            assertEquals(2, statuses.count { it == "Streaming" })
+            recovery.packet(video(1_040_000)); finish(1)
+            assertEquals(2, statuses.count { it == "Streaming" })
+        } finally {
+            (field("timer").get(sender) as java.util.concurrent.ScheduledExecutorService).shutdownNow()
+        }
+    }
+
     @Test(timeout = 30_000) fun stopAndReadyCommitShareStartupOutcomeBoundary() {
         for (mode in listOf("before_ready", "before_commit", "ready_first")) {
             val stopFirst = mode != "ready_first"
@@ -605,6 +659,13 @@ class SenderSessionTeardownTest {
                     val worker = ScheduledThreadPoolExecutor(1)
                     worker.execute { entered.countDown(); release.await() }
                     val blocked = dev.redrain.cast.diagnostics.ReceiverTelemetrySession({ true }, worker = worker)
+                    val diagnostics = dev.redrain.cast.diagnostics.RemoteDiagnostics.recorder
+                    diagnostics.grantConsent()
+                    val arms = dev.redrain.cast.diagnostics.DiagnosticArmRegistry(diagnostics)
+                    val pair = arms.start("collector", setOf("session"), setOf("session"), 10_000, 100)
+                        .getString("pairId")
+                    val claim = checkNotNull(arms.claim(ID))
+                    claim.bootstrapAccepted.set(true)
                     try {
                         assertTrue(entered.await(2, TimeUnit.SECONDS))
                         link.connect()
@@ -629,6 +690,8 @@ class SenderSessionTeardownTest {
                             dev.redrain.cast.diagnostics.DiagnosticStage.PRESSURE.ordinal, 1, 1,
                             detail = listOf(0, 0, 0, 0, 1), pressure = true)
                         session.startWorkers()
+                        arms.receiverEnded(claim, expected = false)
+                        assertEquals("draining", arms.status("collector", pair).getString("state"))
                         if (fatal) link.send(Wire.control(Wire.ERROR, ID,
                             Wire.obj("code" to "AUDIO_FAILED", "message" to "controlled failure", "fatal" to true)))
                         else session.sender.stop()
@@ -641,12 +704,26 @@ class SenderSessionTeardownTest {
                         assertEquals("PREPARATION_TIMEOUT", report.getJSONObject("receiver").getString("finalSkipReason"))
                         assertTrue(dev.redrain.cast.diagnostics.IncidentSummary.text(report).contains("PREPARATION_TIMEOUT"))
                         assertFalse(report.getBoolean("receiverComplete"))
+                        finishSenderDiagnostic(diagnostics, arms, claim, ID, fatal, {}, { it() })
+                        val frozen = arms.fetch("collector", pair, 0, 0, 32)
+                        assertEquals("frozen", frozen.getString("state"))
+                        val records = frozen.getJSONArray("records")
+                        val details = (0 until records.length()).map { records.getJSONObject(it) }
+                            .map { it.getJSONObject("record") }
+                            .mapNotNull { it.getJSONObject("data").optJSONObject("metrics") }
+                            .single { it.optString("schema") == "terminal_coverage" }
+                            .getJSONObject("preparationTimeout")
+                        assertEquals("QUEUED", details.getString("phase"))
+                        assertTrue(details.getString("elapsedNs").toLong() > 0)
+                        assertEquals(0, details.getInt("activeProducers"))
                     } finally {
                         release.countDown()
                         worker.shutdownNow()
                         dev.redrain.cast.diagnostics.TelemetryRegistry.end("sender", sender)
                         dev.redrain.cast.diagnostics.TelemetryRegistry.end("receiver", blocked)
                         sender.finish()
+                        arms.revoke()
+                        diagnostics.revoke()
                     }
                 }
             }
@@ -1143,6 +1220,24 @@ class SenderSessionTeardownTest {
         }
     }
 
+    @Test fun startupStopDoesNotClassifyMediaEofAsOrderlyStopFailure() {
+        for ((playing, stopped) in listOf(false to false, false to true, true to true)) {
+            Harness(1).use { session ->
+                val link = Mockito.mock(ReceiverLink::class.java)
+                Mockito.`when`(link.streamRecovery).thenReturn(true)
+                session.prepare(link, playing = playing)
+                if (stopped) session.outcome.requestStop()
+                session.sender.recordMediaFailure(EOFException("media closed"), SessionOutcome.Origin.RECEIVER_READ)
+                when {
+                    !stopped -> assertTrue(session.outcome.failure is MediaConnectionFailure)
+                    !playing -> assertNull(session.outcome.failure)
+                    else -> assertTrue(session.outcome.failure?.message.orEmpty()
+                        .contains("media transport failed during orderly Stop"))
+                }
+            }
+        }
+    }
+
     @Test(timeout = 15_000) fun mediaEofWaitsForTerminalWriteResultWithoutMaskingWriteFailure() {
         for ((remoteStop, failWrite) in listOf(false to false, true to false, false to true)) {
             runSession { server, session, link ->
@@ -1398,6 +1493,29 @@ class SenderSessionTeardownTest {
                 assertTrue(session.outcome.failure is ReceiverReportedFailure)
                 assertEquals("DECODER_FAILED", SessionOutcome.errorCode(checkNotNull(session.outcome.failure)))
             } else assertNull(session.outcome.failure)
+        }
+    }
+
+    @Test(timeout = 10_000) fun localStopDuringRecoveryUsesEstablishedOrderlyTeardown() {
+        runSession { server, session, link ->
+            val peer = CompletableFuture.runAsync {
+                attachPeer(server, v2 = true) { control, video, audio ->
+                    assertEquals(Wire.STOP, terminal(control).type)
+                    Wire.write(control.outputStream, Wire.control(Wire.SESSION_END, ID, Wire.obj("reason" to "user")))
+                    assertEquals(-1, video.inputStream.read())
+                    assertEquals(-1, audio.inputStream.read())
+                    assertEquals(-1, control.inputStream.read())
+                }
+            }
+            negotiate(link)
+            session.prepare(link)
+            session.setRecovering()
+            session.startWorkers()
+            session.sender.stop()
+            session.sender.retireTransport()
+            peer.get(3, TimeUnit.SECONDS)
+            assertNull(session.outcome.failure)
+            assertFalse(session.diagnostics.any { it.contains("STARTUP_CANCEL") })
         }
     }
 
@@ -1677,7 +1795,10 @@ class SenderSessionTeardownTest {
             field("link").set(sender, link)
             for (name in listOf("requestSent", "acceptedSession")) field(name).setBoolean(sender, true)
             field("playing").setBoolean(sender, playing)
+            field("established").setBoolean(sender, playing)
         }
+
+        fun setRecovering() = field("playing").setBoolean(sender, false)
 
         fun useTelemetry(owner: dev.redrain.cast.diagnostics.SenderTelemetrySession, negotiated: Boolean = true) {
             field("telemetry").set(sender, owner)

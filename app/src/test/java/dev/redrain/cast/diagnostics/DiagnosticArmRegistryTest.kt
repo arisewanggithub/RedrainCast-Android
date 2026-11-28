@@ -7,6 +7,18 @@ import org.json.JSONObject
 import org.screencopy.receiver.protocol.DiagnosticProxyNegotiation
 
 class DiagnosticArmRegistryTest {
+    @Test fun workRequiresLegacyTimingBeforeArmingAndSelectionSurvivesClaim() {
+        error("INVALID_ARGUMENT") {
+            registry.start("owner", setOf("session"), setOf("audio.timing.work"), 1000, 100)
+        }
+        val flags = setOf("audio.timing", "audio.timing.work")
+        val pair = registry.start("owner", setOf("session"), flags, 1000, 100)
+        assertEquals(flags, pair.getJSONArray("receiverFlags").let { array ->
+            (0 until array.length()).map { array.getString(it) }.toSet()
+        })
+        assertEquals(flags, checkNotNull(registry.claim(77)).receiverFlags)
+    }
+
     private var now = 1_000_000_000L
     private val recorder = DiagnosticRecorder { now }
     private val registry = DiagnosticArmRegistry(recorder) { now }
@@ -67,6 +79,7 @@ class DiagnosticArmRegistryTest {
         DiagnosticProxyNegotiation.stages.forEachIndexed { index, stage ->
             stages.put(JSONObject().put("stage", stage).put("monoNs", "$index"))
         }
+
         val bootstrap = JSONObject().put("session", "77").put("pairId", claim.pairId)
             .put("captureId", "remote").put("clockId", "clock").put("complete", true)
             .put("loss", false).put("stages", stages)
@@ -81,6 +94,35 @@ class DiagnosticArmRegistryTest {
         assertTrue(outcome.getJSONObject("captureEnd").getBoolean("truncated"))
         assertFalse(registry.fetch("owner", pair.getString("pairId"), 0, 0, 32)
             .getJSONObject("receiver").getBoolean("endConfirmed"))
+    }
+
+    @Test fun receiverEofKeepsSenderCaptureUntilItsLaterFailure() {
+        start()
+        val claim = checkNotNull(registry.claim(77))
+        val stages = JSONArray()
+        DiagnosticProxyNegotiation.stages.forEachIndexed { index, stage ->
+            stages.put(JSONObject().put("stage", stage).put("monoNs", "$index"))
+        }
+        val bootstrap = JSONObject().put("session", "77").put("pairId", claim.pairId)
+            .put("captureId", "remote").put("clockId", "clock").put("complete", true)
+            .put("loss", false).put("stages", stages)
+        val intake = DiagnosticProxyIntake("77", claim.pairId, "remote", "clock", false, bootstrap)
+        registry.covered(claim, intake, "remote", "clock")
+        intake.closeUnconfirmed()
+        registry.receiverEnded(claim, false)
+        val draining = registry.status("owner", claim.pairId)
+        assertEquals("draining", draining.getString("state"))
+        assertFalse(draining.getJSONObject("receiverRole").getJSONObject("outcome").getBoolean("confirmed"))
+        dev.screencopy.sender.finishSenderDiagnostic(recorder, registry, claim, 77, true, {}, { it() },
+            failureCode = "AUDIO_FAILED")
+        assertEquals("coverage_lost", registry.status("owner", claim.pairId).getString("endReason"))
+        val records = registry.fetch("owner", claim.pairId, 0, 0, 32).getJSONArray("records")
+        assertTrue((0 until records.length()).any {
+            val item = records.getJSONObject(it)
+            item.getString("role") == "sender" &&
+                item.getJSONObject("record").getString("kind") == "SESSION" &&
+                item.getJSONObject("record").getJSONObject("data").optString("stage") == "failed"
+        })
     }
 
     @Test fun committedReceiverTerminalSurvivesFreezeBeforeNotification() {

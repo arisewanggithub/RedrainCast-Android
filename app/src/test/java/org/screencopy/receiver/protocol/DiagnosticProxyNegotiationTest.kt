@@ -6,6 +6,55 @@ import org.junit.Assert.*
 import org.junit.Test
 
 class DiagnosticProxyNegotiationTest {
+    @Test fun ownerTracingRequiresAllPrerequisitesAndReceiverSupport() {
+        val selected = setOf("audio.timing", "audio.timing.work", "audio.timing.detail", "audio.timing.owner")
+        val old = JSONObject().put("diagProxy", JSONObject().put("version", 2)
+            .put("receiverFlags", JSONArray(selected - "audio.timing.owner")))
+        assertFalse(DiagnosticProxyNegotiation.supportsReceiver(old, selected))
+        assertTrue(DiagnosticProxyNegotiation.supportsReceiver(
+            JSONObject().put("diagProxy", DiagnosticProxyNegotiation.receiverCapability()), selected))
+        assertEquals(selected, checkNotNull(DiagnosticProxyNegotiation.offer(
+            hello(offer().put("receiverFlags", JSONArray(selected))), 0)).flags)
+        assertThrows(ProtocolException::class.java) {
+            DiagnosticProxyNegotiation.offer(hello(offer().put("receiverFlags",
+                JSONArray().put("audio.timing.owner"))), 0)
+        }
+    }
+
+    @Test fun workTracingIsIndependentlySelectedAndOldReceiversDoNotAdvertiseIt() {
+        val legacy = JSONObject().put("diagProxy", JSONObject().put("version", 2)
+            .put("receiverFlags", JSONArray().put("session").put("audio.timing")))
+        val work = setOf("audio.timing", "audio.timing.work")
+        assertTrue(DiagnosticProxyNegotiation.supportsReceiver(legacy, setOf("audio.timing")))
+        assertFalse(DiagnosticProxyNegotiation.supportsReceiver(legacy, work))
+        assertTrue(DiagnosticProxyNegotiation.supportsReceiver(
+            JSONObject().put("diagProxy", DiagnosticProxyNegotiation.receiverCapability()), work))
+        val oldSenderOffer = offer().put("receiverFlags", JSONArray().put("audio.timing"))
+        assertEquals(setOf("audio.timing"),
+            checkNotNull(DiagnosticProxyNegotiation.offer(hello(oldSenderOffer), 0)).flags)
+        val selected = offer().put("receiverFlags", JSONArray(work))
+        assertEquals(work, checkNotNull(DiagnosticProxyNegotiation.offer(hello(selected), 0)).flags)
+        val invalid = offer().put("receiverFlags", JSONArray().put("audio.timing.work"))
+        assertThrows(ProtocolException::class.java) {
+            DiagnosticProxyNegotiation.offer(hello(invalid), 0)
+        }
+        assertNull(DiagnosticProxyNegotiation.offer(JSONObject(), 0))
+        assertNull(DiagnosticProxyNegotiation.offer(JSONObject().put("diagProxy",
+            DiagnosticProxyNegotiation.capability()), 0))
+    }
+
+    @Test fun explicitAudioTimingRequiresReceiverCapabilityWithoutChangingOldSelections() {
+        val old = JSONObject().put("diagProxy", JSONObject().put("version", 2)
+            .put("receiverFlags", JSONArray().put("session").put("audio.queue")))
+        assertTrue(DiagnosticProxyNegotiation.supportsReceiver(old, setOf("session", "audio.queue")))
+        assertFalse(DiagnosticProxyNegotiation.supportsReceiver(old, setOf("session", "audio.timing")))
+        val current = JSONObject().put("diagProxy", DiagnosticProxyNegotiation.receiverCapability())
+        assertTrue(DiagnosticProxyNegotiation.supportsReceiver(current, setOf("audio.timing")))
+        val selected = offer().put("receiverFlags", JSONArray().put("audio.timing"))
+        assertEquals(setOf("audio.timing"),
+            checkNotNull(DiagnosticProxyNegotiation.offer(hello(selected), 1_000_000_000)).flags)
+    }
+
     private fun offer() = JSONObject().put("session", "77").put("pairId", "pair")
         .put("armGeneration", "9223372036854775807").put("receiverFlags", JSONArray().put("session"))
         .put("durationMs", 250).put("samplePeriodMs", 100)

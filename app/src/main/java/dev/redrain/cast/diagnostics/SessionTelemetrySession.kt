@@ -10,6 +10,7 @@ import java.util.concurrent.TimeoutException
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
+import java.util.concurrent.atomic.AtomicReference
 
 internal object TelemetryTerminalBudget {
     const val FATAL_CLEANUP_MS = 6_000L
@@ -41,10 +42,14 @@ internal class ReceiverTelemetrySession(
 ) {
     data class FinalBatch(val payload: ByteArray, val sequence: Long, val cleanupSucceeded: Boolean)
     enum class FinalSkipReason { PREPARATION_TIMEOUT, PREPARATION_FAILED, UNAVAILABLE, WRITE_SKIPPED }
-    data class FinalResult(val batch: FinalBatch?, val reason: FinalSkipReason?)
+    enum class PreparationPhase { NOT_STARTED, QUEUED, QUIESCING, PUBLISHING, VALIDATING, COMPLETE }
+    data class FinalResult(val batch: FinalBatch?, val reason: FinalSkipReason?,
+                           val phase: PreparationPhase = PreparationPhase.NOT_STARTED,
+                           val elapsedNs: Long = 0, val activeProducers: Int = 0)
 
     private val collector = SessionTelemetryCollector(clock)
     fun causal(row: TelemetryRow) = produce { collector.causal.record(row) }
+    fun firstRejection(row: TelemetryRow) = produce { collector.firstRejection(row) }
     fun freezeCausal(generation: Int, atNs: Long) = produce { collector.causal.freeze(generation, atNs) }
     private val active = AtomicBoolean(true)
     private val producers = AtomicInteger()
@@ -106,16 +111,22 @@ internal class ReceiverTelemetrySession(
             TelemetryTerminalBudget.FINAL_PREPARATION_MS * 1_000_000L, deadlineNs - now)
         if (budget == 0L) {
             worker.shutdown()
-            return FinalResult(null, FinalSkipReason.PREPARATION_TIMEOUT)
+            return FinalResult(null, FinalSkipReason.PREPARATION_TIMEOUT,
+                elapsedNs = System.nanoTime() - startedAt, activeProducers = producers.get())
         }
         var skipReason = FinalSkipReason.PREPARATION_TIMEOUT
+        val phase = AtomicReference(PreparationPhase.QUEUED)
         val result = try {
             val task = worker.submit<FinalBatch?> {
+                phase.set(PreparationPhase.QUIESCING)
                 if (!quiesced.await(budget, TimeUnit.NANOSECONDS) || clock() >= deadlineNs)
                     return@submit null
+                phase.set(PreparationPhase.PUBLISHING)
                 beforeFinal()
                 val payload = collector.publish(final = true)
+                phase.set(PreparationPhase.VALIDATING)
                 val batch = SessionTelemetryProtocol.parse(payload, "receiver")
+                phase.set(PreparationPhase.COMPLETE)
                 FinalBatch(payload, batch.sequence, cleanupSucceeded)
             }
             try {
@@ -140,7 +151,8 @@ internal class ReceiverTelemetrySession(
             null
         }
         worker.shutdown()
-        return FinalResult(result, if (result == null) skipReason else null)
+        return FinalResult(result, if (result == null) skipReason else null,
+            phase.get(), System.nanoTime() - startedAt, producers.get())
     }
 }
 

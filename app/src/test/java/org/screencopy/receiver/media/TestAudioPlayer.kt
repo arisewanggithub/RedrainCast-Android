@@ -1,5 +1,7 @@
 package org.screencopy.receiver.media
 
+import android.media.MediaCodec
+
 internal class IdentityPcmResampler(private val channels: Int) : PcmResampler {
     val compensations = mutableListOf<AudioCompensation>()
     override val delayFrames = 0
@@ -23,6 +25,9 @@ internal fun testAudioPlayer(
     onRegulation: (AudioRegulationDiagnostic) -> Unit = {},
     resamplerFactory: (Int, Int) -> PcmResampler = { _, channels -> IdentityPcmResampler(channels) },
     onServiceDiagnostic: ((String) -> Unit)? = null,
-    threadCpuNs: () -> Long = { 0 }
+    threadCpuNs: () -> Long = { 0 },
+    aacFactory: ((AudioFormat) -> MediaCodec)? = null,
+    audioQueueSpanUs: Long = DEFAULT_AUDIO_QUEUE_SPAN_US
 ) = AudioPlayer(format, clock, failure, outputFactory, onClockCorrection, onOutputTiming,
-    onUnderrunRecovery, opusFactory, onRegulation, resamplerFactory, onServiceDiagnostic, threadCpuNs, {})
+    onUnderrunRecovery, opusFactory, onRegulation, resamplerFactory, onServiceDiagnostic, threadCpuNs, {}, aacFactory,
+    audioQueueSpanUs)

@@ -101,11 +101,28 @@ class SessionTelemetrySessionTest {
         }
         try {
             await(entered)
-            assertNull(receiver.requestFinal(true, System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(20)))
+            val result = receiver.requestFinalResult(true, System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(20))
+            assertNull(result.batch)
+            assertEquals(ReceiverTelemetrySession.FinalSkipReason.PREPARATION_TIMEOUT, result.reason)
+            assertEquals(ReceiverTelemetrySession.PreparationPhase.QUEUED, result.phase)
+            assertEquals(0, result.activeProducers)
         } finally {
             release.countDown()
             worker.shutdown()
         }
+    }
+
+    @Test fun receiverReportsPublishingPhaseWhenFinalPreparationTimesOut() {
+        val entered = CountDownLatch(1)
+        val receiver = ReceiverTelemetrySession({ true }, beforeFinal = {
+            entered.countDown()
+            CountDownLatch(1).await()
+        })
+        val result = receiver.requestFinalResult(true, System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(100))
+        assertEquals(0, entered.count)
+        assertEquals(ReceiverTelemetrySession.FinalSkipReason.PREPARATION_TIMEOUT, result.reason)
+        assertEquals(ReceiverTelemetrySession.PreparationPhase.PUBLISHING, result.phase)
+        assertTrue(result.elapsedNs > 0)
     }
 
     @Test fun normalAndUnsupportedCastWritesNothingAndRejectsLateInput() {

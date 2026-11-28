@@ -88,7 +88,9 @@ class LaunchUpdateTest {
         result = null
         open()
         assertEquals("0.5.4", checkedVersion)
-        assertEquals(if (BuildConfig.DEBUG) "0.5.4-debug" else "0.5.4", BuildConfig.VERSION_NAME)
+        if (BuildConfig.DEBUG)
+            assertTrue(BuildConfig.VERSION_NAME.matches(Regex("0\\.5\\.4-debug-\\d{8}T\\d{9}Z-[0-9a-f]{8}")))
+        else assertEquals("0.5.4", BuildConfig.VERSION_NAME)
         assertEquals(1, checks)
         assertNull(ShadowAlertDialog.getLatestAlertDialog())
     }

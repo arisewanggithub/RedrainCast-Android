@@ -8,6 +8,8 @@ import org.mockito.Mockito
 import org.screencopy.receiver.media.AudioPlayer
 import org.screencopy.receiver.media.AccessUnit
 import org.screencopy.receiver.media.PlaybackClock
+import org.screencopy.receiver.media.QueueLimit
+import org.screencopy.receiver.media.QueuePressure
 import org.screencopy.receiver.media.AudioOutput
 import org.screencopy.receiver.media.AudioOutputTiming
 import org.screencopy.receiver.media.AudioClockSource
@@ -43,6 +45,345 @@ import dev.redrain.cast.diagnostics.TelemetryHistory
 import dev.redrain.cast.diagnostics.TelemetryReport
 
 class ThreeSocketReceiverTest {
+    @Test(timeout = 15_000) fun audioOnlyNegotiationAttachesBothLanesAndReadiesOnlyAudioWithoutVideoDecoder() {
+        val videoCreated = AtomicInteger()
+        val audioCreated = AtomicInteger()
+        ReceiverServer.forProtocolTests("Receiver",
+            videoFactory = { _, _, _, _ ->
+                videoCreated.incrementAndGet()
+                error("Audio-only must not create a video decoder")
+            },
+            audioFactory = { _, _, _ ->
+                audioCreated.incrementAndGet()
+                Mockito.mock(AudioPlayer::class.java).also {
+                    Mockito.`when`(it.decoderDescription).thenReturn("test audio decoder")
+                }
+            }).use { server ->
+            server.start()
+                fun beginAudioOnly(owner: Socket, session: Long): MediaSockets {
+                    send(owner, Type.HELLO, JSONObject().put("role", "sender")
+                        .put("versions", JSONArray().put(3)).put("name", "test").put("audioOnlyVersion", 1))
+                    val hello = Wire.read(owner.inputStream)
+                    assertEquals(Type.HELLO, hello.type)
+                    assertEquals(1, hello.json().getInt("audioOnlyVersion"))
+                    val request = JSONObject().put("video", JSONObject()
+                        .put("enabled", false).put("codec", "h264").put("encoder", "")
+                        .put("bitrate", 8_000_000).put("maxSize", 1920).put("maxFps", 0)
+                        .put("displayId", 0).put("orientation", "0").put("crop", JSONObject.NULL)
+                        .put("codecOptions", ""))
+                        .put("audio", JSONObject().put("enabled", true).put("codec", "raw")
+                            .put("encoder", "").put("bitrate", 192_000).put("source", "playback")
+                            .put("codecOptions", ""))
+                    send(owner, Type.SESSION_REQUEST, request, session)
+                    val accepted = Wire.read(owner.inputStream)
+                    assertEquals(Type.SESSION_ACCEPT, accepted.type)
+                    val tracks = accepted.json().getJSONArray("tracks")
+                    assertEquals(1, tracks.length())
+                    assertEquals(2, tracks.getInt(0))
+                    return MediaSockets.attach(server, accepted)
+                }
+                fun configureAudio(owner: Socket, media: MediaSockets, session: Long) {
+                    Wire.write(media.audio.outputStream, Message.json(Type.STREAM_CONFIG,
+                        JSONObject().put("codec", "raw").put("sampleRate", 48000).put("channels", 2)
+                            .put("sampleFormat", "s16le").put("csd", JSONArray()), session, 2, 1))
+                    var ready: Message
+                    do { ready = Wire.read(owner.inputStream) }
+                    while (ready.type == Type.STATUS || ready.type == Type.PING)
+                    assertEquals(Type.STREAM_READY, ready.type)
+                    assertEquals(2, ready.track)
+                }
+                fun currentTicket(session: Long): Triple<Long, Long, Long> {
+                    val active = checkNotNull((server.javaClass.getDeclaredField("active")
+                        .apply { isAccessible = true }.get(server) as AtomicReference<*>).get())
+                    fun longField(name: String) = active.javaClass.getDeclaredField(name)
+                        .apply { isAccessible = true }.getLong(active)
+                    return Triple(longField("connectionId"), session, longField("audioEpoch"))
+                }
+                var firstTicket: Triple<Long, Long, Long>? = null
+            control(server).use { owner ->
+                    val media = beginAudioOnly(owner, 301)
+                    media.use {
+                    assertTrue(media.video.isConnected)
+                    assertTrue(media.audio.isConnected)
+                    owner.soTimeout = 150
+                        try {
+                            while (true) {
+                                val pending = Wire.read(owner.inputStream)
+                                assertEquals("Only non-readiness status is allowed before audio config",
+                                    Type.STATUS, pending.type)
+                            }
+                        } catch (_: java.net.SocketTimeoutException) {
+                    }
+                    owner.soTimeout = 3000
+                        configureAudio(owner, media, 301)
+                    assertEquals(1, audioCreated.get())
+                    assertEquals(0, videoCreated.get())
+                        firstTicket = currentTicket(301)
+                        assertTrue(server.audioSubmissionCurrent(firstTicket!!.first, firstTicket!!.second, firstTicket!!.third))
+                    send(owner, Type.STOP, JSONObject().put("reason", "test"), 301)
+                    var terminal: Message
+                    do { terminal = Wire.read(owner.inputStream) }
+                    while (terminal.type == Type.STATUS || terminal.type == Type.PING)
+                    assertEquals(Type.SESSION_END, terminal.type)
+                }
+            }
+                await { !server.busyForUpdate }
+                assertFalse(server.audioSubmissionCurrent(firstTicket!!.first, firstTicket!!.second, firstTicket!!.third))
+                control(server).use { replacement ->
+                    val media = beginAudioOnly(replacement, 301)
+                    media.use {
+                        configureAudio(replacement, media, 301)
+                        val freshTicket = currentTicket(301)
+                        assertNotEquals(firstTicket!!.first, freshTicket.first)
+                        assertFalse(server.audioSubmissionCurrent(firstTicket!!.first, firstTicket!!.second, firstTicket!!.third))
+                        assertTrue(server.audioSubmissionCurrent(freshTicket.first, freshTicket.second, freshTicket.third))
+                        send(replacement, Type.STOP, JSONObject().put("reason", "test"), 301)
+                        var terminal: Message
+                        do { terminal = Wire.read(replacement.inputStream) }
+                        while (terminal.type == Type.STATUS || terminal.type == Type.PING)
+                        assertEquals(Type.SESSION_END, terminal.type)
+                }
+                }
+        }
+    }
+
+    @Test(timeout = 15_000) fun obsoleteValidationFailureDoesNotTerminateRecovery() {
+        val blockNext = AtomicBoolean(false)
+        val entered = CountDownLatch(1)
+        val release = CountDownLatch(1)
+        val initialAdmitted = CountDownLatch(1)
+        val finished = CountDownLatch(2)
+        val player = Mockito.mock(VideoPlayer::class.java)
+        Mockito.doAnswer { initialAdmitted.countDown(); null }.`when`(player).tryOffer(
+            Mockito.any(AccessUnit::class.java) ?: AccessUnit(0, byteArrayOf()), Mockito.anyLong())
+        try {
+            ReceiverServer.forProtocolTests("Receiver", videoFactory = { _, _, _, _ -> player },
+                beforeMediaValidation = {
+                    if (it == 1 && blockNext.compareAndSet(true, false)) {
+                        entered.countDown()
+                        release.await()
+                    }
+                }, afterMediaAdmission = { if (it == 1) finished.countDown() }).use { server ->
+                server.start()
+                control(server).use { owner ->
+                    MediaSockets.attach(server, negotiate(owner, 220, recovery = true)).use { media ->
+                        configure(media.video, 220)
+                        assertEquals(Type.STREAM_READY, Wire.read(owner.inputStream).type)
+                        Wire.write(media.video.outputStream, Message(Type.VIDEO_FRAME, 220, 1, 1, 0,
+                            flags = 1, payload = byteArrayOf(0, 0, 0, 1, 0x65)))
+                        assertTrue(initialAdmitted.await(2, TimeUnit.SECONDS))
+                        blockNext.set(true)
+                        Wire.write(media.video.outputStream, Message(Type.VIDEO_FRAME, 220, 1, 1, 1,
+                            payload = byteArrayOf(1)))
+                        assertTrue(entered.await(2, TimeUnit.SECONDS))
+                        val connection = checkNotNull((server.javaClass.getDeclaredField("active")
+                            .apply { isAccessible = true }.get(server) as AtomicReference<*>).get())
+                        connection.javaClass.getDeclaredMethod("requestRecovery",
+                            QueuePressure::class.java, java.lang.Long::class.java).apply { isAccessible = true }
+                            .invoke(connection, QueuePressure(1, QueueLimit.PACKETS, 1, 4, 2, 8, 0, 1, 4, 1000), null)
+                        assertEquals(Type.STATUS, Wire.read(owner.inputStream).type)
+                        release.countDown()
+                        assertTrue(finished.await(2, TimeUnit.SECONDS))
+                        ping(owner, 220)
+                        stop(owner, 220)
+                    }
+                }
+            }
+        } finally { release.countDown() }
+    }
+
+    @Test(timeout = 15_000) fun retiredAdmissionPressureCannotRecoverReplacementVideo() {
+        val entered = CountDownLatch(1)
+        val release = CountDownLatch(1)
+        val finished = CountDownLatch(2)
+        val events = java.util.concurrent.ConcurrentLinkedQueue<String>()
+        val old = Mockito.mock(VideoPlayer::class.java)
+        val replacement = Mockito.mock(VideoPlayer::class.java)
+        Mockito.doAnswer {
+            entered.countDown()
+            release.await()
+            QueuePressure(1, QueueLimit.PACKETS, 1, 4, 2, 8, 0, 1, 4, 1000)
+        }.`when`(old).tryOffer(
+            Mockito.any(AccessUnit::class.java) ?: AccessUnit(0, byteArrayOf()), Mockito.anyLong())
+        try {
+            ReceiverServer.forProtocolTests("Receiver",
+                videoFactory = { _, _, _, generation -> if (generation == 1L) old else replacement },
+                onDiscoveryDiagnostic = events::add,
+                afterMediaAdmission = { if (it == 1) finished.countDown() }).use { server ->
+                server.start()
+                control(server).use { owner ->
+                    MediaSockets.attach(server, negotiate(owner, 219, recovery = true)).use { media ->
+                        configure(media.video, 219)
+                        assertEquals(Type.STREAM_READY, Wire.read(owner.inputStream).type)
+                        val frame = Message(Type.VIDEO_FRAME, session = 219, track = 1, generation = 1,
+                            ptsUs = 0, flags = 1, payload = byteArrayOf(0, 0, 0, 1, 0x65))
+                        Wire.write(media.video.outputStream, frame)
+                        assertTrue(entered.await(2, TimeUnit.SECONDS))
+                        val connection = checkNotNull((server.javaClass.getDeclaredField("active")
+                            .apply { isAccessible = true }.get(server) as AtomicReference<*>).get())
+                        connection.javaClass.getDeclaredMethod("configure", Message::class.java)
+                            .apply { isAccessible = true }.invoke(connection, videoConfig(219).copy(generation = 2))
+                        assertEquals(Type.STREAM_READY, Wire.read(owner.inputStream).type)
+                        connection.javaClass.getDeclaredMethod("receiveMedia", Message::class.java)
+                            .apply { isAccessible = true }.invoke(connection, frame.copy(generation = 2))
+                        release.countDown()
+                        assertTrue(finished.await(2, TimeUnit.SECONDS))
+                        ping(owner, 219)
+                        assertFalse(events.any { it.startsWith("event=STREAM_RECOVERY_REQUEST track=1") })
+                        stop(owner, 219)
+                    }
+                }
+            }
+        } finally { release.countDown() }
+    }
+
+    @Test(timeout = 30_000) fun slowVideoValidationDoesNotBlockAudioOrRouteAfterStop() {
+        for (recovery in listOf(false, true)) slowVideoValidationDoesNotBlockAudioOrRouteAfterStop(recovery)
+    }
+
+    private fun slowVideoValidationDoesNotBlockAudioOrRouteAfterStop(recovery: Boolean) {
+        val entered = CountDownLatch(1)
+        val release = CountDownLatch(1)
+        val audioOffered = CountDownLatch(1)
+        val videoFinished = CountDownLatch(1)
+        val videoPlayer = Mockito.mock(VideoPlayer::class.java)
+        val audioPlayer = Mockito.mock(AudioPlayer::class.java)
+        Mockito.`when`(audioPlayer.decoderDescription).thenReturn("fixture")
+        Mockito.doAnswer { audioOffered.countDown(); null }.`when`(audioPlayer).offer(
+            Mockito.any(AccessUnit::class.java) ?: AccessUnit(0, byteArrayOf()), Mockito.anyLong())
+        Mockito.doAnswer { audioOffered.countDown(); null }.`when`(audioPlayer).tryOffer(
+            Mockito.any(AccessUnit::class.java) ?: AccessUnit(0, byteArrayOf()), Mockito.anyLong())
+        try {
+            ReceiverServer.forProtocolTests("Receiver",
+                videoFactory = { _, _, _, _ -> videoPlayer },
+                audioFactory = { _, _, _ -> audioPlayer },
+                beforeMediaValidation = { track ->
+                    if (track == 1) { entered.countDown(); release.await() }
+                }, afterMediaAdmission = { track -> if (track == 1) videoFinished.countDown() }).use { server ->
+                server.start()
+                control(server).use { owner ->
+                    MediaSockets.attach(server, negotiate(owner, 215, recovery = recovery, audio = true)).use { media ->
+                        configure(media.video, 215)
+                        assertEquals(Type.STREAM_READY, Wire.read(owner.inputStream).type)
+                        Wire.write(media.audio.outputStream, Message.json(Type.STREAM_CONFIG,
+                            JSONObject().put("codec", "raw").put("sampleRate", 48000).put("channels", 2)
+                                .put("sampleFormat", "s16le").put("csd", JSONArray()), 215, 2, 1))
+                        assertEquals(Type.STREAM_READY, Wire.read(owner.inputStream).type)
+                        Wire.write(media.video.outputStream, Message(Type.VIDEO_FRAME, session = 215, track = 1,
+                            generation = 1, ptsUs = 0, flags = 1, payload = byteArrayOf(0, 0, 0, 1, 0x65)))
+                        assertTrue(entered.await(2, TimeUnit.SECONDS))
+                        Wire.write(media.audio.outputStream, Message(Type.AUDIO_PACKET, session = 215, track = 2,
+                            generation = 1, ptsUs = 0, payload = ByteArray(4)))
+                        assertTrue("audio admission blocked by video validation", audioOffered.await(2, TimeUnit.SECONDS))
+                        stop(owner, 215)
+                        release.countDown()
+                        assertTrue(videoFinished.await(2, TimeUnit.SECONDS))
+                        Mockito.verify(videoPlayer, Mockito.never()).offer(
+                            Mockito.any(AccessUnit::class.java) ?: AccessUnit(0, byteArrayOf()), Mockito.anyLong())
+                        Mockito.verify(videoPlayer, Mockito.never()).tryOffer(
+                            Mockito.any(AccessUnit::class.java) ?: AccessUnit(0, byteArrayOf()), Mockito.anyLong())
+                    }
+                }
+            }
+        } finally { release.countDown() }
+    }
+
+    @Test(timeout = 15_000) fun slowAudioClockObservationDoesNotBlockVideoRecoveryKey() {
+        val entered = CountDownLatch(1)
+        val release = CountDownLatch(1)
+        val videoOffered = CountDownLatch(1)
+        val audioOffered = CountDownLatch(1)
+        val clock = PlaybackClock(nanoTime = { 0L })
+        val video = Mockito.mock(VideoPlayer::class.java)
+        Mockito.doAnswer { videoOffered.countDown(); null }.`when`(video).tryOffer(
+            Mockito.any(AccessUnit::class.java) ?: AccessUnit(0, byteArrayOf()), Mockito.anyLong())
+        try {
+            ReceiverServer.forProtocolTests("Receiver", clockFactory = { clock },
+                videoFactory = { _, _, _, _ -> video },
+                audioFactory = { _, _, _ ->
+                    Mockito.mock(AudioPlayer::class.java).also {
+                        Mockito.`when`(it.decoderDescription).thenReturn("fixture")
+                        Mockito.doAnswer { audioOffered.countDown(); null }.`when`(it).tryOffer(
+                            Mockito.any(AccessUnit::class.java) ?: AccessUnit(0, byteArrayOf()), Mockito.anyLong())
+                    }
+                }).use { server ->
+                server.start()
+                control(server).use { owner ->
+                    MediaSockets.attach(server, negotiate(owner, 217, recovery = true, audio = true)).use { media ->
+                        configure(media.video, 217)
+                        assertEquals(Type.STREAM_READY, Wire.read(owner.inputStream).type)
+                        val config = Message.json(Type.STREAM_CONFIG,
+                            JSONObject().put("codec", "raw").put("sampleRate", 48000).put("channels", 2)
+                                .put("sampleFormat", "s16le").put("csd", JSONArray()), 217, 2, 1)
+                        Wire.write(media.audio.outputStream, config)
+                        assertEquals(Type.STREAM_READY, Wire.read(owner.inputStream).type)
+                        clock.anchorAudio(0) { entered.countDown(); release.await(); 0 }
+                        Wire.write(media.audio.outputStream, config.copy(generation = 2,
+                            payload = config.json().put("recoveryPtsUs", "0").toString().toByteArray()))
+                        assertEquals(Type.STREAM_READY, Wire.read(owner.inputStream).type)
+                        Wire.write(media.audio.outputStream, Message(Type.AUDIO_PACKET, session = 217, track = 2,
+                            generation = 2, ptsUs = 1_000_000, payload = ByteArray(4)))
+                        assertTrue(entered.await(2, TimeUnit.SECONDS))
+                        Wire.write(media.video.outputStream, Message(Type.VIDEO_FRAME, session = 217, track = 1,
+                            generation = 1, ptsUs = 0, flags = 1, payload = byteArrayOf(0, 0, 0, 1, 0x65)))
+                        assertTrue("video key blocked by audio clock callback", videoOffered.await(2, TimeUnit.SECONDS))
+                        release.countDown()
+                        assertTrue(audioOffered.await(2, TimeUnit.SECONDS))
+                        stop(owner, 217)
+                    }
+                }
+            }
+        } finally { release.countDown() }
+    }
+
+    @Test(timeout = 15_000) fun delayedRecoveryRequestDoesNotPublishAfterNewGenerationReady() {
+        val entered = CountDownLatch(1)
+        val release = CountDownLatch(1)
+        try {
+            ReceiverServer.forProtocolTests("Receiver",
+                videoFactory = { _, _, _, _ -> Mockito.mock(VideoPlayer::class.java) },
+                audioFactory = { _, _, _ ->
+                    Mockito.mock(AudioPlayer::class.java).also {
+                        Mockito.`when`(it.decoderDescription).thenReturn("fixture")
+                    }
+                }, onDiscoveryDiagnostic = {
+                    if (it.startsWith("event=STREAM_RECOVERY_REQUEST track=2")) {
+                        entered.countDown()
+                        release.await()
+                    }
+                }).use { server ->
+                server.start()
+                control(server).use { owner ->
+                    MediaSockets.attach(server, negotiate(owner, 218, recovery = true, audio = true)).use { media ->
+                        configure(media.video, 218)
+                        assertEquals(Type.STREAM_READY, Wire.read(owner.inputStream).type)
+                        val config = Message.json(Type.STREAM_CONFIG,
+                            JSONObject().put("codec", "raw").put("sampleRate", 48000).put("channels", 2)
+                                .put("sampleFormat", "s16le").put("csd", JSONArray()), 218, 2, 1)
+                        Wire.write(media.audio.outputStream, config)
+                        assertEquals(Type.STREAM_READY, Wire.read(owner.inputStream).type)
+                        val connection = checkNotNull((server.javaClass.getDeclaredField("active")
+                            .apply { isAccessible = true }.get(server) as AtomicReference<*>).get())
+                        val recovery = connection.javaClass.getDeclaredMethod("requestRecovery",
+                            QueuePressure::class.java, java.lang.Long::class.java).apply { isAccessible = true }
+                        val delayed = CompletableFuture.runAsync {
+                            recovery.invoke(connection, QueuePressure(2, QueueLimit.PACKETS, 1, 4,
+                                2, 8, 0, 1, 4, 1000), null)
+                        }
+                        assertTrue(entered.await(2, TimeUnit.SECONDS))
+                        Wire.write(media.audio.outputStream, config.copy(generation = 2,
+                            payload = config.json().put("recoveryPtsUs", "0").toString().toByteArray()))
+                        assertEquals(Type.STREAM_READY, Wire.read(owner.inputStream).type)
+                        release.countDown()
+                        delayed.get(2, TimeUnit.SECONDS)
+                        ping(owner, 218)
+                        stop(owner, 218)
+                    }
+                }
+            }
+        } finally { release.countDown() }
+    }
+
     @Test(timeout = 30_000) fun mediaMessageFailureCapturesMessageTrackAndGenerationAfterAudioConfiguration() {
         for (case in 0..3) {
             val failures = java.util.concurrent.ConcurrentLinkedQueue<org.screencopy.receiver.ui.FailureDiagnostic>()

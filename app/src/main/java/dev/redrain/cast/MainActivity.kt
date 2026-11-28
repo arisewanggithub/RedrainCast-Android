@@ -22,6 +22,7 @@ import android.view.View
 import android.view.WindowInsets
 import android.view.WindowManager
 import android.widget.EditText
+import android.widget.Button
 import android.widget.FrameLayout
 import android.widget.LinearLayout
 import android.widget.TextView
@@ -155,6 +156,7 @@ class MainActivity : Activity(), SurfaceHolder.Callback, TextureView.SurfaceText
     private val receiveCapabilities = AtomicReference(org.screencopy.receiver.protocol.ReceiveCapabilities())
     private lateinit var playbackStatistics: PlaybackStatisticsSurface
     private lateinit var inlineStatisticsHost: InlineStatisticsHost
+    private lateinit var audioOnlyPanel: LinearLayout
     private val statisticsWindowProtection by lazy { StatisticsWindowProtection.forWindow(window) }
     private var reportedStatisticsProtection = false
     private var statisticsDetails: PlaybackStatisticsDetails? = null
@@ -278,6 +280,35 @@ class MainActivity : Activity(), SurfaceHolder.Callback, TextureView.SurfaceText
         val statisticsAnchor = FrameLayout(this)
         statisticsAnchor.addView(playbackStatistics, FrameLayout.LayoutParams(-1, -1))
         root.addView(statisticsAnchor, FrameLayout.LayoutParams(-1, -1, Gravity.TOP or Gravity.START))
+        val panelPadding = (12 * resources.displayMetrics.density + 0.5f).toInt()
+        audioOnlyPanel = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(panelPadding, panelPadding / 2, panelPadding, panelPadding / 2)
+            setBackgroundColor(0xE6202833.toInt())
+            tag = "audioOnlyControls"
+            visibility = View.GONE
+            val label = TextView(this@MainActivity).apply {
+                text = getString(R.string.rc_audio_receiving)
+                setTextColor(Color.WHITE)
+                textSize = 16f
+                contentDescription = getString(R.string.rc_audio_receiving)
+            }
+            addView(label, LinearLayout.LayoutParams(0, -2, 1f))
+            addView(Button(this@MainActivity).apply {
+                text = getString(R.string.rc_audio_stop)
+                isAllCaps = false
+                contentDescription = getString(R.string.rc_audio_stop)
+                setOnClickListener { listenerRun?.server?.disconnect("receiver_user_stop") }
+            })
+            addView(Button(this@MainActivity).apply {
+                text = getString(R.string.rc_audio_stats)
+                isAllCaps = false
+                contentDescription = getString(R.string.rc_audio_stats)
+                setOnClickListener { showPlaybackDiagnostics() }
+            })
+        }
+        root.addView(audioOnlyPanel, FrameLayout.LayoutParams(-1, -2, Gravity.BOTTOM))
         inlineStatisticsHost = InlineStatisticsHost(this, statisticsAnchor, playbackStatistics, statisticsWindowProtection)
         setContentView(root)
         root.setOnApplyWindowInsetsListener { view, insets ->
@@ -288,7 +319,7 @@ class MainActivity : Activity(), SurfaceHolder.Callback, TextureView.SurfaceText
         render()
         @Suppress("DEPRECATION")
         val retained = lastNonConfigurationInstance as? RetainedState
-        val installedVersion = if (BuildConfig.DEBUG) BuildConfig.VERSION_NAME.removeSuffix("-debug")
+        val installedVersion = if (BuildConfig.DEBUG) BuildConfig.VERSION_NAME.substringBefore("-debug")
             else BuildConfig.VERSION_NAME
         retainedState = retained ?: RetainedState(updateFactory(installedVersion))
         updateCheck = retainedState.updateCheck
@@ -432,6 +463,13 @@ class MainActivity : Activity(), SurfaceHolder.Callback, TextureView.SurfaceText
                     onListener = {}, port = 0, videoOutput = run.output,
                     onScreenEvent = { event -> main.post { if (current(run)) screenEvent(event) } },
                     onPresentationStart = { mode -> beginPresentation(mode, run) },
+                    onAudioSubmitted = { connectionId, session, audioEpoch -> main.post {
+                        if (current(run) &&
+                            run.server?.audioSubmissionCurrent(connectionId, session, audioEpoch) == true) {
+                            audioOnlyPanel.visibility = View.VISIBLE
+                            showPlayer()
+                        }
+                    } },
                     onVideoRotation = { degrees, owns -> main.post {
                         if (current(run) && owns()) {
                             rotation = degrees; hasPresentation = true; fitVideo()
@@ -449,6 +487,7 @@ class MainActivity : Activity(), SurfaceHolder.Callback, TextureView.SurfaceText
                     onFramePresented = { owns -> main.post {
                         if (current(run) && owns()) {
                             hasPresentation = true
+                            audioOnlyPanel.visibility = View.GONE
                             fitVideo()
                             showPlayer()
                         }
@@ -484,6 +523,7 @@ class MainActivity : Activity(), SurfaceHolder.Callback, TextureView.SurfaceText
                 detail = getString(if (event.addresses.isEmpty()) R.string.flow_no_network else R.string.flow_ready)
             }
             ReceiverScreenEvent.Connecting -> {
+                audioOnlyPanel.visibility = View.GONE
                 updateDialog?.dismiss()
                 updateDialog = null
                 problem = null
@@ -499,6 +539,7 @@ class MainActivity : Activity(), SurfaceHolder.Callback, TextureView.SurfaceText
                 main.post(statisticsRefresh)
             }
             ReceiverScreenEvent.CleanupFinished -> {
+                audioOnlyPanel.visibility = View.GONE
                 hidePlayer()
                 readiness = if (endpoints.isEmpty()) "NO NETWORK" else "READY"
                 detail = getString(if (endpoints.isEmpty()) R.string.flow_no_network else R.string.flow_ready)
@@ -954,6 +995,7 @@ class MainActivity : Activity(), SurfaceHolder.Callback, TextureView.SurfaceText
 
     private fun hidePlayer() {
         playing = false
+        if (::audioOnlyPanel.isInitialized) audioOnlyPanel.visibility = View.GONE
         hasPresentation = false
         main.removeCallbacks(statisticsRefresh)
         videoBox.isLongClickable = false

@@ -1,9 +1,20 @@
 package org.screencopy.receiver.media
 
-import org.junit.Assert.assertThrows
+import org.junit.Assert.*
 import org.junit.Test
 
 class PacketBudgetTest {
+    @Test fun reorderedDependencyCountsInRawSpanUntilDequeued() {
+        val budget = PacketBudget(100, 250_000)
+        budget.add(AccessUnit(1_370_000, byteArrayOf(1)))
+        budget.add(AccessUnit(1_390_000, byteArrayOf(2)))
+        assertEquals(390_000L, budget.pressure(AccessUnit(1_000_000, byteArrayOf(3)))?.spanUs)
+        budget.remove()
+        assertEquals(390_000L, budget.pressure(AccessUnit(1_000_000, byteArrayOf(3)))?.spanUs)
+        budget.remove()
+        budget.add(AccessUnit(1_000_000, byteArrayOf(3)))
+    }
+
     @Test fun bytesAreBoundedBeforeQueueing() {
         val budget = PacketBudget(10, 250_000)
         budget.add(AccessUnit(0, ByteArray(10)))

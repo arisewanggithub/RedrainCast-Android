@@ -8,11 +8,11 @@ class ResampledAudioTest {
         val mapping = ResampledAudioTimeline(48000)
         mapping.offer(960, 1_000_000)
         val first = mapping.output(943, 17)
-        assertEquals(listOf(MappedPcm(0, 943, 1_000_000, 943_000_000)), first)
+        assertEquals(listOf(MappedPcm(0, 943, 1_000_000, 943_000_000, 48_000_000_000)), first)
         mapping.offer(960, 1_020_000)
         val next = mapping.output(960, 17)
-        assertEquals(listOf(MappedPcm(0, 17, 1_019_645, 17_000_000),
-            MappedPcm(17, 943, 1_020_000, 943_000_000)), next)
+        assertEquals(listOf(MappedPcm(0, 17, 1_019_645, 17_000_000, 48_943_000_000),
+            MappedPcm(17, 943, 1_020_000, 943_000_000, 48_960_000_000)), next)
     }
 
     @Test fun zeroOutputDoesNotLoseInputOrResamplerHistory() {
@@ -73,5 +73,16 @@ class ResampledAudioTest {
         assertEquals(98, result.sumOf { it.frames })
         assertEquals(100_000_000L, result.sumOf { it.sourceUnits })
         assertEquals(1_000_000L, result.first().ptsUs)
+        assertNull(result.first().originalStartUnits)
+    }
+
+    @Test fun unalignedRateAndFilterDelayKeepExactOriginalSamplePosition() {
+        val mapping = ResampledAudioTimeline(44100)
+        val start = 1_000_000L * 44100 + 1_000_000
+        mapping.offer(1024, 1_000_022, start)
+        mapping.output(1000, 24)
+        mapping.offer(1024, 1_023_242)
+        val delayed = mapping.output(1024, 24).first()
+        assertEquals(start + 1000 * 1_000_000L, delayed.originalStartUnits)
     }
 }

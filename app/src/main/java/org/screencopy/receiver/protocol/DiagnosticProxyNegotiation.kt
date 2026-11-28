@@ -39,6 +39,12 @@ internal object DiagnosticProxyNegotiation {
             "Unsupported receiver flag", "UNSUPPORTED_CONFIG")
         protocolRequire("video.timing" !in result || "video.progress" in result,
             "video.timing requires video.progress")
+        protocolRequire("audio.timing.work" !in result || "audio.timing" in result,
+            "audio.timing.work requires audio.timing")
+        protocolRequire("audio.timing.detail" !in result || "audio.timing.work" in result,
+            "audio.timing.detail requires audio.timing.work")
+        protocolRequire("audio.timing.owner" !in result || "audio.timing.detail" in result,
+            "audio.timing.owner requires audio.timing.detail")
         return result
     }
 

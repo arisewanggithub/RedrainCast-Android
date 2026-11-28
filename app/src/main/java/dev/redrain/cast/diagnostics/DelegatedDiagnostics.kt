@@ -42,7 +42,7 @@ internal class DelegatedDiagnostics(
             tick()
             return synchronized(this) {
                 session?.let { "Delegated receiver session: $it\n" +
-                    "LAN TCP endpoint: ${listener?.endpoint ?: "unavailable"}\n" +
+                    "LAN / VPN TCP endpoints: ${listener?.endpoint ?: "unavailable"}\n" +
                     "Access: ${if (active) "enabled; awaiting explicit PC START" else "frozen retrieval only"}" }
             }
         }

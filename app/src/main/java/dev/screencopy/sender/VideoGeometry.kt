@@ -6,9 +6,15 @@ internal data class VideoSize(val width: Int, val height: Int) {
     fun rotated() = VideoSize(height, width)
     override fun toString() = "${width}x$height"
 }
+internal object EncoderFrameRate {
+    /** The encoder input rate is a configuration hint; the renderer applies the separate user ceiling. */
+    fun effective(userCeiling: Int): Int = if (userCeiling == 0) 60 else userCeiling
+}
 internal data class VideoGeometry(val requested: VideoSize, val output: VideoSize, val maxSize: Int, val normalizedMaxSize: Int, val fps: Int) {
+    val effectiveEncoderFps: Int get() = EncoderFrameRate.effective(fps)
     fun description(): String {
-        val rate = if (fps == 0) "with uncapped capture FPS" else "at up to $fps fps"
+        val rate = if (fps == 0) "with an uncapped capture ceiling (encoder configured for $effectiveEncoderFps fps)"
+            else "at up to $fps fps"
         return "Requested capture $requested, max size $maxSize (scrcpy $normalizedMaxSize); encoded output $output $rate."
     }
 }
@@ -18,7 +24,7 @@ internal object ScrcpyVideoSizing {
         val display = inventory.displays.single { it.id == settings.displayId }
         if (display.rotation == null) throw IOException("UNSUPPORTED_CONFIG: Refresh display rotation metadata before checking video size.")
         var size = VideoSize(display.naturalWidth, display.naturalHeight)
-        if (settings.cropWidth > 0) {
+        if (!settings.fullscreen && settings.cropWidth > 0) {
             size = VideoSize(settings.cropWidth, settings.cropHeight)
         }
         val requested = size

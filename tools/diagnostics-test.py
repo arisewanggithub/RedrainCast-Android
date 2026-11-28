@@ -62,8 +62,14 @@ class VideoFlagTests(unittest.TestCase):
     def test_video_defaults_negotiate_current_and_legacy_capabilities(self):
         for role in collector.FLAGS:
             supported = collector.FLAGS[role]
-            self.assertIn("video.progress", collector.select_flags(role, None, supported))
-            legacy = [flag for flag in supported if flag not in ("video.progress", "video.timing")]
+            defaults = collector.select_flags(role, None, supported)
+            self.assertIn("video.progress", defaults)
+            self.assertEqual([flag for flag in supported if flag not in
+                              ("tail.details", "audio.timing", "audio.timing.work", "audio.timing.detail",
+                               "audio.timing.owner")], defaults)
+            legacy = [flag for flag in supported if flag not in
+                      ("video.progress", "video.timing", "tail.details", "audio.timing", "audio.timing.work",
+                       "audio.timing.detail", "audio.timing.owner")]
             self.assertEqual(legacy, collector.select_flags(role, None, legacy))
 
     def test_explicit_video_is_strict_and_parser_accepts_it(self):
@@ -119,13 +125,13 @@ class SenderDiscoveryTests(unittest.TestCase):
             self.response(diagnostic=dict(version=2, port=41234, access="lan", host="evil")),
             self.nonce, "192.168.1.135"))
 
-    def test_only_explicit_private_ipv4_hosts_can_be_queried(self):
-        for host in ("192.168.1.135", "10.0.0.1", "172.16.0.1"):
-            self.assertEqual(host, collector.private_ipv4(host))
-        for host in ("example.com", "127.0.0.1", "::1", "8.8.8.8", "169.254.1.1",
-                     "192.0.2.1", "224.0.0.1", "255.255.255.255"):
+    def test_only_explicit_unicast_ipv4_hosts_can_be_queried(self):
+        for host in ("192.168.1.135", "10.0.0.1", "172.16.0.1", "100.64.1.2", "8.8.8.8"):
+            self.assertEqual(host, collector.discovery_ipv4(host))
+        for host in ("example.com", "127.0.0.1", "::1", "0.1.2.3", "169.254.1.1",
+                     "224.0.0.1", "255.255.255.255"):
             with self.subTest(host=host), self.assertRaises(collector.argparse.ArgumentTypeError):
-                collector.private_ipv4(host)
+                collector.discovery_ipv4(host)
 
     def test_discovery_cannot_be_mixed_with_capture_or_broadcast_discovery(self):
         for extra in (["--discover"], ["--sender", "192.168.1.135:41234"],
@@ -156,7 +162,7 @@ class SenderDiscoveryIntegrationTests(unittest.IsolatedAsyncioTestCase):
         loop = asyncio.get_running_loop()
         transport, _ = await loop.create_datagram_endpoint(Responder, local_addr=("127.0.0.1", 0))
         try:
-            with patch.object(collector, "private_ipv4", return_value="127.0.0.1"), \
+            with patch.object(collector, "discovery_ipv4", return_value="127.0.0.1"), \
                     patch.object(collector, "ENDPOINT_QUERY_PORT",
                                  transport.get_extra_info("sockname")[1]), \
                     patch("sys.stdout", new=io.StringIO()), \
@@ -175,7 +181,7 @@ class SenderDiscoveryIntegrationTests(unittest.IsolatedAsyncioTestCase):
         transport.bind(("127.0.0.1", 0))
         try:
             loop = asyncio.get_running_loop()
-            with patch.object(collector, "private_ipv4", return_value="127.0.0.1"), \
+            with patch.object(collector, "discovery_ipv4", return_value="127.0.0.1"), \
                     patch.object(collector, "ENDPOINT_QUERY_PORT", transport.getsockname()[1]), \
                     patch.object(loop, "sock_recv", new=AsyncMock(side_effect=TimeoutError)), \
                     self.assertRaisesRegex(collector.DiagnosticError, "No enabled diagnostic endpoint"):

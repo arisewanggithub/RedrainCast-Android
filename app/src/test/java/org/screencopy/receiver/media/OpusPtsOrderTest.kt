@@ -60,7 +60,7 @@ class OpusPtsOrderTest {
     @Test fun actualOpusDecodeWorkerAlsoAcceptsTheBackwardObservationAfterTrackValidation() =
         play(listOf(1_000_000, 999_551), throughWire = false)
 
-    @Test fun laterLargeOpusReversalsRemainArrivalOrderedWithoutALifetimeOrMagnitudeGuard() =
+    @Test fun laterLargeOpusReversalsDecodeInArrivalOrderWithoutAmbiguousTrimming() =
         play((0 until 90).map { index ->
             when {
                 index == 1 -> 999_551L
@@ -95,7 +95,7 @@ class OpusPtsOrderTest {
         }
     }
 
-    @Test fun actualWorkerQueueStillRejectsActualMinMaxSpanOver250msWithoutReordering() {
+    @Test fun actualWorkerQueueRejectsActualMinMaxSpanOverOneSecondWithoutReordering() {
         val now = AtomicLong()
         val entered = CountDownLatch(1)
         val resume = CountDownLatch(1)
@@ -114,11 +114,11 @@ class OpusPtsOrderTest {
             player.start()
             player.offer(AccessUnit(1_000_000, packet()))
             assertTrue(entered.await(2, TimeUnit.SECONDS))
-            listOf(1_000_000L, 800_000L, 1_050_000L).forEach { player.offer(AccessUnit(it, packet())) }
+            listOf(1_000_000L, 800_000L, 1_800_000L).forEach { player.offer(AccessUnit(it, packet())) }
             val error = assertThrows(QueueCongestionException::class.java) { player.offer(AccessUnit(799_999, packet())) }
             assertEquals(QueueLimit.PTS, error.pressure.limit)
-            assertEquals(250_001L, error.pressure.spanUs)
-            assertEquals(250_000L, error.pressure.maxSpanUs)
+            assertEquals(1_000_001L, error.pressure.spanUs)
+            assertEquals(DEFAULT_AUDIO_QUEUE_SPAN_US, error.pressure.maxSpanUs)
             assertEquals(3, player.queuedPackets())
         } finally { resume.countDown(); player.close() }
     }
@@ -152,27 +152,34 @@ class OpusPtsOrderTest {
             { output }, onClockCorrection = adjustments::add, opusFactory = { decoder })
         var liveStart = 0L
         var previous = Long.MIN_VALUE
+        var discardedSum = 0L
+        var previousDiscarded = 0L
         try {
             player.start()
             points.forEachIndexed { index, pts ->
-                if (index > 0) now.set(liveStart + index * 20_000_000L)
+                if (index > 0 && points.size > 2) now.set(liveStart + index * 20_000_000L)
                 val message = roundTrip(Message(Type.AUDIO_PACKET, 1, 2, 1, pts, payload = packet()))
                 if (throughWire) state.media(message)
                 assertEquals(pts, message.ptsUs)
                 player.offer(AccessUnit(message.ptsUs, message.payload))
                 val frames = (index + 1) * 960 - 312
-                await { player.sourceSubmittedFrames >= frames || errors.isNotEmpty() }
+                await { player.sourceSubmittedFrames + player.staleDiscardedSourceFrames >= frames || errors.isNotEmpty() }
                 assertTrue(errors.toString(), errors.isEmpty())
+                discardedSum += (player.staleDiscardedSourceFrames - previousDiscarded) * (index + 1) * 2
+                previousDiscarded = player.staleDiscardedSourceFrames
                 if (index == 0) liveStart = now.get()
                 val current = checkNotNull(clock.currentUs())
                 assertTrue("Source observation reversals must not rewind presentation", current >= previous)
                 previous = current
             }
-            assertEquals(points.size * 960L - 312, player.sourceSubmittedFrames)
-            assertEquals(1296L + (2..points.size).sumOf { it * 1920L }, output.sum.get())
+            assertEquals(points.size * 960L - 312, player.sourceSubmittedFrames + player.staleDiscardedSourceFrames)
+            assertEquals(1296L + (2..points.size).sumOf { it * 1920L } - discardedSum, output.sum.get())
             assertEquals(points.size, decoded.get())
             assertTrue(received.all { it.contentEquals(packet()) })
-            assertTrue(adjustments.toString(), adjustments.any { it.afterOffsetUs == -20_449L })
+            if (points.size == 2)
+                assertTrue(adjustments.toString(), adjustments.any { it.afterOffsetUs == -20_449L })
+            else assertEquals("Reordered/overlapping source intervals have no discard authority",
+                0L, player.staleDiscardedSourceFrames)
             assertTrue(output.maxQueued.get() <= 6240)
         } finally { player.close() }
     }

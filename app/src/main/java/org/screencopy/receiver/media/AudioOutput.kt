@@ -36,6 +36,7 @@ internal class PlatformAudioOutput private constructor(
     private val opened = AudioOutputPreparation.open(format, platform, failure) {
         prepared("event=AUDIO_OUTPUT_HEADROOM_RETRY stage=OUTPUT_PREPARE ${it.logMessage()}")
     }
+    internal val nativeAndroid = platform === AndroidAudioOutputPlatform
     private val device = opened.first
     override var timingCheckpoint: ((Int) -> Unit)?
         get() = (device as? AudioTimingDiagnostic)?.timingCheckpoint

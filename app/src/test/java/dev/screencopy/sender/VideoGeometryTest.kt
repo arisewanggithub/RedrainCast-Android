@@ -31,7 +31,8 @@ class VideoGeometryTest {
         val settings = settings().apply { maxFps = 0 }
         val plan = ScrcpyVideoSizing.calculate(settings, inventory())
         assertEquals(0, plan.fps)
-        assertTrue(plan.description().contains("uncapped capture FPS"))
+        assertTrue(plan.description().contains("uncapped capture ceiling"))
+        assertTrue(plan.description().contains("encoder configured for 60 fps"))
         assertEquals(plan, VideoPreflightReport.decode(VideoPreflightReport.encode(plan)))
         VideoGeometryValidation.validate(plan, listOf(EncoderGeometryCheck(limits(), true, true)), false)
         val error = assertThrows(VideoGeometryException::class.java) {
@@ -67,6 +68,22 @@ class VideoGeometryTest {
         assertEquals(VideoSize(104, 200), ScrcpyVideoSizing.calculate(settings, inventory(1)).output)
         settings.orientation = "90"
         assertEquals(VideoSize(104, 200), ScrcpyVideoSizing.calculate(settings, inventory(1)).output)
+    }
+    @Test fun fullscreenIgnoresDormantOutOfBoundsCropForValidationGeometryAndRenderer() {
+        val settings = settings().apply {
+            fullscreen = true
+            cropWidth = 100
+            cropHeight = 200
+            cropX = 5000
+            maxSize = 0
+        }
+        val display = inventory().displays.single()
+        inventory().validate(settings)
+        assertEquals(VideoSize(display.naturalWidth, display.naturalHeight),
+            ScrcpyVideoSizing.calculate(settings, inventory()).requested)
+        val (coordinates, ratio) = ProjectionTransform.coordinates(settings, display)
+        assertEquals(display.naturalWidth.toFloat() / display.naturalHeight, ratio, 0.00001f)
+        assertTrue(coordinates.all { it in 0f..1f })
     }
     @Test fun sizeAlignmentAndFpsAreIndependentExplicitFailuresAndSuggestionsAreNotApplied() {
         val plan = ScrcpyVideoSizing.calculate(settings().apply { cropWidth = 104; cropHeight = 104 }, inventory())
@@ -148,7 +165,7 @@ class VideoGeometryTest {
             VideoGeometryValidation.validate(plan, listOf(EncoderGeometryCheck(limits(), false, false)), false)
         }
         saved.getJSONObject("video").put("maxSize", 100.5)
-        assertThrows(org.json.JSONException::class.java) { Settings.from(saved) }
+        assertThrows(IllegalArgumentException::class.java) { Settings.from(saved) }
     }
     @Test fun cropSharedUiHintMatchesAllZeroAndPositiveDimensionValidation() {
         Settings().validate()

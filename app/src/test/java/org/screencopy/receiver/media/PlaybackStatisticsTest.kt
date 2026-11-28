@@ -4,6 +4,73 @@ import org.junit.Assert.*
 import org.junit.Test
 
 class PlaybackStatisticsTest {
+    @Test fun audioQueueAcceptsOneSecondOfRealisticPcmAndReportsActualLimits() {
+        for (packetMs in listOf(20, 5)) {
+            val player = testAudioPlayer(AudioFormat("pcm", 48000, 2, byteArrayOf()), PlaybackClock(),
+                { _, _ -> fail("not started") }, { Output() }).apply { statisticsEnabled = true }
+            try {
+                val count = 1000 / packetMs
+                repeat(count + 1) { index ->
+                    assertNull(player.tryOffer(AccessUnit(index * packetMs * 1000L,
+                        ByteArray(packetMs * 48 * 4))))
+                }
+                val stats = player.queueStatistics()
+                assertEquals(count + 1, stats.entries)
+                assertEquals(1_000_000L, stats.spanUs)
+                assertEquals(1_000_000L, stats.maximumSpanUs)
+                assertEquals(256, stats.maximumEntries)
+                val pressure = checkNotNull(player.tryOffer(AccessUnit(1_000_001, ByteArray(packetMs * 48 * 4))))
+                assertEquals(QueueLimit.PTS, pressure.limit)
+                assertEquals(1_000_001L, pressure.spanUs)
+                assertEquals(stats.maximumSpanUs, pressure.maxSpanUs)
+                assertEquals(stats.maximumEntries, pressure.maxPackets)
+            } finally { player.close() }
+        }
+    }
+
+    @Test fun audioQueueConfigurationAndIndependentSafetyCapsRemainEnforced() {
+        fun player(span: Long = DEFAULT_AUDIO_QUEUE_SPAN_US) =
+            testAudioPlayer(AudioFormat("pcm", 48000, 2, byteArrayOf()), PlaybackClock(),
+                { _, _ -> fail("not started") }, { Output() }, audioQueueSpanUs = span)
+        player(300_000).use {
+            assertNull(it.tryOffer(AccessUnit(0, ByteArray(1))))
+            assertNull(it.tryOffer(AccessUnit(300_000, ByteArray(1))))
+            assertEquals(300_000L, checkNotNull(it.tryOffer(AccessUnit(300_001, ByteArray(1)))).maxSpanUs)
+            assertEquals(300_000L, it.queueStatistics().maximumSpanUs)
+        }
+        player().use {
+            repeat(256) { _ -> assertNull(it.tryOffer(AccessUnit(0, ByteArray(1)))) }
+            val pressure = checkNotNull(it.tryOffer(AccessUnit(0, ByteArray(1))))
+            assertEquals(QueueLimit.PACKETS, pressure.limit)
+            assertEquals(256, pressure.maxPackets)
+        }
+        player().use {
+            repeat(2) { _ -> assertNull(it.tryOffer(AccessUnit(0, ByteArray(256 * 1024)))) }
+            val pressure = checkNotNull(it.tryOffer(AccessUnit(0, ByteArray(1))))
+            assertEquals(QueueLimit.BYTES, pressure.limit)
+            assertEquals(512 * 1024, pressure.maxBytes)
+        }
+    }
+
+    @Test fun audioQueueAcceptsOneSecondOfOpusPacketStarts() {
+        val player = testAudioPlayer(AudioFormat("opus", 48000, 2, byteArrayOf()), PlaybackClock(),
+            { _, _ -> fail("not started") }, { Output() }, opusFactory = {
+                object : OpusPacketDecoder {
+                    override fun decode(packet: ByteArray) = ShortArray(1920)
+                    override fun close() {}
+                }
+            })
+        try {
+            repeat(51) { index ->
+                assertNull(player.tryOffer(AccessUnit(index * 20_000L, ByteArray(200))))
+            }
+            val pressure = checkNotNull(player.tryOffer(AccessUnit(1_020_000, ByteArray(200))))
+            assertEquals(QueueLimit.PTS, pressure.limit)
+            assertEquals(1_020_000L, pressure.spanUs)
+            assertEquals(51, player.queuedPackets())
+        } finally { player.close() }
+    }
+
     @Test fun cachedAudioObservationExpiresWhileNativeWriteIsBlockedWithoutQueryingIt() {
         val now = java.util.concurrent.atomic.AtomicLong(1_000_000_000)
         val entered = java.util.concurrent.CountDownLatch(1)
@@ -95,7 +162,7 @@ class PlaybackStatisticsTest {
             anchorVideo(1_000_000)
         }
         assertNull(clock.cachedPlayedAudioSource())
-        clock.prepareAudio(TrimmedAudio(0, 960, 1_000_000), 48000)
+        clock.prepareAudio(TrimmedAudio(0, 960, 1_000_000))
         now = 50_000_000
         clock.anchorAudio(1_000_000, 48000) { queries++; 10_000 }
         clock.audioWritten(20_000)
@@ -144,6 +211,26 @@ class PlaybackStatisticsTest {
         val display = PlaybackStatisticsText.display(snapshot, 1080, 1920)
         assertEquals("Uncapped", display.video.first { it.id == "captureLimit" }.value)
         assertNull(snapshot.rxFps)
+    }
+
+    @Test fun audioOnlyStatisticsShowVideoAndAvSyncAsUnavailableRatherThanZero() {
+        val source = input(count = 4).copy(videoCodec = "", encodedWidth = null, encodedHeight = null,
+            requestedFps = 0, configuredVideoBps = 0, receivedVideo = 0, videoBytes = 0,
+            video = null, videoQueue = null, videoEnabled = false, audioCodec = "raw")
+        val snapshot = PlaybackStatisticsSampler().sample(1000, source)
+        assertNull(snapshot.rxFps)
+        assertNull(snapshot.decodedFps)
+        assertNull(snapshot.presentedFps)
+        assertNull(snapshot.videoMbps)
+        val display = PlaybackStatisticsText.display(snapshot, 1080, 1920)
+        assertEquals("N/A", display.kpis.first { it.id == "receivedFps" }.value)
+        assertEquals("N/A", display.kpis.first { it.id == "decodedFps" }.value)
+        assertEquals("N/A", display.kpis.first { it.id == "presentedFps" }.value)
+        assertEquals("N/A", display.video.first { it.id == "videoCodec" }.value)
+        assertEquals("N/A", display.video.first { it.id == "encodedSize" }.value)
+        assertEquals("N/A", display.video.first { it.id == "captureLimit" }.value)
+        assertEquals("N/A", display.video.first { it.id == "videoBitrate" }.value)
+        assertEquals("N/A", display.audio.first { it.id == "avSkew" }.value)
     }
 
     @Test fun skippedPercentageUsesActualPresentedPlusSkippedRatherThanDecodedOrReceived() {

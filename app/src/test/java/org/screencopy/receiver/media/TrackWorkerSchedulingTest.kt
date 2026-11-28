@@ -12,6 +12,157 @@ import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicReference
 
 class TrackWorkerSchedulingTest {
+    @Test fun nonRecoveryAdmissionClaimsTransientPressureBeforeSuccessfulRetry() {
+        val timing = DiagnosticAudioTiming()
+        val checking = CountDownLatch(1)
+        val drained = CountDownLatch(1)
+        val worker = object : TrackWorker("timing-transient", 1, { _, _ -> fail("not started") }, 2) {
+            @Volatile var signal = false
+            override fun causalNowNs(): Long {
+                if (signal) checking.countDown()
+                return System.nanoTime()
+            }
+            fun dequeue() = next()
+            override fun step() {}
+            override fun release() {}
+        }.also { it.diagnosticSession = 137; it.diagnosticGeneration = 3 }
+        fun packet(pts: Long) = AccessUnit(pts, ByteArray(1)).also {
+            it.diagnosticAudioTiming = timing
+            it.diagnosticPacketId = timing.packetId()
+        }
+        try {
+            assertNull(worker.tryOffer(packet(1)))
+            worker.signal = true
+            Thread {
+                try {
+                    check(checking.await(3, TimeUnit.SECONDS))
+                    worker.dequeue()
+                } finally { drained.countDown() }
+            }.start()
+            worker.offer(packet(2))
+            assertTrue(drained.await(3, TimeUnit.SECONDS))
+            assertEquals(QueueLimit.BYTES.ordinal, checkNotNull(timing.firstPressure()).reason)
+        } finally { worker.close() }
+    }
+
+    @Test fun decodedByteReservationClaimsMarkerOnInitialFailure() {
+        val recorder = RemoteDiagnostics.recorder
+        recorder.revoke()
+        recorder.unrestricted()
+        val owner = java.util.concurrent.atomic.AtomicBoolean(true)
+        val id = recorder.startAdmittedReceiver(138, setOf("audio.timing"),
+            System.nanoTime() + 10_000_000_000L, 100, owner).getString("captureId")
+        val worker = object : TrackWorker("timing-reservation", 1, { _, _ -> fail("not started") }, 2) {
+            fun reserve(bytes: Int) = reserveInputBytes(bytes)
+            override fun step() {}
+            override fun release() {}
+        }.also { it.diagnosticSession = 138; it.diagnosticGeneration = 4 }
+        try {
+            assertFalse(worker.reserve(2))
+            val marker = checkNotNull(recorder.audioTiming(138)?.firstPressure())
+            assertEquals(DiagnosticAudioTiming.RESERVATION_BYTES, marker.reason)
+            assertEquals(4, marker.generation)
+        } finally {
+            worker.close()
+            recorder.finishAdmittedReceiver(id, "test")
+            recorder.discardAdmittedReceiver(id)
+            recorder.revoke()
+        }
+    }
+
+    @Test fun audioTimingRetainsInitialPressureWhenRetrySucceeds() {
+        val timing = DiagnosticAudioTiming()
+        val worker = object : TrackWorker("timing-pressure", 1, { _, _ -> fail("not started") }, 2) {
+            fun dequeue() = next()
+            override fun step() {}
+            override fun release() {}
+        }.also { it.diagnosticSession = 137; it.diagnosticGeneration = 3 }
+        fun packet(pts: Long) = AccessUnit(pts, ByteArray(1)).also {
+            it.diagnosticAudioTiming = timing
+            it.diagnosticPacketId = timing.packetId()
+        }
+        try {
+            val first = packet(1)
+            val second = packet(2)
+            assertNull(worker.tryOffer(first))
+            assertEquals(QueueLimit.BYTES, checkNotNull(worker.tryOffer(second)).limit)
+            val marker = checkNotNull(timing.firstPressure())
+            assertEquals(137L, marker.session)
+            assertEquals(3, marker.generation)
+            assertEquals(QueueLimit.BYTES.ordinal, marker.reason)
+            assertEquals(first, worker.dequeue())
+            assertNull(worker.tryOffer(second))
+            assertEquals(marker, timing.firstPressure())
+            val events = timing.drain(DiagnosticAudioTiming.CAPACITY)
+            assertTrue(events.any { it.packetId == first.diagnosticPacketId &&
+                it.type == DiagnosticAudioTiming.DEQUEUED })
+            assertEquals(listOf(DiagnosticAudioTiming.ADMISSION_CHECK, DiagnosticAudioTiming.ADMISSION_PRESSURE,
+                DiagnosticAudioTiming.ADMISSION_CHECK, DiagnosticAudioTiming.ADMITTED),
+                events.filter { it.packetId == second.diagnosticPacketId }.map { it.type })
+        } finally { worker.close() }
+    }
+
+    @Test fun retainedDecodedInputSharesTheEncodedByteCapWithoutRelaxingItsPtsLimit() {
+        val worker = object : TrackWorker("retained-input", 10, { _, _ -> fail("not started") }, 2) {
+            fun retain(bytes: Int) = reserveInputBytes(bytes).also { if (it) retainDecodedInput(bytes) }
+            fun discard(bytes: Int) = releaseDecodedInput(bytes)
+            override fun step() {}
+            override fun release() {}
+        }
+        try {
+            assertTrue(worker.retain(8))
+            assertNull(worker.tryOffer(AccessUnit(0, ByteArray(2))))
+            assertFalse(worker.retain(1))
+            val pressure = checkNotNull(worker.tryOffer(AccessUnit(1, ByteArray(1))))
+            assertEquals(QueueLimit.BYTES, pressure.limit)
+            assertEquals(10, pressure.queuedBytes)
+            assertEquals(11L, pressure.attemptedBytes)
+            assertEquals(1L, pressure.incomingPtsUs)
+            assertEquals(2, pressure.encodedBytes)
+            assertEquals(8, pressure.retainedDecodedBytes)
+            assertTrue(pressure.detectedAtNs > 0)
+            worker.discard(8)
+            assertNull(worker.tryOffer(AccessUnit(250_000, ByteArray(1))))
+            assertEquals(QueueLimit.PTS, checkNotNull(
+                worker.tryOffer(AccessUnit(250_001, ByteArray(1)))).limit)
+        } finally { worker.close() }
+    }
+
+    @Test fun rejectionFreezesAlreadyPublishedCausalCheckpointsAtDetection() {
+        val telemetry = ReceiverTelemetrySession({ true })
+        TelemetryRegistry.beginReceiver(136, telemetry)
+        val worker = object : TrackWorker("reject-freeze", 1, { _, _ -> fail("not started") }, 2) {
+            override fun step() {}
+            override fun release() {}
+        }.also { it.diagnosticSession = 136; it.diagnosticGeneration = 3 }
+        try {
+            val old = LongArray(17) { 1 }
+            val newer = LongArray(17) { 2 }
+            TelemetryRegistry.causal(136, CausalEvidence.Stage.WORKER, 3, *old, atNs = 1)
+            assertNull(worker.tryOffer(AccessUnit(10, ByteArray(1))))
+            val rejected = checkNotNull(worker.tryOffer(AccessUnit(11, ByteArray(1))))
+            TelemetryRegistry.causal(136, CausalEvidence.Stage.WORKER, 3, *newer, atNs = rejected.detectedAtNs + 1)
+            TelemetryRegistry.end("receiver", telemetry)
+            val batch = SessionTelemetryProtocol.parse(checkNotNull(
+                telemetry.requestFinal(true, System.nanoTime() + 1_000_000_000L)).payload)
+            val frozen = batch.events.single { it.kind == CausalEvidence.KIND &&
+                it.stage == CausalEvidence.Stage.WORKER.ordinal && it.value == 1L }
+            assertEquals(old.toList(), frozen.detail)
+            val capture = batch.events.single { it.kind == CausalEvidence.KIND &&
+                it.stage == CausalEvidence.Stage.CAPTURE.ordinal }
+            assertEquals(rejected.detectedAtNs, capture.atNs)
+            val snapshot = batch.state.single { it.kind == DiagnosticKind.AUDIO_QUEUE.ordinal + 1 &&
+                it.stage == DiagnosticStage.REJECTED.ordinal }
+            assertEquals(rejected.detectedAtNs, snapshot.atNs)
+            assertEquals(11L, snapshot.value)
+            assertEquals(listOf(1L, 0L, 1L, 2L, 1L, QueueLimit.BYTES.ordinal.toLong()), snapshot.detail)
+        } finally {
+            worker.close()
+            TelemetryRegistry.end("receiver", telemetry)
+            telemetry.requestFinal(false, System.nanoTime())
+        }
+    }
+
     @Test fun queueAdmitThenDequeuePublishesEmptyDuringIdleAndFinal() {
         val published = CountDownLatch(1)
         val periodic = AtomicReference<ByteArray>()

@@ -97,7 +97,7 @@ internal object Bitrates {
     }
     fun validate(settings: Settings, ranges: CodecBitrates) {
         settings.validate()
-        require(ranges.permits(settings.videoCodec, settings.videoEncoder, settings.videoBitrate)) {
+        if (settings.video) require(ranges.permits(settings.videoCodec, settings.videoEncoder, settings.videoBitrate)) {
             "Video bitrate is outside the advertised encoder range. " + ranges.describe(settings.videoCodec, settings.videoEncoder)
         }
         if (settings.audio && settings.audioCodec != "raw")

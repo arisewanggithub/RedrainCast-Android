@@ -1,6 +1,7 @@
 package dev.screencopy.sender
 
 import dev.redrain.cast.diagnostics.DiagnosticArmRegistry
+import dev.redrain.cast.diagnostics.DiagnosticAudioTiming
 import dev.redrain.cast.diagnostics.DiagnosticKind
 import dev.redrain.cast.diagnostics.DiagnosticProxyWire
 import dev.redrain.cast.diagnostics.DiagnosticRecorder
@@ -27,6 +28,64 @@ import java.util.concurrent.atomic.AtomicReference
 
 class DiagnosticProxyIntegrationTest {
     private val session = 77L
+
+    @Test(timeout = 15_000) fun receiverOnlySendsWorkToExplicitlySelectedUpdatedPeers() {
+        for (work in listOf(false, true)) {
+            val source = DiagnosticRecorder()
+            val registry = DiagnosticArmRegistry(DiagnosticRecorder().apply { grantConsent() })
+            val flags = if (work) setOf("audio.timing", "audio.timing.work") else setOf("audio.timing")
+            registry.start("collector", setOf("session"), flags, 10_000, 100)
+            val claim = checkNotNull(registry.claim(session))
+            val received = CompletableFuture<org.json.JSONObject>()
+            val failure = AtomicReference<Exception>()
+            val timer = Executors.newSingleThreadScheduledExecutor()
+            try {
+                ReceiverServer.forProtocolTests("Receiver", proxyRecorder = source).use { server ->
+                    server.start()
+                    val target = ReceiverTarget("127.0.0.1", server.listeningPort)
+                    ReceiverLink(target).use { link ->
+                        link.connectArmed(5000, claim) { registry.remainingMs(claim) }
+                        val request = Settings().apply { audio = false }.request()
+                        link.selectDiagnosticProxy(request, claim)
+                        link.send(Wire.control(Wire.SESSION_REQUEST, session, request))
+                        val accepted = link.receive()
+                        val client = DiagnosticProxyClient(target, registry, claim, timer,
+                            onFailure = { failure.set(it); received.completeExceptionally(it) },
+                            onRecord = {
+                                val records = registry.receiverFetch(claim, 0, 32).getJSONArray("records")
+                                for (index in 0 until records.length()) {
+                                    val record = records.getJSONObject(index).getJSONObject("record")
+                                    if (record.optString("kind") == "AUDIO_TIMING") received.complete(record)
+                                }
+                            })
+                        try {
+                            client.start(link.acceptedDiagnosticProxy(accepted.json(), claim),
+                                System.nanoTime() + 5_000_000_000L) { registry.remainingMs(claim) }
+                            val timing = checkNotNull(source.audioTiming(session))
+                            val now = System.nanoTime()
+                            timing.record(now, 1, 7, DiagnosticAudioTiming.WORK_BEGIN, 2, 100)
+                            timing.record(now + 1, 1, 7, DiagnosticAudioTiming.WORK_END, 2, 101)
+                            timing.record(now + 2, 1, 7, DiagnosticAudioTiming.RECEIVED, 1000, 4)
+                            val batch = received.get(3, TimeUnit.SECONDS).getJSONObject("data")
+                            assertEquals(if (work) "audio_timing_v2" else "audio_timing_v1", batch.getString("schema"))
+                            val events = batch.getJSONArray("events")
+                            val types = (0 until events.length()).map { events.getJSONArray(it).getInt(4) }
+                            if (work) assertTrue(types.contains(DiagnosticAudioTiming.WORK_BEGIN))
+                            else assertEquals(listOf(DiagnosticAudioTiming.RECEIVED), types)
+                            assertEquals(if (work) 3L else 1L, timing.attempted())
+                            assertEquals("covered", registry.status("collector", claim.pairId).getString("state"))
+                            assertNull(failure.get())
+                        } finally {
+                            client.cancel("test_done")
+                        }
+                    }
+                }
+            } finally {
+                timer.shutdownNow()
+                registry.revoke()
+            }
+        }
+    }
 
     @Test(timeout = 15_000) fun controlTerminalBeforeProxyEndedStillConfirms() = senderRetirement(true)
     @Test(timeout = 15_000) fun senderRetirementDeadlineClosesUnconfirmedLane() = senderRetirement(false)
@@ -366,6 +425,9 @@ class DiagnosticProxyIntegrationTest {
                         client.cancel("sender_finished")
                         resume.countDown()
                         assertTrue(closed.await(3, TimeUnit.SECONDS))
+                        assertEquals("draining", registry.status("collector", pair.getString("pairId")).getString("state"))
+                        claim.senderFinished.set(true)
+                        registry.senderEnded(claim)
                         val status = registry.status("collector", pair.getString("pairId"))
                         assertEquals("frozen", status.getString("state"))
                         assertEquals("coverage_lost", status.getString("endReason"))
@@ -1052,7 +1114,7 @@ class DiagnosticProxyIntegrationTest {
                         }
                         assertUnknown(draining)
                         finishSenderDiagnostic(sender, registry, claim, session, mode == "fatal",
-                            { client.cancel("sender_finished") }, { it() })
+                            { client.cancel("sender_finished") }, { it() }, "AUDIO_FAILED")
                         val frozen = registry.status("collector", claim.pairId)
                         assertEquals("frozen", frozen.getString("state"))
                         assertUnknown(frozen)
@@ -1062,6 +1124,15 @@ class DiagnosticProxyIntegrationTest {
                             records.getJSONObject(it).optJSONObject("data")?.optString("stage") ==
                                 if (mode == "fatal") "failed" else "ended"
                         })
+                        if (mode == "fatal") {
+                            val failure = (0 until records.length()).map { records.getJSONObject(it) }.single {
+                                it.optJSONObject("data")?.optString("stage") == "failed"
+                            }.getJSONObject("data").getJSONObject("metrics")
+                            assertEquals("terminal_failure", failure.getString("schema"))
+                            assertEquals(dev.redrain.cast.diagnostics.IncidentEvidence.cause("AUDIO_FAILED"),
+                                failure.getLong("cause"))
+                            assertTrue(failure.isNull("origin"))
+                        }
                         for (i in 0 until records.length()) {
                             val record = records.getJSONObject(i)
                             if (record.has("role")) {

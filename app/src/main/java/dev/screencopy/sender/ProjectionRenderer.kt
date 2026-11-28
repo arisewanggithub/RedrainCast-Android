@@ -183,7 +183,7 @@ internal object ProjectionTransform {
         val rotation = checkNotNull(display.rotation)
         val naturalWidth = display.naturalWidth.toFloat()
         val naturalHeight = display.naturalHeight.toFloat()
-        val cropped = settings.cropWidth > 0
+        val cropped = !settings.fullscreen && settings.cropWidth > 0
         val x = if (cropped) settings.cropX / naturalWidth else 0f
         val y = if (cropped) settings.cropY / naturalHeight else 0f
         val w = if (cropped) settings.cropWidth / naturalWidth else 1f

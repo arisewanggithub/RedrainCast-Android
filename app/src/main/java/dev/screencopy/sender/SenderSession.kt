@@ -33,11 +33,13 @@ internal fun setupFailure(error: Exception, setupTimedOut: Boolean): DiagnosticA
 
 internal fun finishSenderDiagnostic(
     recorder: DiagnosticRecorder, arms: DiagnosticArmRegistry, claim: DiagnosticArmRegistry.Claim?,
-    session: Long, failed: Boolean, retire: () -> Unit, dispatch: (() -> Unit) -> Unit
+    session: Long, failed: Boolean, retire: () -> Unit, dispatch: (() -> Unit) -> Unit,
+    failureCode: String? = null
 ) {
     recorder.observe("sender", session, DiagnosticKind.SESSION,
         if (failed) DiagnosticStage.FAILED else DiagnosticStage.ENDED,
-        reason = if (failed) DiagnosticReason.FAILURE else DiagnosticReason.STOPPED)
+        reason = if (failed) DiagnosticReason.FAILURE else DiagnosticReason.STOPPED,
+        metadata = if (failed) DiagnosticTerminalFailure(IncidentEvidence.cause(failureCode ?: ""), null) else null)
     recorder.sessionEnded("sender", session)
     if (claim != null) {
         claim.senderFinished.set(true)
@@ -74,10 +76,22 @@ class SenderSession internal constructor(
     private var statisticsUnavailable = false
     private fun streamingStatus(value: String) = status(if (statisticsUnavailable)
         "$value - Playback statistics unavailable on this receiver" else value)
+    private fun recoveryDiagnostic(line: String) {
+        diagnostic(line)
+        if (line.startsWith("event=STREAM_RECOVERY_BEGIN")) {
+            synchronized(streamingPublication) {
+                playing = false
+                if (!stopping && !closing && outcome.failure == null) status("Recovering stream")
+            }
+        }
+        if (line.startsWith("event=STREAM_RECOVERY_COMPLETE") && recovery?.isStreaming() == true)
+            publishStreaming()
+    }
     private val session = (SecureRandom().nextLong() and Long.MAX_VALUE) or 1
-    private val mux = MediaBudget(settings.audio)
+    private val mux = MediaBudget(settings.video, settings.audio)
     private val outcome = SessionOutcome()
     private val outcomePublication = Any()
+    private val streamingPublication = Any()
     private val trace = SessionStopTrace(diagnostic)
     private var frameTrace: VideoFrameTrace? = null
     private val terminalQueued = AtomicBoolean()
@@ -91,6 +105,7 @@ class SenderSession internal constructor(
     @Volatile private var linkClosed = false
     @Volatile private var startupTransportAborted = false
     @Volatile private var playing = false
+    @Volatile private var established = false
     @Volatile private var cleanupComplete = false
     @Volatile private var cleanupSucceeded = true
     val cleanSizeSwitch get() = cleanupComplete &&
@@ -138,8 +153,10 @@ class SenderSession internal constructor(
         return true
     }
     @Synchronized private fun requestStop() {
-        val committed = synchronized(outcomePublication) {
-            outcome.requestStop { proxyClaim?.commitTerminal(now()) }
+        val committed = synchronized(streamingPublication) {
+            synchronized(outcomePublication) {
+                outcome.requestStop { proxyClaim?.commitTerminal(now()) }
+            }.also { if (it) status("Stopping") }
         }
         if (!committed) return
         if (!proxyEstablished) {
@@ -148,12 +165,11 @@ class SenderSession internal constructor(
             catch (_: java.util.concurrent.RejectedExecutionException) { }
         }
         trace.mark(SessionStopTrace.Stage.REQUESTED)
-        status("Stopping")
         queueTerminal()
         val orderlyRemoteStop = remoteStop && acceptedSession && link?.streamRecovery == true && link?.mediaAttached == true
-        if (!playing) startCaptureAbort {
+        if (!established) startCaptureAbort {
             trace.mark(SessionStopTrace.Stage.STARTUP_CANCEL)
-            if (!playing && !orderlyRemoteStop) {
+            if (!established && !orderlyRemoteStop) {
                 if (requestSent) try { terminalSent.await(500, TimeUnit.MILLISECONDS) }
                 catch (e: InterruptedException) { Thread.currentThread().interrupt(); fail(e, SessionOutcome.Origin.CLEANUP) }
                 startupTransportAborted = true
@@ -230,7 +246,7 @@ class SenderSession internal constructor(
                 return
             }
         }
-        if ((stopping || closing) && !linkClosed && !mediaRetiring && outcome.failure == null && link?.streamRecovery == true &&
+        if ((stopping || closing) && !linkClosed && !mediaRetiring && orderlyTeardown &&
             error is IOException) {
             fail(IOException("${if (error is java.net.SocketTimeoutException) "TIMEOUT" else "PROTOCOL"}: " +
                 "media transport failed during orderly Stop", error), origin)
@@ -278,7 +294,7 @@ class SenderSession internal constructor(
             phase("Checking screen-sharing permission", SessionStopTrace.Phase.ACCESS)
             val owner = projectionOwner ?: throw IOException("CAPTURE_FAILED: screen-sharing consent is required")
             phase("ConnectingReceiver", SessionStopTrace.Phase.CONNECTING)
-            val connected = ReceiverLink(receiver).also { link = it }
+            val connected = ReceiverLink(receiver, senderVideoEnabled = settings.video).also { link = it }
             if (armed != null) timer.scheduleWithFixedDelay({
                 if (!armed.valid.get()) {
                     proxyClient?.cancel("capture_ended")
@@ -290,14 +306,13 @@ class SenderSession internal constructor(
             else connected.connectArmed(10_000, armed) { DiagnosticAccess.arms.remainingMs(armed) }
             lastIncoming = now()
             trace.phase(SessionStopTrace.Phase.CAPABILITIES)
-            connected.requireVideoRotation()
-            connected.requireFpsSupport(settings.maxFps)
+            if (settings.video) {
+                connected.requireVideoRotation()
+                connected.requireFpsSupport(settings.maxFps)
+            }
             if (connected.streamRecovery)
-                recovery = StreamRecoverySender(session, mux, diagnostic = { line ->
-                    diagnostic(line)
-                    if (line.startsWith("event=STREAM_RECOVERY_BEGIN")) status("Recovering stream")
-                    if (line.startsWith("event=STREAM_RECOVERY_COMPLETE")) streamingStatus("Streaming")
-                }, withAudio = settings.audio)
+                recovery = StreamRecoverySender(session, mux, diagnostic = ::recoveryDiagnostic,
+                    withAudio = settings.audio, withVideo = settings.video)
             diagnostic("event=STREAM_RECOVERY_NEGOTIATED enabled=${connected.streamRecovery}")
             val capture = ProjectionCapture(context, owner, ::captureFailed, frameTrace).also { backend = it }
             settings = capture.validate(settings)
@@ -340,9 +355,10 @@ class SenderSession internal constructor(
                     java.util.UUID.randomUUID().toString().replace("-", ""),
                     { error -> android.util.Log.w("SessionTelemetry", "telemetry_failed=${error.javaClass.simpleName}") })
                     .also { TelemetryRegistry.beginSender(session, it) }
-                TelemetryRegistry.sessionConfiguration("sender", session, settings.videoCodec,
-                    settings.audioCodec.takeIf { settings.audio }, settings.maxFps,
-                    settings.videoBitrate, settings.audioBitrate.takeIf { settings.audio && settings.audioCodec != "raw" })
+                TelemetryRegistry.sessionConfiguration("sender", session, settings.videoCodec.takeIf { settings.video },
+                    settings.audioCodec.takeIf { settings.audio }, settings.maxFps.takeIf { settings.video } ?: -1,
+                    settings.videoBitrate.takeIf { settings.video } ?: -1,
+                    settings.audioBitrate.takeIf { settings.audio && settings.audioCodec != "raw" })
             } catch (e: Exception) {
                 android.util.Log.w("SessionTelemetry", "telemetry_start_failed=${e.javaClass.simpleName}")
             }
@@ -383,7 +399,6 @@ class SenderSession internal constructor(
             phase("StartingCapture", SessionStopTrace.Phase.CAPTURE_START)
             capture.start(settings, session, this)
             while (!stopping && outcome.failure == null) {
-                if (mux.allReady()) phaseDeadline = 0
                 Thread.sleep(100)
             }
         } catch (e: Exception) {
@@ -423,7 +438,8 @@ class SenderSession internal constructor(
             trace.mark(SessionStopTrace.Stage.FINISHED)
             cleanupComplete = true
             finishSenderDiagnostic(RemoteDiagnostics.recorder, DiagnosticAccess.arms, proxyClaim, session,
-                outcome.failure != null, { proxyClient?.retire() }, DiagnosticAccess::dispatch)
+                outcome.failure != null, { proxyClient?.retire() }, DiagnosticAccess::dispatch,
+                outcome.failure?.let { SessionOutcome.errorCode(it) })
             TelemetryRegistry.end("sender", telemetry)
             telemetry?.finish(cleanupSucceeded)
             finished()
@@ -431,10 +447,9 @@ class SenderSession internal constructor(
     }
 
     internal fun attachReceiver(connected: ReceiverLink, accepted: Wire.Message) {
-        connected.attach(session, accepted, settings.audio,
-            onFailure = { fail(it, SessionOutcome.Origin.STARTUP) }) {
-            startReceiverReader()
-        }
+        connected.attachTracks(session, accepted, settings.video, settings.audio,
+            onFailure = { fail(it, SessionOutcome.Origin.STARTUP) },
+            onValidated = { startReceiverReader() })
     }
 
     private fun startReceiverReader() = synchronized(this) {
@@ -500,7 +515,7 @@ class SenderSession internal constructor(
     }
 
     private val orderlyTeardown: Boolean get() =
-        link?.streamRecovery == true && (playing || remoteStop && link?.mediaAttached == true) &&
+        link?.streamRecovery == true && (established || remoteStop && link?.mediaAttached == true) &&
             acceptedSession && outcome.failure == null
 
     private val negotiatedFatalCleanup: Boolean get() =
@@ -616,7 +631,24 @@ class SenderSession internal constructor(
         }
         if (sequence != null && skip != null)
             throw IOException("PROTOCOL: final telemetry cannot be both sent and skipped")
+        val rawPreparation = json.opt("preparationTimeout")
+        val preparation = if (rawPreparation == null) null else {
+            if (skip != ReceiverTelemetrySession.FinalSkipReason.PREPARATION_TIMEOUT ||
+                rawPreparation !is JSONObject || rawPreparation.keys().asSequence().toSet() !=
+                setOf("phase", "elapsedNs", "activeProducers"))
+                throw IOException("PROTOCOL: invalid final preparation details")
+            val phase = ReceiverTelemetrySession.PreparationPhase.entries.firstOrNull {
+                it.name == rawPreparation.opt("phase")
+            } ?: throw IOException("PROTOCOL: invalid final preparation phase")
+            val elapsed = SessionTelemetryProtocol.number(rawPreparation.opt("elapsedNs"))
+            val producers = rawPreparation.opt("activeProducers") as? Int
+                ?: throw IOException("PROTOCOL: invalid producer count")
+            if (elapsed < 0 || producers < 0) throw IOException("PROTOCOL: invalid preparation duration")
+            DiagnosticPreparationTimeout(phase, elapsed, producers)
+        }
         telemetry?.terminal(sequence, cleanup == true, skipReason = skip)
+        RemoteDiagnostics.recorder.observe("sender", session, DiagnosticKind.SESSION, DiagnosticStage.SAMPLE,
+            metadata = DiagnosticTerminalCoverage(sequence, cleanup as Boolean?, skip, preparation))
     }
     private fun worker(name: String, action: () -> Unit) { threads.add(Thread(action, name).also { it.start() }) }
     private fun readLoop() {
@@ -638,10 +670,11 @@ class SenderSession internal constructor(
                         TelemetryRegistry.evidence("sender", session, message.track, message.generation,
                             IncidentEvidence.Stage.READY_PROCESSED)
                         if (mux.allReady() && !stopping && !closing && outcome.failure == null) {
-                            phaseDeadline = 0
-                            playing = true
-                            trace.phase(SessionStopTrace.Phase.STREAMING)
-                            streamingStatus(if (recovery == null) "Streaming" else "Resynchronizing stream")
+                            if (recovery == null && mux.allForwarding()) publishStreaming()
+                            else synchronized(streamingPublication) {
+                                if (!playing && !stopping && !closing && outcome.failure == null)
+                                    status(if (recovery != null) "Resynchronizing stream" else "Starting stream")
+                            }
                         }
                     }
                     Wire.PING -> {
@@ -723,7 +756,22 @@ class SenderSession internal constructor(
         } finally { receiverReleased.countDown() }
     }
     @Synchronized private fun writeCompleted(message: Wire.Message) {
-        if (!stopping && !closing) recovery?.written(message)
+        if (stopping || closing) return
+        mux.markForwarded(message)
+        recovery?.written(message)
+        if (mux.allReady() && mux.allForwarding()) phaseDeadline = 0
+        val current = recovery
+        if (current == null) publishStreaming() else current.whenStreaming { publishStreaming() }
+    }
+
+    private fun publishStreaming() = synchronized(streamingPublication) {
+        if (!playing && !stopping && !closing && outcome.failure == null &&
+            mux.allReady() && mux.allForwarding()) {
+            playing = true
+            established = true
+            trace.phase(SessionStopTrace.Phase.STREAMING)
+            streamingStatus("Streaming")
+        }
     }
 
     private fun writeFailed(lane: Int, error: Exception) {

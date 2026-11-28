@@ -96,7 +96,11 @@ internal class DiagnosticProxyClient(
                 claim.receiverFlags, claim.expiresNs, claim.samplePeriodMs)
             val bootstrap = DiagnosticProxyNegotiation.ready(StrictJson.decode(ready.payload), offer, accepted)
             val receiver = DiagnosticProxyIntake(claim.session.toString(), claim.pairId, accepted.captureId,
-                accepted.clockId, "video.timing" in claim.receiverFlags, bootstrap)
+                accepted.clockId, "video.timing" in claim.receiverFlags, bootstrap,
+                audioTiming = "audio.timing" in claim.receiverFlags,
+                audioWork = "audio.timing.work" in claim.receiverFlags,
+                audioDetail = "audio.timing.detail" in claim.receiverFlags,
+                audioOwner = "audio.timing.owner" in claim.receiverFlags)
             intake = receiver
             socket.soTimeout = 0
             val reader = Thread({ read(socket, receiver, accepted.captureId, accepted.clockId) },
@@ -203,6 +207,15 @@ internal class DiagnosticProxyClient(
                             ?: throw IOException("PROTOCOL: missing diagnostic watermarks")
                         receiver.sourceLoss(watermarks)
                     }
+                    "AUDIO_PRESSURE" -> {
+                        if ("audio.timing" !in claim.receiverFlags ||
+                            frame.value.keys().asSequence().toSet() != common + "marker")
+                            throw IOException("PROTOCOL: invalid audio pressure marker")
+                        val marker = frame.value.opt("marker") as? JSONObject
+                            ?: throw IOException("PROTOCOL: missing audio pressure marker")
+                        receiver.audioPressure(marker)
+                        onRecord()
+                    }
                     "CLOCK_RESPONSE" -> {
                         if (frame.value.keys().asSequence().toSet() != common +
                             setOf("requestId", "receiveNs", "sendNs", "clockId"))
@@ -219,9 +232,12 @@ internal class DiagnosticProxyClient(
                         pending.result.complete(frame.value)
                     }
                     "ENDED" -> {
-                        if (frame.value.keys().asSequence().toSet() != common +
+                        val terminalFields = common +
                             setOf("clockId", "reason", "endedNs", "mediaRetirement", "ownershipCleanup",
-                                "tailTruncated", "captureEnd", "sourceLoss") ||
+                                "tailTruncated", "captureEnd", "sourceLoss")
+                        val detailsSelected = "tail.details" in claim.receiverFlags
+                        if (frame.value.keys().asSequence().toSet() !=
+                            (if (detailsSelected) terminalFields + "tailDetails" else terminalFields) ||
                             frame.value.opt("clockId") != clockId)
                             throw IOException("PROTOCOL: invalid diagnostic terminal")
                         val reason = frame.value.opt("reason") as? String
@@ -240,6 +256,29 @@ internal class DiagnosticProxyClient(
                             end.opt("complete") == end.opt("truncated"))
                             throw IOException("PROTOCOL: invalid diagnostic capture outcome")
                         DiagnosticProxyWire.decimal(end.opt("atNs"))
+                        val tailDetails = if (detailsSelected) {
+                            val details = frame.value.opt("tailDetails") as? JSONObject
+                                ?: throw IOException("PROTOCOL: missing diagnostic tail details")
+                            if (details.keys().asSequence().toSet() != setOf("cause", "stage",
+                                    "unsentFirstSeq", "unsentLastSeq", "observedUnsentCount"))
+                                throw IOException("PROTOCOL: invalid diagnostic tail details")
+                            val truncated = frame.value.getBoolean("tailTruncated")
+                            val cause = if (details.isNull("cause")) null else details.opt("cause")
+                            val stage = if (details.isNull("stage")) null else details.opt("stage")
+                            if ((!truncated && (cause != null || stage != null)) ||
+                                (truncated && (cause !in setOf("deadline", "budget", "source_pending") ||
+                                    stage != if (cause == "source_pending") "source" else "delivery")))
+                                throw IOException("PROTOCOL: invalid diagnostic tail cause")
+                            val first = if (details.isNull("unsentFirstSeq")) null
+                                else DiagnosticProxyWire.decimal(details.opt("unsentFirstSeq"))
+                            val last = if (details.isNull("unsentLastSeq")) null
+                                else DiagnosticProxyWire.decimal(details.opt("unsentLastSeq"))
+                            val count = DiagnosticProxyWire.decimal(details.opt("observedUnsentCount"))
+                            if ((first == null) != (last == null) || first != null && (last!! < first || first == 0L) ||
+                                count > 0 && first == null || !truncated && (first != null || count != 0L))
+                                throw IOException("PROTOCOL: invalid diagnostic tail range")
+                            details
+                        } else null
                         val loss = frame.value.opt("sourceLoss") as? JSONObject
                             ?: throw IOException("PROTOCOL: missing diagnostic final loss")
                         receiver.sourceLoss(loss)
@@ -248,7 +287,7 @@ internal class DiagnosticProxyClient(
                             .put("mediaRetirement", frame.value.getString("mediaRetirement"))
                             .put("ownershipCleanup", "unknown")
                             .put("tailTruncated", frame.value.getBoolean("tailTruncated"))
-                            .put("captureEnd", end).toString()
+                            .put("captureEnd", end).apply { tailDetails?.let { put("tailDetails", it) } }.toString()
                         registry.receiverFinishing(claim)
                         receiver.terminal(frame.value, confirmed = true, outcome = terminalOutcome)
                         afterTerminalReserved()

@@ -41,7 +41,7 @@ internal class DisplayInventory(val displays: List<CaptureDisplay>) {
         requireAvailable()
         val display = displays.singleOrNull { it.id == settings.displayId }
             ?: throw IOException("Selected display is unavailable. Refresh displays and choose a screen explicitly.")
-        if (settings.cropWidth > 0) {
+        if (!settings.fullscreen && settings.cropWidth > 0) {
             if (display.rotation == null) throw IOException("Natural display bounds unavailable. Refresh displays before applying crop.")
             Settings.require(settings.cropX.toLong() + settings.cropWidth <= display.naturalWidth &&
                 settings.cropY.toLong() + settings.cropHeight <= display.naturalHeight,

@@ -92,7 +92,7 @@ class DiagnosticRecorder(private val clock: () -> Long = System::nanoTime) {
 
         val capabilities = mapOf(
             "sender" to setOf("session", "recovery", "audio.capture", "audio.transport", "audio.queue", "video.progress", "transport.health"),
-            "receiver" to setOf("session", "recovery", "audio.transport", "audio.queue", "audio.output", "video.progress", "video.timing", "transport.health")
+            "receiver" to setOf("session", "recovery", "audio.transport", "audio.queue", "audio.output", "audio.timing", "audio.timing.work", "audio.timing.detail", "audio.timing.owner", "video.progress", "video.timing", "transport.health", "tail.details")
         )
 
         fun limits() = JSONObject().put("maxRecords", MAX_RECORDS).put("maxBytes", MAX_BYTES)
@@ -181,6 +181,13 @@ class DiagnosticRecorder(private val clock: () -> Long = System::nanoTime) {
         val videoTraceCandidates = AtomicLong()
         val videoTiming = AtomicReference<DiagnosticVideoTiming?>()
         val videoTimingContention = AtomicLong()
+        val audioTiming = if (role == "receiver" && "audio.timing" in flags)
+            DiagnosticAudioTiming(expires, workEnabled = "audio.timing.work" in flags,
+                detailEnabled = "audio.timing.detail" in flags,
+                ownerEnabled = "audio.timing.owner" in flags) else null
+        var audioBatchDropped = 0L
+        var audioProducersAtClose = 0L
+        val audioClockObservationAt = AtomicLong(Long.MIN_VALUE)
 
         // Per-kind/point fixed counters: starts, completions, unnumbered calls,
         // bytes, units, four duration buckets, slow count and maximum duration.
@@ -202,6 +209,7 @@ class DiagnosticRecorder(private val clock: () -> Long = System::nanoTime) {
     @Volatile internal var afterSequenceReservation: (() -> Unit)? = null
     @Volatile internal var beforeVideoTimingSwap: (() -> Unit)? = null
     @Volatile internal var afterVideoTimingReplacement: (() -> Unit)? = null
+    @Volatile internal var afterAudioTimingAttemptedSnapshot: (() -> Unit)? = null
     private var consent = true
     private var delegatedSession: Long? = null
     private var delegatedActive = false
@@ -246,6 +254,27 @@ class DiagnosticRecorder(private val clock: () -> Long = System::nanoTime) {
         val current = gate ?: return false
         return current.collecting && ownerActive() &&
             current.role == role && current.session == session && kind.group in current.flags
+    }
+
+    internal fun audioTiming(session: Long): DiagnosticAudioTiming? {
+        val current = gate ?: return null
+        val timing = current.audioTiming ?: return null
+        if (!current.collecting || current.role != "receiver" || current.session != session ||
+            !ownerActive() || clock() >= current.expires) return null
+        return timing
+    }
+
+    internal fun audioOwnerTiming(session: Long): DiagnosticAudioTiming? {
+        val current = gate ?: return null
+        if (!current.collecting || current.role != "receiver" || current.session != session ||
+            proxyOwner?.get() != true) return null
+        return current.audioTiming?.takeIf { it.ownerEnabled }
+    }
+
+    internal fun audioPressure(id: String): DiagnosticAudioTiming.Pressure? {
+        val current = capture ?: return null
+        if (current.id != id) return null
+        return current.audioTiming?.firstPressure()
     }
 
     fun operation(role: String, session: Long, kind: DiagnosticKind): Long {
@@ -438,6 +467,44 @@ class DiagnosticRecorder(private val clock: () -> Long = System::nanoTime) {
         c.videoTiming.get()?.let { submitVideoTiming(c, it, now, priority, priority = priority) }
     }
 
+    private fun sampleAudioTiming(c: Capture, now: Long, maxBatches: Int) {
+        val timing = c.audioTiming ?: return
+        repeat(maxBatches) {
+            val entries = timing.drain(8)
+            if (entries.isEmpty()) return
+            val events = JSONArray()
+            entries.forEach { entry ->
+                events.put(JSONArray().put(entry.sequence.toString()).put(entry.monoNs.toString())
+                    .put(entry.generation).put(entry.packetId.toString()).put(entry.type)
+                    .put(entry.value1.toString()).put(entry.value2.toString()))
+            }
+            val data = audioTimingCounters(c, timing)
+                .put("schema", if (entries.any { it.type >= DiagnosticAudioTiming.OWNER_BEGIN }) "audio_timing_v4"
+                    else if (entries.any { it.type >= DiagnosticAudioTiming.QUEUE_DETAIL ||
+                        it.type in DiagnosticAudioTiming.WORK_BEGIN..DiagnosticAudioTiming.WORK_FAILED &&
+                        it.value1 > DiagnosticAudioTiming.STARTUP_SUBMISSION }) "audio_timing_v3"
+                    else if (entries.any { it.type >= DiagnosticAudioTiming.WORK_BEGIN }) "audio_timing_v2"
+                    else "audio_timing_v1").put("events", events)
+            val event = Observation(0, now, DiagnosticKind.AUDIO_OUTPUT, DiagnosticStage.SAMPLE,
+                c.role, c.session ?: 0, 0, 0, 0, -1, -1, -1, -1, -1, DiagnosticReason.NONE,
+                DiagnosticPoint.UNSPECIFIED, null, controlKind = "AUDIO_TIMING", controlData = data)
+            if (!submit(c, event, false)) c.audioBatchDropped += entries.size
+        }
+    }
+
+    private fun audioTimingCounters(c: Capture, timing: DiagnosticAudioTiming): JSONObject {
+        // A producer reserves its attempt before counting loss. Read loss first so
+        // even producers still finishing after close cannot exceed this upper bound.
+        val dropped = timing.dropped()
+        val droppedBeforeSequence = timing.droppedBeforeSequence()
+        val batchDropped = c.audioBatchDropped
+        val attempted = timing.attempted()
+        afterAudioTimingAttemptedSnapshot?.invoke()
+        return JSONObject().put("attempted", attempted.toString()).put("dropped", dropped.toString())
+            .put("droppedBeforeSequence", droppedBeforeSequence.toString())
+            .put("batchDropped", batchDropped.toString())
+    }
+
     fun observe(
         role: String, session: Long, kind: DiagnosticKind, stage: DiagnosticStage,
         track: Int = 0, generation: Int = 0, operation: Long = 0, pts: Long = -1,
@@ -460,6 +527,7 @@ class DiagnosticRecorder(private val clock: () -> Long = System::nanoTime) {
             drop(current, Drop.EXPIRED, ns)
             return
         }
+
         if (operation > 0 && (stage == DiagnosticStage.BEGIN || stage == DiagnosticStage.COMPLETE ||
                 stage == DiagnosticStage.FAILED)) {
             operationObservation(current, ns, kind, stage, track, generation, operation, bytes, point, reason,
@@ -475,6 +543,29 @@ class DiagnosticRecorder(private val clock: () -> Long = System::nanoTime) {
         }
         submit(current, observation(ns, kind, stage, role, session, track, generation, operation, pts,
             endPts, count, bytes, cutoff, reason, point, metadata), isCritical(kind, stage))
+    }
+
+    internal fun audioStartDecision(session: Long, generation: Int, operation: Long,
+                                    decision: org.screencopy.receiver.media.AudioStartDecision) {
+        if (!enabled("receiver", session, DiagnosticKind.AUDIO_OUTPUT)) return
+        observe("receiver", session, DiagnosticKind.AUDIO_OUTPUT, DiagnosticStage.SAMPLE,
+            2, generation, operation, pts = decision.targetUs, point = DiagnosticPoint.AUDIO_START_WAIT,
+            metadata = DiagnosticAudioStartDecision(decision))
+    }
+
+    internal fun audioClockObservation(session: Long, generation: Int,
+                                       observation: org.screencopy.receiver.media.AudioClockObservation) {
+        val current = gate ?: return
+        if (!enabled("receiver", session, DiagnosticKind.AUDIO_OUTPUT)) return
+        val now = clock()
+        while (true) {
+            val last = current.audioClockObservationAt.get()
+            if (last != Long.MIN_VALUE && now >= last && now - last < 250_000_000L) return
+            if (current.audioClockObservationAt.compareAndSet(last, now)) break
+        }
+        observe("receiver", session, DiagnosticKind.AUDIO_OUTPUT, DiagnosticStage.SAMPLE, 2, generation,
+            pts = observation.sourcePtsUs, point = DiagnosticPoint.TIMING,
+            metadata = DiagnosticAudioClockObservation(observation))
     }
 
     private fun operationObservation(
@@ -684,6 +775,9 @@ class DiagnosticRecorder(private val clock: () -> Long = System::nanoTime) {
         if (terminal) submitFinal(c, event) else submit(c, event, true)
     }
 
+    private fun buildInfo() = JSONObject().put("versionName", dev.redrain.cast.BuildConfig.VERSION_NAME)
+        .put("versionCode", dev.redrain.cast.BuildConfig.VERSION_CODE)
+
     @Synchronized fun sessionStarted(role: String, session: Long) {
         if (sessions.put(role, session) == session) return
         val c = capture ?: return
@@ -691,7 +785,7 @@ class DiagnosticRecorder(private val clock: () -> Long = System::nanoTime) {
         if (c.collecting && c.role == role && c.session == null) {
             gate = null
             c.session = session
-            lifecycle(c, "SESSION_BOUND", JSONObject())
+            lifecycle(c, "SESSION_BOUND", buildInfo())
             gate = c
         }
         observe(role, session, DiagnosticKind.SESSION, DiagnosticStage.STARTED)
@@ -727,6 +821,8 @@ class DiagnosticRecorder(private val clock: () -> Long = System::nanoTime) {
     @Synchronized internal fun startAdmittedReceiver(
         session: Long, flags: Set<String>, expiresNs: Long, periodMs: Int, owner: AtomicBoolean
     ): JSONObject {
+        if (dev.redrain.cast.BuildConfig.DEBUG && dev.redrain.cast.BuildConfig.VIRTUAL_AUDIO_EXPERIMENT)
+            throw DiagnosticError("UNSUPPORTED_FLAG")
         tick()
         capture?.let { throw DiagnosticError(if (it.collecting) "CAPTURE_ACTIVE" else "RETAINED_CAPTURE_EXISTS") }
         if (!owner.get()) throw DiagnosticError("SESSION_ENDED")
@@ -734,7 +830,10 @@ class DiagnosticRecorder(private val clock: () -> Long = System::nanoTime) {
             throw DiagnosticError("SESSION_NOT_FOUND")
         if (flags.isEmpty() || flags.any { it !in capabilities.getValue("receiver") })
             throw DiagnosticError("UNSUPPORTED_FLAG")
-        if ("video.timing" in flags && "video.progress" !in flags || periodMs !in 100..5000)
+        if ("video.timing" in flags && "video.progress" !in flags ||
+            "audio.timing.work" in flags && "audio.timing" !in flags ||
+            "audio.timing.detail" in flags && "audio.timing.work" !in flags ||
+            "audio.timing.owner" in flags && "audio.timing.detail" !in flags || periodMs !in 100..5000)
             throw DiagnosticError("INVALID_ARGUMENT")
         val now = clock()
         val remaining = try { Math.subtractExact(expiresNs, now) }
@@ -743,11 +842,12 @@ class DiagnosticRecorder(private val clock: () -> Long = System::nanoTime) {
             throw DiagnosticError("INVALID_ARGUMENT")
         val c = Capture(UUID.randomUUID().toString(), "receiver", session, flags.toSet(), now,
             expiresNs, periodMs * 1_000_000L, operations.get(), DiagnosticProxyIntake.BOOTSTRAP_BYTES)
+        c.audioTiming?.bindOwnerGate(owner)
         sessions["receiver"] = session
         proxyOwner = owner
         capture = c
         lifecycle(c, "CAPTURE_STARTED", JSONObject())
-        lifecycle(c, "SESSION_BOUND", JSONObject())
+        lifecycle(c, "SESSION_BOUND", buildInfo())
         gate = c
         observe("receiver", session, DiagnosticKind.SESSION, DiagnosticStage.STARTED)
         return JSONObject().put("captureId", c.id).put("clockId", clockId)
@@ -774,6 +874,7 @@ class DiagnosticRecorder(private val clock: () -> Long = System::nanoTime) {
         val offered = try { Math.addExact(receivedNs, remainingMs * 1_000_000L) }
             catch (_: ArithmeticException) { throw DiagnosticError("INVALID_ARGUMENT") }
         c.expires = minOf(c.expires, offered)
+        c.audioTiming?.shortenDeadline(c.expires)
         if (now >= c.expires) {
             end(id, "lease_expired")
             throw DiagnosticError("SESSION_ENDED")
@@ -791,6 +892,8 @@ class DiagnosticRecorder(private val clock: () -> Long = System::nanoTime) {
     }
 
     @Synchronized fun start(role: String, session: Long?, flags: Set<String>, durationMs: Int, periodMs: Int): JSONObject {
+        if (role == "receiver" && dev.redrain.cast.BuildConfig.DEBUG && dev.redrain.cast.BuildConfig.VIRTUAL_AUDIO_EXPERIMENT)
+            throw DiagnosticError("UNSUPPORTED_FLAG")
         if (!consent) throw DiagnosticError("PERMISSION_REQUIRED")
         delegatedSession?.let {
             if (role != "receiver" || session != it) throw DiagnosticError("SCOPE_MISMATCH")
@@ -801,6 +904,9 @@ class DiagnosticRecorder(private val clock: () -> Long = System::nanoTime) {
         if (role !in capabilities || flags.isEmpty() || flags.any { it !in capabilities.getValue(role) })
             throw DiagnosticError("UNSUPPORTED_FLAG")
         if ("video.timing" in flags && "video.progress" !in flags) throw DiagnosticError("INVALID_ARGUMENT")
+        if ("audio.timing.work" in flags && "audio.timing" !in flags) throw DiagnosticError("INVALID_ARGUMENT")
+        if ("audio.timing.detail" in flags && "audio.timing.work" !in flags) throw DiagnosticError("INVALID_ARGUMENT")
+        if ("audio.timing.owner" in flags) throw DiagnosticError("UNSUPPORTED_FLAG")
         if (durationMs !in 1000..180000 || periodMs !in 100..5000) throw DiagnosticError("INVALID_ARGUMENT")
         if (session != null && sessions[role] != session) throw DiagnosticError("SESSION_NOT_FOUND")
         val now = clock()
@@ -808,7 +914,7 @@ class DiagnosticRecorder(private val clock: () -> Long = System::nanoTime) {
             now + durationMs * 1_000_000L, periodMs * 1_000_000L, operations.get())
         capture = c
         lifecycle(c, "CAPTURE_STARTED", JSONObject())
-        if (session != null) lifecycle(c, "SESSION_BOUND", JSONObject())
+        if (session != null) lifecycle(c, "SESSION_BOUND", buildInfo())
         gate = c
         return limits().put("maxRecordBytes", if ("video.timing" in flags) MAX_VIDEO_TIMING_RECORD_BYTES else MAX_RECORD_BYTES)
             .put("captureId", c.id).put("startedNs", "$now").put("expiresNs", "${c.expires}")
@@ -846,6 +952,7 @@ class DiagnosticRecorder(private val clock: () -> Long = System::nanoTime) {
             return
         }
         drain(c)
+        if (c.collecting) sampleAudioTiming(c, now, 8)
         if (c.collecting && now >= c.sampleAt) {
             flushAggregates(c, now)
             sampleVideo(c, now)
@@ -939,6 +1046,7 @@ class DiagnosticRecorder(private val clock: () -> Long = System::nanoTime) {
         if (c.collecting) {
             gate = null
             c.collecting = false
+            c.audioTiming?.let { c.audioProducersAtClose = it.close() }
             val now = clock()
             val effective = if (now >= c.expires && (c.pairRetentionHeld || proxyOwner != null ||
                     reason in setOf("requested", "client_disconnected", "lease_expired")))
@@ -948,13 +1056,20 @@ class DiagnosticRecorder(private val clock: () -> Long = System::nanoTime) {
             c.reason = effective
             lastEndReason = effective
             drain(c)
+            sampleAudioTiming(c, now, DiagnosticAudioTiming.CAPACITY / 8)
             flushAggregates(c, now, priority = true)
             sampleVideo(c, now, priority = true)
-            lifecycle(c, "CAPTURE_ENDED", JSONObject().put("reason", effective)
+            val ended = JSONObject().put("reason", effective)
                 .put("inFlightCount", countInFlight(c))
                 .put("inFlightNotTracked", "${c.untrackedOperations.get()}")
                 .put("videoTimingContention", "${c.videoTimingContention.get()}")
-                .put("inFlight", inFlight(c, now)), terminal = true)
+                .put("inFlight", inFlight(c, now))
+            c.audioTiming?.let {
+                ended.put("audioTiming", audioTimingCounters(c, it)
+                    .put("producersAtClose", c.audioProducersAtClose.toString())
+                    .put("pendingProducers", it.pendingProducers().toString()))
+            }
+            lifecycle(c, "CAPTURE_ENDED", ended, terminal = true)
             drain(c)
         }
         return JSONObject().put("captureId", id).put("endedNs", "${c.ended}").put("reason", c.reason)
@@ -1117,7 +1232,8 @@ class DiagnosticRecorder(private val clock: () -> Long = System::nanoTime) {
             if (session != null) json.put("role", if (event.controlKind != null) c.role else event.role)
                 .put("session", "$session")
             if (event.track > 0) json.put("track", event.track).put("generation", event.generation)
-            retain(c, event.seq, json, isCritical(event.kind, event.stage) || event.controlKind != null)
+            retain(c, event.seq, json, isCritical(event.kind, event.stage) ||
+                event.controlKind != null && event.controlKind != "AUDIO_TIMING")
         }
     }
 

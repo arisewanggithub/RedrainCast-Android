@@ -45,7 +45,7 @@ internal object CausalEvidence {
         Stage.START -> listOf("operationId", "decision", "mode", "targetPtsUs", "positionUs",
             "delayUs;int64-min unavailable", "revision", "flags", "waitedUs", "releasedVideoPtsUs",
             "rawPtsUs", "effectiveTrimCutoffUs", "trimReason;-1 none")
-        Stage.TRIM -> listOf("reason:0 startup,1 recovery,2 recoveryRefresh,3 clockPrepare", "rawPtsUs",
+        Stage.TRIM -> listOf("reason:0 startup,1 recovery,2 recoveryRefresh,3 clockPrepare,4 playedAudio", "rawPtsUs",
             "trimmedPtsUs", "cutoffUs", "clockPositionUs", "rawFrames", "trimmedFrames")
         Stage.CAPTURE -> listOf("layoutRevision", "availableStageMask", "omittedLaterTransitions",
             "laterTransitionSequence", "triggerTrack")

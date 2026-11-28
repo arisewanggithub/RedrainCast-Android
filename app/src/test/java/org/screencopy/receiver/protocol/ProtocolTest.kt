@@ -151,6 +151,47 @@ class ProtocolTest {
         }
     }
 
+    @Test fun audioOnlyRequiresNegotiatedCapabilityAndEnablesExactlyAudioTrack() {
+        val settings = dev.screencopy.sender.Settings().apply {
+            video = false
+            audio = true
+        }
+        val requestJson = json(settings.request().toString())
+        val unsupported = assertThrows(ProtocolException::class.java) {
+            Request.parse(requestJson)
+        }
+        assertEquals("UNSUPPORTED_CONFIG", unsupported.code)
+        val request = Request.parse(requestJson, audioOnlyNegotiated = true)
+        assertFalse(request.videoEnabled)
+        assertEquals(listOf(2), request.tracks)
+        assertTrue(request.summary.contains("Video disabled"))
+        assertThrows(ProtocolException::class.java) {
+            Configuration.video(json("""{"codec":"h264","width":640,"height":360,"csd":["AAAAAWdC"]}"""), request)
+        }
+        assertThrows(ProtocolException::class.java) {
+            Request.parse(json(settings.request().apply {
+                getJSONObject("video").put("enabled", JSONObject.NULL)
+            }.toString()), audioOnlyNegotiated = true)
+        }
+        val oldRequest = JSONObject(settings.request().toString()).apply {
+            getJSONObject("video").remove("enabled")
+        }
+        assertTrue(Request.parse(json(oldRequest.toString())).videoEnabled)
+    }
+
+    @Test fun enabledTrackSetsRejectNoTracksAndAudioOnlyWithoutAudio() {
+        val base = dev.screencopy.sender.Settings().request()
+        val audioOnly = JSONObject(base.toString()).apply {
+            getJSONObject("video").put("enabled", false)
+        }
+        val noTracks = JSONObject(audioOnly.toString()).apply {
+            getJSONObject("audio").put("enabled", false)
+        }
+        assertThrows(ProtocolException::class.java) {
+            Request.parse(json(noTracks.toString()), audioOnlyNegotiated = true)
+        }
+    }
+
     @Test fun independentGenerationsAndStartupGate() {
         val state = TrackState(listOf(1, 2))
         state.configure(1, 1)
@@ -172,6 +213,16 @@ class ProtocolTest {
     @Test fun audioDisabledCannotAcquireAnAudioTrack() {
         val state = TrackState(listOf(1))
         assertThrows(ProtocolException::class.java) { state.configure(2, 1) }
+    }
+
+    @Test fun audioOnlyInitialReadyBarrierDoesNotRequireOrAcceptVideo() {
+        val state = TrackState(listOf(2))
+        assertThrows(ProtocolException::class.java) { state.configure(1, 1) }
+        state.configure(2, 1, "raw")
+        state.ready(2)
+        assertTrue(state.allReady())
+        state.media(media(2, 1, 10))
+        assertThrows(ProtocolException::class.java) { state.media(media(1, 1, 10)) }
     }
 
     @Test fun opusDelayAndPcmFormatAreNotSilentlyChanged() {

@@ -29,7 +29,8 @@ import java.util.concurrent.atomic.AtomicReference
 internal class ProjectionCapture(
     private val context: Context, private val owner: ProjectionOwner,
     private val fail: (Exception) -> Unit,
-    private val frameTrace: VideoFrameTrace? = null
+    private val frameTrace: VideoFrameTrace? = null,
+    private val audioStartForTests: ((Settings, Long, ScrcpyAdapter.Sink) -> Unit)? = null
 ) : Closeable {
     private val closed = AtomicBoolean()
     private val workers = mutableListOf<Thread>()
@@ -56,42 +57,50 @@ internal class ProjectionCapture(
 
     @Synchronized fun start(settings: Settings, session: Long, sink: ScrcpyAdapter.Sink) {
         if (closed.get()) throw SessionCancelledException()
-        configureVideo(settings, ProjectionInventory.displays(context).displays.single())
-        val videoOutput = EncodedOutput(1, settings.videoCodec, session, sink, rotations::at, frameTrace)
-        val listener = object : DisplayManager.DisplayListener {
-            override fun onDisplayAdded(displayId: Int) = Unit
-            override fun onDisplayRemoved(displayId: Int) {
-                if (displayId == Display.DEFAULT_DISPLAY) report(IOException("CAPTURE_FAILED: capture display was removed"))
+        if (settings.video) {
+            configureVideo(settings, ProjectionInventory.displays(context).displays.single())
+            val videoOutput = EncodedOutput(1, settings.videoCodec, session, sink, rotations::at, frameTrace)
+            val listener = object : DisplayManager.DisplayListener {
+                override fun onDisplayAdded(displayId: Int) = Unit
+                override fun onDisplayRemoved(displayId: Int) {
+                    if (displayId == Display.DEFAULT_DISPLAY) report(IOException("CAPTURE_FAILED: capture display was removed"))
+                }
+                override fun onDisplayChanged(displayId: Int) {
+                    if (displayId == Display.DEFAULT_DISPLAY) refreshSource()
+                }
             }
-            override fun onDisplayChanged(displayId: Int) {
-                if (displayId == Display.DEFAULT_DISPLAY) refreshSource()
-            }
-        }
-        context.getSystemService(DisplayManager::class.java).registerDisplayListener(listener, Handler(Looper.getMainLooper()))
-        displayListener = listener
-        if (settings.audio) startAudio(settings, session, sink)
-        attachVideo()
-        worker("projection-video", MediaThreadRole.VIDEO) {
-            while (!closed.get()) {
-                pendingSource.getAndSet(null)?.let { source ->
-                    val geometry = VideoEncoderPreflight.validate(settings, DisplayInventory(listOf(source)))
-                    val latest = if (geometry.output != videoGeometry?.output) {
-                        sink.awaitVideoDrain()
-                        pendingSource.getAndSet(null) ?: source
-                    } else source
-                    synchronized(this@ProjectionCapture) {
-                        if (!closed.get()) updateVideo(settings, latest, videoOutput)
+            context.getSystemService(DisplayManager::class.java).registerDisplayListener(listener, Handler(Looper.getMainLooper()))
+            displayListener = listener
+            if (settings.audio) startAudioTrack(settings, session, sink)
+            attachVideo()
+            worker("projection-video", MediaThreadRole.VIDEO) {
+                while (!closed.get()) {
+                    pendingSource.getAndSet(null)?.let { source ->
+                        val geometry = VideoEncoderPreflight.validate(settings, DisplayInventory(listOf(source)))
+                        val latest = if (geometry.output != videoGeometry?.output) {
+                            sink.awaitVideoDrain()
+                            pendingSource.getAndSet(null) ?: source
+                        } else source
+                        synchronized(this@ProjectionCapture) {
+                            if (!closed.get()) updateVideo(settings, latest, videoOutput)
+                        }
+                    }
+                    if (!closed.get()) {
+                        if (keyFrameRequested.getAndSet(false))
+                            checkNotNull(video).setParameters(android.os.Bundle().apply {
+                                putInt(MediaCodec.PARAMETER_KEY_REQUEST_SYNC_FRAME, 0)
+                            })
+                        videoOutput.drain(checkNotNull(video), 10_000)
                     }
                 }
-                if (!closed.get()) {
-                    if (keyFrameRequested.getAndSet(false))
-                        checkNotNull(video).setParameters(android.os.Bundle().apply {
-                            putInt(MediaCodec.PARAMETER_KEY_REQUEST_SYNC_FRAME, 0)
-                        })
-                    videoOutput.drain(checkNotNull(video), 10_000)
-                }
             }
-        }
+        } else if (settings.audio) startAudioTrack(settings, session, sink)
+    }
+
+    private fun startAudioTrack(settings: Settings, session: Long, sink: ScrcpyAdapter.Sink) {
+        val testStarter = audioStartForTests
+        if (testStarter == null) startAudio(settings, session, sink)
+        else testStarter(settings, session, sink)
     }
 
     private fun configureVideo(settings: Settings, source: CaptureDisplay) {
@@ -262,7 +271,7 @@ internal class ProjectionCapture(
             return MediaFormat.createVideoFormat(mime, size.width, size.height).apply {
                 setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface)
                 setInteger(MediaFormat.KEY_BIT_RATE, settings.videoBitrate)
-                setInteger(MediaFormat.KEY_FRAME_RATE, 60)
+                setInteger(MediaFormat.KEY_FRAME_RATE, EncoderFrameRate.effective(settings.maxFps))
                 if (settings.maxFps > 0) setFloat(MediaFormat.KEY_MAX_FPS_TO_ENCODER, settings.maxFps.toFloat())
                 setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 10)
                 setInteger(MediaFormat.KEY_MAX_B_FRAMES, 0)

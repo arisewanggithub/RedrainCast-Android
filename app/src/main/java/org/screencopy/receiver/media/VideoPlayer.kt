@@ -199,7 +199,7 @@ class VideoPlayer private constructor(
             diagnosticVideo(DiagnosticVideoStage.RELEASED, heldPtsUs, sourceAtNs = renderAtNs, delayUs = delayUs,
                 heldNs = callAtNs?.let { elapsedNs(it, heldAtNs) },
                 releaseCallNs = if (returnedAtNs != null && callAtNs != null) elapsedNs(returnedAtNs, callAtNs) else null)
-            clock.videoPresented(heldPtsUs, renderAtNs)
+            clock.videoPresented(heldPtsUs, renderAtNs, schedulingClock.mode == "VIRTUAL_SYNC")
             renderSubmitted++
             heldOutput = -1
             reportPresentation()

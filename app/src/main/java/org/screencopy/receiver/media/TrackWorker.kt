@@ -11,8 +11,11 @@ abstract class TrackWorker(
     private val maxBytes: Int,
     private val failure: (String, String) -> Unit,
     private val track: Int = 0,
-    private val prepareThread: () -> Unit = {}
+    private val prepareThread: () -> Unit = {},
+    private val maxPackets: Int = 48,
+    private val maxSpanUs: Long = 250_000
 ) : AutoCloseable {
+    init { require(maxPackets > 0 && maxSpanUs >= 0) }
     private val queue = ArrayDeque<AccessUnit>()
     private val admittedAt = ArrayDeque<Long>()
     @Volatile internal var statisticsEnabled = false
@@ -43,12 +46,12 @@ abstract class TrackWorker(
             count = queue.size.toLong(), bytes = queue.sumOf { it.bytes.size.toLong() },
             reason = if (stage == DiagnosticStage.REJECTED) DiagnosticReason.CAPACITY else DiagnosticReason.NONE,
             point = DiagnosticPoint.QUEUE,
-            metadata = DiagnosticQueue(queue.size, 48, queue.sumOf { it.bytes.size }, maxBytes,
+            metadata = DiagnosticQueue(queue.size, maxPackets, queue.sumOf { it.bytes.size }, maxBytes,
                 admittedAt.firstOrNull()?.let { (System.nanoTime() - it).coerceAtLeast(0) },
-                if (queue.isEmpty()) 0 else queue.maxOf { it.ptsUs } - queue.minOf { it.ptsUs }, 250_000))
+                if (queue.isEmpty()) 0 else queue.maxOf { it.ptsUs } - queue.minOf { it.ptsUs }, maxSpanUs))
     }
     private val monitor = Object()
-    private val budget = PacketBudget(maxBytes, 250_000)
+    private val budget = PacketBudget(maxBytes, maxSpanUs)
     protected val running = AtomicBoolean(true)
     private val thread = Thread({ runTrack() }, name)
 
@@ -57,11 +60,68 @@ abstract class TrackWorker(
         thread.start()
     }
     protected open fun packetEvent(kind: String, packet: AccessUnit, queued: Int) {}
+    @Volatile protected var retainedInputBytes: Int = 0
+        private set
+    private var retainedDecodedBytes = 0
+    private var retainedDecodedPackets = 0
+    protected fun reserveInputBytes(bytes: Int): Boolean = synchronized(monitor) {
+        require(bytes >= 0)
+        if (queue.sumOf { it.bytes.size.toLong() } + retainedInputBytes + bytes > maxBytes) {
+            if (track == 2) {
+                RemoteDiagnostics.recorder.audioTiming(diagnosticSession)?.let {
+                    it.pressure(causalNowNs(), diagnosticSession, diagnosticGeneration,
+                        DiagnosticAudioTiming.RESERVATION_BYTES)
+                }
+            }
+            false
+        }
+        else {
+            retainedInputBytes += bytes
+            true
+        }
+    }
+    protected fun retainDecodedInput(bytes: Int) = synchronized(monitor) {
+        require(bytes in 0..(retainedInputBytes - retainedDecodedBytes))
+        retainedDecodedBytes += bytes
+        retainedDecodedPackets++
+    }
+    protected fun releaseInputReservation(bytes: Int) = synchronized(monitor) {
+        require(bytes in 0..(retainedInputBytes - retainedDecodedBytes))
+        retainedInputBytes -= bytes
+        monitor.notifyAll()
+    }
+    protected fun releaseDecodedInput(bytes: Int) = synchronized(monitor) {
+        require(retainedDecodedPackets > 0 && bytes in 0..retainedDecodedBytes)
+        retainedDecodedBytes -= bytes
+        retainedDecodedPackets--
+        retainedInputBytes -= bytes
+        monitor.notifyAll()
+    }
+    protected fun clearInputRetention() = synchronized(monitor) {
+        retainedInputBytes = 0
+        retainedDecodedBytes = 0
+        retainedDecodedPackets = 0
+        monitor.notifyAll()
+    }
 
     internal fun queuedPackets(): Int = synchronized(monitor) { queue.size }
+    protected data class RetentionSnapshot(val decodedBytes: Int, val decodedPackets: Int,
+                                           val encodedBytes: Int, val encodedPackets: Int)
+    protected fun retentionSnapshot(): RetentionSnapshot = synchronized(monitor) {
+        RetentionSnapshot(retainedDecodedBytes, retainedDecodedPackets, queue.sumOf { it.bytes.size }, queue.size)
+    }
+    protected fun reservationPressure(bytes: Int): QueuePressure? = synchronized(monitor) {
+        if (queue.isEmpty()) return@synchronized null
+        val encoded = queue.sumOf { it.bytes.size }
+        val span = queue.maxOf { it.ptsUs } - queue.minOf { it.ptsUs }
+        QueuePressure(track, QueueLimit.BYTES, queue.size, encoded + retainedInputBytes, queue.size,
+            encoded.toLong() + retainedInputBytes + bytes, span, maxPackets, maxBytes, maxSpanUs,
+            detectedAtNs = causalNowNs(), incomingPtsUs = queue.first().ptsUs,
+            encodedBytes = encoded, retainedDecodedBytes = retainedDecodedBytes)
+    }
     private data class QueueObservation(val value: EncodedQueueStatistics, val oldestAtNs: Long?)
     @Volatile private var queueObservation = QueueObservation(
-        EncodedQueueStatistics(0, 0, 0, null, maxBytes), null)
+        EncodedQueueStatistics(0, 0, 0, null, maxBytes, maxPackets, maxSpanUs), null)
     internal fun queueStatistics(): EncodedQueueStatistics {
         val observed = queueObservation
         return observed.value.copy(oldestAgeMs =
@@ -78,19 +138,48 @@ abstract class TrackWorker(
             TelemetryRegistry.state("receiver", diagnosticSession, 60 + track,
                 DiagnosticKind.entries.size + 1, DiagnosticStage.SAMPLE.ordinal,
                 track, diagnosticGeneration, span,
-                detail = listOf(queue.size.toLong(), 48, queue.sumOf { it.bytes.size.toLong() },
+                detail = listOf(queue.size.toLong(), maxPackets.toLong(), queue.sumOf { it.bytes.size.toLong() },
                     maxBytes.toLong(), admittedAt.firstOrNull()?.let { (now - it).coerceAtLeast(0) / 1_000_000 } ?: -1))
         }
         if (!statisticsEnabled) return
         queueObservation = QueueObservation(EncodedQueueStatistics(queue.size, queue.sumOf { it.bytes.size },
             if (queue.isEmpty()) 0 else queue.maxOf { it.ptsUs } - queue.minOf { it.ptsUs },
-            null, maxBytes), admittedAt.firstOrNull())
+            null, maxBytes, maxPackets, maxSpanUs), admittedAt.firstOrNull())
+    }
+
+    private fun rejected(pressure: QueuePressure, packet: AccessUnit): QueuePressure {
+        val at = causalNowNs()
+        val enriched = pressure.copy(detectedAtNs = at, incomingPtsUs = packet.ptsUs,
+            encodedBytes = queue.sumOf { it.bytes.size }, retainedDecodedBytes = retainedDecodedBytes)
+        if (causalEnabled()) {
+            TelemetryRegistry.receiverRejection(diagnosticSession, diagnosticGeneration, enriched)
+            TelemetryRegistry.freezeReceiver(diagnosticSession, diagnosticGeneration, at)
+        }
+        return enriched
+    }
+
+    private fun timingAdmission(packet: AccessUnit, pressure: QueuePressure?) {
+        val timing = packet.diagnosticAudioTiming ?: return
+        val now = causalNowNs()
+        if (pressure != null) timing.pressure(now, diagnosticSession, diagnosticGeneration, pressure.limit.ordinal)
+        timing.record(now, diagnosticGeneration, packet.diagnosticPacketId,
+            if (pressure == null) DiagnosticAudioTiming.ADMITTED else DiagnosticAudioTiming.ADMISSION_PRESSURE,
+            queue.size.toLong(), retainedInputBytes.toLong())
+        if (timing.detailEnabled) {
+            val span = if (queue.isEmpty()) 0 else queue.maxOf { it.ptsUs } - queue.minOf { it.ptsUs }
+            val age = admittedAt.firstOrNull()?.let { (now - it).coerceAtLeast(0) } ?: -1
+            timing.record(now, diagnosticGeneration, packet.diagnosticPacketId,
+                DiagnosticAudioTiming.QUEUE_DETAIL, span, age)
+        }
     }
 
     fun tryOffer(packet: AccessUnit, durationUs: Long = -1): QueuePressure? = synchronized(monitor) {
         if (!running.get()) throw TrackStoppedException()
         if (causalEnabled()) inputProgress.arrival(causalNowNs(), packet.ptsUs, durationUs)
-        val pressure = budget.pressure(packet, track, 48)
+        packet.diagnosticAudioTiming?.record(causalNowNs(), diagnosticGeneration, packet.diagnosticPacketId,
+            DiagnosticAudioTiming.ADMISSION_CHECK, queue.size.toLong(), retainedInputBytes.toLong())
+        val pressure = budget.pressure(packet, track, maxPackets, retainedBytes = retainedInputBytes)
+        timingAdmission(packet, pressure)
         if (pressure == null) {
             budget.add(packet)
             queue.addLast(packet)
@@ -101,8 +190,9 @@ abstract class TrackWorker(
             publishQueueStatistics()
             monitor.notifyAll()
         }
-        diagnosticQueue(if (pressure == null) DiagnosticStage.ADMITTED else DiagnosticStage.REJECTED, packet)
-        pressure
+        val result = pressure?.let { rejected(it, packet) }
+        diagnosticQueue(if (result == null) DiagnosticStage.ADMITTED else DiagnosticStage.REJECTED, packet)
+        result
     }
 
     fun offer(packet: AccessUnit, durationUs: Long = -1) {
@@ -112,7 +202,11 @@ abstract class TrackWorker(
             if (causalEnabled()) inputProgress.arrival(causalNowNs(), packet.ptsUs, durationUs)
             while (true) {
                 if (!running.get()) throw TrackStoppedException()
-                val pressure = budget.pressure(packet, track, 48, TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - started))
+                packet.diagnosticAudioTiming?.record(causalNowNs(), diagnosticGeneration, packet.diagnosticPacketId,
+                    DiagnosticAudioTiming.ADMISSION_CHECK, queue.size.toLong(), retainedInputBytes.toLong())
+                val pressure = budget.pressure(packet, track, maxPackets, TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - started),
+                    retainedInputBytes)
+                timingAdmission(packet, pressure)
                 if (pressure == null) {
                     budget.add(packet)
                     queue.addLast(packet)
@@ -127,15 +221,21 @@ abstract class TrackWorker(
                 }
                 val remaining = deadline - System.nanoTime()
                 if (remaining <= 0 || packet.bytes.size > pressure.maxBytes)
-                    throw QueueCongestionException(pressure)
+                    throw QueueCongestionException(rejected(pressure, packet))
                 TimeUnit.NANOSECONDS.timedWait(monitor, remaining)
             }
         }
     }
 
-    protected fun next(): AccessUnit? = synchronized(monitor) {
-        if (queue.isEmpty() && running.get()) monitor.wait(2)
+    protected fun next(onEmpty: () -> Unit = {}): AccessUnit? = synchronized(monitor) {
+        if (queue.isEmpty() && running.get()) {
+            // Linearize the empty transition with admission; the callback must not block.
+            onEmpty()
+            monitor.wait(2)
+        }
         if (queue.isEmpty()) null else queue.removeFirst().also {
+            it.diagnosticAudioTiming?.record(causalNowNs(), diagnosticGeneration, it.diagnosticPacketId,
+                DiagnosticAudioTiming.DEQUEUED, it.ptsUs, it.bytes.size.toLong())
             if (admittedAt.isNotEmpty()) admittedAt.removeFirst()
             budget.remove()
             if (causalEnabled()) {

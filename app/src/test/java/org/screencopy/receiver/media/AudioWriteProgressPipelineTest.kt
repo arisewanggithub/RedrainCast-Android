@@ -6,11 +6,129 @@ import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.util.concurrent.ConcurrentLinkedQueue
 import java.util.concurrent.CountDownLatch
+import java.util.concurrent.Semaphore
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicLong
 import dev.redrain.cast.diagnostics.*
 
 class AudioWriteProgressPipelineTest {
+    @Test fun causalStartGateResetsForPendingGenerationSessionAndCapture() {
+        val gate = AudioCausalStartGate()
+        val a = AudioStartDecision(1, 1, 100, null, null, null, null, 0, 0, 0)
+        val b = a.copy(revision = 1)
+        assertTrue(gate.take(1, 1, null, a))
+        assertTrue(gate.take(1, 1, null, b))
+        assertFalse(gate.take(1, 1, null, b))
+        assertTrue(gate.take(1, 1, "capture", b))
+        assertTrue(gate.take(1, 2, "capture", b))
+        assertTrue(gate.take(2, 2, "capture", b))
+        gate.reset()
+        assertTrue(gate.take(2, 2, "capture", b))
+    }
+
+    @Test(timeout = 15_000) fun recoveryWaitRetriesDoNotOverwriteLastCausalTransition() {
+        val now = AtomicLong()
+        val entered = Semaphore(0)
+        val proceed = Semaphore(0)
+        val errors = ConcurrentLinkedQueue<String>()
+        val clock = PlaybackClock(now::get) {
+            entered.release()
+            check(proceed.tryAcquire(3, TimeUnit.SECONDS))
+        }.apply { anchorVideo(1_000_000); beginAudioRecovery() }
+        val output = object : AudioOutput {
+            override val underrunCount = 0
+            override fun play() {}
+            override fun pause() {}
+            override fun setSpeed(speed: Float) {}
+            override fun timing() = AudioOutputTiming(48000, 5760, 0, 0, 0, null,
+                AudioClockSource.HEAD_UNAVAILABLE)
+            override fun write(samples: ShortArray, offset: Int, count: Int) = count
+            override fun close() {}
+        }
+        val player = testAudioPlayer(AudioFormat("pcm", 48000, 2, byteArrayOf()), clock,
+            { code, detail -> errors.add("$code: $detail") }, { output }).apply {
+            recoveryCutoffUs = 4_000_000
+            diagnosticSession = 505
+            diagnosticGeneration = 1
+        }
+        val telemetry = ReceiverTelemetrySession({ true })
+        TelemetryRegistry.beginReceiver(505, telemetry)
+        try {
+            player.start()
+            assertNull(player.tryOffer(AccessUnit(4_000_000, ByteArray(960 * 4))))
+            assertTrue(entered.tryAcquire(3, TimeUnit.SECONDS))
+            TelemetryRegistry.freezeReceiver(505, 1)
+            clock.videoPresented(2_000_000, now.get())
+            proceed.release()
+            assertTrue(entered.tryAcquire(3, TimeUnit.SECONDS))
+            proceed.release()
+            assertTrue(entered.tryAcquire(3, TimeUnit.SECONDS))
+            val final = SessionTelemetryProtocol.parse(checkNotNull(
+                telemetry.requestFinal(true, System.nanoTime() + 1_000_000_000L)).payload)
+            val starts = final.events.filter { it.kind == CausalEvidence.KIND &&
+                it.stage == CausalEvidence.Stage.START.ordinal }
+            val first = starts.single { it.value == 1L }
+            val later = starts.filter { it.value == 2L }
+            assertEquals(1, later.size)
+            assertEquals(1L, first.detail[1])
+            assertEquals(1L, later.single().detail[1])
+            assertTrue(later.single().detail[6] > first.detail[6])
+            val capture = final.events.single { it.kind == CausalEvidence.KIND &&
+                it.stage == CausalEvidence.Stage.CAPTURE.ordinal }
+            assertEquals(0L, capture.detail[2])
+            assertEquals(1L, capture.detail[3])
+            assertTrue(errors.toString(), errors.isEmpty())
+        } finally {
+            proceed.release()
+            player.close()
+            TelemetryRegistry.end("receiver", telemetry)
+            telemetry.requestFinal(false, System.nanoTime())
+        }
+    }
+
+    @Test fun startupEvidencePreservesTransitionsAndAccountsForSuppressedRepeats() {
+        val gate = AudioStartEvidenceGate()
+        val waiting = AudioStartDecision(1, 1, 100, null, null, null, null, 0, 0, 0)
+        assertEquals(0L, gate.take(1, waiting, 0))
+        assertNull(gate.take(1, waiting, 1))
+        assertNull(gate.take(1, waiting, 2))
+        assertEquals(2L, gate.take(1, waiting.copy(reason = 4), 3))
+        assertEquals(0L, gate.take(1, waiting.copy(reason = 5), 4))
+        assertEquals(0L, gate.take(2, waiting, 5))
+        assertNull(gate.take(2, waiting, 6))
+        assertEquals(1L, gate.take(2, waiting, 250_000_005))
+        assertEquals(0L, gate.take(2, waiting, 250_000_006, "new-capture"))
+        assertNull(gate.take(2, waiting, 250_000_007, "new-capture"))
+        assertEquals(1L, gate.take(2, waiting.copy(revision = 1), 250_000_008, "new-capture"))
+    }
+
+    @Test fun startupStepCpuIsCapturedBeforeAudioOutputStarts() {
+        val cpu = AtomicLong()
+        val fixture = Fixture(threadCpuNs = { cpu.addAndGet(1_000_000) }) { _, count, _ -> count }
+        val telemetry = ReceiverTelemetrySession({ true })
+        TelemetryRegistry.beginReceiver(504, telemetry)
+        fixture.player.diagnosticSession = 504
+        fixture.player.diagnosticGeneration = 1
+        try {
+            fixture.start()
+            await { fixture.player.sourceSubmittedFrames > 0 || fixture.errors.isNotEmpty() }
+            assertTrue(fixture.errors.toString(), fixture.errors.isEmpty())
+            TelemetryRegistry.freezeReceiver(504, 1)
+            fixture.close()
+            TelemetryRegistry.end("receiver", telemetry)
+            val final = SessionTelemetryProtocol.parse(checkNotNull(
+                telemetry.requestFinal(true, System.nanoTime() + 1_000_000_000L)).payload)
+            val worker = final.events.single { it.kind == CausalEvidence.KIND &&
+                it.stage == CausalEvidence.Stage.WORKER.ordinal }
+            assertTrue(worker.detail.toString(), worker.detail[8] >= 5_000_000)
+            assertTrue(worker.detail.toString(), worker.detail[9] > 0)
+        } finally {
+            fixture.close()
+            TelemetryRegistry.end("receiver", telemetry)
+            telemetry.requestFinal(false, System.nanoTime())
+        }
+    }
+
     @Test fun audioStartDecisionIsPublishedDuringControlledWaitAndResetForNewGeneration() {
         val entered = CountDownLatch(1)
         val release = CountDownLatch(1)
@@ -73,6 +191,11 @@ class AudioWriteProgressPipelineTest {
             assertEquals(4, reset.generation)
             assertEquals(0L, reset.detail[2])
             assertEquals(-1L, reset.detail[11])
+            val retentionReset = final.state.single { it.kind == DiagnosticKind.AUDIO_OUTPUT.ordinal + 1 &&
+                it.stage == DiagnosticStage.SAMPLE.ordinal && it.detail.size == 17 }
+            assertEquals(4, retentionReset.generation)
+            assertEquals(listOf(-1L, 0L, 0L, 0L, 0L), retentionReset.detail.subList(2, 7))
+            assertEquals(-1L, retentionReset.detail[9])
             val frozenWait = final.events.single { it.kind == CausalEvidence.KIND &&
                 it.stage == CausalEvidence.Stage.START.ordinal && it.value == 1L }
             assertEquals(1L, frozenWait.detail[1])
@@ -183,7 +306,8 @@ class AudioWriteProgressPipelineTest {
                 val wait = capturedRecords(id).filter {
                     it.getString("kind") == "AUDIO_OUTPUT" &&
                         it.getJSONObject("data").optString("point") == "audio_start_wait" &&
-                        it.getJSONObject("data").optString("stage") == "sample"
+                        it.getJSONObject("data").optString("stage") == "sample" &&
+                        it.getJSONObject("data").optJSONObject("metrics")?.optString("schema") == "operation_summary"
                 }
                 assertTrue(wait.isNotEmpty())
                 val metrics = wait.map { it.getJSONObject("data").getJSONObject("metrics") }
@@ -208,7 +332,7 @@ class AudioWriteProgressPipelineTest {
             val clock = fixture.clock
             fixture.player.diagnosticSession = 9703
             fixture.player.diagnosticGeneration = 2
-            clock.prepareAudio(TrimmedAudio(0, 960, 1_000_000), 48000)
+            clock.prepareAudio(TrimmedAudio(0, 960, 1_000_000))
             assertTrue(clock.awaitAudioStart(1_000_000) { true })
             clock.anchorAudio(1_000_000) { 20_000 }
             clock.audioWritten(40_000)
@@ -397,31 +521,32 @@ class AudioWriteProgressPipelineTest {
         assertEquals(0, fixture.player.queuedPackets())
     }
 
-    @Test fun writeProgressFixDoesNotEnlargeProducerQueueOrAdmissionTimeout() {
+    @Test fun stalledOutputStillHonorsProducerQueueAndAdmissionTimeout() {
         val entered = CountDownLatch(1)
         val wait = CountDownLatch(1)
         val fixture = Fixture { _, _, _ -> entered.countDown(); wait.await(); 0 }
         fixture.use {
             it.start()
             assertTrue(entered.await(2, TimeUnit.SECONDS))
-            for (index in 1..13) it.player.offer(AccessUnit(1_000_000 + index * 20_000L, ByteArray(3840)))
+            for (index in 1..51) it.player.offer(AccessUnit(1_000_000 + index * 20_000L, ByteArray(3840)))
             val started = System.nanoTime()
             try {
-                it.player.offer(AccessUnit(1_280_000, ByteArray(3840)))
-                fail("An output retry must not enlarge the existing producer budget")
+                it.player.offer(AccessUnit(2_040_000, ByteArray(3840)))
+                fail("An output retry must not bypass the producer budget")
             } catch (error: QueueCongestionException) {
                 assertEquals(QueueLimit.PTS, error.pressure.limit)
-                assertEquals(250_000L, error.pressure.maxSpanUs)
+                assertEquals(DEFAULT_AUDIO_QUEUE_SPAN_US, error.pressure.maxSpanUs)
                 assertEquals(512 * 1024, error.pressure.maxBytes)
-                assertEquals(48, error.pressure.maxPackets)
+                assertEquals(256, error.pressure.maxPackets)
             }
             assertTrue(TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - started) in 240..1000)
-            assertEquals(13, it.player.queuedPackets())
+            assertEquals(51, it.player.queuedPackets())
             assertTrue(it.errors.toString(), it.errors.isEmpty())
         }
     }
 
     private class Fixture(waitTick: ((AtomicLong, Long) -> Unit)? = null,
+                          threadCpuNs: () -> Long = { 0 },
                           write: (TraceTrack, Int, Int) -> Int) : AutoCloseable {
         val now = AtomicLong(1_000_000_000)
         val errors = ConcurrentLinkedQueue<String>()
@@ -440,7 +565,7 @@ class AudioWriteProgressPipelineTest {
         }
             .apply { audioExpected = true; anchorVideo(1_000_000) }
         val player = testAudioPlayer(format, clock,
-            { code, detail -> errors.add("$code: $detail") }, { output })
+            { code, detail -> errors.add("$code: $detail") }, { output }, threadCpuNs = threadCpuNs)
         fun start() {
             player.start()
             val bytes = ByteBuffer.allocate(1920 * 2).order(ByteOrder.LITTLE_ENDIAN)

@@ -192,7 +192,7 @@ internal object SessionTelemetryProtocol {
 internal class SessionTelemetryCollector(private val clock: () -> Long = System::nanoTime) {
     val causal = CausalEvidence.Cache()
     private data class Operation(val row: TelemetryRow, val unknownGeneration: Boolean)
-    private val states = AtomicReferenceArray<TelemetryRow?>(64)
+    private val states = AtomicReferenceArray<TelemetryRow?>(66)
     private val operations = AtomicReferenceArray<Operation?>(16)
     private val ingress = AtomicReferenceArray<TelemetryRow?>(128)
     private val next = AtomicLong()
@@ -212,6 +212,10 @@ internal class SessionTelemetryCollector(private val clock: () -> Long = System:
         require(slot in 0 until states.length())
         val previous = states.getAndSet(slot, row.copy(detail = row.detail.toList()))
         if (previous != null) coalesced.incrementAndGet()
+    }
+
+    fun firstRejection(row: TelemetryRow) {
+        states.compareAndSet(65, null, row.copy(detail = row.detail.toList()))
     }
 
     fun operation(slot: Int, row: TelemetryRow, unknownGeneration: Boolean = false) {
@@ -261,41 +265,43 @@ internal class SessionTelemetryCollector(private val clock: () -> Long = System:
             .put("firstFailure", firstFailure.get()?.json() ?: JSONObject.NULL)
             .put("dropped", "${dropped.get()}").put("coalesced", "${coalesced.get()}")
             .put("omitted", "$omitted").put("unsent", "${unsent.get()}")
-        fun encodedSize(): Int = root.toString().toByteArray(Charsets.UTF_8).size
-        fun fits(): Boolean = encodedSize() <= SessionTelemetryProtocol.MAX_BATCH_BYTES - 32
         // This small reserved bundle is repeated, including in the terminal batch. Ordinary
         // event saturation and replacement of a periodic STATUS cannot erase the first fault.
         causal.rows().forEach { eventRows.put(it.json()) }
-        check(fits())
+        var encodedSize = root.toString().toByteArray(Charsets.UTF_8).size
+        val limit = SessionTelemetryProtocol.MAX_BATCH_BYTES - 32
+        check(encodedSize <= limit)
         val stateBudget = minOf(SessionTelemetryProtocol.MAX_BATCH_BYTES / 2,
-            (SessionTelemetryProtocol.MAX_BATCH_BYTES - encodedSize() - 32).coerceAtLeast(0))
-        val beforeState = encodedSize()
-        // Settled outcome and cleanup failure must survive state truncation.
+            (limit - encodedSize).coerceAtLeast(0))
+        var stateSize = 0
+        fun append(array: JSONArray, row: TelemetryRow, state: Boolean): Boolean {
+            val json = row.json()
+            val added = json.toString().toByteArray(Charsets.UTF_8).size +
+                if (array.length() == 0) 0 else 1
+            if (encodedSize + added > limit || state && stateSize + added > stateBudget) return false
+            array.put(json)
+            encodedSize += added
+            if (state) stateSize += added
+            return true
+        }
+        // The first rejection and settled outcomes must survive state truncation.
+        states.get(65)?.let { if (!append(stateRows, it, true)) omitted++ }
         for (i in 0 until operations.length()) {
             val row = operations.get(i)?.row ?: continue
-            stateRows.put(row.json())
-            if (encodedSize() - beforeState > stateBudget || !fits()) {
-                stateRows.remove(stateRows.length() - 1)
-                omitted++
-            }
+            if (!append(stateRows, row, true)) omitted++
         }
-        val ordered = listOf(60, 63) + (0 until 62).map {
+        val ordered = listOf(60, 63, 64) + (0 until 62).map {
             val index = (stateOffset + it) % 62
             if (index >= 60) index + 1 else index
         }
         for (i in ordered) {
             val row = states.get(i) ?: continue
             if (stateRows.length() >= 64) { omitted++; continue }
-            stateRows.put(row.json())
-            if (encodedSize() - beforeState > stateBudget || !fits()) {
-                stateRows.remove(stateRows.length() - 1)
-                omitted++
-            }
+            if (!append(stateRows, row, true)) omitted++
         }
         stateOffset = (stateOffset + 1) % 62
         while (pending.isNotEmpty() && eventRows.length() < 64) {
-            eventRows.put(pending.first().json())
-            if (!fits()) { eventRows.remove(eventRows.length() - 1); break }
+            if (!append(eventRows, pending.first(), false)) break
             pending.removeFirst()
         }
         if (final) {

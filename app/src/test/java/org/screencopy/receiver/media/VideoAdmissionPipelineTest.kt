@@ -302,12 +302,16 @@ class VideoAdmissionPipelineTest {
         val output = TransitOutput(now, transitUs)
         val decoders = CopyOnWriteArrayList<BoundedDecoder>()
         val errors = ConcurrentLinkedQueue<String>()
+        val statuses = ConcurrentLinkedQueue<String>()
+        val events = ConcurrentLinkedQueue<String>()
         val corrections = ConcurrentLinkedQueue<AudioClockCorrection>()
         val expectedPts = mutableListOf<Long>()
         val pcmFrames = 48000 / fps
         var sourceFrames = 0L
         var generation = 1L
         ReceiverServer.forProtocolTests("Receiver", onFailure = { errors.add(it.logMessage()) },
+            onStatus = { title, detail -> statuses.add("$title: $detail") },
+            onDiscoveryDiagnostic = events::add,
             clockFactory = { clock },
             videoFactory = { format, shared, failed, epoch ->
                 assertEquals(1080, format.width)
@@ -364,7 +368,8 @@ class VideoAdmissionPipelineTest {
                             " source_frames=$sourceFrames written_frames=${output.written.get()}" +
                             " decoder_inputs=${decoders.map { it.inputs.get() }}" +
                             " decoder_rendered=${decoders.map { it.rendered.get() }}" +
-                            " decoder_closed=${decoders.map { it.closed }} receiver_errors=$errors"
+                            " decoder_closed=${decoders.map { it.closed }} receiver_errors=$errors" +
+                            " receiver_statuses=$statuses receiver_events=$events"
                     }) {
                         assertTrue("Real-time stream scenario exceeded its 30-second budget",
                             now() - scenarioStart < TimeUnit.SECONDS.toNanos(30))

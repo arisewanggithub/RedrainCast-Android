@@ -1,15 +1,52 @@
 # Remote diagnostics control contract v2
 
 The live collector connects **only to the sender**, over a locally opted-in,
-plaintext and unauthenticated LAN listener. Use a trusted LAN. START arms the
+plaintext and unauthenticated listener on eligible LAN and VPN IPv4 addresses.
+Any reachable LAN or VPN peer can control captures and read diagnostic metadata;
+the TCP listener does not authenticate or filter peers, including routed or
+forwarded connections. Use only trusted networks and do not forward the port.
+START arms the
 next cast; it cannot attach to an existing cast. The receiver supplies evidence
 through a token-bound diagnostic lane on its existing cast listener, not a
 separate diagnostic listener or advertised endpoint. Peers must implement the
 proxy capability; there is no v1 fallback. A failed bootstrap stops the armed
 attempt before media. Ordinary, unarmed casts do not wait for diagnostics.
+For historical captures only, see the [archived v1 transport and delegation
+contract](REMOTE_DIAGNOSTICS_V1_ARCHIVE.md); it is not a current collection guide.
+
+## Sender endpoint discovery
+
+With the sender listener enabled, TCP binds each eligible private Wi-Fi/Ethernet
+IPv4 and, when the active network is a VPN, each eligible VPN IPv4. The optional
+responder binds those addresses on UDP 27184. Send one unicast query to a known
+sender LAN or VPN IPv4 address,
+not a scan. The request is exactly 256 bytes: UTF-8 JSON padded with spaces,
+with exactly `{"protocol":"redraincast-diagnostics","version":1,"nonce":"<32 lowercase hex digits>"}`.
+The response is at most 256 bytes and contains the same protocol, version and
+nonce plus `"diagnostic":{"version":2,"port":<TCP port>,"access":"lan"}`.
+The port is an integer in 1–65535. The discovery envelope version 1 is separate
+from the diagnostic control version 2. The responder accepts site-local IPv4
+sources on LAN bindings and unicast IPv4 sources on VPN bindings (and loopback
+in loopback tests), and replies no more than once per 250 ms per binding.
+It sends nothing for malformed queries or without a live endpoint;
+failure to bind discovery does not close the TCP listener. The hint is
+unauthenticated, does not enable consent, sampling or identify a device, and
+has no receiver endpoint or receiver-discovery fallback.
+
+The app verifies each address belongs to the reported live interface and fails
+closed on duplicate or unverifiable bindings. Changes to the active network,
+selected addresses, or interfaces, when observed by the listener's 100 ms
+checks or command/discovery gates, revoke consent and close all sockets rather
+than silently rebinding. A transient change entirely between checks may not
+be observed. Re-enable explicitly after revocation. VPN
+reachability depends on the VPN's routing and policy; an endpoint is not proof
+that a remote collector can reach it. No listener is bound to the wildcard address.
+
+## Control framing and commands
 
 The collector uses UTF-8 JSON lines, `v:2`, a 16,384-byte line limit and
-canonical nonnegative decimal strings for int64 values. Requests are limited to
+canonical nonnegative decimal strings for request int64 values. Signed metric
+values such as delays and offsets use signed decimal strings. Requests are limited to
 depth 8; paired FETCH responses to depth 11. A source-record subtree is limited
 to depth 7, and receiver lane frames to depth 8. Normal source records are at
 most 2,048 bytes; selected `video.timing` records at most 12,000 bytes.
@@ -18,6 +55,35 @@ All encoded responses, including errors and their newline, share the rolling
 20-command-per-second request budget. Capacity is reserved for an explicit
 sanitized error; if no error fits, the listener closes the connection.
 Unknown operation names are not reflected in the response `op` field (null).
+
+Each LF-terminated line is one JSON object. The listener rejects malformed
+UTF-8/JSON, duplicate keys, non-object roots, excess depth and oversized or
+truncated lines. A request has exactly `v`, `id`, `op`, `args`: `v` is integer
+2, `id` matches `[A-Za-z0-9_-]{1,64}`, `op` is a string of 1–64 characters,
+and `args` is an object containing exactly the fields required by the command.
+Numbers required to be integers must be JSON integer tokens in signed 32-bit
+range, not strings, Booleans or fractional/exponent forms. Request int64
+strings are `0` or a nonzero digit followed by digits, within signed int64
+range. HELLO precedes all other commands; duplicate IDs cannot repeat effects
+and at most 4,096 IDs are retained per connection. The request budget is 20
+commands per second with a burst of 20.
+
+Responses have `v:2`, `id`, `op`, Boolean `ok`, and exactly one of `result`
+or `error`; errors contain controlled `code` and `message`. Invalid identifiers
+and unknown operations can be echoed as null. Unsupported versions, invalid
+framing and HELLO-before-state violations close the connection as applicable;
+invalid arguments do not authorize a partial START. HELLO is not authentication.
+Responses, including the newline, must fit the 16,384-byte frame limit.
+
+The sender supports `session`, `recovery`, `audio.capture`, `audio.transport`,
+`audio.queue`, `video.progress`, and `transport.health`. The receiver supports
+`session`, `recovery`, `audio.transport`, `audio.queue`, `audio.output`,
+`video.progress`, `video.timing`, `transport.health`, `tail.details`, `audio.timing`,
+and `audio.timing.work`.
+`video.timing` requires `video.progress`; `tail.details` is optional and is
+not selected by the collector by default. `audio.timing` is independently
+selected and also excluded by default. `audio.timing.work` requires `audio.timing`
+and is separately opt-in, excluded by default. Explicit flag requests are strict.
 
 | Operation | Arguments | Purpose |
 |---|---|---|
@@ -29,6 +95,61 @@ Unknown operation names are not reflected in the response `op` field (null).
 | `FETCH` | `pairId`, `afterSenderSeq`, `afterReceiverSeq`, `limit` | Fetch up to 32 fairly interleaved source envelopes and per-role cursors/loss. |
 | `END` / `CLEAR` | `pairId` | Freeze / clear the pair. |
 | `PING` | none | Check liveness without extending any lease. |
+
+START requires exact integer `durationMs` in 1,000–180,000 and
+`samplePeriodMs` in 100–5,000. Each flag array contains 1–16 distinct,
+nonempty strings of at most 64 characters, supported for that role.
+`target` contains only Boolean `nextSession:true`. FETCH's `limit` is an
+integer in 1–32; its cursors are canonical nonnegative decimal int64 strings.
+The lease starts at START, including waiting for the cast.
+
+### FETCH pagination and drain
+
+The result has a shared `records` array and separate `sender` and `receiver`
+page objects. `receiver` is null until receiver intake exists; it is not an
+empty, complete receiver capture. For each present role:
+
+| Field | Type and meaning |
+|---|---|
+| `oldestSeq` | Decimal string: oldest retained source sequence, or `"0"` if none. |
+| `latestSeq` | Decimal string: sender's contiguous drained publication watermark, or receiver intake's committed source-sequence watermark. It is not necessarily the latest retained record; receiver source `publishedSeq` can be greater. |
+| `nextAfterSeq` | Decimal string: last record from that role actually included in this response, or that role's requested cursor when none was included. |
+| `hasMore` | Boolean: retained records for that role remain after its returned cursor, including records omitted by the shared count or byte limit. |
+| `pendingRecords` | JSON integer: sender publication tickets not yet drained in order, or receiver intake records still staged. It is separate from retained backlog and terminal confirmation. |
+
+Advance `afterSenderSeq` and `afterReceiverSeq` independently to their
+respective `nextAfterSeq`; do not advance a role without its returned record.
+Records are fairly interleaved but ordered by source sequence within each role;
+the shared `limit` and response byte bound can yield fewer than requested.
+An empty role on a page may still have `hasMore` when the other role used the
+page; an entirely empty response claiming `hasMore` is rejected by the
+collector. Cursors and sequence numbers are source-local, not media packet
+identities.
+
+After freezing, retrieval is drained only when **every present role** reports
+both `hasMore:false` and `pendingRecords:0`. An empty page with pending work
+is not completion: retain both cursors and retry with pacing, delivery-budget
+limits and the original frozen deadline. Exhaustion, stalled producers or an
+unavailable receiver cannot be called a complete paired capture. Draining
+alone does not establish receiver terminal confirmation or lossless evidence.
+
+The sender page has decimal-string `droppedBeforeRetention` and
+`evictedAfterRetention` plus compact `lossWatermarks`. The receiver page has
+nullable compact `sourceLoss` and three separate loss objects:
+`intakeLoss` counts source tickets rejected at sender proxy staging admission;
+`forcedLoss` counts staged tickets discarded at a forced intake cutoff;
+`retentionLoss` counts tickets evicted after sender intake retention. Each
+object has decimal `count`, nullable decimal `firstSeq`/`lastSeq`, and Boolean
+`exactRange`: zero count has null endpoints and false; an inexact nonempty
+envelope is not a contiguous loss assertion. Do not combine these with source
+admission/retention loss or infer lossless capture from their absence.
+
+The receiver page also carries `state` (`active`, `finishing`, `finished`),
+nullable decimal `cutoffOrdinal`, Boolean `endConfirmed`, and nullable
+`terminal` containing `reason`, `tailTruncated`, and optional `tailDetails`.
+These describe intake cutoff and terminal evidence, not the separate detailed
+receiver outcome in STATUS. A missing, unconfirmed or truncated terminal is not
+proof of cleanup or successful completion.
 
 Each FETCH record wraps the unchanged source record with `role`, source
 `session` (null when unbound), `captureId` and `clockId`. Pair state and
@@ -49,7 +170,210 @@ It retains the same values: each admission reason is
 Preserve source, intake and
 retention loss and terminal/truncation information; missing evidence is not
 proof that no loss occurred. Frozen pair data is retained for up to 120 seconds
-while consent remains enabled. Consent revocation clears it.
+from freeze while consent remains enabled; reconnect, FETCH and PING do not
+extend the deadline. The current collector cannot reattach. A separate v2
+client may HELLO on a new connection, query STATUS without a pair ID and FETCH
+a frozen pair by its returned ID, preserving both independent cursors and
+existing output. Active pairs remain owner-restricted; reconnect is not an
+active-session attach. Consent revocation clears retained data.
+
+### Audio timing
+
+`audio.timing` selects only the original v1 trace. To include worker boundaries,
+explicitly select both `audio.timing` and `audio.timing.work` through the existing
+receiver flag offer. Collector HELLO advertises the sender's accepted receiver
+flags; an older sender lacking `audio.timing.work` is rejected by explicit
+collector selection before START. The sender offers the exact selected set and
+requires the receiver's HELLO capabilities to contain it; an older receiver
+lacking work support fails setup with `UNSUPPORTED_CONFIG`, before lane/media
+startup. Work without base timing is invalid at START and receiver offer
+validation. No proxy revision change or new listener is used.
+The additional explicit `audio.timing.detail` flag requires both flags above.
+Older peers reject its selection during negotiation rather than silently
+accepting an incompatible record. It is not in the default selection.
+The additional `audio.timing.owner` flag requires detail and is supported only
+for an explicitly admitted paired receiver capture. It is opt-in and both
+peers must advertise it; an older peer rejects the selection.
+The receiver has a separate preallocated 1,024-slot numeric buffer (about
+56 KiB of primitive arrays), in addition to the existing recorder staging
+budget. Producers make bounded atomic attempts and do not perform diagnostic
+I/O. Capture closure fences new producers; pending producers and unknown tail
+must not be interpreted as complete coverage.
+
+The `AUDIO_TIMING` source record has `data.schema:"audio_timing_v1"` (types
+1–21 only), `"audio_timing_v2"` (types 1–24), or
+`"audio_timing_v3"` (selected detail only, types 1–29), or
+`"audio_timing_v4"` (selected owner only, types 1–31), with
+1–8 event arrays `[eventSeq,monoNs,generation,packetId,type,value1,value2]`.
+Int64 values are canonical decimal strings; generation and type are integers.
+Event sequences are capture-local, may arrive out of timestamp order, and
+can have gaps. `attempted`, `dropped`, `droppedBeforeSequence`, and
+`batchDropped` are cumulative counts, not source RECORD sequences. Counter
+snapshots are not atomic: loss is read before `attempted` so `dropped` and
+`batchDropped` cannot exceed it, including while admitted producers retire.
+`droppedBeforeSequence` is independent and can exceed `attempted`. Each
+encoded source record is at most 2,048 bytes. These batches share the existing
+proxy and collector traffic budgets.
+
+Types are: 1 receipt (`ptsUs`, bytes); 2 admission check (queue packets,
+retained input bytes); 3 admitted (same measurements); 4 admission pressure
+(same measurements); 5 dequeue (`ptsUs`, bytes); 6/7 RAW decode
+begin/end (`ptsUs`, input bytes/output samples); 8 AAC input (`ptsUs`, bytes);
+9 AAC output (`ptsUs`, bytes); 10 trim (input frames, remaining frames);
+11 preroll replacement (old/new PTS); 12/13 output write request/result and
+14/15 silence write request/result (requested samples and buffered
+frames/accepted samples); 16 stale or trimmed drop (`ptsUs`, bytes or zero);
+17 output progress (submitted, consumed frames); 18 output presentation
+(presented frames, buffered microseconds); 19/20 Opus decode begin/end
+(`ptsUs`, input bytes/output samples); 21 decoded FIFO drop (discarded,
+remaining frames). Types 22/23/24 are worker work begin/end/failed
+(`workStage`, cumulative current-thread CPU nanoseconds, or -1 if unavailable).
+Work stages are 1 pending preparation (fresh recovery trim, clock preparation,
+and associated trim diagnostics), 2 start gate, 3 resampling/source FIFO mapping
+(including compensation and callbacks), 4 playback `play()` call,
+5 output refill, 6 output timing query, 7 start-decision diagnostics callback,
+8 other callbacks/diagnostic reporting, 9 underrun observation/query, 10 source
+clock anchoring, 11 resampler compensation, 12 startup submission (pending
+cleanup through source anchoring, resampling, playback start and initial
+underrun observation). Preparation ends even when no video is available or
+all frames are trimmed; that does not imply gate entry. Gate end does not
+imply permission to start: retries/cancellation can return normally.
+Failed boundaries indicate an escaping exception, not successful completion.
+The first-submission callback's existing outer stage 8 contains two adjacent
+nested stage-8 intervals, in fixed order: playback-lock acquisition, then
+critical section. The first ends immediately after acquisition; the second
+ends inside the monitor before release. CPU snapshots belong to the calling
+audio epoch, including retired callbacks. Neither interval identifies a lock
+owner or distinguishes descheduling from monitor contention by itself. Other
+stage-8 callbacks do not have this fixed pair; identify first submission using
+the surrounding first source write and intact nesting, not stage 8 alone.
+
+Types 30/31 are playback-monitor owner begin/end. `packetId` is zero;
+`value1` is the numeric Java thread ID and `value2` is a positive,
+capture-local span ID. Match begin/end by capture, generation, thread ID and
+span, and compare their monotonic timestamps with the callback acquisition
+interval. Each complete pair records an interval actually inside the existing
+`playbackLock` monitor; it is not the full hold time and overlap with a callback
+wait does not prove that the callback was blocked rather than descheduled.
+Nested/reentrant intervals can overlap and must not be summed. Java thread IDs
+are not necessarily OS TIDs used by Perfetto; correlation requires independent
+evidence. No thread names or payloads are added.
+
+Coverage is best effort, not a complete owner history: a hold already in
+progress when capture starts, an acquisition before an audio generation exists,
+capture revocation/closure, a lost boundary, and undrained or saturated buffers
+all leave ownership unknown. Never infer an owner from an unmatched endpoint,
+a gap, or the absence of an interval, and do not extrapolate beyond a matched
+pair. Inspect all loss counters and incomplete tails. Instrumentation may
+perturb timing; owner events contend for the same bounded trace capacity and
+can cause other evidence to be dropped. With the opt-in disabled, monitor acquisitions
+perform a gate check but allocate no ownership events. Existing sampled trace
+overhead does not isolate the cost of owner instrumentation.
+
+With both `audio.output` and work selected, recovery begin/end and detach also
+emit ordinary `AUDIO_OUTPUT` records at point `recovery`, stages
+`config`/`settled`/`reset` respectively. Existing `ptsUs`, `cutoffUs`, and `count`
+carry the base PTS, base monotonic ns (not a trim cutoff), and mapping revision.
+The existing `audio_clock_observation` metrics retain the cached observation
+and its native timestamp/progress. Detach retains the final observation sampled
+by the existing retirement path before clearing the source; begin/end use the
+latest cached observation, not an additional native query. Absent metrics mean
+no coherent observation. Record monoNs is publication time; observation atNs
+and the causal mapping transition identify the separately sampled state.
+Compare observation age, progress counters and base mapping across epochs to
+locate accumulated lag. Missing/stale records are not proof of a clock fault.
+Without detail, strict older work-v2 validators accept the same envelope and
+stage range.
+
+Detail v3 adds work stage 13 (PCM/Opus decoder or AAC pump) and 14 (actual
+AudioTrack write call); stage 6 times the overall output timing query and stage
+2 the startup gate. Event 25 is queue PTS span in microseconds and oldest
+admission age in nanoseconds at admission check; -1 means unavailable or empty.
+Event 26 is the active output buffer size in frames and last sampled underrun
+count (-1 if unavailable); event 28 is native AudioTrack maximum capacity in
+frames (-1 for another output), accompanying progress/presentation events.
+Event 29 contains requested and accepted write frames. Older request and result
+events use samples; divide by channel count to obtain frames.
+Event 27 samples approximately one in 128 work starts: wall and thread CPU
+nanoseconds spent sampling the first boundary and recording it. It excludes
+the second sample, this event, aggregation, transport, queue scans and the rest
+of tracing; it is not total overhead. Compare runs with and without tracing.
+All records remain numeric, bounded and share the existing pressure window,
+loss counters and explicit unknown-tail semantics.
+
+Work boundaries are nested and synchronous on the audio worker; closing-caller
+teardown timing/reporting does not emit worker CPU boundaries. Pair by
+generation, packet ID, stage and nesting in event-sequence order, only when
+coverage is intact; loss can remove either endpoint. Wall duration is the
+receiver-local monotonic difference; CPU duration is the difference of two
+nonnegative CPU snapshots on that same worker. Wall minus CPU includes waits,
+scheduling and instrumentation overhead, not proof of any one cause. Nested
+durations overlap and must not be added. Begin/end sampling itself adds small
+overhead; snapshots are not simultaneous. Start-decision callback boundaries
+separate diagnostic work inside the gate from deliberate gate waits.
+
+Batches containing work boundaries use v2 only when `audio.timing.work` was
+selected; batches with only original types remain v1. Receiver producers skip
+work tracing (including CPU snapshots) when that flag is absent; the bounded
+buffer also ignores unselected work before consuming sequence/loss budget.
+Updated sender and collector validators accept v2 only for the explicit work
+selection and reject unsolicited v2 schemas and unknown event/stage IDs.
+An older sender selecting only `audio.timing` from a new receiver gets v1,
+never automatic work events. Updated peers can still select legacy v1 timing;
+there is no silent downgrade of an explicit work request. Unarmed casts,
+non-opt-in captures and original event meanings are unchanged. Packet ID zero is
+unknown: AAC output and device writes do not establish source-packet
+attribution. Resampling and output work also use zero when the caller has no
+retained packet identity; adjacency to a packet is not write attribution.
+Existing output progress remains separate; no event proves sound
+was audible.
+
+The first failed admission or decoded-input reservation claims one
+capture-scoped marker separately from the ordered recorder queue. Negotiated
+`AUDIO_PRESSURE` lane metadata carries receiver `monoNs`, session, generation,
+and numeric reason: 0 packet limit, 1 bytes, 2 PTS span, 3 decoded-byte
+reservation, 4 retained-packet reservation. It has no source sequence.
+Transmission is best effort, checked before routine batches and during the
+existing retirement grace, including an accepted peer's fatal ERROR without
+session telemetry when `audio.timing` was selected. Until sent, selected
+captures reserve one existing delivery slot and 512 bytes for the marker; the 256-record/128-KiB rolling
+limits are unchanged. The receiver page's `audioTiming.marker` is null
+if it was not received. Repeated identical markers are deduplicated.
+
+Sender intake holds at most 768 KiB of timing source envelopes, separately
+from its existing staging budget. Before a marker it keeps rolling history;
+after one it retains batches intersecting the receiver-local
+`[marker-5s, marker+10s]` interval, including late-arriving batches, subject to
+that finite cap. Whole batches can extend beyond the interval. `audioTiming`
+reports retained bytes, actual oldest/latest event timestamps, requested window,
+eviction count and sequence envelope, and `tailUnknown`. Missing markers,
+sequence gaps, evictions, incomplete terminal information and disconnects
+prevent a guarantee of the requested window. FETCH source cursors remain
+ordered and never replay earlier records when a marker arrives.
+
+### Recorder bounds and reserves
+
+Each source recorder uses a 1,024-slot staging ring. Routine submissions are
+limited to 896 outstanding slots, leaving 128 for priority work. Nonterminal
+priority submissions are further limited to `1024 - reservedFinalSummaryRecords
+- 1`; final summaries may use all but the last slot, reserved for the terminal.
+`reservedFinalSummaryRecords` is computed from diagnostic kind and point counts,
+video stage count, and one additional summary; HELLO limits report its value.
+Retention holds at most 4,096 records / 2 MiB: routine records have 3,584
+records / 1.5 MiB and critical records 512 records / 512 KiB. Routine retention
+cannot evict critical records. These are bounded reserves, not guarantees of
+lossless delivery; staging admission and retention evictions are reported.
+
+Receiver proxy intake reserves eight of its existing 64 staging slots and
+32 KiB of its existing 256 KiB staging byte budget for lifecycle, session, recovery and
+failure/pressure records. The terminal reservation is unchanged. This is
+bounded protection, not a guarantee under critical saturation; intake and
+later retention losses remain reported separately.
+Worker CPU intervals begin at startup step entry when diagnostics are active.
+The existing bounded worker checkpoint records phase and in-flight step times.
+Wall time minus thread CPU includes blocking, locks, GC and scheduling; it
+does not distinguish runnable from blocked time. Resolve that distinction
+with OS scheduler tracing if needed.
 
 When an admitted receiver ends without a validated lane ENDED, STATUS retains
 a sender-reconstructed receiver outcome with `confirmed:false`, null `reason`
@@ -58,6 +382,70 @@ and `endedNs`, unknown retirement and ownership, and a truncated, incomplete
 An unadmitted receiver remains unavailable with no outcome. FETCH retains only
 its existing compact terminal confirmation; unconfirmed or truncated coverage
 is a collection failure.
+If receiver coverage is lost after bootstrap, the sender continues collecting
+until its own retirement or the existing lease/terminal deadline; the final
+pair reason remains `coverage_lost` when sender retirement completes first.
+
+The collector emits `sequence_completeness` separately from terminal
+confirmation. Per role it reports the count and up to 32 ranges of missing
+published sequence tickets, including a final known tail; additional ranges
+are counted. Previously fetched tickets remain observed even if subsequently
+evicted. The receiver's source-loss `publishedSeq` can exceed the last ticket
+relayed by the proxy; the collector uses that known watermark to account for
+missing trailing tickets, including when a later critical record was delivered.
+This does not establish lossless capture: admission
+drops have no ticket, and an unconfirmed or truncated receiver tail may have
+an unknown extent. Inspect the separate loss and terminal evidence as well.
+
+The optional receiver flag `tail.details` negotiates the extended ENDED
+schema; it is opt-in so old peers continue to use the exact legacy frame.
+The canonical collector does not select it by default: for a receiver known
+to support it, include `tail.details` in `--receiver-flags` alongside the
+other desired receiver flags. Requesting it from an older receiver can make
+the diagnostic setup fail rather than silently downgrade.
+It reserves one record, one delivery slot and 4096 bytes within the existing
+delivery window for a failed SESSION record, as well as the unchanged ENDED
+reservation. Other failed records, including operation failures, cannot consume
+that reservation. When earlier records cannot fit, the bounded scan may skip
+them to deliver a later failed SESSION record in source-sequence order.
+`tailDetails` reports `cause` (`budget`,
+`deadline`, or `source_pending`), `stage` (`delivery` or `source`), the
+nullable envelope `unsentFirstSeq`/`unsentLastSeq`, and
+`observedUnsentCount`. The envelope can include delivered records and is not
+an exact contiguous loss range; pending or deadline-expired records may not
+have been counted. A deadline reached before a terminal can be written still
+leaves coverage unconfirmed rather than inventing a cause.
+
+An audio queue rejection captures detection time, incoming PTS and the
+encoded/retained-decoded byte split while holding the admission monitor. Its
+first-fault causal cache is frozen at detection, with each checkpoint's own
+identity and timestamp. The independently produced worker, clock and output
+checkpoints are not a globally atomic snapshot.
+
+Audio startup decisions emit the first sample of each capture and each
+reason/mode/flag, target, mapping-revision or generation transition,
+including READY and FAILED. Repeated unchanged samples
+are limited to one per 250 ms per player; `omittedRepeats` counts repeats
+since the prior emitted sample. Normal recorder admission and retention loss
+still apply.
+Under audio-led initial startup, `firstVideoUs` and `releasedVideoUs` can be
+null even when audio is READY or playing. A missing first-video timestamp is
+not itself an audio-start gate; compare decision, source-clock observations
+and the audio work intervals rather than inferring a video wait. Existing
+captures from older builds may reflect the former first-video gate.
+
+`audio_clock_observation` samples active output at most every 250 ms and
+includes one clock observation sequence, source sample and mapped PTS,
+submitted/consumed/presented frames, native timestamp/frame and applied
+offset. Video scheduling examples carry that same coherent observation inline
+and its sequence, including when a later sampled event is not retained. The
+snapshot describes the timing read, not independent samples from later
+checkpoints; it does not prove scheduler behavior.
+
+For `PREPARATION_TIMEOUT`, newer control terminals optionally carry the typed
+`preparationTimeout` phase, elapsed nanoseconds and active producer count;
+the sender validates and preserves these in `terminal_coverage`. Older peers
+without the optional detail remain accepted.
 
 After successful normal STOP retirement, the receiver opportunistically flushes
 ENDED asynchronously within the existing maximum 100 ms retirement window;
@@ -65,642 +453,77 @@ control acknowledgement and ownership cleanup do not wait for this flush.
 If the lane cannot deliver in that window, it closes and the outcome remains
 unconfirmed and truncated.
 
+Fatal retirement now uses the same bounded asynchronous window once media
+retirement has been attempted, including a failed retirement. Previously its
+cleanup closed the proxy lane immediately after requesting the flush; that race
+could discard the terminal and tail. Routine receiver-lane egress reserves one
+slot and 16,388 bytes of the existing rolling budget for ENDED; it does not
+raise the 128-KiB/s limit. If the tail cannot fit, ENDED may still report
+truncation. A blocked writer, expiry, unretired media or lost lane can still
+prevent confirmation. The observed Galaxy capture had receiver source sequence
+3900 but intake only through 3837 and no validated ENDED; these data do not
+prove which of the close race, delivery budget, or another interruption occurred.
+
+The rate-limited `audio_start_decision` includes clock sample and later queue
+sample times, observation sequence/time/source PTS, output source, native
+timestamp time/frame and applied source offset/correction sequence. Null means
+unavailable. The sequence identifies receiver clock observations, not native
+timestamp updates: repeated native time/frame values can accompany new clock
+observations. Compare successive observation sequences to distinguish reuse;
+compare native time/frame separately, and inspect timestamp age/source for
+staleness or fallback. Clock fields are captured together under the playback
+clock lock; queue and retained counts are collected afterwards and are not an
+atomic snapshot with it or necessarily with each other. These are session-local
+timing and frame counts, not device identifiers or audio content.
+`queueSampledAtNs` is read after the queue snapshot, not an exact timestamp
+of each constituent count; preemption can enlarge that uncertainty.
+
+For symptom-led collection, clock correlation and interpretation, see the
+[troubleshooting runbook](../TROUBLESHOOTING.md). Missing observations,
+coalescing, rate limits and retention loss are not evidence of absence.
+
+Live `SESSION/FAILED` records carry `terminal_failure` metadata: `cause` is
+the numeric automatic-telemetry terminal cause vocabulary and `origin` is the
+receiver failure-origin ordinal (null for the sender's retained outcome).
+Unknown causes map to zero. The receiver record is its first classified failure;
+the sender record is its retained outcome at cleanup. Neither includes
+peer-provided messages or other arbitrary text. Cause ordinals are UNKNOWN,
+VERSION, BUSY, UNSUPPORTED_CONFIG, PROTOCOL, CAPTURE_FAILED, AUDIO_FAILED,
+DECODER_FAILED, TIMEOUT, CONGESTION, INTERNAL (0 through 10). Receiver origins
+are AUDIO, VIDEO, SESSION, PEER, CLEANUP, PRESENTATION (0 through 5).
+On receipt of a negotiated control terminal the sender also emits
+`SESSION/SAMPLE` with `terminal_coverage`: final sequence, cleanup outcome
+and typed skip reason, each null if absent. Receipt of a sequence alone is
+not proof that its matching final batch was received.
+
+Overhead measurement: inserting representative new values into one retained
+Galaxy `audio_start_decision` JSON source record increased its UTF-8 size from
+633 to 956 bytes (+323 bytes; synthetic values, no framing). Values vary.
+The JVM recorder fixture measured 607 to 865 bytes (+258 bytes).
+Unchanged audio-start decisions are sampled no more often than once per
+250 ms per player; changed decisions bypass that repeat gate, so there is no
+four-records-per-second upper bound. Each record remains subject to the
+2,048-byte source-record limit; the automatic state adds ten numeric
+details to one existing slot and remains within the existing 8,192-byte batch
+limit. This is a byte-size measurement, not an on-device CPU, allocation,
+latency or playback-impact measurement; those remain unmeasured.
+
 After a validated receiver ENDED or lane closure starts the ordered intake
 cutoff, STATUS reports the receiver role as `finishing` until that cutoff is
 accounted and the outcome is published. FETCH's intake state may advance
 independently while that final publication is pending. The receiver-role state
 in STATUS and FETCH is `unavailable`, `active`, `finishing`, or `finished`.
 
-The following archived v1 material is retained only as historical background
-and for its event/metric schema descriptions. Its transport, API commands,
-examples, endpoint discovery, validation claims and capture workflows do
-**not** describe the v2 implementation above.
-
-<details>
-<summary>Archived v1 material (not the current live protocol)</summary>
-
-# Remote diagnostics control contract v1 (archived)
-
-Status: implemented in the Android source and available starting in v0.5.0.
-One 180-second paired LAN capture with the latest debug build completed without
-disconnect, recovery or a sustained freeze. This single run is not broad
-LAN/lifetime acceptance or a physical sender/projector overhead/display
-measurement; those remain required before a nonperturbing-performance claim.
-This is a separate diagnostic service, not an extension of SCPY media/control framing.
-It must not change casting behavior or require both casting peers to support it.
-The approved, integration-in-progress [automatic session telemetry
-replacement](PRESSURE_INCIDENTS.md) instead uses the admitted cast control
-connection and sender-owned reports; it does not enable this listener or use
-this service's frozen-capture retrieval. The 120-second retrieval rules below
-apply only to this separately consented live diagnostic service.
-
-**Intentional revised, unreleased v1 draft:** local opt-in now authorizes
-unauthenticated, unencrypted LAN TCP diagnostics without manual pairing. This
-replaces the earlier TLS/AUTH draft, not an automatic downgrade or fallback.
-Anyone on the LAN can read controlled metadata, occupy the single collector
-slot, and start/end/clear diagnostic captures while enabled. There is no proof
-of device identity, confidentiality, peer authentication, or protection from
-on-path alteration/denial of diagnostics. Use only a trusted LAN and disable
-after use. The sender's local consent also delegates receiver access for its
-normally admitted cast, without a receiver settings change. Receiver-local
-explicit access remains available independently. No media or casting control is exposed.
-
-## Local consent and lifetime
-
-- Settings expose an independent **Allow unpaired LAN
-  diagnostics** switch, off by default. The detailed risk warning is available in
-  **LAN diagnostics endpoint / status**. The switch alone authorizes the local
-  diagnostic listener. Delegated receiver access is described below.
-  LAN permission remains required where applicable.
-- Enabling access starts only the listener and HELLO machinery. It does
-  not enable additional media instrumentation, event history or disk logging.
-  Existing ordinary application logging/statistics are unaffected.
-- The UI displays the endpoint, unauthenticated LAN access warning and whether
-  a collector/capture is active. No certificate, pairing secret or fingerprint exists.
-- Local access is process-local, not persisted across app restarts. Turning diagnostic
-  access off stops local collection, closes its sockets and clears its history.
-  On a sender it also sends delegated revocation to the admitted receiver; that
-  receiver freezes same-cast evidence for up to 120 seconds rather than continuing sampling.
-  UI recreation must not accidentally enable access or duplicate the listener.
-- A sender may be backgrounded while casting. Backgrounding or changing the
-  statistics setting or overlay does not revoke consent. A receiver must remain diagnosable after casting fails.
-- A compatible receiver honors the admitted sender's negotiated diagnostic flag
-  for that single cast without requiring local receiver statistics/remote opt-in.
-  Accepting a cast with this flag intentionally opens bounded LAN metadata
-  access. It never modifies saved receiver settings or bypasses OS permission.
-- Capture is a bounded lease: at most 180 seconds per START. There is no automatic
-  renewal, automatic capture on connection or silent capture of the next cast.
-  The collector must explicitly START again after expiry.
-
-## Transport and access
-
-- Use a separate plain TCP listener. There is intentionally no encryption,
-  certificate, credential or authentication. The collector requires explicit
-  `--lan` acknowledgment and sends HELLO; no implicit downgrade/fallback is allowed.
-- Bind only the intended local-network interfaces, never automatically expose
-  through port forwarding, and display the actual bound endpoint/port.
-  Optional receiver discovery advertises only the live port as described below;
-  QR presentation is not implemented. Discovery does not grant consent.
-- Allow one HELLO-completed collector and at most two pending HELLO connections.
-  HELLO has a 5-second deadline. Reject further connections. There is no
-  authentication-attempt limit because no authentication is performed.
-- The listener exposes only the commands below. No shell, file access, system
-  log streaming, media payload retrieval, settings changes or playback commands.
-- Losing the collector connection immediately ends collection. Previously
-  collected records remain frozen for retrieval for up to 120 seconds while
-  local consent remains enabled. No collection continues during disconnection.
-  Disconnecting a local collector (including after HELLO alone) releases only
-  collector ownership, not local consent or the listener. Explicit local disable
-  still closes sockets immediately and clears retained capture data.
-- A slow client must never stall media. Disconnect it after a diagnostic write
-  remains incomplete for 2 seconds. Apply independent diagnostic I/O deadlines,
-  never SCPY media/Stop deadlines.
-
-## Framing and validation
-
-Each message is one UTF-8 JSON object terminated by LF. Limit every original
-line to 16,384 bytes, excluding LF, before JSON parsing. Reject malformed UTF-8,
-duplicate keys, non-object roots, excessive nesting, and
-noncanonical typed values; do not coerce strings, Booleans or fractional numbers.
-Requests and legacy responses retain the 8-level bound. Only captures explicitly
-selecting `video.timing` may return responses through depth 10 (root depth zero,
-counting descent into values), for fully populated clock corrections. Depth 11
-is rejected by the current collector.
-Maximum command rate is 20/second, with a burst allowance of 20.
-
-Requests have `v:1`, `id` (ASCII identifier, 1..64 characters from
-`[A-Za-z0-9_-]`), `op` and `args` (object). Responses echo `id` and `op`, have
-`ok` (Boolean), and contain either `result` or `error`, never both.
-Errors have a stable `code` and a controlled `message`, not arbitrary exception
-text. Unsupported versions/operations/flags fail explicitly; no silent downgrade
-or partial START. Unknown request/argument fields are rejected in v1.
-Operation names are 1..64 characters. Invalid/oversized identifiers or operation
-names receive `INVALID_ARGUMENT` with the invalid echo field set to null, rather
-than reflecting an unbounded attacker-controlled value into a response.
-IDs must be unique for the connection; duplicate IDs return `DUPLICATE_ID`
-without repeating side effects. Keep at most 4,096 IDs, then require reconnect.
-
-Session IDs, monotonic nanoseconds, source PTS microseconds, capture sequence
-numbers and other int64 values use canonical nonnegative decimal strings
-(`0` or a nonzero digit followed by digits), bounded to signed int64. IDs must
-not pass through floating-point JSON conversion. Small bounded counts and
-durations use exact JSON integers.
-
-Every peer must complete HELLO before other commands; otherwise return
-`HELLO_REQUIRED` and close without state disclosure. HELLO is not authentication.
-Old AUTH always returns `UNKNOWN_OPERATION`; there is no compatibility fallback.
-Invalid framing closes the connection; a valid command
-with invalid arguments receives an explicit error and makes no state change.
-Control responses have priority over telemetry, which may be dropped as described
-below. Serialize all writes on one diagnostic I/O lane.
-
-## Commands
-
-| Operation | Arguments | Result / behavior |
-|---|---|---|
-| `HELLO` | none | Acquires the single collector slot; returns `access:"lan"`, capabilities, roles, connection ID, process clock ID and limits. A competing collector receives `BUSY` and closes. No credential checks occur. |
-| `STATUS` | none | Returns listener/capture state, selected target, flags, expiry, retained range, loss watermarks and currently available cast roles/sessions. Does not enable sampling. |
-| `CONNECTIONS` | none | Returns current process-memory connection hints, also included as `connections` in HELLO/STATUS. Does not enable sampling or discover/probe peers. |
-| `CLOCK` | `clientSendNs` decimal string | Echoes the client value and returns device `receiveNs`/`sendNs`, sampled around handling. Available without an active capture, after HELLO. |
-| `START` | `target`, `flags`, `durationMs`, `samplePeriodMs` | Starts a new capture atomically after full validation; returns `captureId`, effective limits, `startedNs` and `expiresNs`. Reject if a capture is active or frozen data remains. |
-| `END` | `captureId` | Stops instrumentation and periodic sampling, freezes retained data and emits `CAPTURE_ENDED`. Repeating END for the same retained capture succeeds with its original end state. Does not disconnect. |
-| `FETCH` | `captureId`, `afterSeq`, `limit` | Returns up to 32 retained records, with a smaller page if required by the line limit, plus cursor and explicit admission/retention loss watermarks. Valid during capture and while frozen. Never enables collection. |
-| `CLEAR` | `captureId` | Clears a frozen capture and its buffers. Reject while collecting. Does not start another capture. |
-| `PING` | none | Liveness response only; does not extend the capture lease or data-retention lifetime. |
-
-`durationMs` is 1,000..180,000; `samplePeriodMs` is 100..5,000. No implicit
-defaults for START arguments. `target` is exactly one of:
-
-```json
-{"role":"sender","session":"797516823435589197"}
-{"role":"receiver","session":"797516823435589197"}
-{"role":"sender","nextSession":true}
-```
-
-`nextSession` binds once to the first newly started local cast of that role after
-START; the lease starts immediately, including time waiting for that cast.
-It never attaches to an existing session or a later replacement session.
-An explicit session must currently exist in that role or START fails
-`SESSION_NOT_FOUND`. When the bound session ends, freeze capture automatically.
-Do not silently rebind across reconnects or size-switch sessions.
-
-Capabilities enumerate supported flags separately for each role. `flags` is a
-nonempty array of unique names, not an ambiguous numeric bitmask:
-
-| Flag | Requested observations |
-|---|---|
-| `session` | Binding, track configuration, terminal outcome and controlled failure category. |
-| `recovery` | Trigger, pressure limits, generation/state transitions, cutoff, available source window, READY, proofs and explicit window-rejection reason. |
-| `audio.capture` | Sender read start/end, sample counts, AudioTimestamp observations and source PTS; no PCM or encoded bytes. |
-| `audio.transport` | Sender write begin/end/failure; receiver read begin/end and admission outcome; bytes/counts and generation/PTS only. |
-| `audio.queue` | Queue occupancy, oldest age, PTS range, eviction/hold/release and writer-in-flight age. |
-| `audio.output` | Receiver decode/resample/refill/AudioTrack call begin/end, frame counts, playback progress and underrun observations where available. |
-| `video.progress` | Low-rate video stage counters and bounded receiver anomaly examples. |
-| `video.timing` | Receiver-only extended timing snapshots; requires `video.progress` and a collector supporting depth 10 and 12,000-byte records. |
-| `transport.health` | Per-lane application progress and supported TCP statistics, with metric provenance and availability. |
-
-No automatic enabling of omitted groups. A minimal capture lifecycle, sequence
-and drop accounting always accompanies selected flags. START acceptance must
-guarantee the returned groups are supported; unavailable individual OS metrics
-are reported explicitly, never as zero. Adding more groups requires END, CLEAR
-and another START in v1, not a mid-capture unbounded expansion.
-
-Example:
-
-```json
-{"v":1,"id":"capture1","op":"START","args":{"target":{"role":"sender","nextSession":true},"flags":["session","recovery","audio.capture","audio.transport","audio.queue"],"durationMs":180000,"samplePeriodMs":1000}}
-{"v":1,"id":"capture1","op":"START","ok":true,"result":{"captureId":"c1","startedNs":"613130000000000","expiresNs":"613310000000000","maxRecords":4096,"maxBytes":2097152,"maxRecordBytes":2048,"maxDefaultRecordBytes":2048}}
-{"v":1,"id":"end1","op":"END","args":{"captureId":"c1"}}
-```
-
-Stable error codes include `HELLO_REQUIRED`, `BUSY`, `UNSUPPORTED_VERSION`,
-`UNKNOWN_OPERATION`, `INVALID_ARGUMENT`, `UNSUPPORTED_FLAG`, `DUPLICATE_ID`,
-`RATE_LIMITED`, `SESSION_NOT_FOUND`, `CAPTURE_ACTIVE`, `CAPTURE_NOT_FOUND`,
-`RETAINED_CAPTURE_EXISTS`, `PERMISSION_REQUIRED`, `SCOPE_MISMATCH`,
-`SESSION_ENDED` and `INTERNAL`.
-Unexpected internal errors also use the existing local error-reporting path;
-never report success or silently skip requested instrumentation.
-
-## Telemetry and on-demand instrumentation
-
-Telemetry uses `{"v":1,"event":{...}}`, separate from command responses.
-Each retained event has `captureId`, `seq`, `monoNs`, `kind`, and typed `data`.
-Bound events also include `role` and exact cast `session`; track-specific events
-include integer `track` and `generation`. The schema must be enumerated alongside
-the implementation, not accept arbitrary string maps or free-form log messages.
-
-- Lifecycle events: `CAPTURE_STARTED`, `SESSION_BOUND`, `CAPTURE_ENDED`.
-  END reasons: `requested`, `lease_expired`, `session_ended`,
-  `client_disconnected`, `slow_client`, `local_disabled`, `internal_error`.
-  Closing/revocation paths record the reason locally when remote delivery is
-  impossible. END acknowledges only after instrumentation is disabled; it must
-  not wait for media/native calls or diagnostic network writes.
-- Fast operation starts/completions are aggregated per selected kind/point and
-  sample window. The typed `operation_summary` metrics include started,
-  completed, zero-operation call, payload-byte and supplied-unit counts; four duration histogram
-  buckets (`under1Ms`, `1To5Ms`, `5To20Ms`, `over20Ms`); slow-call count and
-  maximum duration. A slow summary contains at most one correlated exemplar
-  (`slowExampleOperationId`, `slowExampleDurationNs`, `slowExampleTrack`,
-  `slowExampleGeneration`, and optional source PTS/count/bytes) per
-  kind/point/window. No event or allocation is retained per successful fast
-  operation. Failures remain individual records.
-  `RECORDER_SAMPLE` and `CAPTURE_ENDED` report a bounded set of currently
-  in-flight operation IDs, ages, points, track/generation and any supplied
-  source PTS/count/bytes; a missing completion is not proof of a crash.
-- Recovery records include cutoff and first/last queued source intervals,
-  codec/preroll, available coverage, evictions, READY delay and one controlled
-  rejection reason. Record this before discarding the evidence on reset.
-- For cross-device media correlation use the existing cast session, track,
-  generation and source PTS/interval, plus configuration and payload length.
-  Diagnostic sequence/operation IDs are local, not wire packet identities.
-  Do not assume PTS is unique or infer packet loss from sequence numbers on
-  different devices. No media protocol header change is required for v1.
-- Keep at most 4,096 records AND 2 MiB of serialized retained data per device;
-  individual records are at most 2,048 bytes except receiver video timing
-  aggregates, capped at 12,000 bytes. Retention reserves 512 records /
-  512 KiB for lifecycle, session, recovery and failure evidence; routine records
-  use the remaining 3,584 records / 1.5 MiB. Use fixed, bounded typed counters
-  and serialize off media threads. Event hooks do not do socket I/O, disk I/O,
-  JSON formatting or wait for a diagnostic lock/queue.
-- Offer records nonblockingly through a fixed 1,024-slot MPSC ring. Routine
-  records use at most 896 in-flight slots; critical records have 128 reserved
-  slots, and the final slot is reserved for terminal lifecycle state. Assign a
-  sequence only when a record obtains its publication ticket; reject full-queue
-  events without inventing sequence numbers. A terminal admission atomically
-  closes the queue, so no late producer can publish after `CAPTURE_ENDED`.
-  The control lane drains in ticket order and never lets a later record pass an
-  earlier producer that has reserved but not yet published its slot.
-  Video timing generation replacement reserves a routine ticket before retiring
-  the old tracker; if admission fails, the old tracker remains available for
-  final capture sampling. A replacement that loses its compare-and-set publishes
-  a stale contention observation in its reserved slot.
-- Routine retention cannot evict critical retention. Counters distinguish
-  routine/critical queue saturation, expired observations, closed-capture
-  races, oversized records and routine/critical retention eviction. Admission
-  counters include first/last monotonic timestamps. Retention reports first and
-  last lost sequence, count, and whether that envelope is an exact contiguous
-  range; an inexact envelope is not a claim that intermediate records were
-  dropped. `lossWatermarks` reports published, oldest-retained and
-  latest-retained sequence watermarks in STATUS and every FETCH response.
-- Send at most 256 records/second AND 128 KiB/second, including framing.
-  Enforce both budgets; summarize or drop excess with explicit accounting.
-  A slow client cannot cause unbounded outgoing queues. FETCH and live delivery
-  share these budgets and cursors tolerate repeated records.
-- FETCH returns `oldestSeq`, `latestSeq`, `nextAfterSeq`, `hasMore`,
-  integer `pendingRecords` (0..1024),
-  cumulative `droppedBeforeRetention` / `evictedAfterRetention` counts and
-  `lossWatermarks`. Sequence/counter values are decimal strings except integer
-  `pendingRecords`, Boolean `hasMore` and range `exactRange`. On an empty page `nextAfterSeq` equals the
-  requested cursor. `hasMore` describes retained records after this page and
-  must never be true on an empty page. `pendingRecords` counts reserved staging
-  tickets not yet drained in order, including a paused producer and any terminal
-  records behind it. `latestSeq` / `publishedSeq` are the contiguous drained
-  watermark, not the reservation tail. All these fields share one response
-  snapshot. A frozen drain completes only when both `hasMore` is false and
-  `pendingRecords` is zero; an empty pending page is not completion. Retry such
-  pages with pacing under the original frozen deadline, never spin or advance
-  the cursor without records. Sequence gaps identify unretained records; never fabricate
-  continuity. STATUS exposes the same accounting if a notification is lost.
-- Allocate capture buffers and start sampling only after START validation.
-  Hot paths check an inactive/flag gate before reading diagnostic clocks,
-  allocating records or querying platform state. END disables gates and cancels
-  sampling; discard late observations from that capture using a capture epoch.
-  Publishing the epoch must not require pausing a media worker.
-- The 120-second frozen retention starts at capture end and is not extended by
-  FETCH/reconnect. On expiry clear data without re-enabling instrumentation.
-  Idle listeners allocate no per-media-event history. No pre-START replay exists.
-
-Record only controlled categories, numeric timings/counters, codec enums and
-protocol identities. Exclude pixels, audio samples, packet contents, content
-hashes, CSD, application titles, URLs, peer addresses, filesystem paths, hardware
-serials, account names, pairing secrets and arbitrary exception strings.
-Diagnostics are sensitive metadata even without media; do not automatically
-upload them or register raw captures as shareable artifacts.
-
-## Paired collector and clock interpretation
-
-The PC connects and completes HELLO on each locally consenting device independently and STARTs captures
-before reproduction, using `nextSession:true` where necessary. Different device
-capabilities may require different flag sets. One failed connection must not
-silently disable the other or claim a paired capture.
-
-Sample CLOCK several times and retain client send/receive plus both device
-timestamps. Use round-trip bounds and lowest-delay samples to estimate offsets;
-report uncertainty, clock ID and drift. CLOCK samples from different process
-clock IDs must not be merged. Source PTS is a media clock, not a substitute for
-cross-device clock synchronization.
-
-First investigation profile: session/recovery and all available audio groups,
-plus low-rate video progress and transport health. Diagnose in this order:
-
-1. Compare sender capture progress with queue admission and write completion.
-2. Compare writes to receiver read/admission and worker/output call progress.
-3. Inspect receiver backlog/blocked calls and explicit recovery-window reasons.
-4. Distinguish application stalls from TCP evidence where supported.
-
-A successful sender write is not proof of receiver arrival. A delayed receiver
-read is not proof of Wi-Fi latency. Android may not expose TCP retransmission/
-send-queue metrics through supported APIs; report unavailable evidence and
-remaining ambiguity rather than invent a network diagnosis.
-
-## Implementation acceptance requirements
-
-- This document alone does not enable a listener. Implement consent UI/warning,
-  HELLO, strict parser, bounded recorder, role-specific hooks and PC collector
-  together before advertising support.
-- Test HELLO-before-state, competing/idle clients, malformed/oversized frames,
-  duplicate keys/IDs, unsupported flags, rate limits and connection limits.
-- Test inactive hooks produce no diagnostic records or periodic sampling; test
-  selected groups only, explicit START, expiry, END, disconnect, consent revoke,
-  process restart, background sender and frozen retention expiry.
-- Test bounded memory/output, slow/nonreading clients, full/contended buffers,
-  late callbacks, dropped-record visibility and ordered control responses.
-- Test exact int64 round trips, clock uncertainty, independent device clocks,
-  session binding, repeated PTS and cross-generation correlation.
-- Reproduce blocked audio write/output and repeated recovery-window rejection
-  in deterministic tests. Verify diagnostics cannot delay media admission,
-  native output servicing, recovery deadlines or orderly Stop.
-- Measure disabled and enabled overhead on a real sender/projector pair before
-  claiming the instrumentation is nonperturbing. Capture success is not a fix
-  for the underlying audio failure.
-
-## Android implementation profile and schemas
-
-### Sender-delegated receiver access
-
-This unreleased draft intentionally supports sender-controlled receiver
-diagnostics: the sender warning explicitly states that enabling local
-remote diagnostics also opens compatible receiver diagnostics
-for an admitted cast. Projector settings need not be accessed. Local
-receiver statistics/diagnostic preferences are not prerequisites and are never
-mutated by delegation. Any reachable LAN client can use the bounded endpoint;
-neither cast ownership nor the metadata service provides cryptographic identity.
-
-Negotiation is additive to existing SCPY version 3 framing:
-
-1. Sender HELLO offers `diagnostics:{"version":1,"sessionDelegation":true}`.
-   Receiver echoes this capability only when it implements delegation.
-   Missing fields mean legacy/unsupported; future well-typed positive capability
-   versions are unsupported. Integer version and Boolean delegation are exact
-   types, duplicate keys remain forbidden by the normal wire parser.
-2. With both sender local consent and negotiated support, SESSION_REQUEST
-   includes `diagnostic:{"version":1,"enabled":true}`. This object has exactly
-   those two fields, exact integer version 1 and Boolean enabled; malformed
-   requests reject before diagnostic activation. Unsupported peers are reported
-   to the sender as `unsupported`; no speculative request/false success occurs.
-3. Only after normal active-owner CAS, cast-ownership lease acquisition, request
-   validation, and SESSION_ACCEPT may the injected receiver process owner open
-   the listener. Discovery, diagnostic HELLO, pre-admission STATUS, rejected/busy
-   peers and unowned media connections cannot delegate or replace access.
-   SESSION_ACCEPT adds `diagnostic:{"version":1,"state":"starting","session":"77"}` for a
-   supported request (`unsupported` if not negotiated). A later session-bound
-   SCPY STATUS with state `"diagnostics"`, controlled message, and
-   `diagnostic:{"version":1,"state":"enabled","session":"77","port":43210,"access":"lan"}`
-   confirms the actual bound listener. `local` and `frozen` may likewise carry
-   the live endpoint only when the cast control socket's local address matches
-   the diagnostic bind address. Otherwise the result is `unavailable` without a
-   port; casting over other interfaces or IPv6 remains supported.
-   Starting/failed/unsupported results never carry a port.
-   The owner is a canonical int64 string, matching the SCPY frame's session.
-   Other result states: `unavailable`, `frozen`, `local`, `disabled`, `unsupported`.
-   Binding/permission failures report `unavailable`, not a casting error.
-4. The same admitted owner may revoke using session-bound SCPY STATUS
-   `{"state":"diagnostics","message":"disabled","diagnostic":{"version":1,"enabled":false}}`.
-   The sender queues this on local flag-off. Late enable is forbidden; re-enabling
-   the switch does not activate/rebind an already admitted cast. Ownership and
-   exact session are rechecked before accepting revocation.
-
-Delegated diagnostic HELLO and STATUS include
-`scope:{"role":"receiver","session":"<canonical int64>","active":true}`.
-HELLO advertises empty sender capabilities. STATUS filters available sessions
-to the delegated receiver session, and no unrelated retained capture/history
-survives a scope transition. START requires role receiver plus that **explicit
-matching session**. `nextSession`, sender targets or other sessions return
-`SCOPE_MISMATCH`. Once the owner/flag ends, START returns `SESSION_ENDED` even
-after CLEAR; no rearming/rebinding is allowed. PC START is still mandatory:
-admission/listener startup never enables recording.
-
-Owner-liveness checks in the typed recorder gates are atomic/volatile reads,
-not media-thread locks/socket/JSON work. Loss of owner/flag prevents new
-observations immediately. The diagnostic lane freezes retained metadata and
-leaves the same-scope listener available for **at most 120 seconds** from
-revocation/teardown, not 120 seconds from each fetch/ping/reconnect. It then
-closes sockets and clears history. Permission loss has no grace. A new accepted
-cast revokes the old delegated scope, clients and retained data even if the new
-cast does not request diagnostics. Old async startups/callbacks cannot grant a
-replacement session. The regular 180-second capture lease and all byte/record/
-rate/deadline limits remain unchanged.
-
-Explicit local receiver mode takes precedence, has a process-local
-consent gate and unrestricted local profile, and is not closed by delegated
-cast teardown. Enabling local mode revokes a delegated listener/history first;
-turning local mode off does not silently rearm an earlier delegation. No receiver
-preference is changed. Each new cast needs a fresh negotiated request.
-
-Receiver UDP advertisements publish the existing informational
-`diagnostic:{"version":1,"port":43210,"access":"lan"}` while the delegated
-listener is live, including frozen grace. The admitted-owner SCPY result also
-supplies its actual diagnostic port; UDP is not needed to attach from the sender.
-The sender's diagnostics status displays the receiver session,
-and diagnostic HELLO `scope` supplies the exact target identity. Receiver
-endpoint reachability remains unauthenticated and is not a casting capability.
-
-### Sender in-memory connection information
-
-The sender retains the admitted receiver result only in process memory, keyed
-by its owning cast session. The host is the connected SCPY control socket's
-numeric peer address, **never** an advertised host. Version/state/session/port/
-access are strictly typed and validated; malformed or legacy state-only results
-never become endpoints. Late results from another owner cannot replace current
-information. New cast startup clears the old hint even before negotiation.
-
-After diagnostic HELLO, `CONNECTIONS` (no arguments) returns, for example:
-
-```json
-{"version":1,"self":{"host":"192.0.2.1","port":41001,"version":1,"access":"lan"},"receiver":{"available":true,"host":"192.0.2.2","port":43210,"version":1,"access":"lan","session":"77","state":"enabled","reason":"available"}}
-```
-
-`self` uses that diagnostic socket's actual local address and bound port, or null
-if no longer available. Receiver `available:false` omits host/port/version/access
-and supplies `state`, nullable `session` and a controlled `reason`: `no_session`,
-`not_requested`, `unsupported`, `awaiting_endpoint`, `endpoint_unavailable`,
-`malformed`, `cast_ended`, `grace_expired`, or `revoked`. The same object is included
-in HELLO and STATUS. It contains no token, media token, certificate, or secret.
-These are unauthenticated endpoint hints, not proof of identity or reachability.
-
-Cast teardown freezes an enabled delegated hint for at most 120 seconds without
-renewal; expired hints omit the endpoint. Revocation clears sender memory
-synchronously (and closes local access); the receiver independently applies its
-existing frozen grace. New ownership replaces all old hints. Local receiver mode
-is not assumed to survive cast teardown. A stale/new receiver scope is checked
-again at receiver HELLO/START; a hint never authorizes another cast or enables
-collection. That historical hint-based attachment is no longer supported.
-
-The first sender endpoint can be obtained with the bounded unicast query below,
-without settings access or retained startup logs. Successful Android listener startup also logs the controlled local event
-`event=DIAGNOSTIC_LISTENER_STARTED endpoint=<bound-ip>:<bound-port> version=1 access=lan role=local`
-(delegated receiver listeners use `role=receiver`). Existing authorized ADB/log
-access can read it without opening settings during a cast, **if still retained**.
-Logcat is not durable endpoint discovery. There is no port scanning, persistent
-endpoint/consent file or permission bypass.
-
-### Active sender endpoint bootstrap
-
-The diagnostic listener also owns a unicast-only UDP **27184** responder bound
-to its **same private IPv4 address**. It is independent of Activity/settings
-lifetime and the sender's receiver-advertisement reader on UDP 27183. Sharing
-that Activity-owned socket would lose discovery while backgrounded/destroyed
-and could divert existing receiver advertisements. No wildcard/broadcast bind,
-multicast announcement, extra permission, ADB/debug interface or media/control
-executor is added. Both local and session-delegated listeners use this path in
-debug and optimized release builds.
-
-An explicit collector query to one known private IPv4 host is exactly **256
-bytes**: this JSON object, padded with ASCII spaces:
-
-```json
-{"protocol":"redraincast-diagnostics","version":1,"nonce":"0123456789abcdef0123456789abcdef"}
-```
-
-Only these three keys, an exact integer version 1 and 32 lowercase hexadecimal
-nonce characters are accepted. Duplicate keys, malformed UTF-8/JSON, excessive
-nesting, oversized/undersized datagrams, unknown fields and non-private IPv4
-sources are ignored. Production never binds loopback; loopback is injectable
-only for deterministic local tests.
-
-A live, permitted listener replies to the request's source address/port:
-
-```json
-{"protocol":"redraincast-diagnostics","version":1,"nonce":"0123456789abcdef0123456789abcdef","diagnostic":{"version":1,"port":43210,"access":"lan"}}
-```
-
-The existing typed diagnostic discovery envelope supplies the actual bound TCP
-port. Responses contain no host, process/cast identity, capture state, token,
-secret or media, never exceed 256 bytes (no UDP amplification), and are globally
-limited to four per second per listener. Malformed queries do not consume the
-reply budget. Parsing, gating and replies run only on a dedicated diagnostic
-thread; no diagnostic TCP slot is acquired and no capture begins.
-
-The collector sends one request with a fresh random nonce, accepts only replies
-from the queried host/port, validates the nonce/version/access/port and derives
-the TCP host from that known address. The receive window is bounded to 1..30
-seconds; there are no retries, alternative-port probes or broadcast queries.
-This rejects stale process/query replies but is **not authentication** or proof
-of current reachability. Normal TCP HELLO/START and follow-receiver scope checks
-remain required; discovery never enables consent or selects a cast.
-
-Queries recheck the same listener/network/permission/owner gates before replying.
-Explicit local disable, process death, failed binding, identity change or
-listener closure cannot leave persisted hints/responder state. Delegated mode
-uses only its existing 120-second frozen grace; expiry/new ownership/reset closes
-both sockets. Local consent intentionally survives individual cast teardown
-until explicitly revoked or the process/network/permission changes. If UDP
-27184 is occupied, the listener logs discovery unavailability but preserves the
-already-working TCP path/casting; it never evicts another socket or changes port.
-
-The historical second-listener collection workflow is retired. Use the v2
-single-sender procedure at the top of this document.
-Old running builds without this responder cannot be recovered by source changes:
-with settings gated, no known port and no retained log, there is no supported
-non-disruptive bootstrap. Do not restart/toggle consent or scan during a cast.
-
-### Historical receiver endpoint discovery (removed in v2)
-
-The existing receiver discovery advertisement on UDP **27183** may include the
-optional root field `"diagnostic":{"version":1,"port":43210,"access":"lan"}`. `port` is an exact
-JSON integer in 1..65535, taken directly from the bound diagnostic server socket,
-not the casting TCP port or a parsed display string. It is included only when
-local remote consent or admitted session delegation remains valid and the diagnostic listener
-is successfully bound/live with LAN permission. Disabled, revoked, failed,
-starting and closed listeners omit the entire field. Closing the receiver also
-prevents the field from appearing in its advertisement. Existing advertisement
-state/capabilities and the 1024-original-byte budget remain unchanged.
-The UDP socket selects its source for each destination before constructing the
-packet; the field is omitted unless that exact source is the diagnostic bind
-address. If route selection fails, a legacy advertisement without the field is
-sent instead.
-
-The process owner supplies a safe immutable nullable snapshot through
-MainActivity's provider to ReceiverServer. Delegation invokes an injected
-process-owned session-access interface only after cast admission; ReceiverServer
-does not itself create diagnostic sockets or retrieve media data. Listener snapshots recheck closed
-state, socket binding and permission; local revocation gates the snapshot before
-asynchronous listener cleanup. There is no pre-consent diagnostic advertisement.
-
-Android sender discovery retains the optional typed metadata independently of
-the normal casting endpoint. Missing fields are legacy-compatible. A present
-envelope must be an object with positive integer `version` and valid integer
-`port`; version 1 additionally requires exact `access:"lan"`. Strings in numeric
-fields, Booleans, fractional values, nulls, missing required fields,
-duplicate keys and ports outside the TCP range reject the advertisement.
-Unknown positive revisions with a well-typed valid envelope are ignored, never
-treated as version 1. Additional envelope fields are additive; the complete
-datagram must still fit 1024 bytes before parsing.
-
-The PC derives an endpoint host from the UDP source address and combines it
-with this port. Advertisements are unauthenticated, spoofable/stale hints.
-Neither discovery nor the port authenticates a device or grants collection.
-**Never advertise media, credentials or capture state.**
-Discovery reports endpoint/access only; it performs no automatic probing or
-connection. The collector requires explicit `--lan` to acknowledge plaintext,
-unauthenticated access. Network policy, NAT and stale packets can still prevent
-reachability; the exact locally displayed bound endpoint remains authoritative.
-
-Local access: **Settings → Advanced → LAN diagnostics endpoint / status**, read the warning,
-then select **Allow unpaired LAN diagnostics (this process only)** and **Save**. Reopen
-**LAN diagnostics endpoint / status** after listener startup, before casting, to read the actual
-TCP endpoint and unauthenticated-access status/warning. Settings cannot be opened during an active
-casting role; use the bounded unicast bootstrap above instead. This dialog remains screenshot-protected.
-Nothing is persisted about remote consent or capture buffers. A process restart
-requires new local consent. There is no pairing step.
-Disabling either local switch revokes local explicit access immediately, even before saving the draft;
-cancelling a settings dialog never grants access. Backgrounding and overlay
-visibility do not revoke it. Receiver access survives the failed cast.
-Delegated receiver mode instead follows admitted cast ownership/flag and its
-bounded frozen grace, irrespective of the receiver's local checkbox values.
-The listener also rechecks LAN permission independently of Activity foreground
-state and rejects/revokes access if that permission is lost.
-
-The listener binds exactly one private IPv4 address on the active Wi-Fi/Ethernet
-network, not a wildcard, cellular interface, VPN, loopback or forwarded port.
-IPv6-only networks are currently unsupported and startup fails visibly.
-If the active network, its eligible transport, or the bound address changes,
-the listener is revoked rather than silently rebinding under old consent.
-An address on another casting interface is reported unavailable for diagnostics;
-this does not restrict casting.
-No AndroidKeyStore keys, certificates, pairing secrets or fingerprints are generated.
-
-HELLO returns `access:"lan"`, `clockId`, `connectionId`, `roles`, `limits`, `delivery:"fetch"`,
-`capabilities` with separate `sender`/`receiver` arrays, and
-`metricAvailability:{"tcpKernel":false,"transportProvenance":"application_socket_calls","videoPresentation":"codec_release_and_optional_render_callback","physicalDisplay":false}`.
-The supported flags are:
-
-| Role | Supported flags |
-|---|---|
-| sender | `session`, `recovery`, `audio.capture`, `audio.transport`, `audio.queue`, `video.progress`, `transport.health` |
-| receiver | `session`, `recovery`, `audio.transport`, `audio.queue`, `audio.output`, `video.progress`, `video.timing`, `transport.health` |
-
-`video.progress` supplies bounded cumulative stage snapshots and bounded receiver anomaly examples, described below.
-The optional `video.timing` capability requires `video.progress` in START and
-negotiates the extended timing schema and record size. Without it, timing records
-are not produced, all records remain at most 2,048 bytes, and legacy collectors
-can parse and drain the capture including delayed staging publications.
-Collector defaults intersect their known flags with each peer's advertised
-capabilities, including when following the receiver. Explicit flag lists stay
-strict: unsupported requests fail before START; `capture_metadata.flags` always
-records the effective set.
-No TCP send-queue/retransmission/RTT measurement is synthesized from socket call
-durations. These deliberate unavailable surfaces narrow this implementation
-profile without silently accepting omitted groups.
-
-This implementation uses **retained FETCH only**, not unsolicited telemetry.
-Timeout/revocation closes the plain TCP transport directly, independently of
-the diagnostic writer, enforcing a nonreading-client deadline.
-Lifecycle notifications are retained event objects returned in `records`.
-This avoids a second outgoing queue and keeps command ordering/deadlines simple.
-FETCH pages obey both strict rolling one-second budgets (256 records/128 KiB,
-including response framing); a budget-exhausted request returns `RATE_LIMITED`
-without advancing the client cursor or discarding retained evidence.
-`START` returns `captureId`, `startedNs`, `expiresNs`, `maxRecords`, `maxBytes`,
-`maxRecordBytes`, `maxDefaultRecordBytes`, `maxDurationMs`. `STATUS` returns `state` (`idle`, `collecting`,
-`frozen`), nullable `captureId`, `target`, `flags`, `expiresNs`, `endedNs`,
-`endReason`, `sessions` and the retained range/drop counters. The frozen timer
-never renews on STATUS, PING or FETCH. END is idempotent while its capture remains.
-STATUS also returns integer `pendingRecords` (zero when idle). Frozen retrieval
-is bounded by the initial 4,096-record/2 MiB retention plus at most 1,024 staging
-records of at most 12,000 bytes each (a conservative bound including video timing
-aggregates): at most 5,120 records and 14,385,152 record bytes across the drain.
-This is a total transfer bound, not an increase to simultaneous retention.
-Pages may be byte-limited, not just
-32-record-limited. The collector enforces both evidence bounds, cursor progress
-and the original 120-second deadline rather than a 129-page assumption.
-
-When local consent precedes asynchronous listener binding, admitted receiver
-sessions retain a consent-generation/owner-scoped reporter. They publish `local`
-only after the endpoint is bound, outside listener/session state locks.
-Disable, bind failure, retirement, replacement or consent-generation change
-invalidates the pending report. Collector disconnect alone does not revoke
-local consent; explicit access revocation still closes access and clears history.
+## Current v2 source event schemas
+
+These are source records within the v2 FETCH envelopes above, not v1
+transport. See [DiagnosticRecorder.kt](../app/src/main/java/dev/redrain/cast/diagnostics/DiagnosticRecorder.kt),
+[DiagnosticMetadata.kt](../app/src/main/java/dev/redrain/cast/diagnostics/DiagnosticMetadata.kt),
+[DiagnosticVideo.kt](../app/src/main/java/dev/redrain/cast/diagnostics/DiagnosticVideo.kt)
+and [DiagnosticVideoTiming.kt](../app/src/main/java/dev/redrain/cast/diagnostics/DiagnosticVideoTiming.kt).
+`Ns` and `Us` denote nanoseconds and microseconds; integer-valued long fields
+are decimal strings, including signed delays, differences and offsets.
+Small integers, Booleans, enum strings and null are JSON values as noted.
 
 Event objects have `captureId`, decimal-string `seq`/`monoNs`, `kind`, `data`;
 when bound, exact `role`/decimal-string `session`; and track-specific integer
@@ -715,10 +538,19 @@ generation-specific source intervals are not deduplicated.
 
 Controlled `kind` values:
 
-- `CAPTURE_STARTED`, `SESSION_BOUND`, `CAPTURE_ENDED`: lifecycle; end data has
-  the controlled reason listed above. These do not depend on selected groups.
+- `CAPTURE_STARTED`, `SESSION_BOUND`, `CAPTURE_ENDED`: lifecycle.
+  Sender end reasons include `requested`, `lease_expired`, `session_ended`,
+  `setup_failed`, `coverage_lost`, `terminal_deadline`, `client_disconnected`,
+  `slow_client` and `internal_error`; local revocation uses `local_disabled`.
+  Receiver retirement can use `receiver_retired_stop` or
+  `receiver_retired_fatal`. A reason is not proof of receiver cleanup.
+  `SESSION_BOUND.data` contains the local
+  APK `versionName` and integer `versionCode`, including the full unique debug
+  build identifier when applicable. These do not depend on selected groups.
 - `RECORDER_SAMPLE`: periodic recorder-health observation at `samplePeriodMs`;
-  `queueDepth`, `inFlightCount`, decimal-string drop counters, and `inFlight`
+  integer `queueDepth` and `inFlightCount`; decimal-string
+  `droppedBeforeRetention`, `evictedAfterRetention`, `inFlightNotTracked`,
+  `staleVideoUpdates`, `videoTimingContention`; object `dropReasons`, and `inFlight`
   (up to four active operations with decimal-string `operationId`,
   `startedNs`, `ageNs`, and optional decimal-string `ptsUs`, `endPtsUs`,
   `count`, `bytes`;
@@ -729,16 +561,20 @@ Controlled `kind` values:
   inventory. `CAPTURE_ENDED.data` also includes the bounded in-flight snapshot
   and total `inFlightCount`, so an unfinished call remains visible if END occurs
   before the next sample. A lost retained END is not evidence that a call remains
-  blocked.
+  blocked. `dropReasons.total` is a decimal string; each admission reason named
+  above is an object containing decimal `count` and nullable decimal
+  `firstMonoNs`/`lastMonoNs`. `CAPTURE_ENDED.data` contains string `reason`,
+  integer `inFlightCount`, decimal `inFlightNotTracked` and
+  `videoTimingContention`, and the same bounded `inFlight` array.
 - `SESSION`, `RECOVERY`, `AUDIO_CAPTURE`, `AUDIO_TRANSPORT`, `AUDIO_QUEUE`,
   `AUDIO_OUTPUT`, `VIDEO_PROGRESS`, `TRANSPORT_HEALTH`: selected typed observations below.
 
 Selected observation `data` contains controlled `stage`, `reason`, `point` and
 optional decimal-string `operationId`, `ptsUs`, `endPtsUs`, `count`, `bytes`,
-`cutoffUs`. Unavailable numeric observations are omitted, never replaced with
+`cutoffUs`, `durationNs`. Unavailable numeric observations are omitted, never replaced with
 zero. `stage` is one of `started`, `ended`, `config`, `begin`, `complete`,
 `failed`, `admitted`, `rejected`, `pressure`, `ready`, `reset`, `window`,
-`sample`, `proof`, `hold`, `evicted`. `point` is one of `unspecified`, `read`,
+`sample`, `proof`, `hold`, `evicted`, `settled`. `point` is one of `unspecified`, `read`,
 `write`, `decode`, `resample`, `compensate`, `refill`, `timing`, `queue`,
 `recovery`, `audio_start_wait`, `recovery_retire`, `recovery_construct`.
 `reason` is one of `none`, `capture`, `receiver`, `pressure`,
@@ -754,13 +590,26 @@ Optional `data.metrics` is exactly one enumerated typed schema:
 | `queue` | integer `packets`, `maxPackets`, `bytes`, `maxBytes`; nullable decimal `oldestAgeNs`; decimal `spanUs`, `maxSpanUs` |
 | `window` | controlled `codec`; decimal `prerollUs`, `windowStartUs`; enclosing event supplies requested `cutoffUs` and queued `ptsUs`/`endPtsUs` |
 | `output` | decimal `submittedFrames`, `consumedFrames`, `presentedFrames`; nullable decimal `timestampAgeUs`; controlled `clockSource`; nullable integer `underruns` |
+| `audio_start_decision` | Receiver `audio.output`: integer `decision` (1 wait, 2 retry preroll, 3 retry stale recovery, 4 ready, 5 cancelled, 6 failed) and `mode`; decimal `waitedUs`, `revision`, `flags`, `omittedRepeats`; integer `retainedDecodedBytes`, `retainedDecodedPackets`, `encodedQueueBytes`, `encodedQueuePackets`. Nullable decimals: `positionUs`, signed `delayUs`, `firstVideoUs`, `releasedVideoUs`, `observationAgeUs`, `sampledAtNs`, `queueSampledAtNs`, `observationSequence`, `observationAtNs`, `observationPtsUs`, `nativeTimestampAtNs`, `nativeTimestampFrame`, signed `appliedOffsetUs`, `correctionSequence`; nullable lowercase enum `outputSource`. Event supplies target `ptsUs`, operation ID and generation. Observation age is cached-source age, not native timestamp age. Queue counts are a later, non-atomic snapshot; retained decoded counts exclude unused decode reservations. |
+| `audio_clock_observation` | Decimal `sequence`, `atNs`, `sampleUs`, `sourcePtsUs`, signed `appliedOffsetUs`; nullable decimals `submittedFrames`, `consumedFrames`, `presentedFrames`, `nativeTimestampNs`, `nativeTimestampFrame`; nullable enum-name `clockSource`. |
+| `terminal_failure` | JSON integer `cause` and nullable integer `origin`; vocabularies above. |
+| `terminal_coverage` | Nullable decimal `finalSeq`, nullable Boolean `cleanupSucceeded`, nullable enum string `finalSkipReason`; optional `preparationTimeout` object with enum `phase`, decimal `elapsedNs` and integer `activeProducers`. |
 | `capture_timestamp` | Boolean `available`; decimal `framePosition`, `monoNs` when available, otherwise both null |
 | `video_configuration` | controlled `codec`; integer `width`, `height`, `frameRate` (0 means unspecified); nullable Boolean `renderedCallback`; constant `presentationEvidence:"codec_release_or_render_callback_not_physical_display"` |
-| `video_progress` | controlled `videoStage`; decimal cumulative `count`, `firstAtNs`, `lastAtNs`, `maxPtsGapUs`, `maxObservationGapNs`; nullable decimal `bytes`, `keyFrames`, `firstPtsUs`, `lastPtsUs`, `sourceAtNs`; controlled `lastReason`; Boolean `retired`; `reasons` with decimal `stale`, `capacity`, `pressure`, `sourcePending`, `stopped`, `replaced` |
+| `video_progress` | Controlled `videoStage` and `lastReason`; Boolean `retired`; nullable decimal `bytes`, `keyFrames`, `firstPtsUs`, `lastPtsUs`, `sourceAtNs`, signed `minDelayUs`/`maxDelayUs`. Decimal counters/timings: `count`, `firstAtNs`, `lastAtNs`, `maxPtsGapUs`, `maxObservationGapNs`, `intervalCount`, `longIntervals`, `sourceIntervalCount`, `maxSourceIntervalNs`, `sourceRegressions`, `scheduledCount`, `lateSchedules`, `holdSamples`, `maxHoldNs`, `releaseCallSamples`, `maxReleaseCallNs`, `traceCandidates`, `traceSuppressed`. Integer `traceLimit`; `reasons` has decimal `stale`, `capacity`, `pressure`, `sourcePending`, `stopped`, `replaced`. |
 | `video_frame_timing` | receiver-only bounded correlation counters and signed nanosecond ranges, described below |
 | `video_anomaly` | controlled `videoStage`, `reason`; decimal `occurrenceAtNs`; nullable decimal `previousAtNs`, `sourceAtNs`, `previousSourceAtNs`, `delayUs`, `heldNs`, `releaseCallNs`; event supplies PTS and generation |
 | `video_failure` | controlled lowercase decoder `VideoStage` in `videoStage` and `VideoFault` in `fault`; enclosing `failed` event supplies track/generation, waiting/last input PTS and reason `failure`, without exception messages |
-| `operation_summary` | lowercase `point`; decimal `windowStartNs`, `windowEndNs`, `started`, `completed`, `zeroOperationEvents`, `bytes`, `units`, `slow`, `maxDurationNs`; `durationBuckets` with decimal `under1Ms`, `1To5Ms`, `5To20Ms`, `over20Ms`; nullable decimal `slowExampleOperationId`, `slowExampleDurationNs`, `slowExamplePtsUs`, `slowExampleEndPtsUs`, `slowExampleCount`, `slowExampleBytes`; nullable integer slow-exemplar track/generation |
+| `operation_summary` | lowercase `point`; decimal `windowStartNs`, `windowEndNs`, `started`, `completed`, `zeroOperationEvents`, `bytes`, `units`, `slow`, `maxDurationNs`; `durationBuckets` with decimal `under1Ms`, `1To5Ms`, `5To20Ms`, `over20Ms`; nullable decimal `slowExampleOperationId`, `slowExampleDurationNs`, `slowExamplePtsUs`, `slowExampleEndPtsUs`, `slowExampleCount`, `slowExampleBytes`; nullable integer `slowExampleTrack`, `slowExampleGeneration` |
+
+Unchanged audio-start decisions are sampled at most once per 250 ms per player;
+the first sample and changes in capture, generation, reason, mode, flags,
+revision or target pass immediately. `omittedRepeats` counts suppressed repeats.
+Samples are ordinary bounded records,
+so absence does not prove a decision did not occur. Flags use bits 1 audio
+expected, 2 audio started, 4 resuming and 8 recovering; clock modes are 0
+unavailable, 1 monotonic, 2 audio without observation, 3 callback audio and 4
+observed audio. The decision describes scheduling, not physical presentation.
 
 ### Video progress evidence
 
@@ -794,10 +643,10 @@ signed decimal `minNs`/`maxNs`; snapshots are not additive:
   overflow omits the corresponding sample.
 * For safely correlated callbacks, `callbackMinusDeadline` compares the
   codec-supplied timestamp to the intended deadline. `observedMinusCallback`
-  compares local callback observation to the supplied timestamp; it is signed,
-  so a future supplied timestamp remains negative. `futureCallbacks` counts
-  all observed callbacks whose supplied time is in the future, including
-  unmatched callbacks. `worstCallbackErrorExample` is null until a match,
+  compares local callback observation to the supplied timestamp. Future
+  supplied timestamps are excluded from matched correlations and cadence;
+  `futureCallbacks` counts them, including unmatched callbacks.
+  `worstCallbackErrorExample` is null until a match,
   then contains the matched `ptsUs`, `deadlineNs`, `releaseNs`, `callbackNs`,
   `observedNs`, and nullable `decodedMinusDeadlineNs` of the greatest absolute
   callback error; the decode value uses its earlier clock estimate and is
@@ -820,14 +669,15 @@ signed decimal `minNs`/`maxNs`; snapshots are not additive:
   `releaseNs`, `mappingRevision`, `mappingStable`, and a nullable `clock`.
   The clock snapshot is taken atomically at the **delay read actually used**,
   not from a later stats-panel query. `readAtNs` is the local monotonic time
-  used for that read **and** the actual absolute deadline; `scheduleAtNs` is
-  this same time, not a later timing read. `positionUs` includes the monotonic guard,
+  used for that read and the absolute-deadline calculation; `scheduleAtNs` is
+  this same time, not the calculated deadline or a later timing read. `positionUs` includes the monotonic guard,
   while `sourcePositionUs` is its unguarded input (including bounded DAC/source-map
   prediction for qualified cached audio, not necessarily the cached observed PTS).
   `delayUs` is the original
   signed delay. Modes are `CACHED_AUDIO`, `CALLBACK_AUDIO` (legacy callback
   observation), `AUDIO_INITIAL` (attached audio without an observation),
-  `MONOTONIC` (no attached audio), and `UNAVAILABLE` (no anchor).
+  `MONOTONIC` (no attached audio), `UNAVAILABLE` (no anchor), and debug-only
+  `VIRTUAL_SYNC` (video scheduling experiment, not physical audio evidence).
 * `audioObservationSequence` identifies an accepted cached observation within
   the playback clock; unchanged values across decisions mean the same cached
   observation, not a repeated hardware sample read or an unchanged predicted
@@ -854,6 +704,22 @@ signed decimal `minNs`/`maxNs`; snapshots are not additive:
   between delay read and schedule invalidates the intended deadline, but the
   snapshot retains both revisions and `mappingStable=false`.
 
+`worstCallbackErrorExample`, `latestSchedulingExample`, and the minimum/maximum
+pair examples are nullable objects. Pair objects contain signed decimal
+`deadlineCadenceMinusPtsNs` and `previous`/`current` scheduling objects.
+Scheduling fields `ptsUs`, `deadlineNs`, `releaseNs`, `scheduleAtNs`, and
+`mappingRevision` are nullable decimal strings; `mappingStable` is Boolean
+and `clock` is nullable. Clock objects contain string `mode`, Boolean
+`recoveringAudio`, nullable decimal strings for `readAtNs`, `mappingRevision`,
+signed `delayUs`, `positionUs`, `sourcePositionUs`, `audioObservationSequence`,
+`audioObservationAtNs`, signed `audioObservationAgeNs`,
+`audioTimestampAgeAtObservationUs`, and signed `observedAppliedOffsetUs`;
+`audioOutputSource` is a nullable enum name. The nullable `audioObservation`
+object has the fields of `audio_clock_observation` without its `schema`.
+The nullable `lastPacketCorrection` object contains decimal `sequence` and
+signed decimal `beforeOffsetUs`, `afterOffsetUs`, `deltaUs` and
+`appliedOffsetAtPacketUs`.
+
 Only 128 PTS groups, constant-size cumulative ranges and four retained
 scheduling exemplars (latest, minimum pair, maximum pair, worst callback)
 are kept. At most two lightweight occurrence tokens per group and 512 pending
@@ -873,8 +739,8 @@ The existing periodic aggregate remains one record, rather than introducing
 a per-frame stream. Only receiver `video_frame_timing` records have a
 12,000-byte UTF-8 ceiling when `video.timing` is selected (below the existing 15,000-byte read-page budget);
 all other records retain the 2,048-byte ceiling. HELLO advertises the 12,000-byte
-maximum; START advertises 12,000 only when `video.timing` is selected, otherwise
-2,048. `maxDefaultRecordBytes` is 2,048. Capture byte/record quotas,
+maximum and `maxDefaultRecordBytes` of 2,048. START returns the pair context
+and selected flags rather than a per-capture maximum. Capture byte/record quotas,
 retention reserves and oversized-record loss accounting are unchanged.
 
 `matched`, `unmatched`, `ambiguous`, `evicted`, `missing`, `pending`,
@@ -1031,31 +897,3 @@ before discarding it. No new acquisition of a media/READY/retirement lock is
 introduced for diagnostics. Hooks do not change pressure limits or recovery
 decisions. An incomplete native WRITE remains visible when END is acknowledged;
 END does not wait for that call.
-
-Only START allocates the capture's fixed 1,024-slot lock-free MPSC staging ring,
-typed aggregation counters and retained buffers. Media hooks check an
-inactive/selected-group gate before diagnostic clocks, allocation or platform
-queries. Fast operation hooks update bounded atomics and do not allocate one
-record per call. They never format JSON or use sockets, disks or a diagnostic
-mutex. Routine records can occupy 896 ring slots; 128 are reserved for critical
-recovery/session/failure/lifecycle records, and a final slot is reserved for
-terminal state. A record receives a sequence only after a publication ticket
-reserves its slot, so admission drops do not create false sequence gaps.
-The diagnostic lane drains tickets in order and cannot pass an earlier
-unpublished reservation. Closing the queue atomically with terminal admission
-rejects late publishers. The diagnostic lane drains at most 1,024 observations
-per pass, formats bounded schemas, then enforces the 4,096-record/2 MiB split
-retention budgets and publishes exact/inexact loss watermarks.
-
-JVM tests exercise real plain TCP loopback against the app listener,
-HELLO/connection/rate limits, strict framing,
-lease/retention, concurrent producers, blocked native output vs END, UI gating,
-and repeated raw recovery-window rejection with retained cutoff/interval
-evidence. Synthetic fixtures use the app build directory and are removed after
-testing. These are not Wi-Fi, acoustic
-output or real-device overhead acceptance results.
-
-The historical v1 validation and two-listener collection workflow are retired.
-Current tests and collection instructions use the v2 single-sender contract above.
-Loopback tests do not establish device overhead or display timing.
-</details>

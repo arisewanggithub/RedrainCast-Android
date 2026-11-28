@@ -2,6 +2,11 @@ package org.screencopy.receiver.media
 
 import dev.redrain.cast.diagnostics.CausalEvidence
 import dev.redrain.cast.diagnostics.TelemetryRegistry
+import dev.redrain.cast.diagnostics.RemoteDiagnostics
+import dev.redrain.cast.diagnostics.DiagnosticKind
+import dev.redrain.cast.diagnostics.DiagnosticStage
+import dev.redrain.cast.diagnostics.DiagnosticPoint
+import dev.redrain.cast.diagnostics.DiagnosticAudioClockObservation
 
 internal data class VideoSchedulingClock(
     val delayUs: Long?, val readAtNs: Long, val mappingRevision: Long,
@@ -9,33 +14,64 @@ internal data class VideoSchedulingClock(
     val audioObservationSequence: Long?, val audioObservationAtNs: Long?,
     val audioOutputSource: AudioClockSource?, val audioTimestampAgeUs: Long?,
     val observedAppliedOffsetUs: Long?, val lastPacketCorrection: AudioClockCorrection?,
-    val recoveringAudio: Boolean
+    val recoveringAudio: Boolean,
+    val audioObservation: AudioClockObservation? = null
+)
+
+internal data class AudioClockObservation(
+    val sequence: Long, val atNs: Long, val sampleUs: Long, val sourcePtsUs: Long,
+    val timing: AudioOutputTiming?, val appliedOffsetUs: Long
 )
 
 internal data class AudioStartDecision(
     val reason: Int, val mode: Int, val targetUs: Long, val positionUs: Long?,
     val delayUs: Long?, val firstVideoUs: Long?, val releasedVideoUs: Long?,
-    val waitedUs: Long, val revision: Long, val flags: Long
+    val waitedUs: Long, val revision: Long, val flags: Long,
+    val observationAgeUs: Long? = null,
+    val retainedDecodedBytes: Int = 0, val retainedDecodedPackets: Int = 0,
+    val encodedQueueBytes: Int = 0, val encodedQueuePackets: Int = 0,
+    val sampledAtNs: Long? = null, val queueSampledAtNs: Long? = null,
+    val observationSequence: Long? = null, val observationAtNs: Long? = null,
+    val observationPtsUs: Long? = null, val outputSource: AudioClockSource? = null,
+    val nativeTimestampAtNs: Long? = null, val nativeTimestampFrame: Long? = null,
+    val appliedOffsetUs: Long? = null, val correctionSequence: Long? = null,
+    val omittedRepeats: Long = 0
 )
 
 class PlaybackClock(
     private val nanoTime: () -> Long = System::nanoTime,
     private val sleepMs: (Long) -> Unit = Thread::sleep
 ) {
+    internal var hybridVideoSync = dev.redrain.cast.BuildConfig.DEBUG &&
+        dev.redrain.cast.BuildConfig.HYBRID_AUDIO_EXPERIMENT
+        set(value) { field = dev.redrain.cast.BuildConfig.DEBUG && value }
     private var basePtsUs = -1L
     private var baseNs = 0L
     private var audioPositionUs: (() -> Long)? = null
     private var audioSource: AudioSourceClock? = null
+    private var virtualVideoSync: VirtualVideoSyncClock? = null
     private var lastPositionUs: Long? = null
-    @Volatile private var observedAudio: SourceTimestampObservation? = null
+    private data class PlayedAudioState(
+        val source: AudioSourceClock, val observation: SourceTimestampObservation,
+        val coverage: PlayedAudioCoverage?, val cutoffUs: Long?
+    )
+    @Volatile private var playedAudioState: PlayedAudioState? = null
+    private val observedAudio: SourceTimestampObservation? get() = playedAudioState?.observation
     private var audioObservationSequence = 0L
     private var observedOutputTiming: AudioOutputTiming? = null
     private var observedAppliedOffsetUs: Long? = null
+    private var coherentObservation: AudioClockObservation? = null
     private var lastPacketCorrection: AudioClockCorrection? = null
     private var audioProjection: ((Long) -> Long?)? = null
     private var lastVideoPositionUs: Long? = null
     private var releasedVideoUs: Long? = null
     internal fun cachedPlayedAudioSource(): Long? = observedAudio?.ptsUs
+    internal fun cachedAudioDiscardCutoffUs(): Long? = playedAudioState?.cutoffUs
+    internal fun cachedPlayedAudioCoverage(source: AudioSourceClock): PlayedAudioCoverage? =
+        playedAudioState?.takeIf { it.source === source }?.coverage
+    @Synchronized internal fun invalidateAudioDiscardCutoff(source: AudioSourceClock) {
+        if (audioSource === source) playedAudioState = playedAudioState?.copy(coverage = null, cutoffUs = null)
+    }
     internal fun cachedPlayedAudioObservation(): SourceTimestampObservation? = observedAudio
     @Volatile var audioExpected = false
     @Volatile internal var recoveryStartup = false
@@ -45,7 +81,6 @@ class PlaybackClock(
     @Volatile private var resumingAudio = false
     private var recoveringAudio = false
     private var firstVideoAtNs: Long? = null
-    private var prerollEpochUs: Long? = null
     private var videoPrerollEnded = false
     private var mappingRevision = 0L
     @Volatile internal var diagnosticSession = 0L
@@ -66,6 +101,8 @@ class PlaybackClock(
         var transition: LongArray? = null
         var atNs = 0L
         var generation = 0
+        var recoveryBase: LongArray? = null
+        var recoveryObservation: AudioClockObservation? = null
         try {
             return synchronized(this) {
                 val oldRevision = mappingRevision
@@ -74,10 +111,20 @@ class PlaybackClock(
                 val oldMode = modeLocked()
                 val oldFloor = lastPositionUs
                 val oldObservation = observedAudio
+                val oldCoherentObservation = coherentObservation
                 try { block() } finally {
                     if (mappingRevision != oldRevision) {
                         atNs = nanoTime()
                         generation = diagnosticGeneration
+                        if (reason == CausalEvidence.Mapping.RECOVERY_BEGIN ||
+                            reason == CausalEvidence.Mapping.RECOVERY_END || reason == CausalEvidence.Mapping.DETACH) {
+                            RemoteDiagnostics.recorder.audioTiming(diagnosticSession)?.takeIf { it.workEnabled }?.let {
+                                // DETACH clears the observation: retain the last coherent native sample, not a new query.
+                                recoveryObservation = if (reason == CausalEvidence.Mapping.DETACH)
+                                    oldCoherentObservation else coherentObservation
+                                recoveryBase = longArrayOf(basePtsUs, baseNs, mappingRevision)
+                            }
+                        }
                         transition = longArrayOf(reason.ordinal.toLong(), oldRevision, mappingRevision,
                             oldBase, oldNs, basePtsUs, baseNs, oldMode, modeLocked(), oldFloor ?: -1,
                             lastPositionUs ?: -1, observedAudio?.ptsUs ?: -1, observedAudio?.observedAtNs ?: -1,
@@ -90,6 +137,16 @@ class PlaybackClock(
             }
         } finally {
             transition?.let { mappingObserved(it, atNs, generation) }
+            recoveryBase?.let { base ->
+                RemoteDiagnostics.recorder.observe("receiver", diagnosticSession, DiagnosticKind.AUDIO_OUTPUT,
+                    when (reason) {
+                        CausalEvidence.Mapping.RECOVERY_BEGIN -> DiagnosticStage.CONFIG
+                        CausalEvidence.Mapping.RECOVERY_END -> DiagnosticStage.SETTLED
+                        else -> DiagnosticStage.RESET
+                    }, 2, generation, pts = base[0], cutoff = base[1], count = base[2],
+                    point = DiagnosticPoint.RECOVERY,
+                    metadata = recoveryObservation?.let(::DiagnosticAudioClockObservation))
+            }
         }
     }
     @Synchronized internal fun mappingRevision(): Long = mappingRevision
@@ -98,11 +155,6 @@ class PlaybackClock(
         if (firstVideoPtsUs == null) {
             firstVideoPtsUs = ptsUs
             firstVideoAtNs = nanoTime()
-            if (audioExpected && !audioStarted && prerollEpochUs?.let { ptsUs > it } == true) {
-                prerollEpochUs = ptsUs
-                basePtsUs = -1
-                mappingRevision++
-            }
         }
         noteMedia()
         if (!audioExpected) anchor(ptsUs)
@@ -118,34 +170,16 @@ class PlaybackClock(
             throw PlaybackException("Audio/video startup did not complete within three seconds")
     }
 
-    fun prepareAudio(slice: TrimmedAudio, rate: Int): TrimmedAudio? = mapped(CausalEvidence.Mapping.PREPARE) {
+    fun prepareAudio(slice: TrimmedAudio): TrimmedAudio = mapped(CausalEvidence.Mapping.PREPARE) {
         if (!audioExpected || audioStarted) return@mapped slice
-        if (resumingAudio) {
-            if (basePtsUs < 0) {
-                basePtsUs = slice.audiblePtsUs
-                baseNs = nanoTime() + 50_000_000L
-                mappingRevision++
-            }
-            return@mapped slice
-        }
-        checkStartup()
-        val videoPts = firstVideoPtsUs ?: return@mapped null
-        val epoch = maxOf(videoPts, slice.audiblePtsUs)
-        if (epoch - minOf(videoPts, slice.audiblePtsUs) > 3_000_000)
-            throw PlaybackException("Initial track timestamps exceed the three-second synchronization budget")
-        val skip = minOf(slice.frames.toLong(), ((epoch - slice.audiblePtsUs) * rate + 999_999) / 1_000_000).toInt()
-        val result = TrimmedAudio(slice.skipFrames + skip, slice.frames - skip, slice.audiblePtsUs + skip * 1_000_000L / rate)
-        prerollEpochUs = epoch
-        if (result.frames > 0 && (basePtsUs < 0 || basePtsUs != result.audiblePtsUs)) {
-            basePtsUs = result.audiblePtsUs
+        if (!resumingAudio) checkStartup()
+        if (slice.frames > 0 && basePtsUs < 0) {
+            basePtsUs = slice.audiblePtsUs
             baseNs = nanoTime() + 50_000_000L
             mappingRevision++
         }
-        result
+        slice
     }
-
-    @Synchronized
-    fun canPrepareAudio(): Boolean = !audioExpected || firstVideoPtsUs != null || audioStarted || resumingAudio
 
     internal fun beginAudioRecovery() = mapped(CausalEvidence.Mapping.RECOVERY_BEGIN) {
         audioProjection = null
@@ -165,9 +199,11 @@ class PlaybackClock(
         resumingAudio = false
     }
 
-    internal fun videoPresented(ptsUs: Long, presentationAtNs: Long = nanoTime()) = mapped(CausalEvidence.Mapping.VIDEO_RELEASE) {
+    internal fun videoPresented(ptsUs: Long, presentationAtNs: Long = nanoTime(),
+                                virtualScheduling: Boolean = false) = mapped(CausalEvidence.Mapping.VIDEO_RELEASE) {
         require(ptsUs >= 0) { "Negative video presentation timestamp" }
         releasedVideoUs = ptsUs
+        if (virtualScheduling) return@mapped
         if (!recoveringAudio || audioSource != null) return@mapped
         val current = positionLocked()
         if (current == null || ptsUs > current) {
@@ -202,11 +238,12 @@ class PlaybackClock(
     }
 
     fun awaitAudioStart(ptsUs: Long, running: () -> Boolean): Boolean =
-        awaitAudioStartObserved(ptsUs, {}, running)
+        awaitAudioStartObserved(ptsUs, {}, running = running)
 
     internal fun awaitAudioStartObserved(ptsUs: Long, observed: (AudioStartDecision) -> Unit,
+                                         waitForFuture: Boolean = true, startedAtNs: Long? = null,
                                          running: () -> Boolean): Boolean {
-        val started = nanoTime()
+        val started = startedAtNs ?: nanoTime()
         var publishedAt: Long? = null
         var publishedReason = -1
         var publishedRevision = -1L
@@ -229,13 +266,19 @@ class PlaybackClock(
                 delay?.let { ptsUs - it } ?: positionLocked(), delay, firstVideoPtsUs, releasedVideoUs,
                 (now - started).coerceAtLeast(0) / 1000, mappingRevision,
                 (if (audioExpected) 1L else 0L) + (if (audioStarted) 2L else 0L) +
-                    (if (resumingAudio) 4L else 0L) + (if (recoveringAudio) 8L else 0L))
+                    (if (resumingAudio) 4L else 0L) + (if (recoveringAudio) 8L else 0L),
+                observedAudio?.observedAtNs?.let { (now - it).coerceAtLeast(0) / 1000 },
+                sampledAtNs = now, observationSequence = observedAudio?.let { audioObservationSequence },
+                observationAtNs = observedAudio?.observedAtNs, observationPtsUs = observedAudio?.ptsUs,
+                outputSource = observedOutputTiming?.clockSource,
+                nativeTimestampAtNs = observedOutputTiming?.timestampAtNs,
+                nativeTimestampFrame = observedOutputTiming?.timestampFramePosition,
+                appliedOffsetUs = observedAppliedOffsetUs, correctionSequence = lastPacketCorrection?.sequence)
         }
         try {
             while (running()) {
                 val preroll = synchronized(this) {
-                    if (audioExpected && !audioStarted && !resumingAudio &&
-                        (basePtsUs < 0 || prerollEpochUs?.let { ptsUs < it } == true))
+                    if (audioExpected && !audioStarted && !resumingAudio && basePtsUs < 0)
                         snapshotLocked(2) else null
                 }
                 if (preroll != null) { observed(preroll); return false }
@@ -258,6 +301,7 @@ class PlaybackClock(
                         else "Audio startup did not complete within three seconds",
                         if (resumingAudio) "AUDIO_FAILED" else "DECODER_FAILED")
                 sleepMs(2)
+                if (!waitForFuture) return false
             }
             synchronized(this) { snapshotLocked(5) }?.let(observed)
             return false
@@ -284,10 +328,12 @@ class PlaybackClock(
         mappingRevision++
         return AudioSourceClock(ptsUs, sampleRate).also {
             audioSource = it
-            observedAudio = null
+            virtualVideoSync = if (hybridVideoSync) VirtualVideoSyncClock(ptsUs, nanoTime()) else null
+            playedAudioState = null
             audioProjection = null
             observedOutputTiming = null
             observedAppliedOffsetUs = null
+            coherentObservation = null
             lastPacketCorrection = null
             audioStarted = true
             resumingAudio = recoveringAudio
@@ -297,15 +343,25 @@ class PlaybackClock(
     @Synchronized
     internal fun observeAudio(source: AudioSourceClock, sampleUs: Long, observedAtNs: Long,
                               timing: AudioOutputTiming? = null,
-                              presentedSourceAtFrame: ((Long) -> Long)? = null) {
-        if (audioSource !== source) return
+                              retainEvidence: Boolean = true,
+                              presentedSourceCutoffUs: Long? = null,
+                              playedCoverage: PlayedAudioCoverage? = null,
+                              presentedSourceAtFrame: ((Long) -> Long)? = null): AudioClockObservation? {
+        if (audioSource !== source) return null
         val positionAtNs = timing?.positionAtNs ?: observedAtNs
-        if (observedAudio?.let { positionAtNs < it.observedAtNs } == true) return
-        observedAudio = SourceTimestampObservation(source.current(sampleUs), positionAtNs)
+        if (observedAudio?.let { positionAtNs < it.observedAtNs } == true) return null
+        val observation = SourceTimestampObservation(source.current(sampleUs), positionAtNs)
+        // Destructive trimming never uses the slewed sync clock or its head/projection floor.
+        val qualified = timing?.virtualDiscard != true && timing?.clockSource == AudioClockSource.TIMESTAMP &&
+            timing.qualifiedTimestampFrames != null
+        playedAudioState = PlayedAudioState(source, observation, if (qualified) playedCoverage else null,
+            if (qualified) presentedSourceCutoffUs else null)
         audioObservationSequence++
-        observedOutputTiming = timing
+        observedOutputTiming = timing?.takeUnless { it.virtualDiscard }
         observedAppliedOffsetUs = source.appliedOffsetUs()
-        audioProjection = if (!recoveringAudio && timing?.clockSource == AudioClockSource.TIMESTAMP &&
+        coherentObservation = if (retainEvidence && timing?.virtualDiscard != true) AudioClockObservation(audioObservationSequence, positionAtNs, sampleUs,
+            checkNotNull(observedAudio).ptsUs, timing, checkNotNull(observedAppliedOffsetUs)) else null
+        audioProjection = if (!recoveringAudio && timing?.virtualDiscard != true && timing?.clockSource == AudioClockSource.TIMESTAMP &&
             timing.positionAtNs != null && timing.timestampAtNs != null && timing.timestampEstimateFrames != null &&
             timing.positionAtNs <= observedAtNs && timing.sampleRate > 0 &&
             timing.positionAtNs - timing.timestampAtNs in 0..AudioPosition.TIMESTAMP_VALID_NS &&
@@ -326,6 +382,7 @@ class PlaybackClock(
             }
             prediction
         } else null
+        return coherentObservation
     }
 
     internal fun audioPacket(sampleUs: Long, ptsUs: Long): AudioClockCorrection? {
@@ -343,7 +400,10 @@ class PlaybackClock(
     }
 
     @Synchronized
-    internal fun audioWritten(sampleUs: Long) { checkNotNull(audioSource).written(sampleUs) }
+    internal fun audioWritten(sampleUs: Long) {
+        checkNotNull(audioSource).written(sampleUs)
+        virtualVideoSync?.submit(sampleUs, nanoTime())
+    }
 
     internal fun monotonicNs(): Long = nanoTime()
 
@@ -370,10 +430,13 @@ class PlaybackClock(
             resumingAudio = audioStarted || recoveringAudio
             audioPositionUs = null
             audioSource = null
-            observedAudio = null
+            virtualVideoSync = null
+            if (hybridVideoSync) lastVideoPositionUs = null
+            playedAudioState = null
             audioProjection = null
             observedOutputTiming = null
             observedAppliedOffsetUs = null
+            coherentObservation = null
             lastPacketCorrection = null
             mappingRevision++
         }
@@ -383,6 +446,10 @@ class PlaybackClock(
         observeCallback()
         return synchronized(this) { positionLocked() }
     }
+
+    internal fun refreshAudioObservation() = observeCallback()
+
+    @Synchronized internal fun currentUsCached(): Long? = positionLocked()
 
     @Synchronized
     internal fun canProveVideo(ptsUs: Long, previousObservation: SourceTimestampObservation?): Boolean {
@@ -406,14 +473,16 @@ class PlaybackClock(
             val now = nanoTime()
             var raw: Long? = null
             val actual = positionLocked(now) { raw = it }
-            audioProjection?.invoke(now)?.let { sampleUs ->
-                raw = audioSource?.projected(sampleUs)
-            }
+            val virtual = virtualVideoSync?.position(now)
+            if (virtual != null) raw = virtual
+            else audioProjection?.invoke(now)?.let { sampleUs -> raw = audioSource?.projected(sampleUs) }
             val position = raw?.let {
-                maxOf(it, actual ?: it, lastVideoPositionUs ?: it).also { guarded -> lastVideoPositionUs = guarded }
+                maxOf(it, if (virtual == null) actual ?: it else it, lastVideoPositionUs ?: it)
+                    .also { guarded -> lastVideoPositionUs = guarded }
             }
             VideoSchedulingClock(position?.let { ptsUs - it }, now, mappingRevision,
                 when {
+                    virtual != null -> "VIRTUAL_SYNC"
                     audioSource != null && observedAudio == null -> "AUDIO_INITIAL"
                     audioSource != null && audioPositionUs != null -> "CALLBACK_AUDIO"
                     audioSource != null -> "CACHED_AUDIO"
@@ -422,7 +491,7 @@ class PlaybackClock(
                 }, position, raw,
                 observedAudio?.let { audioObservationSequence }, observedAudio?.observedAtNs,
                 observedOutputTiming?.clockSource, observedOutputTiming?.timestampAgeUs,
-                observedAppliedOffsetUs, lastPacketCorrection, recoveringAudio)
+                observedAppliedOffsetUs, lastPacketCorrection, recoveringAudio, coherentObservation)
         }
     }
 
@@ -449,7 +518,9 @@ class PlaybackClock(
             basePtsUs = ptsUs
             baseNs = now
             mappingRevision++
-        } else if (audioSource == null && now < baseNs && ptsUs < basePtsUs) {
+        } else if (audioSource == null && !resumingAudio && now < baseNs && ptsUs < basePtsUs) {
+            // Only initial preroll may move a future anchor to an earlier audio PTS.
+            // During recovery baseNs can be a scheduled video deadline on a running timeline.
             basePtsUs = ptsUs
             mappingRevision++
         }

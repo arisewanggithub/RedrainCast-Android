@@ -7,58 +7,11 @@ policy; there is no migration from the retired applications.
 
 ## Use
 
-**Automatic session telemetry:**
-the sender retains up to 60 seconds and 480 KiB of compact metadata per endpoint.
-A compatible receiver publishes bounded telemetry once per second over the
-existing cast control connection; it does not persist reports. The first
-pressure or retained failure creates at most one sender-owned report for the
-cast, with bounded post-trigger and terminal context. A normal successful cast
-without pressure or failure writes no report. Reports are private, contain no
-screen or audio payloads and are not uploaded. On the sender, Settings →
-Advanced → **View or clear session telemetry reports** provides summary,
-export through Android's document picker and deletion. Up to eight reports of
-at most 2 MiB each are retained for seven days, with expiry checked on later
-report access or save. Retained telemetry payload is bounded to 3 MiB across
-both endpoints. Missing receiver telemetry, publication gaps and
-incomplete teardown remain explicit; an older peer casts normally without
-receiver telemetry and there is no automatic retrieval fallback. Cast traffic
-is unencrypted and not cryptographically paired; use a trusted LAN. See
-[session telemetry](protocol/PRESSURE_INCIDENTS.md) for the approved bounds,
-terminal transaction and interpretation.
-
-**Remote diagnostics (default off, process-local):** in Settings → Advanced,
-open **LAN diagnostics endpoint / status** to review the detailed warning, then select
-**Allow unpaired LAN diagnostics** independently of playback statistics and Save.
-The separate TCP endpoint appears in **LAN diagnostics endpoint / status**
-and the controlled `DIAGNOSTIC_LISTENER_STARTED` local log event.
-**Anyone on the LAN can read bounded metadata and control diagnostic captures
-while enabled. Traffic is unencrypted and unauthenticated; use a trusted LAN.**
-There is no pairing, certificate, or secret; the collector requires explicit
-`--lan` and sends HELLO. Only an explicit bounded START enables this live
-diagnostic capture; automatic session telemetry is separate.
-An explicit v2 START arms the next cast, requesting diagnostics on its compatible
-receiver without changing receiver preferences. The receiver records admission
-before media and sends evidence through a separate lane on its cast listener;
-there is no receiver diagnostics listener or receiver discovery advertisement.
-An armed cast fails before media if its required diagnostic bootstrap fails;
-ordinary unarmed casts do not wait for diagnostics. Frozen pair evidence is
-retained for at most 120 seconds.
-Settings are unavailable during an active cast. To find the sender after its
-startup log is gone, use `--discover-sender PHONE_PRIVATE_IPV4`: one read-only
-unicast query to UDP 27184 returns the live consent-gated TCP endpoint without
-restarting/toggling consent or scanning ports. This requires the updated build;
-it cannot recover an unknown endpoint in an already-running older process.
-Run `--lan --sender PHONE_HOST:PHONE_PORT --output DIRECTORY` **before** starting
-the cast. The collector uses one sender connection for both sources. Disabling
-sender access clears the in-memory pair; backgrounding alone does not revoke consent.
-See the [protocol and supported schemas](protocol/REMOTE_DIAGNOSTICS.md) and
-[paired PC collector](tools/REMOTE_DIAGNOSTICS.md). Select supported role flags
-explicitly: receiver `video.progress,video.timing` includes bounded PTS-keyed scheduling
-and callback evidence, with cached audio observation age and clock-map context,
-independently of the statistics panel. Kernel TCP metrics are not implemented.
-These clock estimates do not prove physical scanout. No media contents or
-unrestricted logs are collected. Device overhead, bootstrap and final-flush
-timings have not been established by JVM tests.
+**Troubleshooting:** For symptoms, automatic sender reports, consented live v2
+collection, and interpreting logs and metrics, see the
+[troubleshooting runbook](TROUBLESHOOTING.md). Automatic telemetry and live
+LAN diagnostics are separate; both carry sensitive metadata. Casting and live
+diagnostics are unauthenticated and unencrypted: use a trusted LAN and VPN.
 
 **Playback statistics (default off):** Settings on the sending Android device
 has **Show playback statistics on receiver (next cast)** at the bottom of
@@ -283,18 +236,28 @@ settings are changed by statistics.
   denial, startup failure, and normal sender teardown release the reservation;
   listening automatically resumes while the app is foregrounded. A restarted
   listener can get a different port, so its displayed/advertised endpoints refresh.
-- **Sharing settings** are accessed through the header settings button and saved
-  only on Save. Codec, size, Maximum capture FPS, bitrate, orientation and audio are the primary
-  controls; crop and detailed audio options are under Advanced. Selection fields
+- **Cast settings** are accessed through the header settings button and saved
+  only on Save. Send video and Send audio can be selected independently, but at
+  least one track must remain enabled. Video codec, size, Maximum capture FPS,
+  bitrate and receiver orientation are grouped under Video; audio codec, source
+  and encoded bitrate are grouped under Audio. Crop and other existing advanced
+  controls are under Advanced. Selection fields
   open standard Android single-choice dialogs with the current option checked.
   Text inputs select their full value when gaining focus for easy replacement;
   subsequent taps in the focused field retain normal cursor placement.
+  Maximum video size offers Original and the common 1280/1920/2560/3840-pixel
+  presets. Video bitrate offers integer 1–30 Mbps choices; existing fractional
+  and non-preset values remain visible as the current selection until changed.
+  Size presets are checked against the current natural capture raster, crop,
+  aligned output geometry, FPS ceiling and encoder.   Known unsupported presets are filtered, except a saved/current selection is
+  retained and labeled. Capability-unverified options are labeled rather than
+  assumed supported. Bitrate presets follow the same distinction.
   Maximum capture FPS defaults to **Uncapped**, followed by the common caps:
   15, 24, 25, 30, 48, 50, 60, 90 and 120. This is a limit, not a promised
   capture or playback rate. A previously saved custom FPS remains selectable alongside
   the sorted presets, but new arbitrary values cannot be entered.
   Selecting updates only the draft; cancelling a choice retains its prior value,
-  and cancelling Sharing settings discards all edits. Child dialogs close with
+  and cancelling Cast settings discards all edits. Child dialogs close with
   their parent, and the settings scroll position is retained.
   Receiver orientation follows the displayed video in Auto mode on phones and
   tablets; explicit Portrait/Landscape overrides still apply there. Displays
@@ -307,9 +270,17 @@ settings are changed by statistics.
   Only codecs with
   an eligible hardware video encoder on this device are offered. An unsupported
   saved codec requires an explicit supported selection; it is not silently
-  replaced. Encoder names are selected automatically, including when loading
+  replaced.   Encoder names are selected automatically, including when loading
   older saved manual overrides. Raw PCM hides the encoded-audio bitrate control
   and uses fixed 48 kHz stereo s16le instead.
+  Fullscreen ignores the active crop while retaining its four dormant natural-
+  orientation pixel coordinates. Bounds are checked when the crop is active;
+  hidden crop drafts do not block saving.
+  Audio-only casting requires the receiver to acknowledge `audioOnlyVersion:1`
+  during HELLO. Older receivers report an update-or-enable-video error instead
+  of silently switching back to video. The receiver's audio controls appear
+  after real source audio is submitted to the output, not on decoder readiness
+  or inserted silence.
   New video settings default to uncapped H.264 capture at 8 Mbps with a
   1920-pixel maximum size; existing saved codec, bitrate and FPS selections
   are preserved. Audio defaults and encoding behavior are unchanged: raw PCM,
@@ -435,108 +406,10 @@ and workload hints, not core locking; it is not enabled speculatively here.
 Real-device before/after underrun, refill wall/CPU time and frame-presentation
 measurements under comparable load are required to establish improvement.
 
-### Diagnosing missing video frames
+### Troubleshooting playback
 
-Debug builds can record a metadata-only sender video trace. Before starting a
-new consent-backed cast, run `adb -s <verified-device> shell setprop
-log.tag.RedrainVideoTrace DEBUG`. Tracing remains off in release builds and when
-that log tag is not enabled. Reset the tag to `INFO` after the measurement.
-The first capture callback starts a 30-second window, limited to 16,384 events.
-For a ten-minute measurement, also set `log.tag.RedrainVideoTraceLong` to
-`DEBUG` before starting the cast. This selects 600 seconds and a fixed
-1,440,000-event bound (enough for all nine stages at 240 FPS); storage grows
-only as events arrive. Reset both tags to `INFO` afterward. The long trace
-can use tens of megabytes of memory and is diagnostic-only.
-Capture callbacks, acquired image PTS, intentional FPS filtering, encoder-surface
-submission begin/end, encoded output, sink return and TCP write begin/end
-are recorded in memory without per-frame logging or file I/O. Only successful
-surface submissions and writes receive end events. Sink return is not proof of
-transmission: recovery may retain or discard that packet. Encoder repeats can
-have PTS without a corresponding new captured image.
-
-The watchdog saves one `files/video-frame-<session>.jsonl` in private app storage
-after the window, or a partial trace on orderly session cleanup. Retrieve it
-with `adb -s <verified-device> exec-out run-as dev.redrain.cast.debug cat
-files/video-frame-<session>.jsonl`. `VIDEO_FRAME_TRACE_SAVED` reports its exact
-name; write failures are logged explicitly. Remove the named private trace after
-retrieval. Each line contains timestamp metadata only, never encoded bytes or
-screen content. The summary distinguishes a full window from early Stop or
-capacity overflow; events at either window boundary cannot prove missing frames.
-
-Compare source PTS across successful submissions, encoded pictures, successful
-writes and receiver decode/presentation. Capture PTS gaps alone do not prove
-loss: `updateTexImage()` acquires the latest available image, static content may
-not update, and source video can have a lower or variable cadence. Receiver
-recovery can remap wire generations, so retain session, PTS and generation when
-correlating stages. Monotonic clocks are local to each device and must not be
-subtracted across devices as if synchronized. Tracing does not change capture
-limits, codecs, queue policy, timestamps or playback scheduling.
-
-`tools\Analyze-VideoFrameTrace.ps1 -SenderTrace <sender.jsonl> [-ReceiverTrace
-<receiver.jsonl>]` reports source/observed cadence, GPU-submit/socket-write
-durations and source-PTS multiset discontinuities across stages.
-The report also bins independent stage counts by source-PTS minute; the first
-and last minute can be partial and are not themselves a matched-loss proof.
-It rejects overflowed traces and different sessions and excludes a 500 ms source-PTS margin
-at both ends of each overlapping stage window. Empty or non-overlapping stages
-remain explicitly unmeasured, not zero loss. Sender-only analysis is supported.
-Receiver files use the matching Windows metadata trace schema. Run
-`tools\Test-VideoFrameTrace.ps1` for the analyzer's synthetic continuity checks.
-Instrumentation adds bounded recording overhead; this is a diagnostic sample,
-not proof that timing is identical to an uninstrumented cast.
-
-### Diagnosing receiver audio crackles
-
-The receiver logs `AUDIO_SERVICE_WINDOW` under `ScreenCopyReceiver` every five
-seconds of active audio servicing, plus a final partial window on clean worker
-release. This is independent of the playback statistics checkbox. Each record
-includes the session/audio epoch, actual window duration, native AudioTrack
-underrun delta and lifetime total, explicitly inserted silence frames/episodes,
-discarded PCM frames, zero writes, and maximum worker/input/decode/refill wall
-and thread-CPU durations. Startup waiting before audio starts is excluded.
-Frame counters convert to milliseconds as `frames * 1000 / sample_rate`.
-Underruns per second are `native_underruns * 1000000 / window_us`; these are
-Android counter increments, not a count of perceptually distinct clicks.
-The existing rate-limited `AUDIO_UNDERRUN_RECOVERY` logs remain available.
-
-On native underrun increments, a bounded 512-event history is emitted as
-`AUDIO_UNDERRUN_HISTORY` plus numbered `AUDIO_HISTORY` chunks, at most once per
-second; throttled increments are retained. Data tuples are
-`relative_us,kind,a,b`, relative to the header's monotonic timestamp. Receipt
-means a validated packet reached its worker before admission, not physical
-network arrival. `receive` holds PTS/bytes; `admit` and `dequeue` hold PTS/queue
-count; `decode_begin` and `aac_input` hold PTS/bytes; `decode_end` holds PTS/PCM
-frames; `refill` holds pre-refill padding microseconds/PCM frames; `silence`
-holds accepted frames/PCM frames; `observe` holds native counter/queue count.
-Refill history is sampled at 5 ms while padding exceeds 5 ms; low-padding
-calls are retained individually. Overwritten entries are reported. This
-history distinguishes observed processing order but does not prove scheduler
-state or identify sender versus network delays without sender-side evidence.
-
-Capture logs from the **receiving** device during a reproduction:
-
-```powershell
-adb -s <receiver-serial> logcat -v threadtime ScreenCopyReceiver:I '*:S' > audio-log.txt
-```
-
-`max_refill_gap_us` includes time between output-service calls. Its paired
-`gap_previous_pre_padding_us` is padding measured before the previous refill,
-not the amount left after that refill. `gap_pcm_frames` and
-`gap_last_arrival_age_us` describe the next call before refilling; arrival age
-measures the last packet admitted to the audio worker, not physical network
-arrival. Minimum pre-refill padding is paired with its decoded PCM count.
-Empty/pending-input observations are sampled after output service and cannot
-prove that a packet was available throughout a preceding stall.
-
-Large worker wall time with little thread CPU suggests off-CPU delay, including
-input waits, lock contention, GC or scheduling; high decode CPU suggests work
-cost. These are clues, not automatic root-cause classifications. To establish
-scheduling specifically, capture an Android Studio System Trace/Perfetto trace
-with CPU scheduling and inspect `ScreenCopy-audio`: runnable-but-not-running
-intervals indicate scheduler delay; sleeping/blocked intervals do not. Correlate
-with the logged underrun windows. The logs do not change thread priority, audio
-buffering, resampling, transport, or silence policy, and cannot diagnose an
-audible glitch solely from the A/V skew.
+See the [troubleshooting runbook](TROUBLESHOOTING.md) for missing frames,
+receiver audio crackles, debug trace collection, and interpretation.
 
 The sender uses MediaProjection, hardware MediaCodec video encoding, an EGL
 natural-coordinate mapping/crop, and a **fixed encoder raster across rotations**.
@@ -575,13 +448,38 @@ Healthy video continues decoding without another keyframe or decoder reset.
 Both tracks retain the same playback clock. While audio is detached, that clock
 continues monotonically; fresh audio resumes against it instead of rebasing the
 video timeline. Staleness is determined by source timestamps, not queue size.
+After recovery READY, a future first audible PTS can legitimately wait longer
+than the encoded audio queue's one-second PTS span. The audio worker checks that gate in bounded
+steps while continuing to decode codec dependencies. It retains the first slice
+and its following original-source PCM in decode order, sharing the existing
+512 KiB input byte cap with encoded admission (at most 256 retained decoded
+entries). Once its source deadline arrives, output drains those slices through
+the unchanged resampler and native output regulation; it does not replace the
+first slice with each new arrival, fill the wait with silence, or jump the clock
+to the newest packet. The audio queue defaults to a one-second raw PTS span and
+256 packets; its shared 512 KiB byte cap and the original ten-second recovery
+deadline remain unchanged. The span is a local receiver code setting
+(`DEFAULT_AUDIO_QUEUE_SPAN_US`), not a wire setting or a latency guarantee.
+Other limits can bind first, including retained decoded bytes and unusually small
+or large packets. Video admission remains at 48 packets and 250 ms.
+This bounded source-time retention is not a claim to remove existing latency.
+Admission counts every queued packet's raw PTS, including proved played
+dependencies: an earlier FIFO decode can invalidate that proof. Safe native
+played-audio trimming remains post-decode only; stale encoded backlog can still
+trigger existing track recovery or legacy congestion instead of gaining capacity.
 Video deadlines project qualified DAC observations to their scheduling time,
 bounded by already-consumed output frames and the existing 100 ms timestamp
 validity. Actual resampler/silence spans and source-clock slew are previewed
 without advancing audio observations. Diagnostics use the same deadline snapshot;
 this fixes cached-observation-age deadline jitter, not proven physical judder.
 Only decoded video pictures and decoded PCM may be trimmed within a retained
-compressed chain. Initial audio does not wait for a video decode proof.
+compressed chain. After all configured tracks are READY, initial audio does not
+wait for the first video packet or a video decode proof. Its source clock drives
+later video deadlines without being reset by that first packet. Late decoded
+pictures may be replaced by newer decoded pictures; with stream recovery
+negotiated, pictures over 250 ms late are discarded after decoding. Otherwise
+a late picture may render immediately. Future pictures keep their deadlines;
+temporary mismatch is acceptable and compressed dependencies are not skipped.
 Video completion proves usable decoded output; audio completion proves actual
 source-sample submission, not silence. Temporary A/V offsets do not terminate
 the session. Codec, bitrate, raster, rotation metadata and timestamps are not
@@ -606,7 +504,10 @@ selected-preroll eviction retries only audio under its original deadline.
 Packet/decode order and byte/count/PTS caps remain bounded.
 Recovery before the first audio submission uses the audio recovery deadline and
 fresh-source window, not the initial three-second startup checks or the original
-first-video timestamp. Ordinary startup still retains its existing checks.
+first-video timestamp. Ordinary startup still retains its independent audio-start
+and decoder failure checks, but missing video cannot trigger the three-second
+audio-start check after audio starts. The separately negotiated video recovery
+deadline still fails the session if usable video never arrives within ten seconds.
 Stop retires pending work and cannot produce late readiness or
 start new audio output. Audio format changes require a new capture session.
 An unsupported or non-acknowledging peer retains the strict congestion policy;
@@ -681,9 +582,11 @@ production signing and reviewed LGPL relink materials are configured; a separate
 same-repository publisher uses the ephemeral GitHub token. No production key
 material or in-app APK installer is included.
 Debug builds use application ID `dev.redrain.cast.debug`, launcher name
-**RedrainCast Debug**, and version name `0.4.19-debug` (the release version plus
-`-debug`). Release remains `dev.redrain.cast`, **RedrainCast**, version `0.4.19`,
-code `32`; both variants retain source namespace `dev.redrain.cast`.
+**RedrainCast Debug**, and a version name such as
+`0.5.4-debug-20261127T011630123Z-1234abcd`. The suffix contains the UTC build
+configuration timestamp and a random identifier, fixed in that APK. Release
+remains `dev.redrain.cast`, **RedrainCast**, version `0.5.4`, code `38`; both
+variants retain source namespace `dev.redrain.cast`.
 The distinct IDs allow debug and release to be installed side by side, with
 separate app data, saved settings and permissions; installing debug does not
 replace release. Older debug APKs using the release ID do not migrate to the
@@ -704,7 +607,7 @@ The launch update check compares the base version without the debug-only suffix,
 preserving alpha/beta/rc ordering and strict public release validation. It still
 offers public **release** pages, not debug updates: a downloaded release APK updates
 the separately installed release app (subject to its signing certificate), never
-the debug app. The displayed debug version retains `-debug`.
+the debug app. The displayed debug version retains its full build identifier.
 Ordinary push/PR CI runs validation only; public publication is manual and gated.
 The separate public
 [RedrainCast-Native repository](https://github.com/arisewanggithub/RedrainCast-Native)
@@ -981,22 +884,8 @@ Use `-p:WindowsRoot=...` to point MSBuild at a different Windows checkout.
 
 ### Reading congestion diagnostics
 
-The sender's media budget bounds queued per-track PTS span to 500 ms and local
-admission waiting to 500 ms, independently of track-local byte limits: 8 MiB
-for video and 512 KiB for audio. Congestion diagnostics report bytes and the
-byte cap for the affected track, not the sum of both media queues. A video
-`PTS_SPAN` failure can therefore occur with only about 1 MiB queued; it is not an
-out-of-memory failure. A receiver `origin=PEER` report means the peer raised the
-error, not that the local decoder reported a fault.
-
-Control, video and audio have independent TCP writers. In-flight duration,
-admitted age and last-write duration are now tracked separately for each lane.
-Older shared-writer diagnostics could incorrectly show `inflight=NONE` after an
-unrelated lane completed while video remained blocked. Queue limits, timestamps,
-requested bitrates and compressed dependencies are unchanged by this diagnostic
-correction. Socket backpressure alone does not distinguish Wi-Fi transport stalls
-from receiver admission/drain stalls; do not claim a particular root cause without
-correlated evidence.
+For pressure symptoms, queue limits and interpreting per-lane evidence, see the
+[troubleshooting runbook](TROUBLESHOOTING.md#pressure-recovery-or-disconnect).
 
 Receiver media admission is also independent per track. Ownership, generation
 and packet validation remain under a short shared lifecycle lock, but a bounded
@@ -1014,7 +903,8 @@ may require a complete 40 ms block. A zero nonblocking write yields immediately;
 partial writes preserve samples/PTS and the existing 250 ms no-progress limit.
 Pre-input servicing never inserts silence ahead of already-queued PCM; the small
 silence cushion is considered only after input/decode servicing finds a gap.
-No decoded-FIFO, native-buffer, network-queue, rate or quality limit is enlarged.
+For normal startup, native-buffer, encoded-queue, rate and quality limits are
+unchanged, as are the ordinary decoded-FIFO limits.
 During startup catch-up, decoding pauses whenever the FIFO reaches its existing
 50 ms target, including after the first actual source-sample write. This keeps
 a held startup burst from discarding source samples while the native ring is
@@ -1025,6 +915,11 @@ Output servicing and the 250 ms no-progress deadline continue while waiting;
 network admission remains independent and bounded. Packet-local overflow and
 steady-state compensation/overflow retain their existing behavior, including
 bounded decoded trimming to recover low latency after repeated short gaps.
+Recovery is different: its retained source PCM shares the 512 KiB input budget
+with encoded data and reservations, and its preservation path permits a
+converted FIFO up to the 50 ms target plus 120 ms of frames plus 256 frames.
+See [bounded stream recovery](#bounded-stream-recovery) for retention and
+admission limits; this is not an increase to the encoded queue budget.
 Regression tests exercise a 3921-frame native ring with a 1920-frame mixer
 quantum, PCM refill before input admission, partial/zero writes and bounded
 silence. These establish servicing behavior, not a claim that every possible

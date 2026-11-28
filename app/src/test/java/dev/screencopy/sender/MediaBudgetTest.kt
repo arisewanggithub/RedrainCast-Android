@@ -188,6 +188,21 @@ class MediaBudgetTest {
     private fun configure(mux: MediaBudget, track: Int, generation: Int) =
         mux.offer(Wire.config(1, track, generation, Wire.obj("codec" to if (track == 1) "h264" else "opus")))
 
+    @Test fun audioOnlyReadinessDoesNotWaitForVideoAndRejectsDisabledTrackTraffic() {
+        val now = AtomicLong(1_000_000_000L)
+        val mux = MediaBudget(withVideo = false, withAudio = true, clock = now::get)
+        configure(mux, 2, 1)
+        val config = checkNotNull(mux.pollLane(2, 1))
+        mux.endWrite(config)
+        mux.ready(2, 1)
+        assertTrue(mux.allReady())
+        val audio = frame(2, 1, 0, 8)
+        mux.offer(audio)
+        assertSame(audio, mux.pollLane(2, 1))
+        assertThrows(IOException::class.java) { configure(mux, 1, 1) }
+        assertThrows(IOException::class.java) { mux.offer(frame(1, 1, 0, 8)) }
+    }
+
     @Test fun independentWriterCompletionCannotEraseAnotherTracksCongestionEvidence() {
         for (blockedTrack in 1..2) {
             val now = AtomicLong(1_000_000_000L)

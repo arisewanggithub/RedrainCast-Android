@@ -202,6 +202,7 @@ internal class DiagnosticVideoTiming(val generation: Int) {
         val valid = g.sealed && !g.pending && g.success && !g.unsafe && g.outputs == 1 && g.releases == 1
         g.schedulingOccurrence?.valid = valid
         g.callbackOccurrence?.valid = valid && g.callbacks == 1 && g.deadline != null &&
+            g.observedAt >= g.callbackAt &&
             g.mapping == g.callbackMapping && difference(g.callbackAt, checkNotNull(g.deadline)) != null &&
             difference(g.observedAt, g.callbackAt) != null
     }
@@ -290,6 +291,7 @@ internal class DiagnosticVideoTiming(val generation: Int) {
                 if (g.callbacks > 0) totals.unmatched++
             }
             g.callbacks == 0 -> Unit
+            g.observedAt < g.callbackAt -> Unit
             g.deadline == null -> Unit
             g.mapping != g.callbackMapping -> { totals.mappingChanged++ }
             else -> {
@@ -416,6 +418,7 @@ internal class DiagnosticVideoTiming(val generation: Int) {
                         put("audioOutputSource", c.audioOutputSource?.name ?: JSONObject.NULL)
                         value("audioTimestampAgeAtObservationUs", c.audioTimestampAgeUs)
                         value("observedAppliedOffsetUs", c.observedAppliedOffsetUs)
+                        put("audioObservation", c.audioObservation?.let(::audioClockObservationJson) ?: JSONObject.NULL)
                         put("recoveringAudio", c.recoveringAudio)
                         put("lastPacketCorrection", c.lastPacketCorrection?.let {
                             JSONObject().put("sequence", "${it.sequence}").put("beforeOffsetUs", "${it.beforeOffsetUs}")

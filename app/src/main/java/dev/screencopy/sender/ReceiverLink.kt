@@ -21,7 +21,7 @@ import org.screencopy.receiver.protocol.DiagnosticProxyNegotiation
 import org.json.JSONObject
 
 /** Three plain TCP connections on a trusted LAN; the media token binds them to one session. */
-class ReceiverLink(private val target: ReceiverTarget) : Closeable {
+class ReceiverLink(private val target: ReceiverTarget, private val senderVideoEnabled: Boolean = true) : Closeable {
     private val sockets = Array(3) { Socket() }
     private val gates = Array(3) { Any() }
     private val timer = Executors.newSingleThreadScheduledExecutor()
@@ -35,6 +35,8 @@ class ReceiverLink(private val target: ReceiverTarget) : Closeable {
     var streamRecovery: Boolean = false
         private set
     var uncappedFps: Boolean = false
+        private set
+    var audioOnlyVersion: Int? = null
         private set
     var receiverOptions = ReceiverOptionCapabilities()
         private set
@@ -120,19 +122,34 @@ class ReceiverLink(private val target: ReceiverTarget) : Closeable {
                         .put("receiverFlags", JSONArray(claim.receiverFlags.sorted()))
                         .put("durationMs", remaining).put("samplePeriodMs", claim.samplePeriodMs))
                 }
-                send(Wire.control(Wire.HELLO, 0, Wire.obj(
+                val senderHello = Wire.obj(
                     "role" to "sender", "versions" to JSONArray().put(3),
                     "name" to "RedrainCast", "videoRotation" to true, "streamRecovery" to true, "uncappedFps" to true,
                     "streamRecoveryVersion" to StreamRecoveryProtocol.VERSION,
                     "receiverOptions" to ReceiverOptionProtocol.IMPLEMENTED.wireValue(),
                     "diagProxy" to proxy,
                     "sessionTelemetry" to SessionTelemetryProtocol.capability()
-                )))
+                )
+                if (!senderVideoEnabled) senderHello.put("audioOnlyVersion", 1)
+                send(Wire.control(Wire.HELLO, 0, senderHello))
                 val hello = receive()
                 reject(hello)
                 if (hello.type != Wire.HELLO || hello.session != 0L)
                     throw IOException("PROTOCOL: receiver HELLO session zero required")
                 val json = hello.json()
+                val offeredAudioOnlyVersion = if (senderVideoEnabled) null else 1
+                if (json.has("audioOnlyVersion")) {
+                    if (offeredAudioOnlyVersion == null)
+                        throw IOException("PROTOCOL: unsolicited audioOnlyVersion acknowledgement")
+                    if (json.opt("audioOnlyVersion") !is Int)
+                        throw IOException("PROTOCOL: audioOnlyVersion must be an integer")
+                    audioOnlyVersion = json.getInt("audioOnlyVersion").also {
+                        if (it != offeredAudioOnlyVersion)
+                            throw IOException("UNSUPPORTED_CONFIG: This receiver does not support audio-only casting version $offeredAudioOnlyVersion. Update the receiver or enable video.")
+                    }
+                }
+                if (offeredAudioOnlyVersion != null && audioOnlyVersion != offeredAudioOnlyVersion)
+                    throw IOException("UNSUPPORTED_CONFIG: This receiver does not support audio-only casting. Update the receiver or enable video.")
                 if (claim != null) {
                     val supported = try {
                         DiagnosticProxyNegotiation.supportsReceiver(
@@ -218,7 +235,11 @@ class ReceiverLink(private val target: ReceiverTarget) : Closeable {
     }
 
     fun attach(session: Long, acceptance: Wire.Message, withAudio: Boolean, timeoutMillis: Long = 10_000,
-               onFailure: (Exception) -> Unit = {},
+               onFailure: (Exception) -> Unit = {}, onValidated: () -> Unit = {}) =
+        attachTracks(session, acceptance, true, withAudio, timeoutMillis, onFailure, onValidated)
+
+    internal fun attachTracks(session: Long, acceptance: Wire.Message, withVideo: Boolean, withAudio: Boolean,
+               timeoutMillis: Long = 10_000, onFailure: (Exception) -> Unit = {},
                onValidated: () -> Unit = {}) {
         val failureGate = Any()
         var failurePublished = false
@@ -241,7 +262,8 @@ class ReceiverLink(private val target: ReceiverTarget) : Closeable {
                     if (tracks.get(it) !is Int) throw IOException("PROTOCOL: track must be an integer")
                     tracks.getInt(it)
                 }.sorted()
-                if (actual != if (withAudio) listOf(1, 2) else listOf(1))
+                val expected = listOfNotNull(1.takeIf { withVideo }, 2.takeIf { withAudio })
+                if (actual.size != actual.toSet().size || actual != expected)
                     throw IOException("PROTOCOL: receiver did not accept exactly the requested tracks")
                 val token = Json.string(json, "mediaToken")
                 if (!token.matches(Regex("[0-9A-Fa-f]{64}")))

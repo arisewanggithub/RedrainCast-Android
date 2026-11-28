@@ -19,6 +19,34 @@ import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicReference
 
 class SenderSocketTest {
+    @Test fun explicitWorkSelectionRejectsOldReceiverBeforeSessionRequestWhileLegacyStillConnects() {
+        for (work in listOf(false, true)) ServerSocket(0).use { server ->
+            val flags = if (work) setOf("audio.timing", "audio.timing.work") else setOf("audio.timing")
+            val peer = CompletableFuture.runAsync {
+                server.accept().use { control ->
+                    control.soTimeout = 3000
+                    val offered = Wire.read(control.inputStream).json().getJSONObject("diagProxy")
+                        .getJSONObject("offer").getJSONArray("receiverFlags")
+                    assertEquals(flags, (0 until offered.length()).map { offered.getString(it) }.toSet())
+                    val oldCapability = org.json.JSONObject().put("version", 2)
+                        .put("receiverFlags", JSONArray().put("session").put("audio.timing"))
+                    Wire.write(control.outputStream, Wire.control(Wire.HELLO, 0,
+                        hello().json().put("diagProxy", oldCapability)))
+                    assertEquals(-1, control.inputStream.read())
+                }
+            }
+            ReceiverLink(ReceiverTarget("127.0.0.1", server.localPort)).use { link ->
+                val claim = dev.redrain.cast.diagnostics.DiagnosticArmRegistry.Claim(
+                    "pair", 9, 71, "sender-capture", flags, 100, Long.MAX_VALUE)
+                if (!work) link.connectArmed(3000, claim) { 1378 }
+                else assertTrue(assertThrows(IOException::class.java) {
+                    link.connectArmed(3000, claim) { 1378 }
+                }.message!!.contains("UNSUPPORTED_CONFIG"))
+            }
+            peer.get(3, TimeUnit.SECONDS)
+        }
+    }
+
     @Test fun armedHelloSendsRemainingLeaseAndRequiresReceiverCapability() {
         for (supported in listOf(false, true)) ServerSocket(0).use { server ->
             val peer = CompletableFuture.runAsync {
@@ -160,6 +188,41 @@ class SenderSocketTest {
                     assertTrue(error.message!!.contains("select an explicit Maximum capture FPS"))
                 }
             }
+            peer.get(3, TimeUnit.SECONDS)
+        }
+    }
+
+    @Test fun audioOnlyAcknowledgementMustBeOfferedAndMatchExactVersion() {
+        data class Case(val videoEnabled: Boolean, val acknowledgement: Any?, val expectedError: String?)
+        val cases = listOf(
+            Case(false, 1, null),
+            Case(false, null, "UNSUPPORTED_CONFIG"),
+            Case(false, 2, "UNSUPPORTED_CONFIG"),
+            Case(false, "1", "PROTOCOL"),
+            Case(true, 1, "PROTOCOL")
+        )
+        for ((videoEnabled, acknowledgement, expectedError) in cases) ServerSocket(0).use { server ->
+            val peer = CompletableFuture.runAsync {
+                server.accept().use { control ->
+                    control.soTimeout = 3000
+                    val offer = Wire.read(control.inputStream).json()
+                    assertEquals(!videoEnabled, offer.has("audioOnlyVersion"))
+                    if (!videoEnabled) assertEquals(1, offer.getInt("audioOnlyVersion"))
+                    val response = hello().json()
+                    if (acknowledgement != null) response.put("audioOnlyVersion", acknowledgement)
+                    Wire.write(control.outputStream, Wire.control(Wire.HELLO, 0, response))
+                    assertEquals(-1, control.inputStream.read())
+                }
+            }
+            val link = ReceiverLink(ReceiverTarget("127.0.0.1", server.localPort),
+                senderVideoEnabled = videoEnabled)
+            try {
+                if (expectedError == null) link.connect()
+                else {
+                    val error = assertThrows(IOException::class.java) { link.connect() }
+                    assertTrue(error.toString(), error.toString().contains(expectedError))
+                }
+            } finally { link.close() }
             peer.get(3, TimeUnit.SECONDS)
         }
     }
