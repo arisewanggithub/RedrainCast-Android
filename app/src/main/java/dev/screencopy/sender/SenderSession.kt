@@ -246,7 +246,7 @@ class SenderSession internal constructor(
                 return
             }
         }
-        if ((stopping || closing) && !linkClosed && !mediaRetiring && outcome.failure == null && link?.streamRecovery == true &&
+        if ((stopping || closing) && !linkClosed && !mediaRetiring && orderlyTeardown &&
             error is IOException) {
             fail(IOException("${if (error is java.net.SocketTimeoutException) "TIMEOUT" else "PROTOCOL"}: " +
                 "media transport failed during orderly Stop", error), origin)

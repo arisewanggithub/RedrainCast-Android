@@ -1220,6 +1220,24 @@ class SenderSessionTeardownTest {
         }
     }
 
+    @Test fun startupStopDoesNotClassifyMediaEofAsOrderlyStopFailure() {
+        for ((playing, stopped) in listOf(false to false, false to true, true to true)) {
+            Harness(1).use { session ->
+                val link = Mockito.mock(ReceiverLink::class.java)
+                Mockito.`when`(link.streamRecovery).thenReturn(true)
+                session.prepare(link, playing = playing)
+                if (stopped) session.outcome.requestStop()
+                session.sender.recordMediaFailure(EOFException("media closed"), SessionOutcome.Origin.RECEIVER_READ)
+                when {
+                    !stopped -> assertTrue(session.outcome.failure is MediaConnectionFailure)
+                    !playing -> assertNull(session.outcome.failure)
+                    else -> assertTrue(session.outcome.failure?.message.orEmpty()
+                        .contains("media transport failed during orderly Stop"))
+                }
+            }
+        }
+    }
+
     @Test(timeout = 15_000) fun mediaEofWaitsForTerminalWriteResultWithoutMaskingWriteFailure() {
         for ((remoteStop, failWrite) in listOf(false to false, true to false, false to true)) {
             runSession { server, session, link ->
