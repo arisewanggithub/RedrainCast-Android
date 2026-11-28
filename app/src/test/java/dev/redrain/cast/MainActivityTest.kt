@@ -1487,7 +1487,7 @@ class MainActivityTest {
             context.applicationInfo.loadLabel(context.packageManager).toString())
         val info = context.packageManager.getPackageInfo(packageName, 0)
         assertEquals(BuildConfig.VERSION_NAME, info.versionName)
-        assertEquals(38L, info.longVersionCode)
+        assertEquals(39L, info.longVersionCode)
         val activity = context.packageManager.getActivityInfo(
             android.content.ComponentName(context, MainActivity::class.java), 0)
         assertEquals("dev.redrain.cast.MainActivity", activity.name)
