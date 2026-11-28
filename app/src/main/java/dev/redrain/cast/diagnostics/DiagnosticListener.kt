@@ -186,7 +186,8 @@ internal class DiagnosticListener(
         }
     }
 
-    fun revokeNetwork() {
+    /** Every caller returns only after network cleanup, not merely after the closed gate is set. */
+    @Synchronized fun revokeNetwork() {
         if (!closed.compareAndSet(false, true)) return
         registry.revoke()
         endpointResponders.values.forEach { it.close() }
