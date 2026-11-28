@@ -7,12 +7,25 @@ import org.junit.Test
 import org.mockito.Mockito
 import java.net.InetAddress
 import java.net.Socket
+import java.net.InetSocketAddress
 import java.io.File
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicReference
+
+internal fun Socket.reserveDistinctSource(address: InetAddress, destinationPort: Int) {
+    bind(InetSocketAddress(address, 0))
+    assertNotEquals("Shutdown probe must have a distinct source port", destinationPort, localPort)
+}
+
+internal fun Socket.assertConnectionRefused(address: InetAddress, destinationPort: Int) {
+    assertThrows(java.net.ConnectException::class.java) {
+        connect(InetSocketAddress(address, destinationPort), 1000)
+        fail("Unexpected TCP connection: local=$localSocketAddress remote=$remoteSocketAddress")
+    }
+}
 
 class DiagnosticListenerTest {
     private var sequence = 0
@@ -288,31 +301,35 @@ class DiagnosticListenerTest {
         val callers = Executors.newFixedThreadPool(2)
         try {
             val port = checkNotNull(server.discovery).port
-            client(server).use { collector ->
-                command(collector, "HELLO")
-                val owner = callers.submit { server.revokeNetwork() }
-                assertTrue(revoking.await(3, TimeUnit.SECONDS))
-                assertNull(server.discovery)
-                val calling = CountDownLatch(1)
-                val concurrent = callers.submit {
-                    calling.countDown()
-                    if (close) server.close() else server.revokeNetwork()
+            Socket().use { firstProbe -> Socket().use { secondProbe ->
+                firstProbe.reserveDistinctSource(first, port)
+                secondProbe.reserveDistinctSource(second, port)
+                client(server).use { collector ->
+                    command(collector, "HELLO")
+                    val owner = callers.submit { server.revokeNetwork() }
+                    assertTrue(revoking.await(3, TimeUnit.SECONDS))
+                    assertNull(server.discovery)
+                    val calling = CountDownLatch(1)
+                    val concurrent = callers.submit {
+                        calling.countDown()
+                        if (close) server.close() else server.revokeNetwork()
+                    }
+                    assertTrue(calling.await(3, TimeUnit.SECONDS))
+                    assertThrows(java.util.concurrent.TimeoutException::class.java) {
+                        concurrent.get(200, TimeUnit.MILLISECONDS)
+                    }
+                    release.countDown()
+                    concurrent.get(3, TimeUnit.SECONDS)
+                    owner.get(3, TimeUnit.SECONDS)
+                    assertEquals(-1, collector.inputStream.read())
+                    firstProbe.assertConnectionRefused(first, port)
+                    secondProbe.assertConnectionRefused(second, port)
+                    assertNull(server.endpointDiscoveryPort)
+                    Mockito.verify(registry, Mockito.times(1)).revoke()
+                    server.revokeNetwork()
+                    Mockito.verify(registry, Mockito.times(1)).revoke()
                 }
-                assertTrue(calling.await(3, TimeUnit.SECONDS))
-                assertThrows(java.util.concurrent.TimeoutException::class.java) {
-                    concurrent.get(200, TimeUnit.MILLISECONDS)
-                }
-                release.countDown()
-                concurrent.get(3, TimeUnit.SECONDS)
-                owner.get(3, TimeUnit.SECONDS)
-                assertEquals(-1, collector.inputStream.read())
-                assertThrows(java.io.IOException::class.java) { Socket(first, port).close() }
-                assertThrows(java.io.IOException::class.java) { Socket(second, port).close() }
-                assertNull(server.endpointDiscoveryPort)
-                Mockito.verify(registry, Mockito.times(1)).revoke()
-                server.revokeNetwork()
-                Mockito.verify(registry, Mockito.times(1)).revoke()
-            }
+            } }
         } finally {
             release.countDown()
             callers.shutdown()

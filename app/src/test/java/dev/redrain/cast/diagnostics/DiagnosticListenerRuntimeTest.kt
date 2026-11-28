@@ -143,12 +143,16 @@ class DiagnosticListenerRuntimeTest {
             Socket(first, port).use { it.soTimeout = 3000; command(it, "HELLO") }
             assertTrue(disconnected.await(3, TimeUnit.SECONDS))
             Socket(second, port).use { it.soTimeout = 3000; command(it, "HELLO") }
-            valid.set(false)
-            assertNull(server.discoveryFor(first))
-            assertNull(server.discoveryFor(second))
-            assertTrue(revoked.await(3, TimeUnit.SECONDS))
-            assertThrows(java.io.IOException::class.java) { Socket(first, port).close() }
-            assertThrows(java.io.IOException::class.java) { Socket(second, port).close() }
+            Socket().use { firstProbe -> Socket().use { secondProbe ->
+                firstProbe.reserveDistinctSource(first, port)
+                secondProbe.reserveDistinctSource(second, port)
+                valid.set(false)
+                assertNull(server.discoveryFor(first))
+                assertNull(server.discoveryFor(second))
+                assertTrue(revoked.await(3, TimeUnit.SECONDS))
+                firstProbe.assertConnectionRefused(first, port)
+                secondProbe.assertConnectionRefused(second, port)
+            } }
         }
     }
 
