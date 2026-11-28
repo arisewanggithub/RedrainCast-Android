@@ -31,8 +31,8 @@ android {
         applicationId = "dev.redrain.cast"
         minSdk = 30
         targetSdk = 37
-        versionCode = 38
-        versionName = "0.5.4"
+        versionCode = 39
+        versionName = "0.5.5"
         buildConfigField("boolean", "VIRTUAL_AUDIO_EXPERIMENT", "false")
         buildConfigField("boolean", "HYBRID_AUDIO_EXPERIMENT", "false")
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
