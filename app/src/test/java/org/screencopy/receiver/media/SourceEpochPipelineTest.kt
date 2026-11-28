@@ -42,7 +42,7 @@ class SourceEpochPipelineTest {
         }
     }
 
-    @Test fun decodedOpusPreskipAndAnOverlappingFirstRefreshPreserveAllAudibleSamples() {
+    @Test fun decodedOpusPreskipAndAnOverlappingFirstRefreshAccountForStaleSamples() {
         val metadata = Configuration.audio(
             StrictJson.decode("""{"codec":"opus","sampleRate":48000,"channels":2,"csd":["T3B1c0hlYWQBAjgBgLsAAAAAAA=="],"codecDelayNs":6500000,"seekPrerollNs":80000000}""".toByteArray()),
             Request("h264", "opus", 60, "")
@@ -113,8 +113,9 @@ class SourceEpochPipelineTest {
                     ByteArray(frames * format.channels * 2)))
                 val expected = ((index + 1) * frames - format.preSkip).coerceAtLeast(0) * format.channels
                 await {
-                    if (player.sourceSubmittedFrames * format.channels < expected) now.addAndGet(1_000_000)
-                    player.sourceSubmittedFrames * format.channels >= expected || errors.isNotEmpty()
+                    val accounted = (player.sourceSubmittedFrames + player.staleDiscardedSourceFrames) * format.channels
+                    if (accounted < expected) now.addAndGet(1_000_000)
+                    accounted >= expected || errors.isNotEmpty()
                 }
                 if (withVideo) {
                     // Do not advance simulated capture time ahead of the three-frame renderer window.
@@ -137,13 +138,15 @@ class SourceEpochPipelineTest {
                 assertTrue(player.queuedPackets() <= 48)
             }
             assertNull("Expected malformed decoded PTS to fail", expectedFailure)
-            assertEquals((packets * frames - format.preSkip).toLong(), player.sourceSubmittedFrames)
+            assertEquals((packets * frames - format.preSkip).toLong(),
+                player.sourceSubmittedFrames + player.staleDiscardedSourceFrames)
             expectedOffset?.let {
-                val expected = base + format.preSkip * 1_000_000L / format.sampleRate + player.sourcePositionUs() + it
+                val expected = base + (format.preSkip + player.staleDiscardedSourceFrames) * 1_000_000L /
+                    format.sampleRate + player.sourcePositionUs() + it
                 assertTrue("Source mapping did not converge: ${clock.currentUs()} vs $expected", abs(checkNotNull(clock.currentUs()) - expected) < 1000)
             }
             expectedRatePpm?.let {
-                val played = player.sourcePositionUs()
+                val played = player.sourcePositionUs() + player.staleDiscardedSourceFrames * 1_000_000L / format.sampleRate
                 val expected = base + played + played * it / 1_000_000
                 assertTrue("Source-rate mapping did not track played samples", abs(checkNotNull(clock.currentUs()) - expected) < 1000)
             }

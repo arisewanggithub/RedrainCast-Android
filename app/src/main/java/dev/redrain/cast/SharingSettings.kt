@@ -18,6 +18,11 @@ import dev.redrain.cast.diagnostics.IncidentStore
 import dev.screencopy.sender.Settings
 import dev.screencopy.sender.HardwareEncoderDiscovery
 import dev.screencopy.sender.HardwareEncoders
+import dev.screencopy.sender.CodecBitrateDiscovery
+import dev.screencopy.sender.ProjectionInventory
+import dev.screencopy.sender.VideoEncoderPreflight
+import dev.screencopy.sender.VideoGeometryException
+import dev.screencopy.sender.VideoGeometryReason
 import org.json.JSONObject
 import java.io.IOException
 import java.math.BigDecimal
@@ -26,7 +31,9 @@ import java.util.Locale
 object SharingSettings {
     private class Choice(var value: String?) {
         var changed: () -> Unit = {}
+        var optionProvider: (() -> Pair<List<String>, List<String>>)? = null
     }
+    private data class CropRect(val width: Int, val height: Int, val x: Int, val y: Int)
 
     internal const val PREFERENCES = "sharing_settings"
     internal const val REQUEST = "request"
@@ -43,12 +50,19 @@ object SharingSettings {
             }
         } catch (error: Exception) {
             onError(IOException(context.getString(R.string.rc_settings_read_error), error))
-            Settings()
+            Settings().apply {
+                invalidSavedError = context.getString(R.string.rc_settings_read_error)
+            }
         }
     }
 
     fun summary(settings: Settings): String {
-        val context = appContext ?: return settings.videoCodec.uppercase(Locale.ROOT)
+        val context = appContext ?: return if (settings.video) settings.videoCodec.uppercase(Locale.ROOT)
+            else "Video off · ${if (settings.audio) settings.audioCodec.uppercase(Locale.ROOT) else "Audio off"}"
+        if (!settings.video) return context.getString(R.string.rc_summary_audio_only,
+            context.getString(R.string.rc_summary_video_off),
+            if (settings.audio) settings.audioCodec.uppercase(Locale.ROOT)
+            else context.getString(R.string.rc_summary_audio_off))
         val size = if (settings.maxSize == 0) context.getString(R.string.rc_original_size)
             else context.getString(R.string.rc_summary_size, settings.maxSize)
         val audio = if (settings.audio) settings.audioCodec.uppercase(Locale.ROOT)
@@ -109,6 +123,8 @@ object SharingSettings {
             accessibilityLiveRegion = View.ACCESSIBILITY_LIVE_REGION_ASSERTIVE
             body.addView(this, spacing(8))
         }
+        var videoCapabilityError: CharSequence? = null
+        var showingVideoCapabilityError = false
 
         fun label(parent: LinearLayout, title: Int, heading: Boolean = false): TextView =
             TextView(activity).apply {
@@ -159,12 +175,15 @@ object SharingSettings {
             }
             val selection = Choice(value)
             button.setOnClickListener {
+                val (availableValues, availableLabels) = selection.optionProvider?.invoke() ?: (values to labels)
+                require(availableValues.size == availableLabels.size && availableValues.isNotEmpty())
                 val previousScroll = scroll.scrollY
                 val picker = AlertDialog.Builder(activity)
                     .setTitle(title)
-                    .setSingleChoiceItems(labels.toTypedArray(), selection.value?.let(values::indexOf) ?: -1) { picker, which ->
-                        selection.value = values[which]
-                        button.text = labels[which]
+                    .setSingleChoiceItems(availableLabels.toTypedArray(),
+                        selection.value?.let(availableValues::indexOf) ?: -1) { picker, which ->
+                        selection.value = availableValues[which]
+                        button.text = availableLabels[which]
                         selection.changed()
                         picker.dismiss()
                     }
@@ -189,7 +208,24 @@ object SharingSettings {
         }
 
         label(body, R.string.rc_settings_description)
-        label(body, R.string.rc_video_heading, heading = true)
+        val videoGroup = column()
+        body.addView(videoGroup, spacing(16))
+        label(videoGroup, R.string.rc_video_heading, heading = true)
+        val videoEnabled = CheckBox(activity).apply {
+            id = View.generateViewId()
+            tag = "videoEnabled"
+            setText(R.string.rc_video_enabled)
+            isChecked = current.video
+            minimumHeight = dp(48)
+            videoGroup.addView(this, spacing())
+        }
+        val videoDisabledHint = label(videoGroup, R.string.rc_last_track_hint).apply {
+            tag = "videoDisabledHint"
+            visibility = View.GONE
+            labelFor = videoEnabled.id
+        }
+        val videoControls = column()
+        videoGroup.addView(videoControls, spacing())
         val supportedVideo = listOf("h264", "h265", "av1").filter { encoders.names(it).isNotEmpty() }
         val savedVideoSupported = current.videoCodec in supportedVideo
         val videoCodecs = supportedVideo
@@ -201,33 +237,65 @@ object SharingSettings {
                 else -> throw IllegalStateException("Unknown video codec")
             }
         }
-        val videoCodec = choice(body, R.string.rc_video_codec, videoCodecs, videoLabels,
+        val videoCodec = choice(videoControls, R.string.rc_video_codec, videoCodecs, videoLabels,
             if (savedVideoSupported) current.videoCodec else null, "videoCodec")
-        if (!savedVideoSupported) {
-            error.text = if (supportedVideo.isEmpty()) activity.getString(R.string.rc_no_hardware_video)
-                else activity.getString(R.string.rc_saved_codec_unavailable, current.videoCodec.uppercase(Locale.ROOT))
+        if (current.invalidSavedError != null) {
+            error.text = current.invalidSavedError
             error.visibility = View.VISIBLE
+        } else if (!savedVideoSupported) {
+            videoCapabilityError = if (supportedVideo.isEmpty()) activity.getString(R.string.rc_no_hardware_video)
+                else activity.getString(R.string.rc_saved_codec_unavailable, current.videoCodec.uppercase(Locale.ROOT))
+            error.text = videoCapabilityError
+            error.visibility = View.VISIBLE
+            showingVideoCapabilityError = true
         }
-        val size = edit(body, R.string.rc_max_size, current.maxSize.toString(), "maxSize", hint = R.string.rc_max_size_hint)
-        label(body, R.string.rc_max_size_hint)
+        val maxSizeValues = (listOf(0, 1280, 1920, 2560, 3840) + current.maxSize).distinct().sorted()
+        val maxSizeLabels = maxSizeValues.map {
+            if (it == 0) activity.getString(R.string.rc_original_size)
+            else activity.getString(R.string.rc_summary_size, it)
+        }
+        val size = choice(videoControls, R.string.rc_max_size, maxSizeValues.map(Int::toString), maxSizeLabels,
+            current.maxSize.toString(), "maxSize")
+        val maxSizeHint = label(videoControls, R.string.rc_max_size_hint)
         val fpsValues = (listOf(0, 15, 24, 25, 30, 48, 50, 60, 90, 120) + current.maxFps)
             .distinct().sorted().map(Int::toString)
         val fpsLabels = fpsValues.map { if (it == "0") activity.getString(R.string.rc_fps_uncapped) else it }
-        val fps = choice(body, R.string.rc_fps, fpsValues, fpsLabels, current.maxFps.toString(), "maxFps")
-        val bitrate = edit(body, R.string.rc_bitrate, decimal(current.videoBitrate, 1_000_000), "videoBitrate")
-        val orientations = listOf("auto", "landscape", "portrait")
+        val fps = choice(videoControls, R.string.rc_fps, fpsValues, fpsLabels, current.maxFps.toString(), "maxFps")
+        val bitrateValues = ((1..30).map { it * 1_000_000 } + current.videoBitrate).distinct().sorted()
+        val bitrateLabels = bitrateValues.map { "${decimal(it, 1_000_000)} Mbps" }
+        val bitrate = choice(videoControls, R.string.rc_bitrate, bitrateValues.map(Int::toString), bitrateLabels,
+            current.videoBitrate.toString(), "videoBitrate")
+        val orientations = (listOf("auto", "landscape", "portrait") + current.receiverOrientation).distinct()
+        val orientationLabels = orientations.map {
+            when (it) {
+                "auto" -> activity.getString(R.string.rc_orientation_auto)
+                "landscape" -> activity.getString(R.string.rc_orientation_landscape)
+                "portrait" -> activity.getString(R.string.rc_orientation_portrait)
+                else -> "$it (${activity.getString(R.string.rc_current_unsupported)})"
+            }
+        }
         val orientation = choice(
-            body, R.string.rc_receiver_orientation, orientations,
-            listOf(R.string.rc_orientation_auto, R.string.rc_orientation_landscape, R.string.rc_orientation_portrait).map(activity::getString),
+            videoControls, R.string.rc_receiver_orientation, orientations, orientationLabels,
             current.receiverOrientation, "receiverOrientation"
         )
+        val audioGroup = column()
+        body.addView(audioGroup, spacing(16))
+        label(audioGroup, R.string.rc_audio_heading, heading = true)
         val audio = CheckBox(activity).apply {
+            id = View.generateViewId()
             tag = "audio"
             setText(R.string.rc_audio_enabled)
             isChecked = current.audio
             minimumHeight = dp(48)
-            body.addView(this, spacing(16))
+            audioGroup.addView(this, spacing())
         }
+        val audioDisabledHint = label(audioGroup, R.string.rc_last_track_hint).apply {
+            tag = "audioDisabledHint"
+            visibility = View.GONE
+            labelFor = audio.id
+        }
+        val audioControls = column()
+        audioGroup.addView(audioControls, spacing())
 
         val advanced = column().apply { visibility = View.GONE }
         lateinit var toggle: Button
@@ -238,43 +306,189 @@ object SharingSettings {
         }
         body.addView(advanced, spacing())
         label(advanced, R.string.rc_advanced_description)
-        label(advanced, R.string.rc_crop_heading, heading = true)
-        val clearCrop = CheckBox(activity).apply {
-            tag = "clearCrop"
-            setText(R.string.rc_crop_clear)
-            isChecked = current.cropWidth == 0
+        val videoAdvanced = column()
+        advanced.addView(videoAdvanced, spacing())
+        label(videoAdvanced, R.string.rc_crop_heading, heading = true)
+        val fullscreen = CheckBox(activity).apply {
+            tag = "fullscreen"
+            setText(R.string.rc_fullscreen)
+            isChecked = current.fullscreen || (
+                current.cropWidth == 0 && current.cropHeight == 0 && current.cropX == 0 && current.cropY == 0)
             minimumHeight = dp(48)
-            advanced.addView(this, spacing(8))
+            videoAdvanced.addView(this, spacing(8))
         }
-        val cropWidth = edit(advanced, R.string.rc_crop_width, current.cropWidth.toString(), "cropWidth")
-        val cropHeight = edit(advanced, R.string.rc_crop_height, current.cropHeight.toString(), "cropHeight")
-        val cropX = edit(advanced, R.string.rc_crop_x, current.cropX.toString(), "cropX")
-        val cropY = edit(advanced, R.string.rc_crop_y, current.cropY.toString(), "cropY")
+        val cropWidth = edit(videoAdvanced, R.string.rc_crop_width, current.cropWidth.toString(), "cropWidth")
+        val cropHeight = edit(videoAdvanced, R.string.rc_crop_height, current.cropHeight.toString(), "cropHeight")
+        val cropX = edit(videoAdvanced, R.string.rc_crop_x, current.cropX.toString(), "cropX")
+        val cropY = edit(videoAdvanced, R.string.rc_crop_y, current.cropY.toString(), "cropY")
         val cropFields = listOf(cropWidth, cropHeight, cropX, cropY)
-        fun updateCrop() { cropFields.forEach { it.isEnabled = !clearCrop.isChecked } }
-        clearCrop.setOnCheckedChangeListener { _, _ -> updateCrop() }
-        updateCrop()
+        val cropBoundsHint = label(videoAdvanced, R.string.rc_crop_bounds_unavailable).apply {
+            tag = "cropBoundsHint"
+            labelFor = cropWidth.id
+        }
+        fun naturalDisplayBounds(): Pair<Int, Int>? {
+            return try {
+                val display = ProjectionInventory.displays(activity).displays
+                    .singleOrNull() ?: return null
+                if (display.rotation == null || display.naturalWidth <= 0 || display.naturalHeight <= 0) null
+                else display.naturalWidth to display.naturalHeight
+            } catch (_: Exception) { null }
+        }
+        fun updateCropBoundsHint() {
+            cropBoundsHint.text = naturalDisplayBounds()?.let { (width, height) ->
+                activity.getString(R.string.rc_crop_natural_hint, width, height)
+            } ?: activity.getString(R.string.rc_crop_bounds_unavailable)
+        }
+        fun cropFits(rect: CropRect, bounds: Pair<Int, Int>): Boolean =
+            rect.width > 0 && rect.height > 0 && rect.x >= 0 && rect.y >= 0 &&
+                rect.x.toLong() + rect.width <= bounds.first && rect.y.toLong() + rect.height <= bounds.second
+        fun cropDraft(): CropRect? {
+            val width = cropWidth.text.toString().trim().toIntOrNull() ?: return null
+            val height = cropHeight.text.toString().trim().toIntOrNull() ?: return null
+            val x = cropX.text.toString().trim().toIntOrNull() ?: return null
+            val y = cropY.text.toString().trim().toIntOrNull() ?: return null
+            return CropRect(width, height, x, y).takeIf { it.width > 0 && it.height > 0 && it.x >= 0 && it.y >= 0 }
+        }
+        updateCropBoundsHint()
+        fun updateCropVisibility() {
+            val visible = !fullscreen.isChecked
+            cropFields.forEach { field ->
+                field.visibility = if (visible) View.VISIBLE else View.GONE
+                videoAdvanced.findViewWithTag<TextView>("${field.tag}Label").visibility = field.visibility
+            }
+            cropBoundsHint.visibility = if (visible) View.VISIBLE else View.GONE
+        }
+        var initializeEmptyCrop = current.cropWidth == 0 && current.cropHeight == 0 &&
+            current.cropX == 0 && current.cropY == 0
+        val legacyNoCrop = initializeEmptyCrop && !current.fullscreen
+        var fullscreenTouched = false
+        fullscreen.setOnCheckedChangeListener { _, checked ->
+            fullscreenTouched = true
+            if (!checked && initializeEmptyCrop && cropFields.all { it.text.toString().trim() == "0" }) {
+                naturalDisplayBounds()?.let { (width, height) ->
+                    cropWidth.setText(width.toString())
+                    cropHeight.setText(height.toString())
+                    cropX.setText("0")
+                    cropY.setText("0")
+                } ?: run {
+                    cropBoundsHint.text = activity.getString(R.string.rc_crop_bounds_unavailable)
+                }
+            }
+            if (!checked) initializeEmptyCrop = false
+            updateCropBoundsHint()
+            updateCropVisibility()
+        }
+        updateCropVisibility()
 
-        label(advanced, R.string.rc_audio_heading, heading = true)
-        val audioCodecs = listOf("raw", "opus", "aac")
+        fun videoDraft(maximumSize: Int): Settings? = try {
+            Settings.from(current.saved(), validate = false).apply {
+                this.video = true
+                this.videoCodec = videoCodec.value ?: current.videoCodec
+                videoEncoder = ""
+                maxSize = maximumSize
+                maxFps = fps.value?.toInt() ?: current.maxFps
+                videoBitrate = bitrate.value?.toInt() ?: current.videoBitrate
+                this.fullscreen = fullscreen.isChecked
+                if (!this.fullscreen) {
+                    this.cropWidth = cropWidth.text.toString().trim().toInt()
+                    this.cropHeight = cropHeight.text.toString().trim().toInt()
+                    this.cropX = cropX.text.toString().trim().toInt()
+                    this.cropY = cropY.text.toString().trim().toInt()
+                }
+                validate()
+            }
+        } catch (_: Exception) { null }
+
+        fun geometrySupport(maximumSize: Int): Boolean? {
+            val draft = videoDraft(maximumSize) ?: return null
+            return try {
+                VideoEncoderPreflight.validate(draft, ProjectionInventory.displays(activity))
+                true
+            } catch (failure: VideoGeometryException) {
+                if (failure.reason == VideoGeometryReason.METADATA_UNAVAILABLE) null else false
+            } catch (_: Exception) { null }
+        }
+
+        fun sourceLongerEdge(): Int? {
+            val bounds = naturalDisplayBounds() ?: return null
+            val currentRect = CropRect(current.cropWidth, current.cropHeight, current.cropX, current.cropY)
+                .takeIf { cropFits(it, bounds) }
+            val selectedRect = if (fullscreen.isChecked) null
+                else cropDraft()?.takeIf { cropFits(it, bounds) } ?: currentRect
+            return selectedRect?.let { maxOf(it.width, it.height) } ?: maxOf(bounds.first, bounds.second)
+        }
+
+        size.optionProvider = {
+            val values = (listOf(0, 1280, 1920, 2560, 3840) + current.maxSize)
+                .distinct().sorted()
+            val selected = size.value?.toIntOrNull() ?: current.maxSize
+            updateCropBoundsHint()
+            val longerEdge = sourceLongerEdge()
+            val withinCapture = sizePresetsWithinCapture(values, longerEdge, selected)
+            val checked = withinCapture.map { value -> value to geometrySupport(value) }
+            val options = checked.filter { (value, supported) -> supported != false || value == selected }
+            val labels = options.map { (value, supported) ->
+                val base = if (value == 0) activity.getString(R.string.rc_original_size)
+                    else activity.getString(R.string.rc_summary_size, value)
+                when (supported) {
+                    true -> "$base (${activity.getString(R.string.rc_capability_supported)})"
+                    false -> "$base (${activity.getString(R.string.rc_current_unsupported)})"
+                    null -> "$base (${activity.getString(R.string.rc_capability_unverified)})"
+                }
+            }
+            options.map { it.first.toString() } to labels
+        }
+
+        bitrate.optionProvider = {
+            val codec = videoCodec.value ?: current.videoCodec
+            val encoder = try { encoders.resolve(codec, "") } catch (_: Exception) { "" }
+            val ranges = try { CodecBitrateDiscovery.read() } catch (_: Exception) { null }
+            val knownRanges = ranges?.candidates(codec, encoder)?.filter { it.min != null }.orEmpty()
+            fun supports(value: Int): Boolean? = when {
+                knownRanges.isEmpty() -> null
+                else -> knownRanges.any { it.permits(value) }
+            }
+            val values = ((1..30).map { it * 1_000_000 } + current.videoBitrate).distinct().sorted()
+            val selected = bitrate.value?.toIntOrNull() ?: current.videoBitrate
+            val options = values.filter { supports(it) != false || it == selected }
+            val labels = options.map { value ->
+                val base = "${decimal(value, 1_000_000)} Mbps"
+                when (supports(value)) {
+                    true -> "$base (${activity.getString(R.string.rc_capability_supported)})"
+                    false -> "$base (${activity.getString(R.string.rc_current_unsupported)})"
+                    null -> "$base (${activity.getString(R.string.rc_capability_unverified)})"
+                }
+            }
+            options.map(Int::toString) to labels
+        }
+
+        val audioCodecs = (listOf("raw", "opus", "aac") + current.audioCodec).distinct()
         val audioCodec = choice(
-            advanced, R.string.rc_audio_codec, audioCodecs,
-            listOf(R.string.rc_audio_raw, R.string.rc_audio_opus, R.string.rc_audio_aac).map(activity::getString),
+            audioControls, R.string.rc_audio_codec, audioCodecs,
+            audioCodecs.map {
+                when (it) {
+                    "raw" -> activity.getString(R.string.rc_audio_raw)
+                    "opus" -> activity.getString(R.string.rc_audio_opus)
+                    "aac" -> activity.getString(R.string.rc_audio_aac)
+                    else -> "$it (${activity.getString(R.string.rc_current_unsupported)})"
+                }
+            },
             current.audioCodec, "audioCodec"
         )
         // Existing output-mode requests remain editable without silently changing their source.
-        val sources = if (current.audioSource == "output") listOf("playback", "mic", "output") else listOf("playback", "mic")
+        val sources = (listOf("playback", "mic") + current.audioSource).distinct()
         val sourceLabels = sources.map {
-            activity.getString(when (it) {
-                "mic" -> R.string.rc_audio_mic
-                "output" -> R.string.rc_audio_output
-                else -> R.string.rc_audio_playback
-            })
+            when (it) {
+                "mic" -> activity.getString(R.string.rc_audio_mic)
+                "output" -> activity.getString(R.string.rc_audio_output)
+                "playback" -> activity.getString(R.string.rc_audio_playback)
+                else -> "$it (${activity.getString(R.string.rc_current_unsupported)})"
+            }
         }
-        val audioSource = choice(advanced, R.string.rc_audio_source, sources, sourceLabels, current.audioSource, "audioSource")
-        val audioBitrate = edit(advanced, R.string.rc_audio_bitrate, decimal(current.audioBitrate, 1_000), "audioBitrate")
-        val audioBitrateLabel = checkNotNull(advanced.findViewWithTag<TextView>("audioBitrateLabel"))
-        val rawHint = label(advanced, R.string.rc_raw_hint)
+        val audioSource = choice(audioControls, R.string.rc_audio_source, sources, sourceLabels, current.audioSource, "audioSource")
+        val audioBitrate = edit(audioControls, R.string.rc_audio_bitrate, decimal(current.audioBitrate, 1_000), "audioBitrate")
+        val audioBitrateLabel = checkNotNull(audioControls.findViewWithTag<TextView>("audioBitrateLabel"))
+        val rawHint = label(audioControls, R.string.rc_raw_hint)
         fun updateAudioBitrate() {
             val raw = audioCodec.value == "raw"
             audioBitrate.isEnabled = !raw
@@ -284,6 +498,25 @@ object SharingSettings {
         }
         audioCodec.changed = ::updateAudioBitrate
         updateAudioBitrate()
+
+        fun updateTrackControls(updateSaveButton: Boolean) {
+            val videoOn = videoEnabled.isChecked
+            val audioOn = audio.isChecked
+            videoControls.visibility = if (videoOn) View.VISIBLE else View.GONE
+            videoAdvanced.visibility = if (videoOn) View.VISIBLE else View.GONE
+            audioControls.visibility = if (audioOn) View.VISIBLE else View.GONE
+            videoEnabled.isEnabled = audioOn
+            audio.isEnabled = videoOn
+            videoDisabledHint.visibility = if (videoOn && !audioOn) View.VISIBLE else View.GONE
+            audioDisabledHint.visibility = if (audioOn && !videoOn) View.VISIBLE else View.GONE
+            if (showingVideoCapabilityError)
+                error.visibility = if (videoOn) View.VISIBLE else View.GONE
+            if (updateSaveButton && dialog.isShowing)
+                dialog.getButton(AlertDialog.BUTTON_POSITIVE).isEnabled = !videoOn || supportedVideo.isNotEmpty()
+        }
+        videoEnabled.setOnCheckedChangeListener { _, _ -> updateTrackControls(true) }
+        audio.setOnCheckedChangeListener { _, _ -> updateTrackControls(true) }
+        updateTrackControls(false)
         if (onDiagnostics != null)
             button(advanced, R.string.rc_playback_diagnostics, "playbackDiagnostics", onDiagnostics)
         val playbackStatistics = CheckBox(activity).apply {
@@ -421,54 +654,159 @@ object SharingSettings {
             }
         }
 
-        dialog.setOnShowListener {
+        fun cropDraftForSave(active: Boolean): CropRect? {
+            cropFields.forEach { it.error = null }
+            val specs = listOf(
+                Triple(cropWidth, R.string.rc_crop_width, true),
+                Triple(cropHeight, R.string.rc_crop_height, true),
+                Triple(cropX, R.string.rc_crop_x, false),
+                Triple(cropY, R.string.rc_crop_y, false)
+            )
+            val parsed = specs.map { (field, title, _) ->
+                field.text.toString().trim().toIntOrNull().also { value ->
+                    if (active && value == null)
+                        field.error = activity.getString(R.string.rc_invalid_number, activity.getString(title))
+                }
+            }
+            if (parsed.any { it == null }) return null
+            val (width, height, x, y) = parsed.map { checkNotNull(it) }
+            val rect = CropRect(width, height, x, y)
+            if (width !in 1..16384 || height !in 1..16384 || x < 0 || y < 0) {
+                if (active) specs.forEachIndexed { index, (field, _, dimension) ->
+                    val value = checkNotNull(parsed[index])
+                    if (dimension && value !in 1..16384 || !dimension && value < 0)
+                        field.error = activity.getString(
+                            if (dimension) R.string.rc_crop_dimensions_invalid else R.string.rc_crop_offsets_invalid)
+                }
+                return null
+            }
+            if (active) {
+                val bounds = naturalDisplayBounds()
+                if (bounds == null) {
+                    cropBoundsHint.text = activity.getString(R.string.rc_crop_bounds_unavailable)
+                    cropFields.forEach { it.error = activity.getString(R.string.rc_crop_bounds_unavailable) }
+                    return null
+                }
+                cropBoundsHint.text = activity.getString(
+                    R.string.rc_crop_natural_hint, bounds.first, bounds.second)
+                val boundsError = activity.getString(
+                    R.string.rc_crop_out_of_bounds, bounds.first, bounds.second)
+                if (x.toLong() + width > bounds.first) {
+                    cropX.error = boundsError
+                    cropWidth.error = boundsError
+                }
+                if (y.toLong() + height > bounds.second) {
+                    cropY.error = boundsError
+                    cropHeight.error = boundsError
+                }
+                if (cropFields.any { it.error != null }) return null
+            }
+            return rect
+        }
+
+        fun configureSaveButton() {
             dialog.getButton(AlertDialog.BUTTON_POSITIVE).minimumHeight = dp(48)
-            dialog.getButton(AlertDialog.BUTTON_POSITIVE).isEnabled = supportedVideo.isNotEmpty()
+            dialog.getButton(AlertDialog.BUTTON_POSITIVE).isEnabled = !videoEnabled.isChecked || supportedVideo.isNotEmpty()
             dialog.getButton(AlertDialog.BUTTON_NEGATIVE).minimumHeight = dp(48)
             dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener {
+                val activeCrop = videoEnabled.isChecked && !fullscreen.isChecked
+                val draftCrop = cropDraftForSave(activeCrop)
+                if (activeCrop && draftCrop == null) return@setOnClickListener
                 val next: Settings
                 try {
                     // Clone the entire request so hidden options and capture orientation survive edits.
                     next = Settings.from(current.saved(), validate = false).apply {
                         showPlaybackStatistics = playbackStatistics.isChecked
-                        this.videoCodec = requireNotNull(videoCodec.value) { activity.getString(R.string.rc_select_hardware_codec) }
-                        encoders.resolve(this.videoCodec, "")
-                        maxSize = number(size, R.string.rc_max_size)
-                        maxFps = checkNotNull(fps.value).toInt()
-                        videoBitrate = number(bitrate, R.string.rc_bitrate, 1_000_000)
-                        receiverOrientation = checkNotNull(orientation.value)
+                        this.video = videoEnabled.isChecked
+                        this.fullscreen = fullscreen.isChecked && (!legacyNoCrop || fullscreenTouched)
+                        if (this.video) {
+                            this.videoCodec = videoCodec.value
+                                ?: throw IllegalArgumentException(activity.getString(R.string.rc_select_hardware_codec))
+                            encoders.resolve(this.videoCodec, "")
+                            maxSize = checkNotNull(size.value).toInt()
+                            maxFps = checkNotNull(fps.value).toInt()
+                            videoBitrate = checkNotNull(bitrate.value).toInt()
+                            receiverOrientation = checkNotNull(orientation.value)
+                        } else {
+                            videoCodec.value?.let { this.videoCodec = it }
+                            size.value?.toIntOrNull()?.takeIf { it in 0..16384 }?.let { maxSize = it }
+                            fps.value?.toIntOrNull()?.takeIf { it in 0..240 }?.let { maxFps = it }
+                            bitrate.value?.toIntOrNull()?.takeIf { it in 100_000..200_000_000 }?.let { videoBitrate = it }
+                            orientation.value?.takeIf { it in setOf("auto", "landscape", "portrait") }
+                                ?.let { receiverOrientation = it }
+                        }
                         this.audio = audio.isChecked
-                        videoEncoder = ""
-                        this.cropWidth = if (clearCrop.isChecked) 0 else number(cropWidth, R.string.rc_crop_width)
-                        this.cropHeight = if (clearCrop.isChecked) 0 else number(cropHeight, R.string.rc_crop_height)
-                        this.cropX = if (clearCrop.isChecked) 0 else number(cropX, R.string.rc_crop_x)
-                        this.cropY = if (clearCrop.isChecked) 0 else number(cropY, R.string.rc_crop_y)
-                        this.audioCodec = checkNotNull(audioCodec.value)
-                        this.audioSource = checkNotNull(audioSource.value)
-                        if (this.audioCodec != "raw") this.audioBitrate = number(audioBitrate, R.string.rc_audio_bitrate, 1_000)
-                        this.audioEncoder = ""
+                        if (this.video) videoEncoder = ""
+                        if (draftCrop != null) {
+                            this.cropWidth = draftCrop.width
+                            this.cropHeight = draftCrop.height
+                            this.cropX = draftCrop.x
+                            this.cropY = draftCrop.y
+                        }
+                        if (this.audio) {
+                            this.audioCodec = checkNotNull(audioCodec.value)
+                            this.audioSource = checkNotNull(audioSource.value)
+                            if (this.audioCodec != "raw")
+                                this.audioBitrate = number(audioBitrate, R.string.rc_audio_bitrate, 1_000)
+                            this.audioEncoder = ""
+                        } else {
+                            audioCodec.value?.takeIf { it in Settings.audioCodecs() }?.let { this.audioCodec = it }
+                            audioSource.value?.takeIf { it in setOf("playback", "mic", "output") }
+                                ?.let { this.audioSource = it }
+                            if (this.audioCodec != "raw") {
+                                val parsed = try {
+                                    audioBitrate.text.toString().trim().toBigDecimal()
+                                        .multiply(BigDecimal(1_000)).intValueExact()
+                                } catch (_: Exception) { null }
+                                parsed?.takeIf { it in 16_000..512_000 }?.let { this.audioBitrate = it }
+                            }
+                        }
                         validate()
                     }
-                    val saved = activity.getSharedPreferences(PREFERENCES, Context.MODE_PRIVATE)
-                        .edit().putString(REQUEST, next.saved().toString()).commit()
-                    if (!saved) throw IOException(activity.getString(R.string.rc_settings_write_error))
                 } catch (exception: Exception) {
                     error.text = activity.getString(R.string.rc_settings_error, exception.message ?: exception.javaClass.simpleName)
                     error.visibility = View.VISIBLE
+                    showingVideoCapabilityError = false
                     scroll.post { scroll.scrollTo(0, 0) }
                     return@setOnClickListener
                 }
-                onSave(next)
-                dev.redrain.cast.diagnostics.DiagnosticAccess.setEnabled(activity,
-                    remoteDiagnostics.isChecked)
-                dialog.dismiss()
+                fun persist() {
+                    try {
+                        val saved = activity.getSharedPreferences(PREFERENCES, Context.MODE_PRIVATE)
+                            .edit().putString(REQUEST, next.saved().toString()).commit()
+                        if (!saved) throw IOException(activity.getString(R.string.rc_settings_write_error))
+                        onSave(next)
+                        dev.redrain.cast.diagnostics.DiagnosticAccess.setEnabled(activity,
+                            remoteDiagnostics.isChecked)
+                        dialog.dismiss()
+                    } catch (exception: Exception) {
+                        error.text = activity.getString(R.string.rc_settings_error,
+                            exception.message ?: exception.javaClass.simpleName)
+                        error.visibility = View.VISIBLE
+                        showingVideoCapabilityError = false
+                        scroll.post { scroll.scrollTo(0, 0) }
+                    }
+                }
+                if (current.invalidSavedError != null) {
+                    val confirmation = AlertDialog.Builder(activity)
+                        .setTitle(R.string.rc_settings_reset_title)
+                        .setMessage(R.string.rc_settings_reset_message)
+                        .setNegativeButton(R.string.rc_cancel, null)
+                        .setPositiveButton(R.string.rc_settings_reset_confirm) { _, _ -> persist() }
+                        .create()
+                    showChild(confirmation)
+                } else persist()
             }
         }
         body.requestFocus()
         dialog.show()
+        configureSaveButton()
         return dialog
     }
 
     private fun decimal(value: Int, divisor: Int) =
         BigDecimal(value).divide(BigDecimal(divisor)).stripTrailingZeros().toPlainString()
+
+    internal fun sizePresetsWithinCapture(values: List<Int>, sourceLongerEdge: Int?, selected: Int): List<Int> =
+        values.filter { it == 0 || sourceLongerEdge == null || it <= sourceLongerEdge || it == selected }
 }

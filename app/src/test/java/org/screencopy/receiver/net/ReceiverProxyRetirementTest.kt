@@ -1,6 +1,7 @@
 package org.screencopy.receiver.net
 
 import dev.redrain.cast.diagnostics.DiagnosticArmRegistry
+import dev.redrain.cast.diagnostics.DiagnosticAudioTiming
 import dev.redrain.cast.diagnostics.DiagnosticRecorder
 import dev.redrain.cast.diagnostics.DiagnosticDeliveryBudget
 import dev.redrain.cast.diagnostics.DiagnosticKind
@@ -20,6 +21,8 @@ import org.json.JSONArray
 import org.json.JSONObject
 import org.mockito.Mockito
 import org.screencopy.receiver.media.VideoPlayer
+import org.screencopy.receiver.media.AccessUnit
+import org.screencopy.receiver.media.TrackWorker
 import org.screencopy.receiver.protocol.Type
 import org.screencopy.receiver.ui.ReceiverScreenEvent
 import org.screencopy.receiver.ui.FailureOrigin
@@ -35,6 +38,361 @@ import java.util.concurrent.atomic.AtomicReference
 
 class ReceiverProxyRetirementTest {
     private val session = 77L
+
+    @Test(timeout = 15_000) fun audioAdmissionMarkerPassesStalledSourceSequence() {
+        val source = DiagnosticRecorder()
+        val registry = DiagnosticArmRegistry(DiagnosticRecorder().apply { grantConsent() })
+        registry.start("collector", setOf("session"), setOf("session", "audio.queue", "audio.timing"), 10_000, 100)
+        val claim = checkNotNull(registry.claim(session))
+        val entered = CountDownLatch(1)
+        val resume = CountDownLatch(1)
+        val done = CountDownLatch(1)
+        val markerReceived = CountDownLatch(1)
+        val blockOnce = AtomicBoolean(true)
+        val timer = Executors.newSingleThreadScheduledExecutor()
+        val worker = object : TrackWorker("timing-test", 1, { _, _ -> fail("not started") }, 2) {
+            override fun step() {}
+            override fun release() {}
+        }.also { it.diagnosticSession = session; it.diagnosticGeneration = 3 }
+        try {
+            ReceiverServer.forProtocolTests("Receiver", proxyRecorder = source, proxyBudgetFactory = {
+                DiagnosticDeliveryBudget().apply {
+                    val now = System.nanoTime()
+                    repeat(254) { assertTrue(tryAcquire(now, 0, 4)) }
+                }
+            }).use { server ->
+                server.start()
+                val target = ReceiverTarget("127.0.0.1", server.listeningPort)
+                ReceiverLink(target).use { link ->
+                    link.connectArmed(5000, claim) { registry.remainingMs(claim) }
+                    val request = Settings().apply { audio = false }.request()
+                    link.selectDiagnosticProxy(request, claim)
+                    link.send(Wire.control(Wire.SESSION_REQUEST, session, request))
+                    val accepted = link.receive()
+                    val client = DiagnosticProxyClient(target, registry, claim, timer, onFailure = {},
+                        onRecord = {
+                            val page = registry.receiverFetch(claim, 0, 1)
+                            if (!page.getJSONObject("audioTiming").isNull("marker")) markerReceived.countDown()
+                        })
+                    try {
+                        client.start(link.acceptedDiagnosticProxy(accepted.json(), claim),
+                            System.nanoTime() + 5_000_000_000L) { registry.remainingMs(claim) }
+                        source.afterSequenceReservation = {
+                            if (Thread.currentThread().name == "timing-stalled-source" &&
+                                blockOnce.compareAndSet(true, false)) {
+                                entered.countDown()
+                                check(resume.await(5, TimeUnit.SECONDS))
+                            }
+                        }
+                        Thread({
+                            try {
+                                source.observe("receiver", session, DiagnosticKind.AUDIO_QUEUE,
+                                    DiagnosticStage.ADMITTED, track = 2, generation = 3)
+                            } finally { done.countDown() }
+                        }, "timing-stalled-source").start()
+                        assertTrue(entered.await(3, TimeUnit.SECONDS))
+                        val timing = checkNotNull(source.audioTiming(session))
+                        fun packet(pts: Long) = AccessUnit(pts, ByteArray(1)).also {
+                            it.diagnosticAudioTiming = timing
+                            it.diagnosticPacketId = timing.packetId()
+                        }
+                        assertNull(worker.tryOffer(packet(1)))
+                        assertNotNull(worker.tryOffer(packet(2)))
+                        assertTrue(markerReceived.await(3, TimeUnit.SECONDS))
+                        val page = registry.receiverFetch(claim, 0, 32)
+                        val marker = page.getJSONObject("audioTiming").getJSONObject("marker")
+                        assertEquals(3, marker.getInt("generation"))
+                        assertEquals(1, marker.getInt("reason"))
+                        assertTrue(source.status().getInt("pendingRecords") > 0)
+                    } finally {
+                        resume.countDown()
+                        assertTrue(done.await(3, TimeUnit.SECONDS))
+                        source.afterSequenceReservation = null
+                        client.cancel("test_done")
+                    }
+                }
+            }
+        } finally {
+            resume.countDown()
+            worker.close()
+            timer.shutdownNow()
+            registry.revoke()
+        }
+    }
+
+    @Test(timeout = 15_000) fun ordinaryRetirementFlushesAudioMarker() = audioMarkerAtRetirement(false)
+
+    @Test(timeout = 15_000) fun fatalRetirementFlushesAudioMarker() = audioMarkerAtRetirement(true)
+
+    @Test(timeout = 15_000) fun fatalPeerErrorWithoutTelemetryFlushesProducedMarker() =
+        fatalPeerErrorWithoutTelemetry(false)
+
+    @Test(timeout = 15_000) fun fatalPeerErrorWithoutTelemetryPastGraceRemainsUnconfirmed() =
+        fatalPeerErrorWithoutTelemetry(true)
+
+    @Test(timeout = 15_000) fun fatalPeerErrorWithoutTelemetryOrAudioTimingKeepsLegacyClose() {
+        val registry = DiagnosticArmRegistry(DiagnosticRecorder().apply { grantConsent() })
+        registry.start("collector", setOf("session"), setOf("session"), 10_000, 100)
+        val claim = checkNotNull(registry.claim(session))
+        val closed = CountDownLatch(1)
+        val timer = Executors.newSingleThreadScheduledExecutor()
+        try {
+            ReceiverServer.forProtocolTests("Receiver", proxyRecorder = DiagnosticRecorder()).use { server ->
+                server.start()
+                val target = ReceiverTarget("127.0.0.1", server.listeningPort)
+                ReceiverLink(target).use { link ->
+                    link.connectArmed(5000, claim) { registry.remainingMs(claim) }
+                    val request = Settings().apply { audio = false }.request()
+                    link.selectDiagnosticProxy(request, claim)
+                    link.send(Wire.control(Wire.SESSION_REQUEST, session, request))
+                    val accepted = link.receive()
+                    assertFalse(accepted.json().has("sessionTelemetry"))
+                    val client = DiagnosticProxyClient(target, registry, claim, timer,
+                        onFailure = {}, onClosed = { closed.countDown() })
+                    try {
+                        client.start(link.acceptedDiagnosticProxy(accepted.json(), claim),
+                            System.nanoTime() + 5_000_000_000L) { registry.remainingMs(claim) }
+                        link.attach(session, accepted, false)
+                        link.send(Wire.control(Wire.ERROR, session,
+                            Wire.obj("code" to "AUDIO_FAILED", "message" to "test", "fatal" to true)))
+                        assertEquals(Wire.ERROR, receiveControl(link).type)
+                        assertTrue(closed.await(3, TimeUnit.SECONDS))
+                        val page = registry.receiverFetch(claim, 0, 32)
+                        assertFalse(page.getBoolean("endConfirmed"))
+                        assertFalse(page.has("audioTiming"))
+                    } finally { client.cancel("test_done") }
+                }
+            }
+        } finally {
+            timer.shutdownNow()
+            registry.revoke()
+        }
+    }
+
+    @Test(timeout = 15_000) fun fatalPeerErrorWithoutTelemetryClosesProxyWhenCleanupStalls() {
+        val registry = DiagnosticArmRegistry(DiagnosticRecorder().apply { grantConsent() })
+        registry.start("collector", setOf("session"), setOf("session", "audio.timing"), 10_000, 100)
+        val claim = checkNotNull(registry.claim(session))
+        val cleanupEntered = CountDownLatch(1)
+        val releaseCleanup = CountDownLatch(1)
+        val closed = CountDownLatch(1)
+        val timer = Executors.newSingleThreadScheduledExecutor()
+        val player = Mockito.mock(VideoPlayer::class.java).also {
+            Mockito.doAnswer {
+                cleanupEntered.countDown()
+                check(releaseCleanup.await(8, TimeUnit.SECONDS))
+                null
+            }.`when`(it).close()
+        }
+        try {
+            ReceiverServer.forProtocolTests("Receiver", proxyRecorder = DiagnosticRecorder(),
+                videoFactory = { _, _, _, _ -> player }).use { server ->
+                server.start()
+                val target = ReceiverTarget("127.0.0.1", server.listeningPort)
+                ReceiverLink(target).use { link ->
+                    link.connectArmed(5000, claim) { registry.remainingMs(claim) }
+                    val request = Settings().apply { audio = false }.request()
+                    link.selectDiagnosticProxy(request, claim)
+                    link.send(Wire.control(Wire.SESSION_REQUEST, session, request))
+                    val accepted = link.receive()
+                    val client = DiagnosticProxyClient(target, registry, claim, timer,
+                        onFailure = {}, onClosed = { closed.countDown() })
+                    try {
+                        client.start(link.acceptedDiagnosticProxy(accepted.json(), claim),
+                            System.nanoTime() + 5_000_000_000L) { registry.remainingMs(claim) }
+                        link.attach(session, accepted, false)
+                        link.send(Wire.config(session, 1, 1,
+                            JSONObject().put("codec", "h264").put("width", 640).put("height", 360)
+                                .put("csd", JSONArray().put("AAAAAWdkACg="))))
+                        assertEquals(Wire.STREAM_READY, receiveControl(link).type)
+                        link.send(Wire.control(Wire.ERROR, session,
+                            Wire.obj("code" to "AUDIO_FAILED", "message" to "test", "fatal" to true)))
+                        assertEquals(Wire.ERROR, receiveControl(link).type)
+                        assertTrue(cleanupEntered.await(3, TimeUnit.SECONDS))
+                        assertTrue("Proxy remained open after the existing cleanup timeout",
+                            closed.await(5, TimeUnit.SECONDS))
+                        assertFalse(registry.receiverFetch(claim, 0, 32).getBoolean("endConfirmed"))
+                    } finally {
+                        releaseCleanup.countDown()
+                        client.cancel("test_done")
+                    }
+                }
+            }
+        } finally {
+            releaseCleanup.countDown()
+            timer.shutdownNow()
+            registry.revoke()
+        }
+    }
+
+    private fun fatalPeerErrorWithoutTelemetry(expire: Boolean) {
+        val source = DiagnosticRecorder()
+        val registry = DiagnosticArmRegistry(DiagnosticRecorder().apply { grantConsent() })
+        registry.start("collector", setOf("session"), setOf("session", "audio.timing"), 10_000, 100)
+        val claim = checkNotNull(registry.claim(session))
+        val fetching = CountDownLatch(1)
+        val releaseFetch = CountDownLatch(1)
+        val retirementFenced = CountDownLatch(1)
+        val flushing = CountDownLatch(1)
+        val releaseFlush = CountDownLatch(1)
+        val timerBlocked = CountDownLatch(1)
+        val releaseServerTimer = CountDownLatch(1)
+        val closed = CountDownLatch(1)
+        val timer = Executors.newSingleThreadScheduledExecutor()
+        val retirementNow = AtomicLong(System.nanoTime())
+        val worker = object : TrackWorker("timing-fatal-test", 1, { _, _ -> fail("not started") }, 2) {
+            override fun step() {}
+            override fun release() {}
+        }.also { it.diagnosticSession = session; it.diagnosticGeneration = 3 }
+        try {
+            ReceiverServer.forProtocolTests("Receiver", proxyRecorder = source,
+                proxyRetirementNow = { retirementFenced.countDown(); retirementNow.get() },
+                proxyBeforeFetch = {
+                    fetching.countDown()
+                    check(releaseFetch.await(5, TimeUnit.SECONDS))
+                }, proxyBeforeRetirementFlush = {
+                    flushing.countDown()
+                    check(releaseFlush.await(5, TimeUnit.SECONDS))
+                }).use { server ->
+                server.start()
+                val target = ReceiverTarget("127.0.0.1", server.listeningPort)
+                ReceiverLink(target).use { link ->
+                    link.connectArmed(5000, claim) { registry.remainingMs(claim) }
+                    val request = Settings().apply { audio = false }.request()
+                    link.selectDiagnosticProxy(request, claim)
+                    link.send(Wire.control(Wire.SESSION_REQUEST, session, request))
+                    val accepted = link.receive()
+                    assertFalse(accepted.json().has("sessionTelemetry"))
+                    val client = DiagnosticProxyClient(target, registry, claim, timer,
+                        onFailure = {}, onClosed = { closed.countDown() })
+                    try {
+                        client.start(link.acceptedDiagnosticProxy(accepted.json(), claim),
+                            System.nanoTime() + 5_000_000_000L) { registry.remainingMs(claim) }
+                        assertTrue(fetching.await(3, TimeUnit.SECONDS))
+                        val timing = checkNotNull(source.audioTiming(session))
+                        fun packet(pts: Long) = AccessUnit(pts, ByteArray(1)).also {
+                            it.diagnosticAudioTiming = timing
+                            it.diagnosticPacketId = timing.packetId()
+                        }
+                        assertNull(worker.tryOffer(packet(1)))
+                        assertNotNull(worker.tryOffer(packet(2)))
+                        retirementNow.set(System.nanoTime())
+                        link.attach(session, accepted, false)
+                        val field = ReceiverServer::class.java.getDeclaredField("timer").apply { isAccessible = true }
+                        (field.get(server) as ScheduledExecutorService).execute {
+                            timerBlocked.countDown()
+                            releaseServerTimer.await()
+                        }
+                        assertTrue(timerBlocked.await(3, TimeUnit.SECONDS))
+                        link.send(Wire.control(Wire.ERROR, session,
+                            Wire.obj("code" to "AUDIO_FAILED", "message" to "test", "fatal" to true)))
+                        val response = receiveControl(link)
+                        assertEquals(Wire.ERROR, response.type)
+                        assertFalse(response.json().has("finalSeq"))
+                        assertFalse(response.json().has("cleanupSucceeded"))
+                        assertTrue(retirementFenced.await(3, TimeUnit.SECONDS))
+                        releaseFetch.countDown()
+                        assertTrue(flushing.await(3, TimeUnit.SECONDS))
+                        retirementNow.addAndGet(if (expire) 100_000_000L else 99_000_000L)
+                        releaseFlush.countDown()
+                        assertTrue(closed.await(3, TimeUnit.SECONDS))
+                        val page = registry.receiverFetch(claim, 0, 32)
+                        assertEquals(!expire, page.getBoolean("endConfirmed"))
+                        if (expire) {
+                            assertTrue(page.getJSONObject("audioTiming").isNull("marker"))
+                            assertTrue(page.isNull("terminal"))
+                        } else {
+                            val marker = page.getJSONObject("audioTiming").getJSONObject("marker")
+                            assertEquals(3, marker.getInt("generation"))
+                            assertEquals(1, marker.getInt("reason"))
+                            assertEquals("receiver_retired_fatal", page.getJSONObject("terminal").getString("reason"))
+                        }
+                    } finally {
+                        releaseFetch.countDown()
+                        releaseFlush.countDown()
+                        releaseServerTimer.countDown()
+                        client.cancel("test_done")
+                    }
+                }
+            }
+        } finally {
+            releaseFetch.countDown()
+            releaseFlush.countDown()
+            releaseServerTimer.countDown()
+            worker.close()
+            timer.shutdownNow()
+            registry.revoke()
+        }
+    }
+
+    private fun audioMarkerAtRetirement(fatal: Boolean) {
+        val source = DiagnosticRecorder()
+        val registry = DiagnosticArmRegistry(DiagnosticRecorder().apply { grantConsent() })
+        registry.start("collector", setOf("session"), setOf("session", "audio.timing"), 10_000, 100)
+        val claim = checkNotNull(registry.claim(session))
+        val fetching = CountDownLatch(1)
+        val resume = CountDownLatch(1)
+        val terminal = CountDownLatch(1)
+        val closed = CountDownLatch(1)
+        val clientFailure = AtomicReference<Exception?>()
+        val timerBlocked = CountDownLatch(1)
+        val releaseServerTimer = CountDownLatch(1)
+        val timer = Executors.newSingleThreadScheduledExecutor()
+        val retirementNow = AtomicLong(System.nanoTime())
+        try {
+            ReceiverServer.forProtocolTests("Receiver", proxyRecorder = source,
+                proxyRetirementNow = retirementNow::get, proxyBeforeFetch = {
+                    fetching.countDown()
+                    check(resume.await(5, TimeUnit.SECONDS))
+                }, proxyAfterFatalError = { resume.countDown() }).use { server ->
+                server.start()
+                val target = ReceiverTarget("127.0.0.1", server.listeningPort)
+                ReceiverLink(target).use { link ->
+                    link.connectArmed(5000, claim) { registry.remainingMs(claim) }
+                    val request = Settings().apply { audio = false }.request()
+                    if (fatal) link.selectSessionTelemetry(request)
+                    link.selectDiagnosticProxy(request, claim)
+                    link.send(Wire.control(Wire.SESSION_REQUEST, session, request))
+                    val accepted = link.receive()
+                    val client = DiagnosticProxyClient(target, registry, claim, timer,
+                        onFailure = { clientFailure.set(it) }, onTerminal = { terminal.countDown() },
+                        onClosed = { closed.countDown() })
+                    try {
+                        client.start(link.acceptedDiagnosticProxy(accepted.json(), claim),
+                            System.nanoTime() + 5_000_000_000L) { registry.remainingMs(claim) }
+                        assertTrue(fetching.await(3, TimeUnit.SECONDS))
+                        checkNotNull(source.audioTiming(session)).pressure(System.nanoTime(), session, 2, 1)
+                        link.attach(session, accepted, false)
+                        if (fatal) {
+                            val field = ReceiverServer::class.java.getDeclaredField("timer").apply { isAccessible = true }
+                            (field.get(server) as ScheduledExecutorService).execute {
+                                timerBlocked.countDown()
+                                releaseServerTimer.await()
+                            }
+                            assertTrue(timerBlocked.await(3, TimeUnit.SECONDS))
+                            link.send(Wire.control(Wire.ERROR, session,
+                                Wire.obj("code" to "AUDIO_FAILED", "message" to "test", "fatal" to true)))
+                        } else link.send(Wire.control(Wire.STOP, session, Wire.obj("reason" to "test")))
+                        val response = receiveControl(link)
+                        assertEquals(if (fatal) Wire.ERROR else Wire.SESSION_END, response.type)
+                        resume.countDown()
+                        val confirmed = terminal.await(3, TimeUnit.SECONDS)
+                        assertTrue("proxy failure=${clientFailure.get()} closed=${closed.count} " +
+                            "page=${registry.receiverFetch(claim, 0, 32)}", confirmed)
+                        val page = registry.receiverFetch(claim, 0, 32)
+                        assertEquals(2, page.getJSONObject("audioTiming").getJSONObject("marker").getInt("generation"))
+                        assertEquals(if (fatal) "receiver_retired_fatal" else "receiver_retired_stop",
+                            page.getJSONObject("terminal").getString("reason"))
+                    } finally { resume.countDown(); releaseServerTimer.countDown(); client.cancel("test_done") }
+                }
+            }
+        } finally {
+            resume.countDown()
+            releaseServerTimer.countDown()
+            timer.shutdownNow()
+            registry.revoke()
+        }
+    }
 
     @Test(timeout = 15_000) fun operationFailuresCannotConsumeTerminalFailureReservation() {
         val source = DiagnosticRecorder()

@@ -20,7 +20,8 @@ internal data class AudioCompensation(val samples: Int, val distance: Int)
 
 /** Decoded FIFO only: compressed packets always retain their codec dependencies. */
 internal class AudioRegulator(private val rate: Int, private val channels: Int) {
-    private data class Entry(val samples: ShortArray, val slice: TrimmedAudio, val sourceUnits: Long, var used: Int = 0)
+    private data class Entry(val samples: ShortArray, val slice: TrimmedAudio, val sourceUnits: Long,
+        val originalStartUnits: Long?, var used: Int = 0)
     private val queue = ArrayDeque<Entry>()
     val targetFrames = rate * 50 / 1000
     private val startupLimit = targetFrames + rate * 10 / 1000
@@ -43,14 +44,15 @@ internal class AudioRegulator(private val rate: Int, private val channels: Int) 
 
     init { require(rate in 1..96000 && channels in 1..2) }
     fun offer(samples: ShortArray, slice: TrimmedAudio,
-        sourceUnits: Long = slice.frames * 1_000_000L, observe: Boolean = true, preserve: Boolean = false) {
+        sourceUnits: Long = slice.frames * 1_000_000L, observe: Boolean = true, preserve: Boolean = false,
+        originalStartUnits: Long? = Math.multiplyExact(slice.audiblePtsUs, rate.toLong())) {
         require(slice.skipFrames >= 0 && slice.frames > 0 &&
             (slice.skipFrames.toLong() + slice.frames) * channels <= samples.size)
         require(sourceUnits >= 0)
         if (preserve) check(bufferedFrames + slice.frames <= targetFrames + rate * 120 / 1000 + 256) {
             "Preserved audio exceeded its bounded converted-frame window"
         }
-        queue.addLast(Entry(samples, slice, sourceUnits))
+        queue.addLast(Entry(samples, slice, sourceUnits, originalStartUnits))
         bufferedFrames += slice.frames
         val excess = if (preserve) 0 else (bufferedFrames - limit()).coerceAtLeast(0)
         if (excess > 0) {
@@ -74,6 +76,12 @@ internal class AudioRegulator(private val rate: Int, private val channels: Int) 
         require(frames in 1..first.slice.frames - first.used)
         return (first.used + frames) * first.sourceUnits / first.slice.frames -
             first.used * first.sourceUnits / first.slice.frames
+    }
+    fun originalSourceStartUnits(): Long? {
+        val first = queue.first()
+        return first.originalStartUnits?.let {
+            Math.addExact(it, first.used * first.sourceUnits / first.slice.frames)
+        }
     }
     fun startAfterPreroll() { started = true }
     fun take(maxFrames: Int): AudioChunk? = peek(maxFrames)?.also { discard(it.frames) }
@@ -149,12 +157,63 @@ internal class AudioPresentationTimeline(private val rate: Int) {
     private var deviceWritten = 0L
     private var sourceWritten = 0L
     private var sourcePresented = 0L
+    private data class OriginalSpan(val start: Long, val end: Long, val sourceStart: Long, val sourceUnits: Long)
+    private val original = ArrayDeque<OriginalSpan>()
+    private var exactMapping = true
+    internal data class Coverage(val startUnits: Long, val endUnits: Long)
+    private var originalPresentedStart: Long? = null
+    private var originalPresentedEnd: Long? = null
+    private var hadGap = false
+    @Synchronized fun disableDiscardMapping() {
+        exactMapping = false
+        original.clear()
+        originalPresentedStart = null
+        originalPresentedEnd = null
+    }
+    @Synchronized fun discardCoverage(timing: AudioOutputTiming): Pair<Coverage, Boolean>? {
+        val frame = timing.qualifiedTimestampFrames ?: return null
+        if (!exactMapping || timing.virtualDiscard || timing.clockSource != AudioClockSource.TIMESTAMP || frame !in 1..deviceWritten)
+            return null
+        while (original.isNotEmpty() && original.first().end < frame) {
+            val span = original.removeFirst()
+            if (span.sourceUnits > 0) cover(span.sourceStart, span.sourceStart + span.sourceUnits)
+        }
+        val span = original.firstOrNull() ?: return null
+        if (frame < span.start) return null
+        if (span.sourceUnits > 0) cover(span.sourceStart, span.sourceStart +
+            (frame - span.start) * span.sourceUnits / (span.end - span.start))
+        val start = originalPresentedStart ?: return null
+        val end = originalPresentedEnd ?: return null
+        return Coverage(start, end) to !hadGap
+    }
+    private fun cover(start: Long, end: Long) {
+        if (end <= start) return
+        val previousEnd = originalPresentedEnd
+        if (previousEnd == null || start > previousEnd) {
+            if (previousEnd != null) hadGap = true
+            originalPresentedStart = start
+            originalPresentedEnd = end
+        } else {
+            originalPresentedEnd = maxOf(previousEnd, end)
+        }
+    }
     @Synchronized fun write(source: Boolean, channels: Int, frames: Int,
-        sourceUnits: (Int) -> Long = { it * 1_000_000L }, operation: () -> Int): Int {
+        sourceUnits: (Int) -> Long = { it * 1_000_000L },
+        originalSourceStartUnits: Long? = null, operation: () -> Int): Int {
         val samples = operation()
         check(samples >= 0) { "AudioTrack write failed ($samples)" }
         check(samples <= frames * channels && samples % channels == 0) { "AudioTrack returned an invalid sample count" }
-        if (samples > 0) submittedUnits(samples / channels, if (source) sourceUnits(samples / channels) else 0)
+        if (samples > 0) {
+            val accepted = samples / channels
+            val units = if (source) sourceUnits(accepted) else 0
+            if (exactMapping) {
+                if (source && originalSourceStartUnits == null || original.size >= rate / 4 + 2)
+                    disableDiscardMapping()
+                else original.addLast(OriginalSpan(deviceWritten, deviceWritten + accepted,
+                    originalSourceStartUnits ?: 0, units))
+            }
+            submittedUnits(accepted, units)
+        }
         return samples
     }
     @Synchronized fun presentedUs(position: () -> Long): Long = presentedUs(position())
@@ -207,5 +266,10 @@ internal class AudioPresentationTimeline(private val rate: Int) {
         deviceWritten = 0
         sourceWritten = 0
         sourcePresented = 0
+        original.clear()
+        exactMapping = true
+        originalPresentedStart = null
+        originalPresentedEnd = null
+        hadGap = false
     }
 }

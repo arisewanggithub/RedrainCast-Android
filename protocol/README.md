@@ -294,22 +294,30 @@ UDP 27183 advertisements are JSON objects with `protocol:"screencopy"`,
 TCP listener ports are dynamic; 27184 is not an implicit receiver endpoint.
 
 1. Control socket: sender HELLO at session zero, `role:"sender"`, `versions:[3]`,
-   `name:"RedrainCast"`. Receiver replies HELLO with receiver role/name/versions.
+   `name:"RedrainCast"`. Audio-only senders additionally offer the strictly
+   typed `audioOnlyVersion:1`; a receiver that supports the feature acknowledges
+   exactly `audioOnlyVersion:1` in HELLO before the request may set
+   `video.enabled:false`. Acknowledgements without an offer, malformed values,
+   and version mismatches are rejected. A missing `video.enabled` remains
+   video-enabled for older senders. A receiver without the acknowledgement
+   rejects audio-only explicitly; video is never silently enabled as fallback.
 2. Sender sends SESSION_REQUEST (type 3) with a positive session ID and explicit
    video/audio settings. Receiver replies SESSION_ACCEPT (4), exact enabled
-   `tracks:[1]` or `[1,2]`, and a fresh 64-hex-character `mediaToken`.
+   `tracks:[1]`, `[2]`, or `[1,2]`, and a fresh 64-hex-character `mediaToken`.
 3. Open **both** video and audio TCP connections to that same endpoint, even for
-   video-only sessions. Each sends HELLO at the accepted session ID with
+   single-track and dual-track sessions. Each sends HELLO at the accepted session ID with
    `role:"media"`, `channel:"video"|"audio"`, and `token:mediaToken`. Each receives
    HELLO acknowledgement containing its channel. Tokens bind to the live control
    session; duplicate, stale and wrong-token attachments fail.
 4. STREAM_CONFIG (6) and VIDEO_FRAME (8) use only the video connection (track 1).
    Audio STREAM_CONFIG and AUDIO_PACKET (9) use only the audio connection
-   (track 2), and only when audio was accepted. Readiness (7), status, heartbeat,
+   (track 2), and only when audio was accepted. Disabled tracks may not send
+   configuration, media, or recovery. Readiness (7), status, heartbeat,
    stop, error, and session-end use only the control connection.
 5. Receiver configures the requested decoder/output before STREAM_READY
    (`ok:true`, matching track/generation). Media transmission waits for readiness
-   of every enabled track. A codec/output failure is not readiness.
+   of every enabled track; audio-only has no video decoder, video deadline, or
+   key-frame startup barrier. A codec/output failure is not readiness.
 6. Independent 2-second PING/PONG liveness and bounded startup/write deadlines
    remain active during media congestion. STOP (14, `reason`) is acknowledged by
    SESSION_END (15) after retirement. Fatal ERROR (11, `code`, `message`, `fatal`)
@@ -429,6 +437,14 @@ validate/capture track ownership under the receiver lifecycle lock, then wait
 for that track's queue outside the shared lock. Per-track socket readers remain
 serial, and track shutdown rejects/wakes pending admission. Do not retain a
 single-socket read-loop lock around blocking queue offers.
+Packet duration parsing, recovery-key inspection and Annex B validation run
+outside that lock. Their results are committed only after rechecking the
+session, track generation, worker, format and recovery state; a retired
+snapshot cannot admit media or switch the recovery key. Recovery audio clock
+callbacks are sampled outside the lifecycle lock, then the current clock state
+is read under it. READY and recovery completion enqueue remain ordered with
+stop under the lifecycle lock. A delayed recovery request is enqueued only if
+its track generation is still the active recovery attempt.
 Worker replacement is serialized per track. Detach retired workers under the
 shared lifecycle lock, then close/join them outside it so their output callbacks
 can finish. Stop waits for both track operations in a fixed order before final
@@ -455,6 +471,59 @@ retired operation, not a fatal session error. Audio configuration remains
 independent of video Surface lifetime; session teardown retires its worker.
 Decoded video callbacks skip the recovery lock when no recovery key is pending;
 pending proofs still revalidate their generation under the lifecycle lock.
+Ordinary live audio may discard decoded source samples strictly before a
+separate, unslewed presented-source cutoff. Only a qualified native DAC timestamp's
+actual frame (not its extrapolated estimate or playback-head floor) supplies this
+authority. Original source PTS and source-sample units pass through the existing
+resampler filter-delay mapping and accepted output writes; output frame counts
+are not source-sample identities. No cutoff exists without this mapping and
+native proof, or after detach/replacement. Admission uses the cached cutoff
+without sampling native output or advancing the clock.
+It does not use newest arrivals, submitted PCM, video, wall time, scheduling
+prediction or the shared monotonic floor as independent freshness evidence.
+A repeated qualified native frame supplies at most a fixed cutoff, not a moving
+live edge; warming, unavailable, stale or invalid native timing disables trimming.
+Source gaps or overlaps of at least one microsecond, nonmonotonic retained
+intervals, or decoded FIFO drops disable normal trimming for that output
+lifetime. Sub-microsecond differences can result from integer PTS rounding;
+they are not assumed continuous. Played coverage retains its exact source-sample
+units and a real gap starts a new coverage interval. Trimming is restricted to
+whole samples within the current proved interval, and the scalar cutoff is
+disabled after any gap; no audio crossing an unproved gap is treated as played.
+The extra original-source write history
+has the existing presentation-history bound; exhaustion disables trimming rather
+than growing a ledger or evicting compressed packets. Conservative mapping loss
+uses the original admission/recovery/failure bounds, not a substitute clock.
+AAC/Opus packets remain FIFO-decoded, including entirely stale dependencies;
+PCM uses the same decoded trimming path. Played-audio trimming removes only
+whole proved source frames (all channels), before resampling and source-unit accounting.
+The TRIM reason `PLAYED_AUDIO` reports the discarded source range from the
+before/after audible PTS and frame counts. Existing source-clock slew is unchanged.
+The A/V synchronization/statistics position still uses its existing phase slew,
+timestamp estimates and monotonic playback-head fallback; it is not destructive
+trim authority and may be ahead of the unslewed DAC-confirmed cutoff. No new wire
+field is required: `PLAYED_AUDIO`'s cutoff is the separate proved source boundary.
+
+The receiver's default one-second audio admission span always counts the raw minimum/maximum PTS
+of every queued dependency and the incoming packet, even with qualified played
+coverage. An earlier FIFO Opus decode can invalidate that coverage before a
+later stale dependency is serviced, so admission never exempts or clamps it.
+This deliberately limits backlog relief: proved stale dependencies can still
+cause ordinary PTS pressure before reaching safe post-decode trimming. They are
+not silently evicted or reported as admitted. Negotiated peers use the existing
+track recovery path; legacy admission retains its 250 ms wait and congestion
+failure semantics. Audio has 256 packet slots; its 512 KiB shared encoded/reservation
+cap and 120 ms decoded-output bound remain unchanged. A one-second span of 20 ms
+48 kHz stereo PCM packet start timestamps needs 51 slots and 195,840 bytes;
+smaller packets, larger payloads or retained decoded input can hit another cap
+first. The span is a local receiver setting (`DEFAULT_AUDIO_QUEUE_SPAN_US`),
+not negotiated on the wire. Video remains at 48 slots and 250 ms. Recovery cutoffs,
+preservation and READY/COMPLETE proofs are unchanged. Queue statistics report
+the raw queued span; PTS rejection reports the attempted raw span.
+This cannot clear an ordinary newer-than-played queue while audio is stalled,
+and is not a fix for a capture whose stale status cannot be independently proved.
+Reducing that backlog would require a separate justified live-latency clock policy.
+
 Native audio timing is sampled only by the audio worker and its joined cleanup,
 not by video, admission, recovery proofs or shared-clock readers. Each output
 service publishes the actually presented source-sample mapping and its original
@@ -700,6 +769,16 @@ released at the initial boundary, restart only audio after both tracks are READY
 so the receiver can apply its explicit recovery cutoff. Later track recoveries
 do not reintroduce this initial all-tracks barrier.
 
+After that barrier, the first usable audio slice starts without waiting for a
+video packet. Its audible source PTS establishes the initial clock; once output
+is attached, observed audio presentation drives video scheduling. A first video
+packet, whether earlier or later, does not re-anchor or retrim audio. Before an
+audio clock is available, video can still be presented without waiting for it.
+The ordinary three-second audio-start check and independent decoder failures
+remain in force; an already-started audio track does not time out for missing
+video under that audio-start check. Negotiated video recovery still has its
+independent ten-second deadline for usable video, including initial startup.
+
 After video is READY, request a hardware sync frame, retrying no
 faster than every 500 ms. Suppress stale/dependent video until a verified fresh
 random-access picture: original PTS at/after video READY,
@@ -854,7 +933,7 @@ track-local deadlines and control-read/write liveness checks still apply.
 Audio recovery before first playback explicitly uses its own recovery startup
 state: video completion cannot restore the initial three-second timeout, and
 fresh audio is not compared to an obsolete first-video timestamp. The common
-clock remains continuous; ordinary non-recovery startup keeps its original rules.
+clock remains continuous; ordinary non-recovery startup uses the audio-led rules above.
 Before any audio has played, fresh submitted video can advance this bootstrap
 clock so audio does not wait behind an obsolete initial video-arrival delay.
 Once audio takes clock ownership, video presentation does not re-anchor it.

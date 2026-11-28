@@ -26,6 +26,8 @@ internal fun testAudioPlayer(
     resamplerFactory: (Int, Int) -> PcmResampler = { _, channels -> IdentityPcmResampler(channels) },
     onServiceDiagnostic: ((String) -> Unit)? = null,
     threadCpuNs: () -> Long = { 0 },
-    aacFactory: ((AudioFormat) -> MediaCodec)? = null
+    aacFactory: ((AudioFormat) -> MediaCodec)? = null,
+    audioQueueSpanUs: Long = DEFAULT_AUDIO_QUEUE_SPAN_US
 ) = AudioPlayer(format, clock, failure, outputFactory, onClockCorrection, onOutputTiming,
-    onUnderrunRecovery, opusFactory, onRegulation, resamplerFactory, onServiceDiagnostic, threadCpuNs, {}, aacFactory)
+    onUnderrunRecovery, opusFactory, onRegulation, resamplerFactory, onServiceDiagnostic, threadCpuNs, {}, aacFactory,
+    audioQueueSpanUs)

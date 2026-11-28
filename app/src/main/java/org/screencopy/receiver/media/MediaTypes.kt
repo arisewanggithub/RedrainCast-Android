@@ -20,7 +20,10 @@ data class AudioFormat(
     val outputGainQ8: Int = 0
 )
 
-data class AccessUnit(val ptsUs: Long, val bytes: ByteArray, val keyFrame: Boolean = false, val rotation: Int = 0)
+data class AccessUnit(val ptsUs: Long, val bytes: ByteArray, val keyFrame: Boolean = false, val rotation: Int = 0) {
+    internal var diagnosticAudioTiming: dev.redrain.cast.diagnostics.DiagnosticAudioTiming? = null
+    internal var diagnosticPacketId = 0L
+}
 
 open class PlaybackException(message: String, val code: String = "DECODER_FAILED") : IllegalStateException(message)
 
@@ -51,6 +54,11 @@ data class QueuePressure(
 class QueueCongestionException(val pressure: QueuePressure) :
     PlaybackException("Playback admission stalled: ${pressure.logMessage()}", "CONGESTION")
 
+/** Original source units are microseconds multiplied by the source sample rate. */
+data class PlayedAudioCoverage(val startUnits: Long, val endUnits: Long, val sampleRate: Int) {
+    init { require(sampleRate > 0 && startUnits >= 0 && endUnits >= startUnits) }
+}
+
 /** Duration and byte limits apply as well as a packet count limit. */
 class PacketBudget(
     private val maxBytes: Int,
@@ -71,8 +79,11 @@ class PacketBudget(
                  retainedBytes: Int = 0): QueuePressure? {
         require(packet.ptsUs >= 0) { "Negative presentation timestamp" }
         require(retainedBytes >= 0)
-        val minimum = minOf(entries.minOfOrNull { it.first } ?: packet.ptsUs, packet.ptsUs)
-        val maximum = maxOf(entries.maxOfOrNull { it.first } ?: packet.ptsUs, packet.ptsUs)
+        // Played proof can be invalidated by an earlier FIFO decode. It cannot
+        // exempt queued dependencies from the admission duration bound.
+        val pts = entries.map { it.first } + packet.ptsUs
+        val minimum = pts.minOrNull() ?: 0L
+        val maximum = pts.maxOrNull() ?: minimum
         val attemptedBytes = bytes.toLong() + retainedBytes + packet.bytes.size
         val limit = when {
             entries.size >= maxPackets -> QueueLimit.PACKETS

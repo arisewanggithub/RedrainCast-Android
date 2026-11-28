@@ -8,6 +8,50 @@ The [cast protocol](protocol/README.md), [automatic telemetry contract](protocol
 and [live v2 contract](protocol/REMOTE_DIAGNOSTICS.md) are the implementation
 references; they are not evidence that a particular device behaved as specified.
 
+## Temporary virtual audio discard experiment
+
+From the repository root, build a **debug-only** experiment with
+`.\gradlew.bat :app:assembleDebug -PvirtualAudioExperiment=true`.
+The APK version contains `virtual-audio`. Omit the property (or set it to
+`false`) for normal debug audio; release builds always use normal audio.
+Install the experimental APK on the receiver as well as the sender if both
+devices need the same build. The receiver decodes and drops PCM without creating
+an AudioTrack. Audio is intentionally inaudible. A bounded 100 ms virtual FIFO
+advances at nominal sample rate and drives internal A/V timing; it is not a
+hardware playback measurement. Its completion and video-recovery proof use this
+simulated timing, not native audio presentation. Receiver logcat marks startup,
+first discard and recovery proof with `VIRTUAL_AUDIO_*` and
+`physical_playback=false`.
+
+To prevent simulated counts being reported as native playback, receiver session
+telemetry, playback statistics and paired/receiver diagnostics are unavailable
+in this experiment. Do not arm a paired diagnostic capture: an armed proxy is
+explicitly rejected, not silently downgraded. Sender audio capture and audio
+transport remain enabled for an unarmed cast. Success would not establish an
+AudioTrack hardware cause: pacing and clock behavior also changed. Reinstall a
+normal build on each device to end the experiment.
+
+## Temporary hybrid audio/video clock experiment
+
+Mode 1 is the default. Mode 2 is the silent discard build above. Mode 3 is
+`.\gradlew.bat :app:assembleDebug -PhybridAudioExperiment=true`; the version
+contains `hybrid-audio`. Properties are mutually exclusive and release builds
+always use mode 1. The receiver log identifies mode 1, 2 or 3. Mode 3 still
+creates and writes the real AudioTrack: native head/timestamps control writable
+capacity, output metrics and discard safety; recovery continues to use real
+accepted writes and native observations, not the virtual clock. An accepted
+write is not proof of audible playback. Only video
+scheduling uses the independent `VIRTUAL_SYNC` clock. It advances at nominal
+source rate, capped by accepted source submissions, and bounds its simulated
+FIFO to 100 ms by skipping excess virtual backlog. It does not model device
+latency, silence or source timestamp corrections, and is not playback evidence.
+Before audio attaches and after it detaches, video uses the ordinary recovery
+clock rather than a virtual audio clock.
+Select `video.progress,video.timing` to retain `VIRTUAL_SYNC` scheduling labels
+in a compatible diagnostic capture; otherwise use the receiver's mode log.
+Video scheduling differences can themselves affect a comparison; no outcome
+alone proves a hardware or scheduler cause.
+
 ## Connection or startup fails
 
 * Keep the receiver awake with RedrainCast in the foreground and check that it
@@ -156,6 +200,19 @@ empty/non-overlapping stages are unmeasured. Validate the analyzer with
 
 ## Audio crackles, silence or A/V drift
 
+To send video only, uncheck **Send audio**, press **Save**, then start a new
+cast. That selection requests only video track 1 and skips audio recording,
+encoding and receiver playback. It does not change the selected codecs, video
+quality or jitter/buffering policy, and cannot change an already reserved or
+running session. Cancel/stop that session before starting another.
+
+The protocol still attaches an audio TCP connection for video-only casts; that
+connection alone is not evidence of an audio track or audio packets. Verify the
+new session's request has `audio.enabled=false` and its acceptance has `tracks:[1]`.
+If sound is still audible, distinguish that session's receiver audio player from
+old/background playback or another source/route. Video-only casting does not
+mute the sender's local media playback.
+
 Check whether audio was enabled, the chosen source is permitted by Android
 capture policy, and whether symptoms persist with a comparable source/route.
 Statistics' A/V skew is rendered video PTS minus played **source** audio PTS,
@@ -261,10 +318,8 @@ pre-refill padding microseconds/PCM frames; `silence` accepted frames/PCM
 frames; `observe` native counter/queue count. Refill sampling and overwritten
 entries limit the history; rate-limited dumps retain throttled increments.
 Large wall time with little thread CPU suggests off-CPU delay, including
-blocking, GC or scheduling; it does not identify which. If needed, use an
-authorized Android Studio System Trace/Perfetto CPU scheduling trace and
-inspect `ScreenCopy-audio`: runnable-but-not-running differs from sleeping or
-blocked. Correlate with local log windows, not unsynchronized device clocks.
+blocking, GC or scheduling; it does not identify which. An external system
+trace may help distinguish scheduling states.
 
 For live evidence, correlate capture timestamps and packet PTS, queue
 admission/dequeue, decode/refill and clock/output observations by session,
@@ -274,6 +329,68 @@ the same native timestamp; compare native time/frame separately. A draining
 encoded queue can coexist with retained decoded recovery slices; it does not
 prove a blocked decoder. Mapping correction is not instantaneous audible-clock
 change. Recovery completion proves source-sample submission, not acoustic output.
+
+### External receiver system trace
+
+Only collect a trace with device-owner consent during an authorized reproduction.
+Use the already-running receiver and existing debugging/tracing access; do not
+change device settings to enable it. If neither route below is available with
+existing access, skip this capture.
+
+* **Authorized ADB and Android Studio:** Connect to the already-authorized
+  receiver, open **Profiler**, select its running app process and start a
+  **System Trace** task attached to it. Start before the relevant interval, then
+  stop after the symptom and wait for parsing. In **Past Recordings**, use
+  **Export recording** if available; otherwise use the device route below or
+  [Perfetto over ADB](https://developer.android.com/tools/perfetto). Profiler
+  recordings otherwise last only for the current Studio session.
+* **Authorized ADB without Studio:** With Python and the existing SDK's ADB,
+  replace the serial and output name below with the receiver's authorized
+  serial and a unique local filename. This 20-second, 16 MiB rolling trace
+  requests scheduler switch/wakeup events and writes binary output directly to
+  a new local file; it does not change device settings.
+
+  ```powershell
+  $adb = Join-Path $env:LOCALAPPDATA 'Android\Sdk\platform-tools\adb.exe'
+  $receiver = 'RECEIVER_SERIAL'
+  @'
+  import subprocess, sys
+  with open(sys.argv[3], "xb") as trace:
+      subprocess.run([sys.argv[1], "-s", sys.argv[2], "exec-out", "perfetto",
+                      "-o", "-", "-t", "20s", "-b", "16mb",
+                      "sched/sched_switch", "sched/sched_wakeup"],
+                     stdout=trace, check=True)
+  '@ | python - $adb $receiver 'receiver-audio-UNIQUE.perfetto-trace'
+  ```
+
+  Start the reproduction within the recording window. A failed command can
+  leave a partial file; do not treat it as a valid trace. Event availability and
+  thread/process names depend on the device; check the resulting tracks.
+* **Existing device System Tracing UI:** If the app or Quick Settings tile is
+  already available, start **Record trace**, reproduce the symptom, then stop
+  via the tile or notification. After **Trace saved**, use the notification or
+  Files app to save/share the `.perfetto-trace` file. Do not enable developer
+  options, add a tile, or change tracing categories or buffer settings. The
+  default rolling buffer may retain only 10–30 seconds; stop promptly.
+  See [Android's on-device instructions](https://developer.android.com/topic/performance/tracing/on-device)
+  and [Studio profiling instructions](https://developer.android.com/studio/profile).
+
+Preserve the original trace under a unique name alongside the matching capture
+and build/mode notes; do not overwrite existing evidence. Open it in Studio or
+the [Perfetto UI](https://ui.perfetto.dev/) and inspect scheduler/thread-state
+tracks for the receiver process and `ScreenCopy-audio` (the displayed name may
+be shortened). Match process and thread IDs and the relevant generation/time
+window; recovery can create a new worker. Runnable-but-not-running differs from
+sleeping or blocked, but unavailable events, buffer loss and trace overhead
+limit conclusions. App timing and system trace clocks need a verified local
+correlation; do not subtract unsynchronized device or host timestamps.
+
+Neither the app log nor this trace procedure identifies the owner of the
+`playbackLock` monitor. A blocked state alone does not establish a lock owner
+or root cause. Separately selected `audio.timing.owner` capture spans can
+identify observed holders, subject to the gaps and correlation limits below.
+Traces can contain system-wide process names and device metadata;
+restrict access and review/redact before sharing.
 
 ## Pressure, recovery or disconnect
 
@@ -365,11 +482,48 @@ is no automatic upload. Do not port-forward or scan.
    lease includes waiting/setup. Both peers need v2 proxy support. There is one
    sender connection, no receiver diagnostics listener/discovery or existing
    session attach. The receiver preference is not changed. Default flags select
-   known advertised groups, except opt-in `tail.details`; `capture_metadata`
+   known advertised groups, except opt-in `tail.details`, `audio.timing`,
+   `audio.timing.work`, `audio.timing.detail`, and `audio.timing.owner`; `capture_metadata`
    records the selection. Explicit comma-separated `--sender-flags` and
    `--receiver-flags` are strict; receiver `video.timing` requires
    `video.progress`, and unsupported flags can fail setup. Optional
    `tail.details` requires a receiver known to support it.
+   To request receiver audio timing including startup wall/CPU work boundaries, add:
+
+   ```powershell
+   --receiver-flags session,recovery,audio.transport,audio.queue,audio.output,audio.timing,audio.timing.work,audio.timing.detail,video.progress,transport.health
+   ```
+
+   Both peers must advertise the requested flags; there is no silent fallback.
+   `audio.timing.detail` requires `audio.timing.work`, which requires `audio.timing`.
+   To request bounded playback-lock ownership intervals in a paired receiver
+   capture, also append `audio.timing.owner`; it requires all three timing
+   flags. Match complete begin/end spans as described in the protocol, and
+   treat activation gaps, loss and unmatched endpoints as unknown. Java thread
+   IDs do not necessarily equal Perfetto OS TIDs. An overlapping observed hold
+   does not establish that the audio callback was blocked instead of descheduled.
+   Detail includes write/decode CPU, queue and native capacity samples plus
+   sampled boundary overhead; see the protocol for limitations. Omitting work preserves the legacy
+   v1 trace, including when a legacy sender connects to an updated receiver.
+   On audio-led builds, a missing `firstVideoUs` during audio startup is expected
+   and does not mean the audio gate is waiting for video. Older captures may
+   reflect the former first-video gate; inspect the decision and clock fields.
+   Ordinary `PLAYED_AUDIO` trims discard only source samples behind actually
+   presented audio, using qualified native frames mapped to original, unslewed
+   source samples—not the sync clock's fallback floor or phase slew. Native
+   timing/mapping loss disables trimming; source gaps, overlap/reordering or FIFO
+   drops disable it for the output lifetime. Admission always counts the raw
+   queued/incoming PTS span, including proved played packets: an earlier FIFO
+   decode can invalidate proof before a later dependency is processed.
+   Post-decode trimming still benefits safely proved samples, but stale encoded
+   backlog can hit the audio queue's one-second PTS span, 256-packet limit, or
+   shared 512 KiB encoded/retained-input byte cap first. These are independent
+   bounds, not a guarantee of one second of audio for every packetization.
+   Negotiated track recovery or legacy wait/congestion semantics handle that
+   pressure; dependencies are not silently dropped. A large span or
+   newer arrivals do not prove staleness: if output is stalled and all queued
+   PTS are ahead of its fixed presented position, track-local recovery remains
+   necessary. Do not infer that live trimming fixes that capture.
 4. The collector creates `paired.jsonl` without overwriting it. During normal
    collection it drains frozen evidence with a bounded 120-second deadline.
    On error or Ctrl+C, already written output is preserved, but the collector
@@ -403,6 +557,33 @@ or partial output is not complete paired coverage. Even a confirmed terminal
 does not imply lossless records: admission drops have no sequence ticket, and
 loss envelopes need not be exact contiguous ranges. `sequence_completeness`
 is separate from terminal confirmation and cannot establish losslessness.
+
+When selected, `audio.timing` adds numeric receiver-local event batches and a
+separate first-pressure marker in receiver retention metadata.
+Work boundaries and worker CPU snapshots additionally require `audio.timing.work`.
+For recovery-clock lag, the selected work trace now includes cached mapping/native
+snapshots at recovery begin/end and detach (ordinary `AUDIO_OUTPUT` records
+at point `recovery`; also select `audio.output`, see the protocol).
+Compare successive epochs: stale observation timestamps with unchanged native
+progress locate a stalled/unobserved output interval; fresh progress with an
+incorrect base discontinuity instead points to mapping. A future video release
+deadline alone proves neither: compare PTS delta with base-time delta first.
+The first-submission callback's outer stage 8 contains two adjacent nested stage-8
+intervals: lock acquisition, then critical section. A dominant first interval
+localizes delay before acquisition; a dominant second interval localizes it
+inside the callback. Low CPU still cannot identify a monitor
+owner or distinguish contention from descheduling. Missing snapshot members,
+loss across an interval, or stale observations require more evidence, not a
+behavior change. Older strict work-v2 sender/collector validators remain compatible;
+do not infer physical playback from head/presentation counters.
+The sender keeps
+at most 768 KiB of these raw batches, favoring receiver timestamps from five
+seconds before to ten seconds after the marker. A missing marker, eviction,
+producer or proxy loss, disconnect, or unknown tail means incomplete evidence;
+the window is not guaranteed. Packet ID zero means unknown attribution, notably
+AAC output and device writes. An accepted write is not proof of audible output.
+See the [protocol](protocol/REMOTE_DIAGNOSTICS.md#audio-timing) for the event
+schema and actual retained bounds.
 
 Each endpoint has an independent monotonic clock. Never subtract sender and
 receiver timestamps directly. The collector records sender CLOCK before START

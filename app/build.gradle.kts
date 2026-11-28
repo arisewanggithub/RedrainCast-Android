@@ -14,6 +14,13 @@ abstract class DebugBuildId : ValueSource<String, ValueSourceParameters.None> {
 }
 
 val debugBuildId = providers.of(DebugBuildId::class.java) {}.get()
+val virtualAudioExperiment = providers.gradleProperty("virtualAudioExperiment").orElse("false").get().also {
+    require(it == "true" || it == "false") { "virtualAudioExperiment must be true or false" }
+}.toBoolean()
+val hybridAudioExperiment = providers.gradleProperty("hybridAudioExperiment").orElse("false").get().also {
+    require(it == "true" || it == "false") { "hybridAudioExperiment must be true or false" }
+}.toBoolean()
+require(!(virtualAudioExperiment && hybridAudioExperiment)) { "Audio experiments are mutually exclusive" }
 
 android {
     namespace = "dev.redrain.cast"
@@ -26,6 +33,8 @@ android {
         targetSdk = 37
         versionCode = 38
         versionName = "0.5.4"
+        buildConfigField("boolean", "VIRTUAL_AUDIO_EXPERIMENT", "false")
+        buildConfigField("boolean", "HYBRID_AUDIO_EXPERIMENT", "false")
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         externalNativeBuild {
             cmake { arguments += "-DANDROID_STL=c++_static" }
@@ -55,7 +64,9 @@ android {
     buildTypes {
         getByName("debug") {
             applicationIdSuffix = ".debug"
-            versionNameSuffix = "-debug-$debugBuildId"
+            versionNameSuffix = "-debug-${if (virtualAudioExperiment) "virtual-audio-" else if (hybridAudioExperiment) "hybrid-audio-" else ""}$debugBuildId"
+            buildConfigField("boolean", "VIRTUAL_AUDIO_EXPERIMENT", virtualAudioExperiment.toString())
+            buildConfigField("boolean", "HYBRID_AUDIO_EXPERIMENT", hybridAudioExperiment.toString())
         }
         getByName("release") {
             isDebuggable = false

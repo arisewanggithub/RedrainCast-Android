@@ -9,8 +9,10 @@ internal enum class RecoveryAudioCoverage { WAITING, READY, LOST }
 
 /** Capture readers wait only for bounded local admission, never while holding a network writer lock. */
 class MediaBudget internal constructor(private val withAudio: Boolean, private val clock: () -> Long,
-                                       private val admissionNanos: Long) {
+                                       private val admissionNanos: Long, private val withVideo: Boolean = true) {
     constructor(withAudio: Boolean, clock: () -> Long = System::nanoTime) : this(withAudio, clock, 500_000_000L)
+    constructor(withVideo: Boolean, withAudio: Boolean, clock: () -> Long = System::nanoTime) :
+        this(withAudio, clock, 500_000_000L, withVideo)
     init { require(admissionNanos in 1..500_000_000L) }
     private data class Entry(val message: Wire.Message, val admitted: Long)
     private val controls = ArrayDeque<Entry>()
@@ -24,6 +26,7 @@ class MediaBudget internal constructor(private val withAudio: Boolean, private v
     private val generation = IntArray(3)
     private val announced = IntArray(3)
     private val ready = IntArray(3)
+    private val forwarded = BooleanArray(3)
     private val readinessDeadline = LongArray(3)
     private val lastPts = LongArray(3) { -1 }
     private val opusSourcePts = BooleanArray(3)
@@ -185,7 +188,8 @@ class MediaBudget internal constructor(private val withAudio: Boolean, private v
             message.json().opt("codec") == "opus"
         while (true) {
             if (ending) throw SessionCancelledException()
-            if (message.type in setOf(Wire.STREAM_CONFIG, Wire.VIDEO_FRAME, Wire.AUDIO_PACKET) && track !in 1..2)
+            if (message.type in setOf(Wire.STREAM_CONFIG, Wire.VIDEO_FRAME, Wire.AUDIO_PACKET) &&
+                (track !in 1..2 || track == 1 && !withVideo || track == 2 && !withAudio))
                 throw protocol(message, CaptureProtocolReason.INVALID_TRACK)
             if (message.type == Wire.STREAM_CONFIG && message.generation != generation[track] + 1)
                 throw protocol(message, CaptureProtocolReason.CONFIG_SEQUENCE)
@@ -223,6 +227,7 @@ class MediaBudget internal constructor(private val withAudio: Boolean, private v
             TelemetryRegistry.evidence("sender", diagnosticSession, track, message.generation,
                 IncidentEvidence.Stage.CONFIG_ENQUEUED)
             generation[track] = message.generation; lastPts[track] = -1
+            forwarded[track] = false
             opusSourcePts[track] = opusConfig
             val queue = if (track == 1) video else audio
             queue.add(entry); configCount++; controlBytes += message.payload.size
@@ -377,11 +382,12 @@ class MediaBudget internal constructor(private val withAudio: Boolean, private v
     }
 
     fun ready(track: Int, gen: Int) = synchronized(monitor) {
-        if (track !in 1..2 || track == 2 && !withAudio || gen != announced[track] || ready[track] == gen)
+        if (track !in 1..2 || track == 1 && !withVideo || track == 2 && !withAudio ||
+            gen != announced[track] || ready[track] == gen)
             throw protocol(Wire.Message(Wire.STREAM_READY, 0, 0, track, gen, -1, byteArrayOf()), CaptureProtocolReason.READY_MISMATCH)
         ready[track] = gen
         readinessDeadline[track] = 0
-        if (ready[1] > 0 && (!withAudio || ready[2] > 0)) started = true
+        if ((!withVideo || ready[1] > 0) && (!withAudio || ready[2] > 0)) started = true
         updateIncidentQueue(track)
         monitor.notifyAll()
     }
@@ -449,8 +455,17 @@ class MediaBudget internal constructor(private val withAudio: Boolean, private v
         sourceSpan(if (track == 1) video else audio)
     }
     fun allReady(): Boolean = synchronized(monitor) {
-        ready[1] == generation[1] && generation[1] > 0 &&
+        (!withVideo || ready[1] == generation[1] && generation[1] > 0) &&
             (!withAudio || ready[2] == generation[2] && generation[2] > 0)
+    }
+    internal fun markForwarded(message: Wire.Message) = synchronized(monitor) {
+        if (message.type in setOf(Wire.VIDEO_FRAME, Wire.AUDIO_PACKET) &&
+            message.track in 1..2 && message.generation == generation[message.track] &&
+            (message.track != 1 || withVideo) && (message.track != 2 || withAudio))
+            forwarded[message.track] = true
+    }
+    fun allForwarding(): Boolean = synchronized(monitor) {
+        (!withVideo || forwarded[1]) && (!withAudio || forwarded[2])
     }
     internal fun trackReady(track: Int): Boolean = synchronized(monitor) {
         require(track in 1..2)

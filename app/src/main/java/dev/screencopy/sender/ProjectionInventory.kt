@@ -38,12 +38,16 @@ object ProjectionInventory {
     fun validate(context: Context, settings: Settings, natural: Boolean = true): Settings {
         require(natural) { "UNSUPPORTED_CONFIG: fixed-natural capture is required" }
         settings.validate()
-        check(settings.displayId == Display.DEFAULT_DISPLAY) { "UNSUPPORTED_CONFIG: MediaProjection captures the default display only. Choose Main screen." }
         val resolved = HardwareEncoderDiscovery.read().resolve(settings)
         Bitrates.validate(resolved, CodecBitrateDiscovery.read())
-        val inventory = displays(context)
-        inventory.validate(resolved)
-        VideoEncoderPreflight.validate(resolved, inventory)
+        if (resolved.video) {
+            check(resolved.displayId == Display.DEFAULT_DISPLAY) {
+                "UNSUPPORTED_CONFIG: MediaProjection captures the default display only. Choose Main screen."
+            }
+            val inventory = displays(context)
+            inventory.validate(resolved)
+            VideoEncoderPreflight.validate(resolved, inventory)
+        }
         return resolved
     }
 }

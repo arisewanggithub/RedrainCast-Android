@@ -9,6 +9,143 @@ import java.util.concurrent.atomic.AtomicInteger
 import dev.redrain.cast.diagnostics.*
 
 class PlaybackClockTest {
+    @Test fun hybridVideoClockNeverAdvancesPhysicalObservationOrCoverage() {
+        var now = 0L
+        val clock = PlaybackClock({ now }) {}.apply { hybridVideoSync = true }
+        val source = clock.anchorObservedAudio(1_000_000, 48000)
+        clock.audioWritten(80_000)
+        val timing = AudioOutputTiming(48000, 4800, 3840, 0, 0, null,
+            AudioClockSource.HEAD_UNAVAILABLE, positionAtNs = 0)
+        clock.observeAudio(source, 0, 0, timing)
+        now = 40_000_000
+        val video = clock.videoSchedulingClock(1_100_000)
+        assertEquals("VIRTUAL_SYNC", video.mode)
+        assertEquals(60_000L, video.delayUs)
+        assertEquals(1_000_000L, clock.currentUs())
+        assertEquals(1_000_000L, clock.cachedPlayedAudioObservation()?.ptsUs)
+        assertNull(clock.cachedPlayedAudioCoverage(source))
+        assertNull(clock.cachedAudioDiscardCutoffUs())
+        now = 300_000_000
+        assertEquals(1_080_000L, clock.videoSchedulingClock(1_100_000).positionUs)
+        assertEquals(1_000_000L, clock.currentUs())
+        clock.beginAudioRecovery()
+        clock.detachObservedAudio(source)
+        val physicalAfterDetach = clock.currentUs()
+        clock.videoPresented(2_000_000, now, virtualScheduling = true)
+        assertEquals(physicalAfterDetach, clock.currentUs())
+        assertNotEquals("VIRTUAL_SYNC", clock.videoSchedulingClock(1_100_000).mode)
+    }
+
+    @Test fun virtualVideoFifoIsBoundedAndDoesNotBankIdleTime() {
+        val virtual = VirtualVideoSyncClock(1_000_000, 0)
+        assertEquals(1_000_000L, virtual.position(1_000_000_000))
+        virtual.submit(250_000, 1_000_000_000)
+        assertEquals(1_150_000L, virtual.position(1_000_000_000))
+        assertEquals(1_200_000L, virtual.position(1_050_000_000))
+        assertEquals(1_250_000L, virtual.position(2_000_000_000))
+        virtual.submit(260_000, 3_000_000_000)
+        assertEquals(1_250_000L, virtual.position(3_000_000_000))
+    }
+    @Test fun cachedCoverageIsQualifiedAndBoundToTheObservedSourceAttachment() {
+        var now = 0L
+        val clock = PlaybackClock({ now }) {}
+        val source = clock.anchorObservedAudio(1_000_000, 48000)
+        clock.audioWritten(120_000)
+        val coverage = PlayedAudioCoverage(1_000_000L * 48000, 1_120_000L * 48000, 48000)
+        val timing = AudioOutputTiming(48000, 5760, 5760, 5760, 5760, 0,
+            AudioClockSource.TIMESTAMP, qualifiedTimestampFrames = 5760)
+        clock.observeAudio(source, 120_000, 10, timing, playedCoverage = coverage)
+        assertEquals(coverage, clock.cachedPlayedAudioCoverage(source))
+        assertEquals(1_120_000L, clock.cachedPlayedAudioObservation()?.ptsUs)
+        assertNull(clock.observeAudio(source, 0, 9, timing, playedCoverage = null))
+        assertEquals(coverage, clock.cachedPlayedAudioCoverage(source))
+        clock.invalidateAudioDiscardCutoff(source)
+        assertNull(clock.cachedPlayedAudioCoverage(source))
+        clock.observeAudio(source, 120_000, 11, timing, playedCoverage = coverage)
+        clock.observeAudio(source, 120_000, 12, timing.copy(qualifiedTimestampFrames = null),
+            playedCoverage = coverage)
+        assertNull(clock.cachedPlayedAudioCoverage(source))
+        clock.observeAudio(source, 120_000, 13, timing, playedCoverage = coverage)
+        clock.detachObservedAudio(source)
+        assertNull(clock.cachedPlayedAudioCoverage(source))
+        now = 120_000_000
+        val replacement = clock.anchorObservedAudio(1_120_000, 48000)
+        assertNull(clock.observeAudio(source, 120_000, 14, timing, playedCoverage = coverage))
+        assertNull(clock.cachedPlayedAudioCoverage(replacement))
+        clock.observeAudio(replacement, 0, 15, timing, playedCoverage = coverage)
+        assertNull(clock.cachedPlayedAudioCoverage(source))
+        assertEquals(coverage, clock.cachedPlayedAudioCoverage(replacement))
+        clock.invalidateAudioDiscardCutoff(source)
+        assertEquals(coverage, clock.cachedPlayedAudioCoverage(replacement))
+        clock.observeAudio(replacement, 0, 16, timing, playedCoverage = null)
+        assertNull(clock.cachedPlayedAudioCoverage(replacement))
+    }
+
+    @Test fun recoverySnapshotsRetainDetachNativeObservationAndStayGated() {
+        val recorder = RemoteDiagnostics.recorder
+        val now = java.util.concurrent.atomic.AtomicLong(1_000_000_000)
+        recorder.grantConsent()
+        recorder.sessionStarted("receiver", 9715)
+        try {
+            val capture = recorder.start("receiver", 9715,
+                setOf("audio.output", "audio.timing", "audio.timing.work"), 10000, 1000).getString("captureId")
+            val trace = checkNotNull(recorder.audioTiming(9715))
+            val clock = PlaybackClock(now::get) {}.apply {
+                diagnosticSession = 9715
+                diagnosticGeneration = 3
+            }
+            val source = clock.anchorObservedAudio(1_000_000, 48000)
+            clock.audioWritten(40_000)
+            clock.observeAudio(source, 20_000, now.get(), AudioOutputTiming(48000, 4800,
+                2000, 1500, 960, 100, AudioClockSource.TIMESTAMP,
+                timestampAtNs = 999_900_000, timestampFramePosition = 950))
+            clock.beginAudioRecovery()
+            now.addAndGet(1_000_000)
+            clock.detachObservedAudio(source)
+            clock.diagnosticGeneration = 4
+            clock.endAudioRecovery()
+            assertTrue(trace.drain(32).isEmpty())
+            recorder.fetch(capture, 0, 32)
+            val records = recorder.fetch(capture, 0, 32).getJSONArray("records")
+            val events = (0 until records.length()).map { records.getJSONObject(it) }
+                .filter { it.getString("kind") == "AUDIO_OUTPUT" }
+            assertEquals(3, events.size)
+            assertEquals(listOf("config", "reset", "settled"),
+                events.map { it.getJSONObject("data").getString("stage") })
+            val detached = events[1].getJSONObject("data")
+            assertEquals("1020000", detached.getString("ptsUs"))
+            assertEquals(now.get().toString(), detached.getString("cutoffUs"))
+            val native = detached.getJSONObject("metrics")
+            assertEquals("1020000", native.getString("sourcePtsUs"))
+            assertEquals("1000000000", native.getString("atNs"))
+            assertEquals("999900000", native.getString("nativeTimestampNs"))
+            assertEquals("950", native.getString("nativeTimestampFrame"))
+            assertEquals("2000", native.getString("submittedFrames"))
+            assertEquals("1500", native.getString("consumedFrames"))
+            assertEquals("960", native.getString("presentedFrames"))
+            assertEquals(3, events[1].getInt("generation"))
+            assertEquals(4, events[2].getInt("generation"))
+            assertFalse(events[2].getJSONObject("data").has("metrics"))
+            events.forEach {
+                DiagnosticProxyWire.validateSource(it, "receiver", "9715", capture, false, true, true)
+            }
+            recorder.revoke()
+            recorder.grantConsent()
+            val legacy = recorder.start("receiver", 9715, setOf("audio.output", "audio.timing"),
+                10000, 1000).getString("captureId")
+            clock.beginAudioRecovery()
+            assertTrue(checkNotNull(recorder.audioTiming(9715)).drain(8).isEmpty())
+            recorder.fetch(legacy, 0, 32)
+            val legacyRecords = recorder.fetch(legacy, 0, 32).getJSONArray("records")
+            assertFalse((0 until legacyRecords.length()).any {
+                legacyRecords.getJSONObject(it).getString("kind") == "AUDIO_OUTPUT"
+            })
+        } finally {
+            recorder.revoke()
+            recorder.sessionEnded("receiver", 9715)
+        }
+    }
+
     @Test fun boundedRecoveryGateStepsKeepTheirOriginalTenSecondDeadline() {
         val now = java.util.concurrent.atomic.AtomicLong()
         val decisions = ArrayList<AudioStartDecision>()
@@ -47,7 +184,7 @@ class PlaybackClockTest {
         try {
             clock.audioExpected = true
             clock.anchorVideo(1_000_000)
-            clock.prepareAudio(TrimmedAudio(0, 960, 1_000_000), 48000)
+            clock.prepareAudio(TrimmedAudio(0, 960, 1_000_000))
             now.addAndGet(50_000_000)
             val source = clock.anchorObservedAudio(1_000_000, 48000)
             clock.audioWritten(40_000)
@@ -572,7 +709,7 @@ class PlaybackClockTest {
         val time = FakeTime()
         val clock = time.clock().apply { audioExpected = true }
         clock.anchorVideo(1_000_000)
-        clock.prepareAudio(TrimmedAudio(0, 960, 1_000_000), 48000)
+        clock.prepareAudio(TrimmedAudio(0, 960, 1_000_000))
         assertTrue(clock.awaitAudioStart(1_000_000) { true })
         clock.anchorAudio(1_000_000) { 20_000 }
         clock.audioWritten(40_000)
@@ -586,7 +723,7 @@ class PlaybackClockTest {
         clock.videoPresented(1_500_000)
         assertEquals("Older video cannot rewind the detached clock", 2_000_000L, clock.currentUs())
         val slice = TrimmedAudio(0, 960, 2_000_000)
-        assertEquals(slice, clock.prepareAudio(slice, 48000))
+        assertEquals(slice, clock.prepareAudio(slice))
         assertTrue(clock.awaitAudioStart(slice.audiblePtsUs) { true })
         assertEquals("Fresh source audio must not wait behind the retired audio clock", before, time.ns)
         clock.anchorAudio(slice.audiblePtsUs) { 0 }
@@ -726,7 +863,7 @@ class PlaybackClockTest {
         val time = FakeTime()
         val clock = time.clock().apply { audioExpected = true }
         clock.anchorVideo(1_000_000)
-        val slice = checkNotNull(clock.prepareAudio(TrimmedAudio(0, 960, 1_300_000), 48000))
+        val slice = clock.prepareAudio(TrimmedAudio(0, 960, 1_300_000))
         time.advanceUs(80_000)
         var playedUs = 0L
         clock.anchorAudio(slice.audiblePtsUs) { playedUs }
@@ -750,7 +887,7 @@ class PlaybackClockTest {
         clock.checkStartup()
         assertEquals(5_000_000L, clock.currentUs())
         val slice = TrimmedAudio(0, 960, 5_000_000)
-        assertEquals(slice, clock.prepareAudio(slice, 48000))
+        assertEquals(slice, clock.prepareAudio(slice))
         assertEquals(5_000_000L, clock.currentUs())
         assertTrue(clock.awaitAudioStart(slice.audiblePtsUs) { true })
         clock.anchorAudio(slice.audiblePtsUs) { 0 }
@@ -763,9 +900,8 @@ class PlaybackClockTest {
         val time = FakeTime()
         val clock = time.clock().apply { audioExpected = true }
         clock.beginAudioRecovery()
-        assertTrue(clock.canPrepareAudio())
         val slice = TrimmedAudio(0, 960, 9_000_000)
-        assertEquals(slice, clock.prepareAudio(slice, 48000))
+        assertEquals(slice, clock.prepareAudio(slice))
         assertTrue(clock.awaitAudioStart(slice.audiblePtsUs) { true })
         clock.anchorAudio(slice.audiblePtsUs) { 0 }
         clock.endAudioRecovery()
@@ -794,7 +930,7 @@ class PlaybackClockTest {
         clock.videoPresented(1_600_000)
         assertEquals(1_600_000L, clock.currentUs())
         val slice = TrimmedAudio(0, 960, 1_600_000)
-        assertEquals(slice, clock.prepareAudio(slice, 48000))
+        assertEquals(slice, clock.prepareAudio(slice))
         assertTrue(clock.awaitAudioStart(slice.audiblePtsUs) { true })
         assertEquals(600_000_000L, time.ns)
         clock.anchorAudio(slice.audiblePtsUs) { 0 }

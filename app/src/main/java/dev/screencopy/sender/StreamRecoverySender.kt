@@ -27,7 +27,8 @@ internal class StreamRecoverySender(
     private val budget: MediaBudget,
     private val now: () -> Long = System::nanoTime,
     private val diagnostic: (String) -> Unit = {},
-    private val withAudio: Boolean = true
+    private val withAudio: Boolean = true,
+    private val withVideo: Boolean = true
 ) {
     private enum class State { WAIT_READY, WAIT_SOURCE, WAIT_PROOF, ACTIVE }
     private val state = Array(3) { State.WAIT_READY }
@@ -69,7 +70,7 @@ internal class StreamRecoverySender(
             if (!budget.allReady()) return false
             initialReady = true
         }
-        for (track in 1..if (withAudio) 2 else 1) {
+        for (track in enabledTracks()) {
             if (state[track] != State.WAIT_READY || !budget.trackReady(track)) continue
             RemoteDiagnostics.recorder.observe("sender", session, DiagnosticKind.RECOVERY, DiagnosticStage.READY,
                 track, wireGeneration[track], cutoff = minimumPts[track])
@@ -79,7 +80,6 @@ internal class StreamRecoverySender(
                 minimumPts[2] = maxOf(now() / 1000,
                     first ?: 0)
                 state[track] = State.WAIT_SOURCE
-                unresolvedAt[track] = null
             } else {
                 state[track] = State.WAIT_SOURCE
                 if (track == 1) minimumPts[track] = now() / 1000
@@ -99,6 +99,7 @@ internal class StreamRecoverySender(
     }
 
     @Synchronized fun keyProved(generation: Int, pts: Long) {
+        requireTrack(1)
         requireWithinDeadline()
         if (!acknowledgement(1, generation, pts)) return
         if (state[1] != State.WAIT_PROOF && state[1] != State.ACTIVE)
@@ -142,6 +143,10 @@ internal class StreamRecoverySender(
         if (packet.type != Wire.AUDIO_PACKET) return
         if (!withAudio || packet.track != 2 || packet.session != session || packet.generation > wireGeneration[2])
             throw IOException("PROTOCOL: invalid audio write completion")
+        if (packet.generation == 1 && wireGeneration[2] == 1 && state[2] == State.ACTIVE) {
+            requireWithinDeadline()
+            unresolvedAt[2] = null
+        }
         if (packet.generation != wireGeneration[2] || state[2] != State.WAIT_PROOF) return
         requireWithinDeadline()
         var start = maxOf(packet.pts, minimumPts[2])
@@ -254,7 +259,7 @@ internal class StreamRecoverySender(
     }
 
     private fun requireWithinDeadline() {
-        for (track in 1..if (withAudio) 2 else 1) {
+        for (track in enabledTracks()) {
             val started = unresolvedAt[track] ?: continue
             val elapsed = (now() - started).coerceAtLeast(0)
             if (elapsed >= 10_000_000_000L) {
@@ -289,10 +294,20 @@ internal class StreamRecoverySender(
 
     @Synchronized fun retryKeyFrame(): Boolean {
         requireWithinDeadline()
+        if (!withVideo) return false
         if (state[1] != State.WAIT_SOURCE ||
             lastKeyRequest?.let { now() - it < 500_000_000L } == true) return false
         lastKeyRequest = now()
         return true
+    }
+
+    @Synchronized fun isStreaming(): Boolean = initialReady && enabledTracks().all { track ->
+        state[track] == State.ACTIVE && wireGeneration[track] > 0 &&
+            budget.trackReady(track)
+    }
+
+    @Synchronized fun whenStreaming(action: () -> Unit) {
+        if (isStreaming()) action()
     }
 
     private fun begin(track: Int, reason: String, initial: Boolean = false) {
@@ -341,9 +356,11 @@ internal class StreamRecoverySender(
     }
 
     private fun requireTrack(track: Int) {
-        if (track !in 1..2 || track == 2 && !withAudio)
+        if (track !in 1..2 || track == 1 && !withVideo || track == 2 && !withAudio)
             throw IOException("PROTOCOL: recovery track is not enabled")
     }
+
+    private fun enabledTracks() = listOf(1.takeIf { withVideo }, 2.takeIf { withAudio }).filterNotNull()
 
     private fun next(generation: Int): Int {
         if (generation == Int.MAX_VALUE) throw IOException("PROTOCOL: track recovery generation exhausted")

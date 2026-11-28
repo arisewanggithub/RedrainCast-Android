@@ -78,9 +78,12 @@ Responses, including the newline, must fit the 16,384-byte frame limit.
 The sender supports `session`, `recovery`, `audio.capture`, `audio.transport`,
 `audio.queue`, `video.progress`, and `transport.health`. The receiver supports
 `session`, `recovery`, `audio.transport`, `audio.queue`, `audio.output`,
-`video.progress`, `video.timing`, `transport.health`, and `tail.details`.
+`video.progress`, `video.timing`, `transport.health`, `tail.details`, `audio.timing`,
+and `audio.timing.work`.
 `video.timing` requires `video.progress`; `tail.details` is optional and is
-not selected by the collector by default. Explicit flag requests are strict.
+not selected by the collector by default. `audio.timing` is independently
+selected and also excluded by default. `audio.timing.work` requires `audio.timing`
+and is separately opt-in, excluded by default. Explicit flag requests are strict.
 
 | Operation | Arguments | Purpose |
 |---|---|---|
@@ -174,6 +177,180 @@ a frozen pair by its returned ID, preserving both independent cursors and
 existing output. Active pairs remain owner-restricted; reconnect is not an
 active-session attach. Consent revocation clears retained data.
 
+### Audio timing
+
+`audio.timing` selects only the original v1 trace. To include worker boundaries,
+explicitly select both `audio.timing` and `audio.timing.work` through the existing
+receiver flag offer. Collector HELLO advertises the sender's accepted receiver
+flags; an older sender lacking `audio.timing.work` is rejected by explicit
+collector selection before START. The sender offers the exact selected set and
+requires the receiver's HELLO capabilities to contain it; an older receiver
+lacking work support fails setup with `UNSUPPORTED_CONFIG`, before lane/media
+startup. Work without base timing is invalid at START and receiver offer
+validation. No proxy revision change or new listener is used.
+The additional explicit `audio.timing.detail` flag requires both flags above.
+Older peers reject its selection during negotiation rather than silently
+accepting an incompatible record. It is not in the default selection.
+The additional `audio.timing.owner` flag requires detail and is supported only
+for an explicitly admitted paired receiver capture. It is opt-in and both
+peers must advertise it; an older peer rejects the selection.
+The receiver has a separate preallocated 1,024-slot numeric buffer (about
+56 KiB of primitive arrays), in addition to the existing recorder staging
+budget. Producers make bounded atomic attempts and do not perform diagnostic
+I/O. Capture closure fences new producers; pending producers and unknown tail
+must not be interpreted as complete coverage.
+
+The `AUDIO_TIMING` source record has `data.schema:"audio_timing_v1"` (types
+1–21 only), `"audio_timing_v2"` (types 1–24), or
+`"audio_timing_v3"` (selected detail only, types 1–29), or
+`"audio_timing_v4"` (selected owner only, types 1–31), with
+1–8 event arrays `[eventSeq,monoNs,generation,packetId,type,value1,value2]`.
+Int64 values are canonical decimal strings; generation and type are integers.
+Event sequences are capture-local, may arrive out of timestamp order, and
+can have gaps. `attempted`, `dropped`, `droppedBeforeSequence`, and
+`batchDropped` are cumulative counts, not source RECORD sequences. Counter
+snapshots are not atomic: loss is read before `attempted` so `dropped` and
+`batchDropped` cannot exceed it, including while admitted producers retire.
+`droppedBeforeSequence` is independent and can exceed `attempted`. Each
+encoded source record is at most 2,048 bytes. These batches share the existing
+proxy and collector traffic budgets.
+
+Types are: 1 receipt (`ptsUs`, bytes); 2 admission check (queue packets,
+retained input bytes); 3 admitted (same measurements); 4 admission pressure
+(same measurements); 5 dequeue (`ptsUs`, bytes); 6/7 RAW decode
+begin/end (`ptsUs`, input bytes/output samples); 8 AAC input (`ptsUs`, bytes);
+9 AAC output (`ptsUs`, bytes); 10 trim (input frames, remaining frames);
+11 preroll replacement (old/new PTS); 12/13 output write request/result and
+14/15 silence write request/result (requested samples and buffered
+frames/accepted samples); 16 stale or trimmed drop (`ptsUs`, bytes or zero);
+17 output progress (submitted, consumed frames); 18 output presentation
+(presented frames, buffered microseconds); 19/20 Opus decode begin/end
+(`ptsUs`, input bytes/output samples); 21 decoded FIFO drop (discarded,
+remaining frames). Types 22/23/24 are worker work begin/end/failed
+(`workStage`, cumulative current-thread CPU nanoseconds, or -1 if unavailable).
+Work stages are 1 pending preparation (fresh recovery trim, clock preparation,
+and associated trim diagnostics), 2 start gate, 3 resampling/source FIFO mapping
+(including compensation and callbacks), 4 playback `play()` call,
+5 output refill, 6 output timing query, 7 start-decision diagnostics callback,
+8 other callbacks/diagnostic reporting, 9 underrun observation/query, 10 source
+clock anchoring, 11 resampler compensation, 12 startup submission (pending
+cleanup through source anchoring, resampling, playback start and initial
+underrun observation). Preparation ends even when no video is available or
+all frames are trimmed; that does not imply gate entry. Gate end does not
+imply permission to start: retries/cancellation can return normally.
+Failed boundaries indicate an escaping exception, not successful completion.
+The first-submission callback's existing outer stage 8 contains two adjacent
+nested stage-8 intervals, in fixed order: playback-lock acquisition, then
+critical section. The first ends immediately after acquisition; the second
+ends inside the monitor before release. CPU snapshots belong to the calling
+audio epoch, including retired callbacks. Neither interval identifies a lock
+owner or distinguishes descheduling from monitor contention by itself. Other
+stage-8 callbacks do not have this fixed pair; identify first submission using
+the surrounding first source write and intact nesting, not stage 8 alone.
+
+Types 30/31 are playback-monitor owner begin/end. `packetId` is zero;
+`value1` is the numeric Java thread ID and `value2` is a positive,
+capture-local span ID. Match begin/end by capture, generation, thread ID and
+span, and compare their monotonic timestamps with the callback acquisition
+interval. Each complete pair records an interval actually inside the existing
+`playbackLock` monitor; it is not the full hold time and overlap with a callback
+wait does not prove that the callback was blocked rather than descheduled.
+Nested/reentrant intervals can overlap and must not be summed. Java thread IDs
+are not necessarily OS TIDs used by Perfetto; correlation requires independent
+evidence. No thread names or payloads are added.
+
+Coverage is best effort, not a complete owner history: a hold already in
+progress when capture starts, an acquisition before an audio generation exists,
+capture revocation/closure, a lost boundary, and undrained or saturated buffers
+all leave ownership unknown. Never infer an owner from an unmatched endpoint,
+a gap, or the absence of an interval, and do not extrapolate beyond a matched
+pair. Inspect all loss counters and incomplete tails. Instrumentation may
+perturb timing; owner events contend for the same bounded trace capacity and
+can cause other evidence to be dropped. With the opt-in disabled, monitor acquisitions
+perform a gate check but allocate no ownership events. Existing sampled trace
+overhead does not isolate the cost of owner instrumentation.
+
+With both `audio.output` and work selected, recovery begin/end and detach also
+emit ordinary `AUDIO_OUTPUT` records at point `recovery`, stages
+`config`/`settled`/`reset` respectively. Existing `ptsUs`, `cutoffUs`, and `count`
+carry the base PTS, base monotonic ns (not a trim cutoff), and mapping revision.
+The existing `audio_clock_observation` metrics retain the cached observation
+and its native timestamp/progress. Detach retains the final observation sampled
+by the existing retirement path before clearing the source; begin/end use the
+latest cached observation, not an additional native query. Absent metrics mean
+no coherent observation. Record monoNs is publication time; observation atNs
+and the causal mapping transition identify the separately sampled state.
+Compare observation age, progress counters and base mapping across epochs to
+locate accumulated lag. Missing/stale records are not proof of a clock fault.
+Without detail, strict older work-v2 validators accept the same envelope and
+stage range.
+
+Detail v3 adds work stage 13 (PCM/Opus decoder or AAC pump) and 14 (actual
+AudioTrack write call); stage 6 times the overall output timing query and stage
+2 the startup gate. Event 25 is queue PTS span in microseconds and oldest
+admission age in nanoseconds at admission check; -1 means unavailable or empty.
+Event 26 is the active output buffer size in frames and last sampled underrun
+count (-1 if unavailable); event 28 is native AudioTrack maximum capacity in
+frames (-1 for another output), accompanying progress/presentation events.
+Event 29 contains requested and accepted write frames. Older request and result
+events use samples; divide by channel count to obtain frames.
+Event 27 samples approximately one in 128 work starts: wall and thread CPU
+nanoseconds spent sampling the first boundary and recording it. It excludes
+the second sample, this event, aggregation, transport, queue scans and the rest
+of tracing; it is not total overhead. Compare runs with and without tracing.
+All records remain numeric, bounded and share the existing pressure window,
+loss counters and explicit unknown-tail semantics.
+
+Work boundaries are nested and synchronous on the audio worker; closing-caller
+teardown timing/reporting does not emit worker CPU boundaries. Pair by
+generation, packet ID, stage and nesting in event-sequence order, only when
+coverage is intact; loss can remove either endpoint. Wall duration is the
+receiver-local monotonic difference; CPU duration is the difference of two
+nonnegative CPU snapshots on that same worker. Wall minus CPU includes waits,
+scheduling and instrumentation overhead, not proof of any one cause. Nested
+durations overlap and must not be added. Begin/end sampling itself adds small
+overhead; snapshots are not simultaneous. Start-decision callback boundaries
+separate diagnostic work inside the gate from deliberate gate waits.
+
+Batches containing work boundaries use v2 only when `audio.timing.work` was
+selected; batches with only original types remain v1. Receiver producers skip
+work tracing (including CPU snapshots) when that flag is absent; the bounded
+buffer also ignores unselected work before consuming sequence/loss budget.
+Updated sender and collector validators accept v2 only for the explicit work
+selection and reject unsolicited v2 schemas and unknown event/stage IDs.
+An older sender selecting only `audio.timing` from a new receiver gets v1,
+never automatic work events. Updated peers can still select legacy v1 timing;
+there is no silent downgrade of an explicit work request. Unarmed casts,
+non-opt-in captures and original event meanings are unchanged. Packet ID zero is
+unknown: AAC output and device writes do not establish source-packet
+attribution. Resampling and output work also use zero when the caller has no
+retained packet identity; adjacency to a packet is not write attribution.
+Existing output progress remains separate; no event proves sound
+was audible.
+
+The first failed admission or decoded-input reservation claims one
+capture-scoped marker separately from the ordered recorder queue. Negotiated
+`AUDIO_PRESSURE` lane metadata carries receiver `monoNs`, session, generation,
+and numeric reason: 0 packet limit, 1 bytes, 2 PTS span, 3 decoded-byte
+reservation, 4 retained-packet reservation. It has no source sequence.
+Transmission is best effort, checked before routine batches and during the
+existing retirement grace, including an accepted peer's fatal ERROR without
+session telemetry when `audio.timing` was selected. Until sent, selected
+captures reserve one existing delivery slot and 512 bytes for the marker; the 256-record/128-KiB rolling
+limits are unchanged. The receiver page's `audioTiming.marker` is null
+if it was not received. Repeated identical markers are deduplicated.
+
+Sender intake holds at most 768 KiB of timing source envelopes, separately
+from its existing staging budget. Before a marker it keeps rolling history;
+after one it retains batches intersecting the receiver-local
+`[marker-5s, marker+10s]` interval, including late-arriving batches, subject to
+that finite cap. Whole batches can extend beyond the interval. `audioTiming`
+reports retained bytes, actual oldest/latest event timestamps, requested window,
+eviction count and sequence envelope, and `tailUnknown`. Missing markers,
+sequence gaps, evictions, incomplete terminal information and disconnects
+prevent a guarantee of the requested window. FETCH source cursors remain
+ordered and never replay earlier records when a marker arrives.
+
 ### Recorder bounds and reserves
 
 Each source recorder uses a 1,024-slot staging ring. Routine submissions are
@@ -251,6 +428,11 @@ including READY and FAILED. Repeated unchanged samples
 are limited to one per 250 ms per player; `omittedRepeats` counts repeats
 since the prior emitted sample. Normal recorder admission and retention loss
 still apply.
+Under audio-led initial startup, `firstVideoUs` and `releasedVideoUs` can be
+null even when audio is READY or playing. A missing first-video timestamp is
+not itself an audio-start gate; compare decision, source-clock observations
+and the audio work intervals rather than inferring a video wait. Existing
+captures from older builds may reflect the former first-video gate.
 
 `audio_clock_observation` samples active output at most every 250 ms and
 includes one clock observation sequence, source sample and mapped PTS,
@@ -494,7 +676,8 @@ signed decimal `minNs`/`maxNs`; snapshots are not additive:
   `delayUs` is the original
   signed delay. Modes are `CACHED_AUDIO`, `CALLBACK_AUDIO` (legacy callback
   observation), `AUDIO_INITIAL` (attached audio without an observation),
-  `MONOTONIC` (no attached audio), and `UNAVAILABLE` (no anchor).
+  `MONOTONIC` (no attached audio), `UNAVAILABLE` (no anchor), and debug-only
+  `VIRTUAL_SYNC` (video scheduling experiment, not physical audio evidence).
 * `audioObservationSequence` identifies an accepted cached observation within
   the playback clock; unchanged values across decisions mean the same cached
   observation, not a repeated hardware sample read or an unchanged predicted

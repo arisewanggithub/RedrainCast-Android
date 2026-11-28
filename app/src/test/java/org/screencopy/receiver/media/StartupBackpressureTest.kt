@@ -33,29 +33,29 @@ class StartupBackpressureTest {
             player.start()
             player.offer(packet(0))
             assertTrue(starting.await(3, TimeUnit.SECONDS))
-            for (index in 1..13) player.offer(packet(index))
-            assertEquals(13, player.queuedPackets())
+            for (index in 1..51) player.offer(packet(index))
+            assertEquals(51, player.queuedPackets())
             val attempted = CountDownLatch(1)
             val burst = producer.submit {
                 attempted.countDown()
-                player.offer(packet(14))
+                player.offer(packet(52))
             }
             assertTrue(attempted.await(3, TimeUnit.SECONDS))
             assertThrows(TimeoutException::class.java) { burst.get(40, TimeUnit.MILLISECONDS) }
-            assertEquals(13, player.queuedPackets())
+            assertEquals(51, player.queuedPackets())
             resume.countDown()
             burst.get(1, TimeUnit.SECONDS)
-            repeat(20) {
+            repeat(58) {
                 now.addAndGet(20_000_000)
                 Thread.sleep(3)
             }
             await {
                 now.addAndGet(5_000_000)
-                output.sourceSamples(15) == 1920 || errors.isNotEmpty()
+                output.sourceSamples(53) == 1920 || errors.isNotEmpty()
             }
             assertTrue(errors.toString(), errors.isEmpty())
-            assertEquals(1920, output.sourceSamples(15))
-            assertTrue(player.sourceSubmittedFrames in 1..15 * 960L)
+            assertEquals(1920, output.sourceSamples(53))
+            assertTrue(player.sourceSubmittedFrames in 1..53 * 960L)
         } finally {
             resume.countDown()
             player.close()

@@ -44,7 +44,7 @@ internal class HardwareEncoders(private val metadata: List<EncoderMetadata>) {
     }
 
     fun resolve(settings: Settings): Settings = Settings.from(settings.saved()).apply {
-        videoEncoder = resolve(videoCodec, videoEncoder)
+        if (video) videoEncoder = resolve(videoCodec, videoEncoder)
         if (audio && audioCodec != "raw") audioEncoder = resolve(audioCodec, audioEncoder)
     }
 

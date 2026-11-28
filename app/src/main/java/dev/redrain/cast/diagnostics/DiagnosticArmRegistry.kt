@@ -87,6 +87,12 @@ internal class DiagnosticArmRegistry(
             throw DiagnosticError("UNSUPPORTED_FLAG")
         if ("video.timing" in receiverFlags && "video.progress" !in receiverFlags)
             throw DiagnosticError("INVALID_ARGUMENT")
+        if ("audio.timing.work" in receiverFlags && "audio.timing" !in receiverFlags)
+            throw DiagnosticError("INVALID_ARGUMENT")
+        if ("audio.timing.detail" in receiverFlags && "audio.timing.work" !in receiverFlags)
+            throw DiagnosticError("INVALID_ARGUMENT")
+        if ("audio.timing.owner" in receiverFlags && "audio.timing.detail" !in receiverFlags)
+            throw DiagnosticError("INVALID_ARGUMENT")
         if (generation == Long.MAX_VALUE) throw DiagnosticError("INTERNAL")
         val started = recorder.startPairedSender(senderFlags, durationMs, periodMs)
         val next = Arm(owner, UUID.randomUUID().toString(), ++generation, started.getString("captureId"),

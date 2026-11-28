@@ -179,6 +179,68 @@ class StreamRecoverySenderTest {
         recovery.completed(1, 1, 1_000_000)
     }
 
+    @Test fun streamingTracksWireEpochsIndependentlyOfCaptureConfigurations() {
+        activate()
+        recovery.packet(audio(1_000_000))
+        finishWrite(2)
+        assertTrue(recovery.isStreaming())
+        repeat(2) { index ->
+            val generation = index + 2
+            recovery.request(1, generation - 1)
+            assertFalse(recovery.isStreaming())
+            assertEquals(generation, finishWrite(1).generation)
+            mux.ready(1, generation)
+            recovery.ready()
+            val pts = 1_000_000L + index * 10_000
+            recovery.packet(video(pts, true))
+            finishWrite(1)
+            recovery.keyProved(generation, pts)
+            recovery.completed(1, generation, pts)
+            assertTrue(recovery.isStreaming())
+        }
+        recovery.config(1, 2, Wire.obj("codec" to "h264"))
+        assertFalse(recovery.isStreaming())
+        assertEquals(4, finishWrite(1).generation)
+        mux.ready(1, 4)
+        recovery.ready()
+        val key = video(1_030_000, true).copy(generation = 2)
+        recovery.packet(key)
+        finishWrite(1)
+        recovery.keyProved(4, key.pts)
+        recovery.completed(1, 4, key.pts)
+        assertTrue(recovery.isStreaming())
+    }
+
+    @Test fun audioOnlyReadyWithoutMediaKeepsInitialDeadline() {
+        val clock = AtomicLong(1_000_000_000)
+        val budget = MediaBudget(false, true, clock::get)
+        val sender = StreamRecoverySender(73, budget, clock::get, withVideo = false)
+        sender.config(2, 1, Wire.obj("codec" to "raw", "sampleRate" to 48000, "channels" to 2))
+        val config = checkNotNull(budget.pollLane(2, 1))
+        budget.beginWrite(config); budget.endWrite(config)
+        budget.ready(2, 1)
+        sender.ready()
+        clock.set(10_999_999_999)
+        sender.checkDeadline()
+        clock.set(11_000_000_000)
+        val failure = assertThrows(RecoveryDeadlineException::class.java) { sender.checkDeadline() }
+        assertEquals(2, failure.track)
+        assertEquals("WAIT_SOURCE", failure.phase)
+    }
+
+    @Test fun initialAudioFlowsBeforeVideoProofButVideoDeadlineRemainsIndependent() {
+        configure()
+        recovery.packet(audio(1_000_000))
+        assertEquals(Wire.AUDIO_PACKET, finishWrite(2).type)
+        now.set(4_000_000_000)
+        recovery.packet(audio(4_000_000))
+        assertEquals(Wire.AUDIO_PACKET, finishWrite(2).type)
+        now.set(11_000_000_000)
+        val failure = assertThrows(RecoveryDeadlineException::class.java) { recovery.checkDeadline() }
+        assertEquals(1, failure.track)
+        assertEquals("WAIT_SOURCE", failure.phase)
+    }
+
     @Test fun audioFirstReadinessCannotSendRecoveryBeforeInitialVideoIsReady() {
         recovery.config(2, 1, Wire.obj("codec" to "raw", "sampleRate" to 48000, "channels" to 2))
         finishWrite(2); mux.ready(2, 1)

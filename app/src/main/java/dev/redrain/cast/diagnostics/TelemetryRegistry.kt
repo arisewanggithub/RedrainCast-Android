@@ -27,6 +27,7 @@ internal object TelemetryRegistry {
     }
 
     fun beginReceiver(session: Long, owner: ReceiverTelemetrySession) {
+        if (dev.redrain.cast.BuildConfig.DEBUG && dev.redrain.cast.BuildConfig.VIRTUAL_AUDIO_EXPERIMENT) return
         receiver.set(Sink(session, owner, owner::state, owner::operation, owner::event))
         DiagnosticBuild.row(System.nanoTime())?.let { owner.state(64, it) }
         causal(session, CausalEvidence.Stage.BUILD, 0,
@@ -147,10 +148,11 @@ internal object TelemetryRegistry {
                 sampleRate.toLong(), channels.toLong()))
     }
 
-    fun sessionConfiguration(role: String, session: Long, videoCodec: String, audioCodec: String?,
+    fun sessionConfiguration(role: String, session: Long, videoCodec: String?, audioCodec: String?,
                              fps: Int, videoBitrate: Int, audioBitrate: Int?) {
         event(role, session, DiagnosticKind.SESSION.ordinal + 1, DiagnosticStage.CONFIG.ordinal, 0, 0,
-            detail = listOf(codec(videoCodec), codec(audioCodec), fps.toLong(), videoBitrate.toLong(),
+            detail = listOf(if (videoCodec == null) -1 else codec(videoCodec),
+                codec(audioCodec), fps.toLong(), videoBitrate.toLong(),
                 audioBitrate?.toLong() ?: -1))
     }
 

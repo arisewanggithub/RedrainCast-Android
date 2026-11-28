@@ -64,8 +64,12 @@ class VideoFlagTests(unittest.TestCase):
             supported = collector.FLAGS[role]
             defaults = collector.select_flags(role, None, supported)
             self.assertIn("video.progress", defaults)
-            self.assertEqual([flag for flag in supported if flag != "tail.details"], defaults)
-            legacy = [flag for flag in supported if flag not in ("video.progress", "video.timing", "tail.details")]
+            self.assertEqual([flag for flag in supported if flag not in
+                              ("tail.details", "audio.timing", "audio.timing.work", "audio.timing.detail",
+                               "audio.timing.owner")], defaults)
+            legacy = [flag for flag in supported if flag not in
+                      ("video.progress", "video.timing", "tail.details", "audio.timing", "audio.timing.work",
+                       "audio.timing.detail", "audio.timing.owner")]
             self.assertEqual(legacy, collector.select_flags(role, None, legacy))
 
     def test_explicit_video_is_strict_and_parser_accepts_it(self):

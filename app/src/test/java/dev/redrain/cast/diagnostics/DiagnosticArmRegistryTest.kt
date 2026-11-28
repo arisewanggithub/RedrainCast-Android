@@ -7,6 +7,18 @@ import org.json.JSONObject
 import org.screencopy.receiver.protocol.DiagnosticProxyNegotiation
 
 class DiagnosticArmRegistryTest {
+    @Test fun workRequiresLegacyTimingBeforeArmingAndSelectionSurvivesClaim() {
+        error("INVALID_ARGUMENT") {
+            registry.start("owner", setOf("session"), setOf("audio.timing.work"), 1000, 100)
+        }
+        val flags = setOf("audio.timing", "audio.timing.work")
+        val pair = registry.start("owner", setOf("session"), flags, 1000, 100)
+        assertEquals(flags, pair.getJSONArray("receiverFlags").let { array ->
+            (0 until array.length()).map { array.getString(it) }.toSet()
+        })
+        assertEquals(flags, checkNotNull(registry.claim(77)).receiverFlags)
+    }
+
     private var now = 1_000_000_000L
     private val recorder = DiagnosticRecorder { now }
     private val registry = DiagnosticArmRegistry(recorder) { now }

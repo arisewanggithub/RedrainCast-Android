@@ -59,7 +59,8 @@ internal object DiagnosticProxyWire {
 
     private fun validateFrame(frame: JSONObject): JSONObject {
         protocolRequire(frame.opt("v") is Int && frame.opt("v") == 2, "Unsupported diagnostic lane version")
-        protocolRequire(frame.opt("type") in setOf("RECORD", "LOSS", "CLOCK_REQUEST", "CLOCK_RESPONSE", "END", "ENDED"),
+        protocolRequire(frame.opt("type") in setOf("RECORD", "LOSS", "CLOCK_REQUEST", "CLOCK_RESPONSE", "END", "ENDED",
+            "AUDIO_PRESSURE"),
             "Invalid diagnostic lane message type")
         return frame
     }
@@ -91,7 +92,8 @@ internal object DiagnosticProxyWire {
      * remains unbound even if the pair has bound since it was produced.
      */
     fun validateSource(record: JSONObject, role: String, session: String?, captureId: String,
-                       videoTiming: Boolean): String? {
+                       videoTiming: Boolean, audioTiming: Boolean = false,
+                       audioWork: Boolean = false, audioDetail: Boolean = false, audioOwner: Boolean = false): String? {
         val encoded = record.toString().toByteArray(Charsets.UTF_8)
         StrictJson.decode(encoded, maxDepth = SOURCE_DEPTH, trackSizes = false)
         val timing = videoTiming && record.opt("kind") == "VIDEO_PROGRESS" &&
@@ -109,6 +111,69 @@ internal object DiagnosticProxyWire {
             record.opt("data") is JSONObject, "Invalid diagnostic record")
         val data = record.optJSONObject("data")
             ?: throw org.screencopy.receiver.protocol.ProtocolException("PROTOCOL", "Missing diagnostic data")
+        if (record.opt("kind") == "AUDIO_TIMING") {
+            protocolRequire(role == "receiver" && audioTiming &&
+                data.keys().asSequence().toSet() ==
+                    setOf("schema", "events", "attempted", "dropped", "droppedBeforeSequence", "batchDropped") &&
+                data.opt("schema") in setOf("audio_timing_v1", "audio_timing_v2", "audio_timing_v3", "audio_timing_v4"), "Invalid audio timing record")
+            val ownerSchema = data.opt("schema") == "audio_timing_v4"
+            val detailSchema = data.opt("schema") == "audio_timing_v3" || ownerSchema
+            val workSchema = data.opt("schema") != "audio_timing_v1"
+            protocolRequire(!workSchema || audioWork, "Unsolicited audio timing work")
+            protocolRequire(!detailSchema || audioDetail, "Unsolicited audio timing detail")
+            protocolRequire(!ownerSchema || audioOwner, "Unsolicited audio timing owner")
+            val maxType = if (ownerSchema) 31 else if (detailSchema) 29 else if (workSchema) 24 else 21
+            val attempted = decimal(data.opt("attempted"))
+            protocolRequire(decimal(data.opt("dropped")) <= attempted &&
+                decimal(data.opt("batchDropped")) <= attempted, "Invalid audio timing loss")
+            decimal(data.opt("droppedBeforeSequence"))
+            val events = data.opt("events") as? JSONArray
+                ?: throw org.screencopy.receiver.protocol.ProtocolException("PROTOCOL", "Missing audio timing events")
+            protocolRequire(events.length() in 1..8, "Invalid audio timing event count")
+            val sequences = HashSet<Long>()
+            for (index in 0 until events.length()) {
+                val event = events.opt(index) as? JSONArray
+                    ?: throw org.screencopy.receiver.protocol.ProtocolException("PROTOCOL", "Invalid audio timing event")
+                protocolRequire(event.length() == 7, "Invalid audio timing event")
+                val sequence = decimal(event.opt(0))
+                protocolRequire(sequence in 1..attempted && sequences.add(sequence), "Invalid audio timing event sequence")
+                decimal(event.opt(1))
+                protocolRequire(event.opt(2) is Int && event.getInt(2) > 0, "Invalid audio timing generation")
+                decimal(event.opt(3))
+                protocolRequire(event.opt(4) is Int && event.getInt(4) in 1..maxType,
+                    "Invalid audio timing event type")
+                for (field in 5..6) {
+                    val raw = event.opt(field) as? String
+                    protocolRequire(raw != null && raw.matches(Regex("0|-?[1-9][0-9]{0,18}")) &&
+                        raw.toLongOrNull() != null, "Invalid audio timing value")
+                }
+                if (event.getInt(4) in 22..24) {
+                    protocolRequire(event.getString(5).toLong() in 1..(if (detailSchema) 14 else 12) &&
+                        event.getString(6).toLong() >= -1, "Invalid audio timing work boundary")
+                }
+                if (event.getInt(4) in 30..31) {
+                    protocolRequire(event.getString(5).toLong() > 0 && event.getString(6).toLong() > 0,
+                        "Invalid audio timing owner boundary")
+                }
+            }
+        }
+        if (record.opt("kind") == "CAPTURE_ENDED") {
+            val summary = data.opt("audioTiming")
+            protocolRequire((summary != null) == (role == "receiver" && audioTiming),
+                "Invalid audio timing terminal selection")
+            if (summary != null) {
+                protocolRequire(summary is JSONObject && summary.keys().asSequence().toSet() ==
+                    setOf("attempted", "dropped", "droppedBeforeSequence", "batchDropped",
+                        "producersAtClose", "pendingProducers"), "Invalid audio timing terminal")
+                summary as JSONObject
+                val attempted = decimal(summary.opt("attempted"))
+                protocolRequire(decimal(summary.opt("dropped")) <= attempted &&
+                    decimal(summary.opt("batchDropped")) <= attempted, "Invalid audio timing terminal loss")
+                decimal(summary.opt("droppedBeforeSequence"))
+                decimal(summary.opt("producersAtClose"))
+                decimal(summary.opt("pendingProducers"))
+            }
+        }
         if (data.has("operationId")) decimal(data.opt("operationId"))
         if (data.has("inFlight")) {
             val inFlight = data.opt("inFlight") as? JSONArray
@@ -126,6 +191,7 @@ internal object DiagnosticProxyWire {
                 decimal(metrics.opt("slowExampleOperationId"))
         }
         val bound = record.has("role") && record.has("session")
+        protocolRequire(record.opt("kind") != "AUDIO_TIMING" || bound, "Unbound audio timing")
         protocolRequire(record.has("role") == record.has("session"), "Incomplete source identity")
         if (bound) {
             protocolRequire(record.opt("role") == role && session != null && record.opt("session") == session,

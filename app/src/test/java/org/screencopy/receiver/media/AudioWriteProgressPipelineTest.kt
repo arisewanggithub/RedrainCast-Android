@@ -332,7 +332,7 @@ class AudioWriteProgressPipelineTest {
             val clock = fixture.clock
             fixture.player.diagnosticSession = 9703
             fixture.player.diagnosticGeneration = 2
-            clock.prepareAudio(TrimmedAudio(0, 960, 1_000_000), 48000)
+            clock.prepareAudio(TrimmedAudio(0, 960, 1_000_000))
             assertTrue(clock.awaitAudioStart(1_000_000) { true })
             clock.anchorAudio(1_000_000) { 20_000 }
             clock.audioWritten(40_000)
@@ -521,26 +521,26 @@ class AudioWriteProgressPipelineTest {
         assertEquals(0, fixture.player.queuedPackets())
     }
 
-    @Test fun writeProgressFixDoesNotEnlargeProducerQueueOrAdmissionTimeout() {
+    @Test fun stalledOutputStillHonorsProducerQueueAndAdmissionTimeout() {
         val entered = CountDownLatch(1)
         val wait = CountDownLatch(1)
         val fixture = Fixture { _, _, _ -> entered.countDown(); wait.await(); 0 }
         fixture.use {
             it.start()
             assertTrue(entered.await(2, TimeUnit.SECONDS))
-            for (index in 1..13) it.player.offer(AccessUnit(1_000_000 + index * 20_000L, ByteArray(3840)))
+            for (index in 1..51) it.player.offer(AccessUnit(1_000_000 + index * 20_000L, ByteArray(3840)))
             val started = System.nanoTime()
             try {
-                it.player.offer(AccessUnit(1_280_000, ByteArray(3840)))
-                fail("An output retry must not enlarge the existing producer budget")
+                it.player.offer(AccessUnit(2_040_000, ByteArray(3840)))
+                fail("An output retry must not bypass the producer budget")
             } catch (error: QueueCongestionException) {
                 assertEquals(QueueLimit.PTS, error.pressure.limit)
-                assertEquals(250_000L, error.pressure.maxSpanUs)
+                assertEquals(DEFAULT_AUDIO_QUEUE_SPAN_US, error.pressure.maxSpanUs)
                 assertEquals(512 * 1024, error.pressure.maxBytes)
-                assertEquals(48, error.pressure.maxPackets)
+                assertEquals(256, error.pressure.maxPackets)
             }
             assertTrue(TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - started) in 240..1000)
-            assertEquals(13, it.player.queuedPackets())
+            assertEquals(51, it.player.queuedPackets())
             assertTrue(it.errors.toString(), it.errors.isEmpty())
         }
     }

@@ -12,6 +12,96 @@ import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicReference
 
 class TrackWorkerSchedulingTest {
+    @Test fun nonRecoveryAdmissionClaimsTransientPressureBeforeSuccessfulRetry() {
+        val timing = DiagnosticAudioTiming()
+        val checking = CountDownLatch(1)
+        val drained = CountDownLatch(1)
+        val worker = object : TrackWorker("timing-transient", 1, { _, _ -> fail("not started") }, 2) {
+            @Volatile var signal = false
+            override fun causalNowNs(): Long {
+                if (signal) checking.countDown()
+                return System.nanoTime()
+            }
+            fun dequeue() = next()
+            override fun step() {}
+            override fun release() {}
+        }.also { it.diagnosticSession = 137; it.diagnosticGeneration = 3 }
+        fun packet(pts: Long) = AccessUnit(pts, ByteArray(1)).also {
+            it.diagnosticAudioTiming = timing
+            it.diagnosticPacketId = timing.packetId()
+        }
+        try {
+            assertNull(worker.tryOffer(packet(1)))
+            worker.signal = true
+            Thread {
+                try {
+                    check(checking.await(3, TimeUnit.SECONDS))
+                    worker.dequeue()
+                } finally { drained.countDown() }
+            }.start()
+            worker.offer(packet(2))
+            assertTrue(drained.await(3, TimeUnit.SECONDS))
+            assertEquals(QueueLimit.BYTES.ordinal, checkNotNull(timing.firstPressure()).reason)
+        } finally { worker.close() }
+    }
+
+    @Test fun decodedByteReservationClaimsMarkerOnInitialFailure() {
+        val recorder = RemoteDiagnostics.recorder
+        recorder.revoke()
+        recorder.unrestricted()
+        val owner = java.util.concurrent.atomic.AtomicBoolean(true)
+        val id = recorder.startAdmittedReceiver(138, setOf("audio.timing"),
+            System.nanoTime() + 10_000_000_000L, 100, owner).getString("captureId")
+        val worker = object : TrackWorker("timing-reservation", 1, { _, _ -> fail("not started") }, 2) {
+            fun reserve(bytes: Int) = reserveInputBytes(bytes)
+            override fun step() {}
+            override fun release() {}
+        }.also { it.diagnosticSession = 138; it.diagnosticGeneration = 4 }
+        try {
+            assertFalse(worker.reserve(2))
+            val marker = checkNotNull(recorder.audioTiming(138)?.firstPressure())
+            assertEquals(DiagnosticAudioTiming.RESERVATION_BYTES, marker.reason)
+            assertEquals(4, marker.generation)
+        } finally {
+            worker.close()
+            recorder.finishAdmittedReceiver(id, "test")
+            recorder.discardAdmittedReceiver(id)
+            recorder.revoke()
+        }
+    }
+
+    @Test fun audioTimingRetainsInitialPressureWhenRetrySucceeds() {
+        val timing = DiagnosticAudioTiming()
+        val worker = object : TrackWorker("timing-pressure", 1, { _, _ -> fail("not started") }, 2) {
+            fun dequeue() = next()
+            override fun step() {}
+            override fun release() {}
+        }.also { it.diagnosticSession = 137; it.diagnosticGeneration = 3 }
+        fun packet(pts: Long) = AccessUnit(pts, ByteArray(1)).also {
+            it.diagnosticAudioTiming = timing
+            it.diagnosticPacketId = timing.packetId()
+        }
+        try {
+            val first = packet(1)
+            val second = packet(2)
+            assertNull(worker.tryOffer(first))
+            assertEquals(QueueLimit.BYTES, checkNotNull(worker.tryOffer(second)).limit)
+            val marker = checkNotNull(timing.firstPressure())
+            assertEquals(137L, marker.session)
+            assertEquals(3, marker.generation)
+            assertEquals(QueueLimit.BYTES.ordinal, marker.reason)
+            assertEquals(first, worker.dequeue())
+            assertNull(worker.tryOffer(second))
+            assertEquals(marker, timing.firstPressure())
+            val events = timing.drain(DiagnosticAudioTiming.CAPACITY)
+            assertTrue(events.any { it.packetId == first.diagnosticPacketId &&
+                it.type == DiagnosticAudioTiming.DEQUEUED })
+            assertEquals(listOf(DiagnosticAudioTiming.ADMISSION_CHECK, DiagnosticAudioTiming.ADMISSION_PRESSURE,
+                DiagnosticAudioTiming.ADMISSION_CHECK, DiagnosticAudioTiming.ADMITTED),
+                events.filter { it.packetId == second.diagnosticPacketId }.map { it.type })
+        } finally { worker.close() }
+    }
+
     @Test fun retainedDecodedInputSharesTheEncodedByteCapWithoutRelaxingItsPtsLimit() {
         val worker = object : TrackWorker("retained-input", 10, { _, _ -> fail("not started") }, 2) {
             fun retain(bytes: Int) = reserveInputBytes(bytes).also { if (it) retainDecodedInput(bytes) }

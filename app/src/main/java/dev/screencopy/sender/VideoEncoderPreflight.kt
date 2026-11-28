@@ -26,8 +26,8 @@ internal object VideoEncoderPreflight {
                         caps.supportedFrameRates.lower.toDouble(), caps.supportedFrameRates.upper.toDouble())
                     val size = geometry.output
                     val supported = size.width > 0 && size.height > 0 && caps.isSizeSupported(size.width, size.height)
-                    val rate = supported && (geometry.fps == 0 ||
-                        caps.areSizeAndRateSupported(size.width, size.height, geometry.fps.toDouble()))
+                    val rate = supported &&
+                        caps.areSizeAndRateSupported(size.width, size.height, geometry.effectiveEncoderFps.toDouble())
                     EncoderGeometryCheck(limits, supported, rate, if (supported && rate) null else suggestion(caps, limits, geometry))
                 }
             } catch (e: IllegalArgumentException) {
@@ -52,7 +52,11 @@ internal object VideoEncoderPreflight {
             val heights = caps.getSupportedHeightsFor(w)
             h = aligned(h.coerceIn(maxOf(1, heights.lower), heights.upper), limits.heightAlignment)
             if (h > heights.upper || !caps.isSizeSupported(w, h)) return null
-            if (geometry.fps == 0) return VideoSize(w, h) to 0
+            if (geometry.fps == 0) {
+                if (caps.areSizeAndRateSupported(w, h, geometry.effectiveEncoderFps.toDouble()))
+                    return VideoSize(w, h) to 0
+                return null
+            }
             val rates = caps.getSupportedFrameRatesFor(w, h)
             val fps = geometry.fps.coerceIn(maxOf(1, ceil(rates.lower).toInt()), minOf(240, floor(rates.upper).toInt()))
             if (caps.areSizeAndRateSupported(w, h, fps.toDouble())) VideoSize(w, h) to fps else null

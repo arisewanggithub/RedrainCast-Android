@@ -11,12 +11,14 @@ data class Request(val videoCodec: String, val audioCodec: String?, val fps: Int
     val receiverOrientation: ReceiverOrientation = ReceiverOrientation.AUTO,
     val receiverOptions: ReceiverOptions = ReceiverOptions(),
     val videoBitrate: Int = 0, val audioBitrate: Int? = null,
-    val videoColor: HdrVideoColor? = null, val diagnosticRequested: Boolean = false) {
-    val tracks: List<Int> get() = if (audioCodec == null) listOf(1) else listOf(1, 2)
+    val videoColor: HdrVideoColor? = null, val diagnosticRequested: Boolean = false,
+    val videoEnabled: Boolean = true) {
+    val tracks: List<Int> get() = listOfNotNull(1.takeIf { videoEnabled }, 2.takeIf { audioCodec != null })
 
     companion object {
         fun parse(json: JSONObject, negotiated: ReceiverOptionCapabilities = ReceiverOptionCapabilities(),
-            hdrNegotiated: Boolean = false, receiveCapabilities: ReceiveCapabilities = ReceiveCapabilities()): Request {
+            hdrNegotiated: Boolean = false, receiveCapabilities: ReceiveCapabilities = ReceiveCapabilities(),
+            audioOnlyNegotiated: Boolean = false): Request {
             val options = ReceiverOptionProtocol.selection(json, negotiated)
             val diagnosticRequested = DiagnosticDelegation.requested(json)
             protocolRequire(!json.has("mediaTransport"),
@@ -24,6 +26,9 @@ data class Request(val videoCodec: String, val audioCodec: String?, val fps: Int
             val receiverOrientation = if (json.has("receiverOrientation")) ReceiverOrientation.parse(json.opt("receiverOrientation"))
                 else ReceiverOrientation.AUTO
             val video = json.obj("video")
+            val videoEnabled = if (video.has("enabled")) video.boolean("enabled") else true
+            protocolRequire(videoEnabled || audioOnlyNegotiated,
+                "This receiver does not support audio-only casting. Update the receiver or enable video.", "UNSUPPORTED_CONFIG")
             val codec = video.string("codec")
             protocolRequire(codec in listOf("h264", "h265", "av1"), "Unsupported video codec", "UNSUPPORTED_CONFIG")
             val color = if (json.has("videoColor")) HdrVideoColor.parse(json.obj("videoColor")) else null
@@ -46,6 +51,7 @@ data class Request(val videoCodec: String, val audioCodec: String?, val fps: Int
             }
             val audio = json.obj("audio")
             val enabled = audio.boolean("enabled")
+            protocolRequire(videoEnabled || enabled, "Enable audio or video; a cast cannot send no tracks")
             val audioCodec = audio.string("codec")
             protocolRequire(audioCodec in listOf("opus", "aac", "raw"), "Unsupported audio codec", "UNSUPPORTED_CONFIG")
             audio.string("encoder", 256)
@@ -53,17 +59,19 @@ data class Request(val videoCodec: String, val audioCodec: String?, val fps: Int
             audio.string("source", 80)
             audio.string("codecOptions", 8192)
             return Request(codec, if (enabled) audioCodec else null, fps,
-                "Requested $codec ${video.integer("bitrate")} bps, max ${video.integer("maxSize")} px, " +
-                    (if (fps == 0) "uncapped capture FPS; " else "$fps fps max; ") +
+                (if (videoEnabled) "Requested $codec ${video.integer("bitrate")} bps, max ${video.integer("maxSize")} px, " +
+                    (if (fps == 0) "uncapped capture FPS; " else "$fps fps max; ") else "Video disabled; ") +
                     (if (enabled) "audio $audioCodec ${audio.integer("bitrate")} bps" else "audio disabled"),
                 receiverOrientation, options, video.integer("bitrate"),
-                if (enabled && audioCodec != "raw") audio.integer("bitrate") else null, color, diagnosticRequested)
+                if (enabled && audioCodec != "raw") audio.integer("bitrate") else null, color, diagnosticRequested,
+                videoEnabled)
         }
     }
 }
 
 object Configuration {
     fun video(json: JSONObject, requested: Request): VideoFormat {
+        protocolRequire(requested.videoEnabled, "Video configuration was sent for a disabled track")
         val codec = json.string("codec")
         protocolRequire(codec == requested.videoCodec, "Actual video codec differs from accepted settings", "UNSUPPORTED_CONFIG")
         val color = if (json.has("videoColor")) HdrVideoColor.parse(json.obj("videoColor")) else null
@@ -80,6 +88,7 @@ object Configuration {
     }
 
     fun audio(json: JSONObject, requested: Request): AudioFormat {
+        protocolRequire(requested.audioCodec != null, "Audio configuration was sent for a disabled track")
         val codec = json.string("codec")
         protocolRequire(codec == requested.audioCodec, "Actual audio codec differs from accepted settings", "UNSUPPORTED_CONFIG")
         val rate = json.integer("sampleRate")

@@ -15,7 +15,9 @@ data class AudioOutputTiming(
     internal val playbackSpeed: Float = 1f,
     internal val timestampAtNs: Long? = null,
     internal val timestampEstimateFrames: Long? = null,
-    internal val timestampFramePosition: Long? = null
+    internal val timestampFramePosition: Long? = null,
+    internal val qualifiedTimestampFrames: Long? = null,
+    internal val virtualDiscard: Boolean = false
 ) {
     val bufferedUs: Long get() = framesToUs((submittedFrames - consumedFrames).coerceAtLeast(0))
     val presentedUs: Long get() = framesToUs(presentedFrames)
@@ -23,7 +25,8 @@ data class AudioOutputTiming(
     fun logMessage() = "sample_rate=$sampleRate buffer_frames=$bufferFrames submitted_frames=$submittedFrames" +
         " consumed_frames=$consumedFrames presented_frames=$presentedFrames buffered_us=$bufferedUs" +
         " transit_us=${framesToUs((consumedFrames - presentedFrames).coerceAtLeast(0))}" +
-        " timestamp_available=${timestampAgeUs != null} timestamp_age_us=${timestampAgeUs ?: 0} clock_source=$clockSource"
+        " timestamp_available=${timestampAgeUs != null} timestamp_age_us=${timestampAgeUs ?: 0}" +
+        " clock_source=${if (virtualDiscard) "VIRTUAL_DISCARD" else clockSource}"
 }
 
 data class AudioClockDiagnostic(val fault: AudioClockFault, val timing: AudioOutputTiming, val headDeltaFrames: Long? = null) {
@@ -119,6 +122,7 @@ internal class AudioPosition(
 
         source = AudioClockSource.HEAD_UNAVAILABLE
         var estimate = (consumed - transitFrames).coerceAtLeast(0)
+        var qualifiedFrames: Long? = null
         if (stamp != null) {
             // Native timestamps use a wrapping 32-bit position in the same client frame domain.
             var frames = stamp.frames
@@ -137,6 +141,7 @@ internal class AudioPosition(
                 else -> AudioClockSource.HEAD_WARMUP
             }
             if (source == AudioClockSource.TIMESTAMP) {
+                qualifiedFrames = frames
                 val elapsedFrames = ((now - stamp.nanoTime) * rate / 1_000_000_000.0 * speed).toLong()
                 estimate = (frames + elapsedFrames).coerceIn(0, consumed)
                 transitFrames = consumed - estimate
@@ -148,7 +153,7 @@ internal class AudioPosition(
         presented = maxOf(presented, estimate).coerceAtMost(consumed)
         return timing().copy(positionAtNs = now, playbackSpeed = speed, timestampAtNs = stamp?.nanoTime,
             timestampEstimateFrames = if (source == AudioClockSource.TIMESTAMP) estimate else null,
-            timestampFramePosition = stamp?.frames)
+            timestampFramePosition = stamp?.frames, qualifiedTimestampFrames = qualifiedFrames)
     }
 
     private fun timing(head: Long = consumed) =

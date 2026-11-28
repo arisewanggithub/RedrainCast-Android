@@ -236,18 +236,28 @@ settings are changed by statistics.
   denial, startup failure, and normal sender teardown release the reservation;
   listening automatically resumes while the app is foregrounded. A restarted
   listener can get a different port, so its displayed/advertised endpoints refresh.
-- **Sharing settings** are accessed through the header settings button and saved
-  only on Save. Codec, size, Maximum capture FPS, bitrate, orientation and audio are the primary
-  controls; crop and detailed audio options are under Advanced. Selection fields
+- **Cast settings** are accessed through the header settings button and saved
+  only on Save. Send video and Send audio can be selected independently, but at
+  least one track must remain enabled. Video codec, size, Maximum capture FPS,
+  bitrate and receiver orientation are grouped under Video; audio codec, source
+  and encoded bitrate are grouped under Audio. Crop and other existing advanced
+  controls are under Advanced. Selection fields
   open standard Android single-choice dialogs with the current option checked.
   Text inputs select their full value when gaining focus for easy replacement;
   subsequent taps in the focused field retain normal cursor placement.
+  Maximum video size offers Original and the common 1280/1920/2560/3840-pixel
+  presets. Video bitrate offers integer 1–30 Mbps choices; existing fractional
+  and non-preset values remain visible as the current selection until changed.
+  Size presets are checked against the current natural capture raster, crop,
+  aligned output geometry, FPS ceiling and encoder.   Known unsupported presets are filtered, except a saved/current selection is
+  retained and labeled. Capability-unverified options are labeled rather than
+  assumed supported. Bitrate presets follow the same distinction.
   Maximum capture FPS defaults to **Uncapped**, followed by the common caps:
   15, 24, 25, 30, 48, 50, 60, 90 and 120. This is a limit, not a promised
   capture or playback rate. A previously saved custom FPS remains selectable alongside
   the sorted presets, but new arbitrary values cannot be entered.
   Selecting updates only the draft; cancelling a choice retains its prior value,
-  and cancelling Sharing settings discards all edits. Child dialogs close with
+  and cancelling Cast settings discards all edits. Child dialogs close with
   their parent, and the settings scroll position is retained.
   Receiver orientation follows the displayed video in Auto mode on phones and
   tablets; explicit Portrait/Landscape overrides still apply there. Displays
@@ -260,9 +270,17 @@ settings are changed by statistics.
   Only codecs with
   an eligible hardware video encoder on this device are offered. An unsupported
   saved codec requires an explicit supported selection; it is not silently
-  replaced. Encoder names are selected automatically, including when loading
+  replaced.   Encoder names are selected automatically, including when loading
   older saved manual overrides. Raw PCM hides the encoded-audio bitrate control
   and uses fixed 48 kHz stereo s16le instead.
+  Fullscreen ignores the active crop while retaining its four dormant natural-
+  orientation pixel coordinates. Bounds are checked when the crop is active;
+  hidden crop drafts do not block saving.
+  Audio-only casting requires the receiver to acknowledge `audioOnlyVersion:1`
+  during HELLO. Older receivers report an update-or-enable-video error instead
+  of silently switching back to video. The receiver's audio controls appear
+  after real source audio is submitted to the output, not on decoder readiness
+  or inserted silence.
   New video settings default to uncapped H.264 capture at 8 Mbps with a
   1920-pixel maximum size; existing saved codec, bitrate and FPS selections
   are preserved. Audio defaults and encoding behavior are unchanged: raw PCM,
@@ -431,23 +449,37 @@ Both tracks retain the same playback clock. While audio is detached, that clock
 continues monotonically; fresh audio resumes against it instead of rebasing the
 video timeline. Staleness is determined by source timestamps, not queue size.
 After recovery READY, a future first audible PTS can legitimately wait longer
-than the encoded queue's 250 ms span. The audio worker checks that gate in bounded
+than the encoded audio queue's one-second PTS span. The audio worker checks that gate in bounded
 steps while continuing to decode codec dependencies. It retains the first slice
 and its following original-source PCM in decode order, sharing the existing
 512 KiB input byte cap with encoded admission (at most 256 retained decoded
 entries). Once its source deadline arrives, output drains those slices through
 the unchanged resampler and native output regulation; it does not replace the
 first slice with each new arrival, fill the wait with silence, or jump the clock
-to the newest packet. The encoded 48-packet/250 ms limits and the original
-ten-second recovery deadline are unchanged. This bounded source-time retention
-is not a larger encoded congestion budget or a claim to remove existing latency.
+to the newest packet. The audio queue defaults to a one-second raw PTS span and
+256 packets; its shared 512 KiB byte cap and the original ten-second recovery
+deadline remain unchanged. The span is a local receiver code setting
+(`DEFAULT_AUDIO_QUEUE_SPAN_US`), not a wire setting or a latency guarantee.
+Other limits can bind first, including retained decoded bytes and unusually small
+or large packets. Video admission remains at 48 packets and 250 ms.
+This bounded source-time retention is not a claim to remove existing latency.
+Admission counts every queued packet's raw PTS, including proved played
+dependencies: an earlier FIFO decode can invalidate that proof. Safe native
+played-audio trimming remains post-decode only; stale encoded backlog can still
+trigger existing track recovery or legacy congestion instead of gaining capacity.
 Video deadlines project qualified DAC observations to their scheduling time,
 bounded by already-consumed output frames and the existing 100 ms timestamp
 validity. Actual resampler/silence spans and source-clock slew are previewed
 without advancing audio observations. Diagnostics use the same deadline snapshot;
 this fixes cached-observation-age deadline jitter, not proven physical judder.
 Only decoded video pictures and decoded PCM may be trimmed within a retained
-compressed chain. Initial audio does not wait for a video decode proof.
+compressed chain. After all configured tracks are READY, initial audio does not
+wait for the first video packet or a video decode proof. Its source clock drives
+later video deadlines without being reset by that first packet. Late decoded
+pictures may be replaced by newer decoded pictures; with stream recovery
+negotiated, pictures over 250 ms late are discarded after decoding. Otherwise
+a late picture may render immediately. Future pictures keep their deadlines;
+temporary mismatch is acceptable and compressed dependencies are not skipped.
 Video completion proves usable decoded output; audio completion proves actual
 source-sample submission, not silence. Temporary A/V offsets do not terminate
 the session. Codec, bitrate, raster, rotation metadata and timestamps are not
@@ -472,7 +504,10 @@ selected-preroll eviction retries only audio under its original deadline.
 Packet/decode order and byte/count/PTS caps remain bounded.
 Recovery before the first audio submission uses the audio recovery deadline and
 fresh-source window, not the initial three-second startup checks or the original
-first-video timestamp. Ordinary startup still retains its existing checks.
+first-video timestamp. Ordinary startup still retains its independent audio-start
+and decoder failure checks, but missing video cannot trigger the three-second
+audio-start check after audio starts. The separately negotiated video recovery
+deadline still fails the session if usable video never arrives within ten seconds.
 Stop retires pending work and cannot produce late readiness or
 start new audio output. Audio format changes require a new capture session.
 An unsupported or non-acknowledging peer retains the strict congestion policy;

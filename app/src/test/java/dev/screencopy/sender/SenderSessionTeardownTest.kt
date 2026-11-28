@@ -23,6 +23,60 @@ import java.util.concurrent.atomic.AtomicReference
 import kotlin.concurrent.thread
 
 class SenderSessionTeardownTest {
+    @Test fun streamingStatusRequiresBothTracksAndIsPublishedOnlyOnTransitions() {
+        val statuses = mutableListOf<String>()
+        val sender = SenderSession(Mockito.mock(Context::class.java), Settings(),
+            ReceiverTarget("127.0.0.1", 7007), statuses::add, {}, {})
+        fun field(name: String) = SenderSession::class.java.getDeclaredField(name).apply { isAccessible = true }
+        val diagnostics = SenderSession::class.java.getDeclaredMethod("recoveryDiagnostic", String::class.java)
+            .apply { isAccessible = true }
+        val written = SenderSession::class.java.getDeclaredMethod("writeCompleted", Wire.Message::class.java)
+            .apply { isAccessible = true }
+        val clock = AtomicLong(1_000_000_000)
+        val mux = field("mux").get(sender) as MediaBudget
+        val recovery = StreamRecoverySender(ID, mux, clock::get,
+            diagnostic = { diagnostics.invoke(sender, it) })
+        field("session").setLong(sender, ID)
+        field("recovery").set(sender, recovery)
+        fun finish(track: Int) {
+            val message = checkNotNull(mux.pollLane(track, 1))
+            mux.beginWrite(message)
+            written.invoke(sender, message)
+            mux.endWrite(message)
+        }
+        fun video(pts: Long) = Wire.Message(Wire.VIDEO_FRAME, 1, ID, 1, 1, pts,
+            byteArrayOf(0, 0, 0, 1, 0x65, 1))
+        fun audio(pts: Long) = Wire.Message(Wire.AUDIO_PACKET, 0, ID, 2, 1, pts, ByteArray(3840))
+        try {
+            recovery.config(1, 1, Wire.obj("codec" to "h264"))
+            recovery.config(2, 1, Wire.obj("codec" to "raw", "sampleRate" to 48000, "channels" to 2))
+            for (track in 1..2) { finish(track); mux.ready(track, 1) }
+            recovery.ready()
+            recovery.packet(audio(1_000_000))
+            recovery.packet(video(1_000_000))
+            finish(1)
+            recovery.keyProved(1, 1_000_000)
+            recovery.completed(1, 1, 1_000_000)
+            assertEquals(0, statuses.count { it == "Streaming" })
+            finish(2)
+            assertEquals(1, statuses.count { it == "Streaming" })
+            recovery.packet(audio(1_020_000)); finish(2)
+            recovery.packet(video(1_020_000)); finish(1)
+            assertEquals(1, statuses.count { it == "Streaming" })
+
+            recovery.request(1, 1)
+            finish(1); mux.ready(1, 2); recovery.ready()
+            recovery.packet(video(1_030_000)); finish(1)
+            recovery.keyProved(2, 1_030_000)
+            recovery.completed(1, 2, 1_030_000)
+            assertEquals(2, statuses.count { it == "Streaming" })
+            recovery.packet(video(1_040_000)); finish(1)
+            assertEquals(2, statuses.count { it == "Streaming" })
+        } finally {
+            (field("timer").get(sender) as java.util.concurrent.ScheduledExecutorService).shutdownNow()
+        }
+    }
+
     @Test(timeout = 30_000) fun stopAndReadyCommitShareStartupOutcomeBoundary() {
         for (mode in listOf("before_ready", "before_commit", "ready_first")) {
             val stopFirst = mode != "ready_first"
@@ -1424,6 +1478,29 @@ class SenderSessionTeardownTest {
         }
     }
 
+    @Test(timeout = 10_000) fun localStopDuringRecoveryUsesEstablishedOrderlyTeardown() {
+        runSession { server, session, link ->
+            val peer = CompletableFuture.runAsync {
+                attachPeer(server, v2 = true) { control, video, audio ->
+                    assertEquals(Wire.STOP, terminal(control).type)
+                    Wire.write(control.outputStream, Wire.control(Wire.SESSION_END, ID, Wire.obj("reason" to "user")))
+                    assertEquals(-1, video.inputStream.read())
+                    assertEquals(-1, audio.inputStream.read())
+                    assertEquals(-1, control.inputStream.read())
+                }
+            }
+            negotiate(link)
+            session.prepare(link)
+            session.setRecovering()
+            session.startWorkers()
+            session.sender.stop()
+            session.sender.retireTransport()
+            peer.get(3, TimeUnit.SECONDS)
+            assertNull(session.outcome.failure)
+            assertFalse(session.diagnostics.any { it.contains("STARTUP_CANCEL") })
+        }
+    }
+
     @Test(timeout = 15_000) fun v2ReceiverStopFinishesStartedMediaBeforeSessionEndWithoutTwoSecondAbort() {
         for (playing in listOf(false, true)) runSession { server, session, link ->
             val entered = CountDownLatch(1)
@@ -1700,7 +1777,10 @@ class SenderSessionTeardownTest {
             field("link").set(sender, link)
             for (name in listOf("requestSent", "acceptedSession")) field(name).setBoolean(sender, true)
             field("playing").setBoolean(sender, playing)
+            field("established").setBoolean(sender, playing)
         }
+
+        fun setRecovering() = field("playing").setBoolean(sender, false)
 
         fun useTelemetry(owner: dev.redrain.cast.diagnostics.SenderTelemetrySession, negotiated: Boolean = true) {
             field("telemetry").set(sender, owner)

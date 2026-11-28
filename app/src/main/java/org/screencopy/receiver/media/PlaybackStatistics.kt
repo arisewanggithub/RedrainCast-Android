@@ -25,7 +25,8 @@ data class PlaybackStatisticsInput(
     val videoLastPacketAgeMs: Long? = null, val audioLastPacketAgeMs: Long? = null,
     val playbackEpoch: Long? = null, val occluded: Boolean? = null,
     val decodedVideo: DecodedVideoStatistics? = null,
-    val presentation: VideoPresentationStatistics? = null
+    val presentation: VideoPresentationStatistics? = null,
+    val videoEnabled: Boolean = true
 )
 
 data class PlaybackStatisticsSnapshot(val input: PlaybackStatisticsInput, val rxFps: Double?,
@@ -85,10 +86,11 @@ class PlaybackStatisticsSampler {
                 rendered - previousRendered + discarded else 0
             if (total > 0) discarded * 100.0 / total else null
         } }
-        return PlaybackStatisticsSnapshot(input, rate(input.receivedVideo, prior?.receivedVideo),
-            input.video?.let { rate(it.decoded, prior?.video?.decoded) },
-            input.video?.rendered?.let { rate(it, prior?.video?.rendered) },
-            rate(input.videoBytes, prior?.videoBytes)?.times(8.0 / 1_000_000),
+        return PlaybackStatisticsSnapshot(input,
+            if (input.videoEnabled) rate(input.receivedVideo, prior?.receivedVideo) else null,
+            if (input.videoEnabled) input.video?.let { rate(it.decoded, prior?.video?.decoded) } else null,
+            if (input.videoEnabled) input.video?.rendered?.let { rate(it, prior?.video?.rendered) } else null,
+            if (input.videoEnabled) rate(input.videoBytes, prior?.videoBytes)?.times(8.0 / 1_000_000) else null,
             if (input.audioCodec == null) null else rate(input.audioBytes, prior?.audioBytes)?.times(8.0 / 1_000_000),
             skipped, input.audio?.let { a -> prior?.audio?.let { (a.silenceMs - it.silenceMs).coerceAtLeast(0.0) } },
             input.audio?.let { a -> prior?.audio?.let { (a.discardedMs - it.discardedMs).coerceAtLeast(0.0) } },
@@ -190,28 +192,29 @@ object PlaybackStatisticsText {
                 number(queue?.spanUs?.div(1000.0), " ms"), age(activity), "—")
         val orientation = s.orientation.replaceFirstChar { it.uppercase() }
         val skew = snapshot.syncMs?.let { String.format(Locale.ROOT, "%+.1f ms", it) } ?: "N/A"
+        fun videoValue(value: String) = if (s.videoEnabled) value else "N/A"
         return PlaybackStatisticsDisplay("Playback statistics",
             listOf(
-                field("receivedFps", "Received FPS", number(snapshot.rxFps)),
-                field("decodedFps", "Decoded FPS", number(snapshot.decodedFps)),
-                field("presentedFps", "Presented FPS", number(snapshot.presentedFps)),
-                field("skippedRecent", "Skipped · recent", number(snapshot.recentSkippedPercent, "%"))),
-            listOf(field("decoded", "Decoded", total(video?.decoded)),
-                field("presented", "Presented", total(video?.rendered)),
-                field("skipped", "Skipped", total(video?.skipped))),
+                field("receivedFps", "Received FPS", videoValue(number(snapshot.rxFps))),
+                field("decodedFps", "Decoded FPS", videoValue(number(snapshot.decodedFps))),
+                field("presentedFps", "Presented FPS", videoValue(number(snapshot.presentedFps))),
+                field("skippedRecent", "Skipped · recent", videoValue(number(snapshot.recentSkippedPercent, "%")))),
+            listOf(field("decoded", "Decoded", videoValue(total(video?.decoded))),
+                field("presented", "Presented", videoValue(total(video?.rendered))),
+                field("skipped", "Skipped", videoValue(total(video?.skipped)))),
             listOf(
-                field("videoCodec", "Codec", codec(s.videoCodec)),
-                field("videoDynamicRange", "Stream range", streamRange(s.decodedVideo)),
-                field("videoDecodeFormat", "Profile / depth", decodeFormat(s.decodedVideo)),
-                field("presentationOutput", "Output", presentationOutput(s.presentation)),
-                field("encodedSize", "Encoded size", if (s.encodedWidth != null && s.encodedHeight != null)
+                field("videoCodec", "Codec", if (s.videoEnabled) codec(s.videoCodec) else "N/A"),
+                field("videoDynamicRange", "Stream range", if (s.videoEnabled) streamRange(s.decodedVideo) else "N/A"),
+                field("videoDecodeFormat", "Profile / depth", if (s.videoEnabled) decodeFormat(s.decodedVideo) else "N/A"),
+                field("presentationOutput", "Output", if (s.videoEnabled) presentationOutput(s.presentation) else "N/A"),
+                field("encodedSize", "Encoded size", if (!s.videoEnabled) "N/A" else if (s.encodedWidth != null && s.encodedHeight != null)
                     "${s.encodedWidth} × ${s.encodedHeight}" else "N/A"),
-                field("captureLimit", "Capture limit", if (s.requestedFps == 0) "Uncapped" else "${s.requestedFps} FPS"),
+                field("captureLimit", "Capture limit", if (!s.videoEnabled) "N/A" else if (s.requestedFps == 0) "Uncapped" else "${s.requestedFps} FPS"),
                 field("displayOutput", "Display mode", measurements.displayOutput?.format() ?: "N/A"),
-                field("rotation", "Rotation", "${s.rotation}° · $orientation"),
-                field("videoBitrate", "Video bitrate", number(snapshot.videoMbps, " Mbps")),
+                field("rotation", "Rotation", if (s.videoEnabled) "${s.rotation}° · $orientation" else "N/A"),
+                field("videoBitrate", "Video bitrate", videoValue(number(snapshot.videoMbps, " Mbps"))),
                 field("configuredBitrate", "Configured bitrate",
-                    number(s.configuredVideoBps.takeIf { it > 0 }?.div(1_000_000.0), " Mbps")),
+                    videoValue(number(s.configuredVideoBps.takeIf { it > 0 }?.div(1_000_000.0), " Mbps"))),
                 field("networkLoss", "Network loss", "N/A")),
             listOf(
                 field("audioFormat", "Audio format", codec(s.audioCodec)),

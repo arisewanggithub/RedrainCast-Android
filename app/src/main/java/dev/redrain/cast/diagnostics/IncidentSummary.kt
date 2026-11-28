@@ -22,7 +22,7 @@ internal object IncidentSummary {
             .put("audioStartDecisions", JSONArray(listOf("NOT_WAITING", "WAIT_TARGET", "RETRY_PREROLL",
                 "RETRY_STALE_RECOVERY", "READY", "CANCELLED", "FAILED")))
             .put("audioStartClockModes", JSONArray(listOf("UNAVAILABLE", "MONOTONIC",
-                "AUDIO_INITIAL", "CALLBACK_AUDIO", "CACHED_AUDIO")))
+                "AUDIO_INITIAL", "CALLBACK_AUDIO", "CACHED_AUDIO", "VIRTUAL_SYNC")))
             .put("telemetryCausalLayouts", JSONArray().apply {
                 CausalEvidence.Stage.entries.forEach { stage ->
                     put(JSONObject().put("kind", CausalEvidence.KIND).put("stage", stage.ordinal)
@@ -263,7 +263,7 @@ internal object IncidentSummary {
             stage == CausalEvidence.Stage.START && index == 12
         if (trimReason && raw == "-1") return "NONE(-1)"
         val dictionary = when {
-            trimReason -> listOf("STARTUP", "RECOVERY", "RECOVERY_REFRESH", "CLOCK_PREPARE")
+            trimReason -> listOf("STARTUP", "RECOVERY", "RECOVERY_REFRESH", "CLOCK_PREPARE", "PLAYED_AUDIO")
             stage == CausalEvidence.Stage.MAPPING && index == 0 -> CausalEvidence.Mapping.entries.map { it.name }
             stage == CausalEvidence.Stage.OUTPUT && index == 0 -> CausalEvidence.Output.entries.map { it.name }
             stage == CausalEvidence.Stage.OUTPUT && index in listOf(2, 19) -> DiagnosticPoint.entries.map { it.name }
@@ -274,7 +274,7 @@ internal object IncidentSummary {
                 listOf("NOT_WAITING", "WAIT_TARGET", "RETRY_PREROLL", "RETRY_STALE_RECOVERY", "READY", "CANCELLED", "FAILED")
             stage == CausalEvidence.Stage.START && index == 2 ||
                 stage == CausalEvidence.Stage.MAPPING && index in listOf(7, 8) ->
-                listOf("UNAVAILABLE", "MONOTONIC", "AUDIO_INITIAL", "CALLBACK_AUDIO", "CACHED_AUDIO")
+                listOf("UNAVAILABLE", "MONOTONIC", "AUDIO_INITIAL", "CALLBACK_AUDIO", "CACHED_AUDIO", "VIRTUAL_SYNC")
             else -> return raw
         }
         return dictionary.getOrNull(raw.toIntOrNull() ?: -1)?.let { "$it($raw)" } ?: "UNKNOWN($raw)"

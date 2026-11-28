@@ -31,6 +31,38 @@ class PairedFetchTests(unittest.TestCase):
         self.assertEqual("receiver", records[0]["role"])
         self.assertEqual(self.page["session"], records[0]["record"]["session"])
 
+    def test_selected_audio_batch_and_marker_are_preserved_with_ordered_cursor(self):
+        page = copy.deepcopy(self.page)
+        source = page["receiver"]
+        source["audioTiming"] = dict(marker=dict(monoNs="20000000000", session=page["session"],
+                                                  generation=1, reason=1),
+                                     retainedBytes=100, oldestEventNs="19000000000",
+                                     latestEventNs="19000000000", windowStartNs="15000000000",
+                                     windowEndNs="30000000000", evictedCount="0",
+                                     firstEvictedSeq=None, lastEvictedSeq=None, tailUnknown=True)
+        record = page["records"][0]["record"]
+        record["kind"] = "AUDIO_TIMING"
+        record["data"] = dict(schema="audio_timing_v1", attempted="1", dropped="0",
+                              droppedBeforeSequence="0", batchDropped="0",
+                              events=[["1", "19000000000", 1, "1", 1, "1000", "4"]])
+        for item in page["records"]:
+            if item["record"]["kind"] == "CAPTURE_ENDED":
+                item["record"]["data"]["audioTiming"] = dict(attempted="1", dropped="0",
+                    droppedBeforeSequence="0", batchDropped="0", producersAtClose="0", pendingProducers="0")
+        selected = {"sender": [], "receiver": ["video.timing", "audio.timing"]}
+        records, cursors = collector.validate_page(page, page["pairId"], self.cursors, flags=selected)
+        self.assertEqual("AUDIO_TIMING", records[0]["record"]["kind"])
+        self.assertEqual(4, cursors["receiver"])
+        with self.assertRaises(collector.DiagnosticError):
+            collector.validate_page(page, page["pairId"], self.cursors, flags=self.flags)
+        record["data"]["schema"] = "audio_timing_v2"
+        record["data"]["events"][0][4:] = [22, "2", "100"]
+        with self.assertRaisesRegex(collector.DiagnosticError, "Unsolicited audio timing work"):
+            collector.validate_page(page, page["pairId"], self.cursors, flags=selected)
+        work_selected = dict(sender=[], receiver=selected["receiver"] + ["audio.timing.work"])
+        records, _ = collector.validate_page(page, page["pairId"], self.cursors, flags=work_selected)
+        self.assertEqual("audio_timing_v2", records[0]["record"]["data"]["schema"])
+
     def test_audio_start_retention_and_observation_age_survive_collection(self):
         page = copy.deepcopy(self.page)
         record = page["records"][0]["record"]
@@ -112,7 +144,119 @@ class PairedFetchTests(unittest.TestCase):
             collector.strict_json(json.dumps(value).encode())
 
 
+class AudioTimingTests(unittest.TestCase):
+    def test_explicit_audio_timing_is_not_a_default_and_old_peers_fail(self):
+        supported = ["session", "audio.timing"]
+        self.assertEqual(["session"], collector.select_flags("receiver", None, supported))
+        self.assertEqual(["audio.timing"], collector.select_flags("receiver", ["audio.timing"], supported))
+        with self.assertRaises(collector.DiagnosticError):
+            collector.select_flags("receiver", ["audio.timing"], ["session"])
+
+    def test_marker_and_receiver_timestamp_bounds_are_strict(self):
+        value = dict(marker=dict(monoNs="20000000000", session="77", generation=3, reason=1),
+                     retainedBytes=100, oldestEventNs="15000000000", latestEventNs="21000000000",
+                     windowStartNs="15000000000", windowEndNs="30000000000",
+                     evictedCount="0", firstEvictedSeq=None, lastEvictedSeq=None, tailUnknown=True)
+        collector.validate_audio_timing(value, "77")
+        for field, invalid in (("windowStartNs", "14999999999"), ("tailUnknown", False),
+                               ("retainedBytes", 768 * 1024 + 1)):
+            altered = dict(value)
+            altered[field] = invalid
+            with self.subTest(field=field), self.assertRaises(collector.DiagnosticError):
+                collector.validate_audio_timing(altered, "77")
+        value["marker"] = None
+        value["windowStartNs"] = value["windowEndNs"] = None
+        collector.validate_audio_timing(value, "77")
+
+    def test_batch_requires_canonical_bounded_numeric_events(self):
+        data = dict(schema="audio_timing_v1", attempted="2", dropped="1", droppedBeforeSequence="0",
+                    batchDropped="0", events=[["1", "200", 1, "7", 1, "-1", "2"]])
+        collector.validate_audio_batch(data)
+        for change in (lambda d: d["events"][0].__setitem__(1, "01"),
+                       lambda d: d["events"][0].__setitem__(5, "-0"),
+                       lambda d: d["events"].append(d["events"][0]),
+                       lambda d: d.__setitem__("schema", "audio_timing_v3")):
+            altered = copy.deepcopy(data)
+            change(altered)
+            with self.assertRaises(collector.DiagnosticError):
+                collector.validate_audio_batch(altered)
+
+    def test_worker_boundaries_require_v2_and_known_stage_and_cpu(self):
+        data = dict(schema="audio_timing_v2", attempted="3", dropped="0", droppedBeforeSequence="0",
+                    batchDropped="0", events=[["1", "200", 1, "7", 22, "2", "100"],
+                                             ["2", "250", 1, "7", 23, "2", "105"],
+                                             ["3", "260", 1, "0", 24, "3", "-1"]])
+        collector.validate_audio_batch(data, work_selected=True)
+        split = copy.deepcopy(data)
+        split["attempted"] = "4"
+        split["events"] = [[str(index + 1), str(300 + index), 2, "0", kind, "8", "100"]
+                           for index, kind in enumerate((22, 23, 22, 23))]
+        collector.validate_audio_batch(split, work_selected=True)
+        with self.assertRaisesRegex(collector.DiagnosticError, "Unsolicited audio timing work"):
+            collector.validate_audio_batch(data)
+        for change in (lambda d: d.__setitem__("schema", "audio_timing_v1"),
+                       lambda d: d["events"][0].__setitem__(4, 25),
+                       lambda d: d["events"][0].__setitem__(5, "0"),
+                       lambda d: d["events"][0].__setitem__(5, "13"),
+                       lambda d: d["events"][0].__setitem__(6, "-2"),
+                       lambda d: d["events"][0].__setitem__(6, 100)):
+            altered = copy.deepcopy(data)
+            change(altered)
+            with self.assertRaises(collector.DiagnosticError):
+                collector.validate_audio_batch(altered, work_selected=True)
+
+    def test_detail_requires_explicit_negotiation(self):
+        data = dict(schema="audio_timing_v3", attempted="3", dropped="0", droppedBeforeSequence="0",
+                    batchDropped="0", events=[["1", "200", 1, "7", 22, "13", "100"],
+                                             ["2", "250", 1, "7", 25, "1000", "50"],
+                                             ["3", "260", 1, "0", 27, "10", "5"]])
+        with self.assertRaisesRegex(collector.DiagnosticError, "Unsolicited audio timing detail"):
+            collector.validate_audio_batch(data, work_selected=True)
+        collector.validate_audio_batch(data, work_selected=True, detail_selected=True)
+
+    def test_owner_requires_explicit_negotiation_and_valid_boundaries(self):
+        requested = ["audio.timing", "audio.timing.work", "audio.timing.detail", "audio.timing.owner"]
+        supported = ["session"] + requested
+        self.assertEqual(["session"], collector.select_flags("receiver", None, supported))
+        self.assertEqual(requested, collector.select_flags("receiver", requested, supported))
+        with self.assertRaises(collector.DiagnosticError):
+            collector.select_flags("receiver", requested, supported[:-1])
+        with self.assertRaises(collector.DiagnosticError):
+            collector.select_flags("receiver", ["audio.timing.owner"], supported)
+        data = dict(schema="audio_timing_v4", attempted="2", dropped="0", droppedBeforeSequence="0",
+                    batchDropped="0", events=[["1", "200", 1, "0", 30, "3", "1"],
+                                             ["2", "250", 1, "0", 31, "3", "1"]])
+        with self.assertRaisesRegex(collector.DiagnosticError, "Unsolicited audio timing owner"):
+            collector.validate_audio_batch(data, work_selected=True, detail_selected=True)
+        collector.validate_audio_batch(data, work_selected=True, detail_selected=True, owner_selected=True)
+        data["events"][0][6] = "0"
+        with self.assertRaises(collector.DiagnosticError):
+            collector.validate_audio_batch(data, work_selected=True, detail_selected=True, owner_selected=True)
+
+
 class SequenceCompletenessTests(unittest.TestCase):
+    def test_detail_selection_requires_work_and_rejects_old_peers(self):
+        requested = ["audio.timing", "audio.timing.work", "audio.timing.detail"]
+        supported = ["session"] + requested
+        self.assertEqual(["session"], collector.select_flags("receiver", None, supported))
+        self.assertEqual(requested, collector.select_flags("receiver", requested, supported))
+        with self.assertRaisesRegex(collector.DiagnosticError, "requires audio.timing.work"):
+            collector.select_flags("receiver", ["audio.timing", "audio.timing.detail"], supported)
+        with self.assertRaisesRegex(collector.DiagnosticError, "Unsupported requested flags"):
+            collector.select_flags("receiver", requested, supported[:-1])
+
+    def test_work_selection_is_explicit_requires_base_and_rejects_old_sender_capabilities(self):
+        supported = ["session", "audio.timing", "audio.timing.work"]
+        self.assertEqual(["session"], collector.select_flags("receiver", None, supported))
+        work = collector.parse_flags("audio.timing,audio.timing.work")
+        self.assertEqual(work, collector.select_flags("receiver", work, supported))
+        self.assertEqual(["audio.timing"], collector.select_flags(
+            "receiver", ["audio.timing"], supported))
+        with self.assertRaisesRegex(collector.DiagnosticError, "requires audio.timing"):
+            collector.select_flags("receiver", ["audio.timing.work"], supported)
+        with self.assertRaisesRegex(collector.DiagnosticError, "Unsupported requested flags"):
+            collector.select_flags("receiver", work, ["session", "audio.timing"])
+
     def test_tail_details_is_explicitly_negotiated_without_changing_legacy_default(self):
         supported = ["session", "tail.details"]
         self.assertEqual(["session"], collector.select_flags("receiver", None, supported))

@@ -25,6 +25,113 @@ import dev.screencopy.sender.StreamRecoverySender
 import dev.screencopy.sender.Wire as SenderWire
 
 class StreamRecoveryPipelineTest {
+    @Test(timeout = 15_000) fun qualifiedPlayedProofCannotHideReorderedOpusPressureFromServerRecovery() {
+        val time = AtomicLong()
+        val paused = CountDownLatch(1)
+        val resume = CountDownLatch(1)
+        val players = ConcurrentLinkedQueue<AudioPlayer>()
+        val clocks = ConcurrentLinkedQueue<PlaybackClock>()
+        val decoded = ConcurrentLinkedQueue<Int>()
+        val retired = AtomicBoolean()
+        val failures = ConcurrentLinkedQueue<String>()
+        ReceiverServer.forProtocolTests("Receiver", onFailure = { failures.add(it.logMessage()) },
+            clockFactory = { PlaybackClock(time::get) { time.addAndGet(it * 1_000_000) }.also(clocks::add) },
+            videoFactory = { format, clock, failed, generation ->
+                VideoPlayer(format, clock, failed, Decoder(false), generation)
+            },
+            audioFactory = { format, clock, failed ->
+                val original = players.isEmpty()
+                var head = 0L
+                var stamp = FrameTimestamp(0, time.get())
+                val position = AudioPosition(48000, 5760, time::get, { stamp }, { head.toInt() })
+                val output = object : AudioOutput {
+                    override val underrunCount = 0
+                    override fun play() {}
+                    override fun pause() {}
+                    override fun close() { if (original) retired.set(true) }
+                    override fun setSpeed(speed: Float) {}
+                    override fun timing() = position.current()
+                    override fun write(samples: ShortArray, offset: Int, count: Int): Int {
+                        position.written(count / 2)
+                        return count
+                    }
+                }
+                AudioPlayer(format, clock, failed, { output },
+                    opusFactory = { object : OpusPacketDecoder {
+                        override fun decode(packet: ByteArray): ShortArray {
+                            val id = packet.last().toInt()
+                            decoded.add(id)
+                            return ShortArray((if (id == 0) 2880 + format.preSkip else 2880) * 2)
+                        }
+                        override fun close() {}
+                    } },
+                    resamplerFactory = { _, channels -> IdentityPcmResampler(channels) },
+                    threadCpuNs = { 0 },
+                    prepareThread = {
+                        if (original) {
+                            paused.countDown()
+                            check(resume.await(5, TimeUnit.SECONDS))
+                        }
+                    }).also { player ->
+                    players.add(player)
+                    if (original) {
+                        val step = AudioPlayer::class.java.getDeclaredMethod("serviceStep").apply { isAccessible = true }
+                        assertNull(player.tryOffer(AccessUnit(1_000_000 - format.preSkip * 1_000_000L / 48000,
+                            byteArrayOf(0))))
+                        step.invoke(player)
+                        head = 2880
+                        stamp = FrameTimestamp(head, time.addAndGet(1_000_000))
+                        assertNull(player.tryOffer(AccessUnit(1_060_000, byteArrayOf(1))))
+                        step.invoke(player)
+                        head = 5760
+                        stamp = FrameTimestamp(head, time.addAndGet(1_000_000))
+                        step.invoke(player)
+                        assertEquals(1_120_000L, clock.cachedAudioDiscardCutoffUs())
+                    }
+                }
+            }).use { server ->
+            try {
+                session(server) { peer, media ->
+                    assertTrue(paused.await(3, TimeUnit.SECONDS))
+                    for ((id, pts) in listOf(2 to 2_000_000L, 3 to 2_010_000L, 4 to 1_000_000L)) {
+                        Wire.write(media.audio.outputStream,
+                            Message(Type.AUDIO_PACKET, 41, 2, 1, pts, 0, byteArrayOf(8, id.toByte())))
+                    }
+                    val request = expect(peer, Type.STATUS).json()
+                    assertEquals(StreamRecoveryProtocol.REQUEST, request.getString("state"))
+                    assertEquals(2, request.getInt("track"))
+                    assertEquals(1, request.getInt("generation"))
+                    assertEquals(2, players.first().queuedPackets())
+                    assertEquals(listOf(0, 1), decoded.toList())
+                    assertEquals(1_120_000L, clocks.single().cachedAudioDiscardCutoffUs())
+                    val step = AudioPlayer::class.java.getDeclaredMethod("serviceStep").apply { isAccessible = true }
+                    step.invoke(players.first())
+                    assertNull(clocks.single().cachedAudioDiscardCutoffUs())
+                    assertEquals(1, players.first().queuedPackets())
+                    assertEquals(listOf(0, 1, 2), decoded.toList())
+                    Wire.write(media.audio.outputStream, audioConfig(2, 1_400_000))
+                    assertEquals(2L, expect(peer, Type.STREAM_READY).generation)
+                    assertTrue(retired.get())
+                    assertEquals(0, players.first().queuedPackets())
+                    assertNull(clocks.single().cachedAudioDiscardCutoffUs())
+                    assertThrows(TrackStoppedException::class.java) {
+                        players.first().tryOffer(AccessUnit(1_000_000, byteArrayOf(4)))
+                    }
+                    Wire.write(media.audio.outputStream,
+                        Message(Type.AUDIO_PACKET, 41, 2, 2, 1_400_000, 0, byteArrayOf(8, 5)))
+                    val complete = expect(peer, Type.STATUS).json()
+                    assertEquals(StreamRecoveryProtocol.COMPLETE, complete.getString("state"))
+                    assertEquals(2, complete.getInt("track"))
+                    assertEquals(2, complete.getInt("generation"))
+                    assertEquals(listOf(0, 1, 2, 5), decoded.toList())
+                    assertTrue(failures.toString(), failures.isEmpty())
+                    sendControl(peer, Type.STOP, JSONObject().put("reason", "raw PTS admission recovered"))
+                    expect(peer, Type.SESSION_END)
+                }
+            } finally { resume.countDown() }
+        }
+    }
+
     @Test(timeout = 10_000) fun realReceiverAcceptsFreshRawSuffixAfterNineHundredEightyMillisecondReadyDelay() {
         val now = AtomicLong(1_000_000_000)
         val constructing = CountDownLatch(1)
@@ -784,7 +891,7 @@ class StreamRecoveryPipelineTest {
                     expect(peer, Type.STATUS); expect(peer, Type.STATUS)
                     Wire.write(media.audio.outputStream, Message(Type.AUDIO_PACKET, 41, 2, 1, 1_000_000, 0, byteArrayOf(8, 1)))
                     assertTrue(decoding.await(2, TimeUnit.SECONDS))
-                    repeat(14) { index ->
+                    repeat(52) { index ->
                         Wire.write(media.audio.outputStream, Message(Type.AUDIO_PACKET, 41, 2, 1,
                             1_020_000 + index * 20_000L, 0, byteArrayOf(8, 1)))
                     }
@@ -861,7 +968,7 @@ class StreamRecoveryPipelineTest {
                 await { retained.getInt(player) == 131 * 3840 || failures.isNotEmpty() }
                 assertEquals((0 until 131).toList(), decoded.toList())
                 assertEquals(0, outputs.last().writtenFrames.get())
-                repeat(14) { index ->
+                repeat(52) { index ->
                     Wire.write(media.audio.outputStream, Message(Type.AUDIO_PACKET, 41, 2, 2,
                         6_620_000 + index * 20_000L, 0, byteArrayOf(8, (131 + index).toByte())))
                 }
@@ -871,7 +978,7 @@ class StreamRecoveryPipelineTest {
                 assertEquals(2, pressure.getInt("generation"))
                 assertEquals(originalDeadlineStart, deadlineStart.getLong(connection))
                 assertTrue(retained.getInt(player) <= 512 * 1024)
-                assertTrue(player.queuedPackets() <= 13)
+                assertTrue(player.queuedPackets() <= 51)
                 assertEquals(131, decoded.size)
                 sendControl(peer, Type.PING, JSONObject().put("nonce", 222))
                 assertEquals(222, expect(peer, Type.PONG).json().getInt("nonce"))
@@ -931,7 +1038,7 @@ class StreamRecoveryPipelineTest {
                     expect(peer, Type.STATUS); expect(peer, Type.STATUS)
                     Wire.write(media.audio.outputStream, Message(Type.AUDIO_PACKET, 41, 2, 1, 1_000_000, 0, byteArrayOf(8, 1)))
                     assertTrue(decoding.await(2, TimeUnit.SECONDS))
-                    repeat(14) { index ->
+                    repeat(52) { index ->
                         Wire.write(media.audio.outputStream, Message(Type.AUDIO_PACKET, 41, 2, 1,
                             1_020_000 + index * 20_000L, 0, byteArrayOf(8, 1)))
                     }

@@ -26,7 +26,7 @@ FLAGS = {
     "sender": ["session", "recovery", "audio.capture", "audio.transport",
                "audio.queue", "video.progress", "transport.health"],
     "receiver": ["session", "recovery", "audio.transport", "audio.queue",
-                 "audio.output", "video.progress", "video.timing", "transport.health", "tail.details"],
+                 "audio.output", "audio.timing", "audio.timing.work", "audio.timing.detail", "audio.timing.owner", "video.progress", "video.timing", "transport.health", "tail.details"],
 }
 
 
@@ -40,6 +40,15 @@ def exact_long(value):
     number = int(value)
     if number > MAX_INT64:
         raise DiagnosticError("Diagnostic int64 overflow")
+    return number
+
+
+def exact_signed_long(value):
+    if not isinstance(value, str) or not re.fullmatch(r"0|-?[1-9][0-9]{0,18}", value):
+        raise DiagnosticError("Invalid signed diagnostic int64")
+    number = int(value)
+    if not -(1 << 63) <= number <= MAX_INT64:
+        raise DiagnosticError("Signed diagnostic int64 overflow")
     return number
 
 
@@ -65,12 +74,26 @@ def select_flags(role, requested, supported):
     selected = [flag for flag in FLAGS[role] if flag in supported] if requested is None else requested
     if requested is None and "tail.details" in selected:
         selected.remove("tail.details")
+    if requested is None and "audio.timing" in selected:
+        selected.remove("audio.timing")
+    if requested is None and "audio.timing.work" in selected:
+        selected.remove("audio.timing.work")
+    if requested is None and "audio.timing.detail" in selected:
+        selected.remove("audio.timing.detail")
+    if requested is None and "audio.timing.owner" in selected:
+        selected.remove("audio.timing.owner")
     if requested is None and "video.timing" in selected and "video.progress" not in selected:
         selected.remove("video.timing")
     if not selected or any(flag not in supported for flag in selected):
         raise DiagnosticError("Unsupported requested flags")
     if "video.timing" in selected and "video.progress" not in selected:
         raise DiagnosticError("video.timing requires video.progress")
+    if "audio.timing.work" in selected and "audio.timing" not in selected:
+        raise DiagnosticError("audio.timing.work requires audio.timing")
+    if "audio.timing.detail" in selected and "audio.timing.work" not in selected:
+        raise DiagnosticError("audio.timing.detail requires audio.timing.work")
+    if "audio.timing.owner" in selected and "audio.timing.detail" not in selected:
+        raise DiagnosticError("audio.timing.owner requires audio.timing.detail")
     return selected
 
 
@@ -205,6 +228,72 @@ def validate_tail_details(details, truncated):
         raise DiagnosticError("Invalid terminal tail range")
 
 
+def validate_audio_timing(value, session):
+    fields = {"marker", "retainedBytes", "oldestEventNs", "latestEventNs", "windowStartNs",
+              "windowEndNs", "evictedCount", "firstEvictedSeq", "lastEvictedSeq", "tailUnknown"}
+    if not isinstance(value, dict) or set(value) != fields or type(value["retainedBytes"]) is not int or \
+            not 0 <= value["retainedBytes"] <= 768 * 1024 or value["tailUnknown"] is not True:
+        raise DiagnosticError("Invalid audio timing retention")
+    marker = value["marker"]
+    if marker is not None:
+        if not isinstance(marker, dict) or set(marker) != {"monoNs", "session", "generation", "reason"} or \
+                marker["session"] != session or type(marker["generation"]) is not int or \
+                not 1 <= marker["generation"] <= 2147483647 or \
+                type(marker["reason"]) is not int or marker["reason"] not in range(5):
+            raise DiagnosticError("Invalid audio pressure marker")
+        ns = exact_long(marker["monoNs"])
+        if exact_long(value["windowStartNs"]) != max(0, ns - 5_000_000_000) or \
+                exact_long(value["windowEndNs"]) != min(MAX_INT64, ns + 10_000_000_000):
+            raise DiagnosticError("Invalid audio timing window")
+    elif value["windowStartNs"] is not None or value["windowEndNs"] is not None:
+        raise DiagnosticError("Window without audio pressure marker")
+    oldest, latest = value["oldestEventNs"], value["latestEventNs"]
+    if (oldest is None) != (latest is None) or oldest is not None and exact_long(oldest) > exact_long(latest):
+        raise DiagnosticError("Invalid audio timing bounds")
+    count = exact_long(value["evictedCount"])
+    first, last = value["firstEvictedSeq"], value["lastEvictedSeq"]
+    if (count == 0 and (first is not None or last is not None)) or \
+            (count > 0 and (first is None or last is None or exact_long(first) == 0 or
+                            exact_long(first) > exact_long(last))):
+        raise DiagnosticError("Invalid audio timing eviction bounds")
+
+
+def validate_audio_batch(data, work_selected=False, detail_selected=False, owner_selected=False):
+    if set(data) != {"schema", "events", "attempted", "dropped", "droppedBeforeSequence", "batchDropped"} or \
+            data["schema"] not in ("audio_timing_v1", "audio_timing_v2", "audio_timing_v3", "audio_timing_v4"):
+        raise DiagnosticError("Invalid audio timing batch")
+    if data["schema"] != "audio_timing_v1" and not work_selected:
+        raise DiagnosticError("Unsolicited audio timing work")
+    if data["schema"] in ("audio_timing_v3", "audio_timing_v4") and not detail_selected:
+        raise DiagnosticError("Unsolicited audio timing detail")
+    if data["schema"] == "audio_timing_v4" and not owner_selected:
+        raise DiagnosticError("Unsolicited audio timing owner")
+    attempted = exact_long(data["attempted"])
+    if exact_long(data["dropped"]) > attempted or exact_long(data["batchDropped"]) > attempted:
+        raise DiagnosticError("Invalid audio timing loss")
+    exact_long(data["droppedBeforeSequence"])
+    if not isinstance(data["events"], list) or not 1 <= len(data["events"]) <= 8:
+        raise DiagnosticError("Invalid audio timing events")
+    seen = set()
+    for event in data["events"]:
+        if not isinstance(event, list) or len(event) != 7:
+            raise DiagnosticError("Invalid audio timing event")
+        sequence = exact_long(event[0])
+        exact_long(event[1])
+        if sequence == 0 or sequence > attempted or sequence in seen or \
+                type(event[2]) is not int or not 1 <= event[2] <= 2147483647 or \
+                type(event[4]) is not int or not 1 <= event[4] <= (31 if data["schema"] == "audio_timing_v4" else 29 if data["schema"] == "audio_timing_v3" else 24 if data["schema"] == "audio_timing_v2" else 21):
+            raise DiagnosticError("Invalid audio timing event values")
+        seen.add(sequence)
+        exact_long(event[3])
+        exact_signed_long(event[5])
+        exact_signed_long(event[6])
+        if 22 <= event[4] <= 24 and (not 1 <= int(event[5]) <= (14 if data["schema"] in ("audio_timing_v3", "audio_timing_v4") else 12) or int(event[6]) < -1):
+            raise DiagnosticError("Invalid audio timing work boundary")
+        if 30 <= event[4] <= 31 and (int(event[5]) <= 0 or int(event[6]) <= 0):
+            raise DiagnosticError("Invalid audio timing owner boundary")
+
+
 def validate_page(page, pair_id, cursors, identity=None, flags=None):
     if not isinstance(page, dict) or page.get("pairId") != pair_id:
         raise DiagnosticError("FETCH pair identity mismatch")
@@ -258,6 +347,11 @@ def validate_page(page, pair_id, cursors, identity=None, flags=None):
             terminal = source.get("terminal")
             if isinstance(terminal, dict) and "tailDetails" in terminal:
                 validate_tail_details(terminal["tailDetails"], terminal.get("tailTruncated"))
+            selected = "audio.timing" in (flags.get(role, []) if flags is not None else page.get(role + "Flags", []))
+            if selected:
+                validate_audio_timing(source.get("audioTiming"), session)
+            elif "audioTiming" in source:
+                raise DiagnosticError("Unsolicited audio timing retention")
     for item in records:
         if not isinstance(item, dict) or set(item) != {"role", "session", "captureId", "clockId", "record"}:
             raise DiagnosticError("Malformed FETCH envelope")
@@ -298,6 +392,27 @@ def validate_page(page, pair_id, cursors, identity=None, flags=None):
                 "track" in record and (type(record["track"]) is not int or type(record["generation"]) is not int)):
             raise DiagnosticError("Malformed source track")
         data = record["data"]
+        if record["kind"] == "AUDIO_TIMING":
+            if role != "receiver" or "audio.timing" not in role_flags or not bound:
+                raise DiagnosticError("Unsolicited audio timing batch")
+            validate_audio_batch(data, work_selected="audio.timing.work" in role_flags,
+                                 detail_selected="audio.timing.detail" in role_flags,
+                                 owner_selected="audio.timing.owner" in role_flags)
+        if record["kind"] == "CAPTURE_ENDED":
+            summary = data.get("audioTiming")
+            selected = role == "receiver" and "audio.timing" in role_flags
+            if (summary is not None) != selected:
+                raise DiagnosticError("Invalid audio timing terminal selection")
+            if selected:
+                fields = {"attempted", "dropped", "droppedBeforeSequence", "batchDropped",
+                          "producersAtClose", "pendingProducers"}
+                if not isinstance(summary, dict) or set(summary) != fields:
+                    raise DiagnosticError("Invalid audio timing terminal")
+                attempted = exact_long(summary["attempted"])
+                if exact_long(summary["dropped"]) > attempted or exact_long(summary["batchDropped"]) > attempted:
+                    raise DiagnosticError("Invalid audio timing terminal loss")
+                for key in ("droppedBeforeSequence", "producersAtClose", "pendingProducers"):
+                    exact_long(summary[key])
         if "operationId" in data:
             exact_long(data["operationId"])
         if "inFlight" in data:
@@ -792,7 +907,8 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--sender", type=endpoint, help="sender host:port")
     parser.add_argument("--sender-flags", type=parse_flags)
-    parser.add_argument("--receiver-flags", type=parse_flags)
+    parser.add_argument("--receiver-flags", type=parse_flags,
+                        help="Explicit receiver groups; startup work tracing requires audio.timing,audio.timing.work")
     parser.add_argument("--duration", type=int, default=180, help="seconds, 1..180")
     parser.add_argument("--output", type=Path, help="local evidence directory")
     parser.add_argument("--discover-sender", type=discovery_ipv4, metavar="LAN_OR_VPN_IPV4")

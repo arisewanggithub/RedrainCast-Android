@@ -11,6 +11,193 @@ import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicReference
 
 class DiagnosticRecorderTest {
+    @Test fun activationInsideExistingHoldDoesNotInventOuterOwnership() {
+        val recorder = DiagnosticRecorder()
+        val lock = Any()
+        val flags = setOf("audio.timing", "audio.timing.work", "audio.timing.detail", "audio.timing.owner")
+        lateinit var timing: DiagnosticAudioTiming
+        lateinit var id: String
+        synchronized(lock) {
+            assertNull(recorder.audioOwnerTiming(73))
+            id = recorder.startAdmittedReceiver(73, flags, System.nanoTime() + 10_000_000_000L,
+                100, AtomicBoolean(true)).getString("captureId")
+            timing = checkNotNull(recorder.audioOwnerTiming(73))
+            synchronized(lock) {
+                timing.ownerInterval(1) { assertTrue(Thread.holdsLock(lock)) }
+            }
+        }
+        val events = timing.drain(8)
+        assertEquals(listOf(DiagnosticAudioTiming.OWNER_BEGIN, DiagnosticAudioTiming.OWNER_END),
+            events.map { it.type })
+        assertEquals(events[0].value2, events[1].value2)
+        recorder.end(id)
+    }
+
+    @Test fun ownerCaptureIsProxyScopedAndFencedOnRevocation() {
+        val recorder = DiagnosticRecorder()
+        val flags = setOf("audio.timing", "audio.timing.work", "audio.timing.detail", "audio.timing.owner")
+        val owner = AtomicBoolean(true)
+        val id = recorder.startAdmittedReceiver(74, flags, System.nanoTime() + 10_000_000_000L,
+            100, owner).getString("captureId")
+        assertNull(recorder.audioOwnerTiming(75))
+        val timing = checkNotNull(recorder.audioOwnerTiming(74))
+        val outer = timing.ownerBegin(2)
+        owner.set(false)
+        assertNull(recorder.audioOwnerTiming(74))
+        timing.ownerEnd(2, outer)
+        assertEquals(1L, timing.droppedBeforeSequence())
+        val events = timing.drain(8)
+        assertEquals(listOf(DiagnosticAudioTiming.OWNER_BEGIN), events.map { it.type })
+        recorder.end(id)
+    }
+
+    @Test fun ownerBatchesRequireExplicitProxyNegotiation() {
+        val recorder = DiagnosticRecorder()
+        val flags = setOf("audio.timing", "audio.timing.work", "audio.timing.detail", "audio.timing.owner")
+        val id = recorder.startAdmittedReceiver(75, flags, System.nanoTime() + 10_000_000_000L,
+            100, AtomicBoolean(true)).getString("captureId")
+        val timing = checkNotNull(recorder.audioOwnerTiming(75))
+        timing.ownerInterval(1) { }
+        recorder.fetch(id, 0, 32)
+        val records = recorder.fetch(id, 0, 32).getJSONArray("records")
+        val batch = (0 until records.length()).map { records.getJSONObject(it) }
+            .single { it.optString("kind") == "AUDIO_TIMING" }
+        assertEquals("audio_timing_v4", batch.getJSONObject("data").getString("schema"))
+        assertThrows(org.screencopy.receiver.protocol.ProtocolException::class.java) {
+            DiagnosticProxyWire.validateSource(batch, "receiver", "75", id, false, true, true, true)
+        }
+        DiagnosticProxyWire.validateSource(batch, "receiver", "75", id, false, true, true, true, true)
+        recorder.end(id)
+    }
+
+    @Test fun legacySelectionCannotSerializeWorkAndWorkDependencyFailsBeforeCaptureStarts() {
+        val recorder = DiagnosticRecorder { 1_000_000_000L }
+        val invalid = assertThrows(DiagnosticError::class.java) {
+            recorder.startAdmittedReceiver(73, setOf("audio.timing.work"), 2_000_000_000L,
+                100, AtomicBoolean(true))
+        }
+        assertEquals("INVALID_ARGUMENT", invalid.code)
+        val id = recorder.startAdmittedReceiver(73, setOf("audio.timing"), 2_000_000_000L,
+            100, AtomicBoolean(true)).getString("captureId")
+        val timing = checkNotNull(recorder.audioTiming(73))
+        timing.record(1_000_000_001L, 1, 7, DiagnosticAudioTiming.WORK_BEGIN, 2, 100)
+        timing.record(1_000_000_002L, 1, 7, DiagnosticAudioTiming.RECEIVED, 100, 4)
+        recorder.fetch(id, 0, 32)
+        val records = recorder.fetch(id, 0, 32).getJSONArray("records")
+        val batch = (0 until records.length()).map { records.getJSONObject(it) }
+            .single { it.optString("kind") == "AUDIO_TIMING" }
+        assertEquals("audio_timing_v1", batch.getJSONObject("data").getString("schema"))
+        assertEquals("1", batch.getJSONObject("data").getString("attempted"))
+        DiagnosticProxyWire.validateSource(batch, "receiver", "73", id, false, true)
+    }
+
+    @Test fun audioTimingBatchRemainsProxySafeWhenLossPassesTheAttemptedSnapshot() {
+        val id = start(setOf("audio.timing"))
+        val timing = checkNotNull(recorder.audioTiming(73))
+        timing.record(now, 1, 1, DiagnosticAudioTiming.RECEIVED, 0, 0)
+        val attemptedBeforeProduction = timing.attempted()
+        var produced = false
+        recorder.afterAudioTimingAttemptedSnapshot = {
+            recorder.afterAudioTimingAttemptedSnapshot = null
+            // The drained event freed its slot. Fill every slot, then lose a full
+            // buffer between reading attempted and the old location of the loss read.
+            repeat(2 * DiagnosticAudioTiming.CAPACITY) {
+                timing.record(now, 1, 1, DiagnosticAudioTiming.RECEIVED, 0, 0)
+            }
+            produced = true
+        }
+
+        recorder.tick()
+        val batch = allRecords(id).first { it.getString("kind") == "AUDIO_TIMING" }
+        assertTrue(produced)
+        assertEquals(DiagnosticAudioTiming.CAPACITY.toLong(), timing.dropped())
+        assertTrue(timing.dropped() > attemptedBeforeProduction)
+        DiagnosticProxyWire.validateSource(batch, "receiver", "73", id, false, true)
+        val data = batch.getJSONObject("data")
+        assertEquals("1", data.getString("attempted"))
+        assertEquals("0", data.getString("dropped"))
+        assertEquals("0", data.getString("batchDropped"))
+        assertEquals("0", data.getString("droppedBeforeSequence"))
+        assertEquals("1", data.getJSONArray("events").getJSONArray(0).getString(0))
+        val torn = JSONObject(batch.toString())
+        torn.getJSONObject("data").put("dropped", timing.dropped().toString())
+        assertThrows(org.screencopy.receiver.protocol.ProtocolException::class.java) {
+            DiagnosticProxyWire.validateSource(torn, "receiver", "73", id, false, true)
+        }
+    }
+
+    @Test fun audioTimingTerminalKeepsUnsequencedLossIndependentOfAttempts() {
+        val id = start(setOf("audio.timing"))
+        val timing = checkNotNull(recorder.audioTiming(73))
+        timing.record(now, 1, 1, DiagnosticAudioTiming.RECEIVED, 0, 0)
+        allRecords(id)
+        timing.shortenDeadline(now)
+        repeat(3) { timing.record(now, 1, 1, DiagnosticAudioTiming.RECEIVED, 0, 0) }
+        var snapshots = 0
+        recorder.afterAudioTimingAttemptedSnapshot = {
+            snapshots++
+            // A retained producer reference can still report rejected work after close.
+            assertEquals(0L, timing.packetId())
+        }
+
+        recorder.end(id)
+        val terminal = allRecords(id).single { it.getString("kind") == "CAPTURE_ENDED" }
+        assertEquals(1, snapshots)
+        val summary = terminal.getJSONObject("data").getJSONObject("audioTiming")
+        assertEquals("1", summary.getString("attempted"))
+        assertEquals("0", summary.getString("dropped"))
+        assertEquals("0", summary.getString("batchDropped"))
+        assertEquals("3", summary.getString("droppedBeforeSequence"))
+        assertEquals("0", summary.getString("producersAtClose"))
+        assertEquals("0", summary.getString("pendingProducers"))
+        assertEquals(4L, timing.droppedBeforeSequence())
+        DiagnosticProxyWire.validateSource(terminal, "receiver", "73", id, false, true)
+    }
+
+    @Test fun selectedBatchUsesBoundedSourceRecordsAndStrictNegotiatedParsing() {
+        val now = Long.MAX_VALUE - 10_000_000_000L
+        val recorder = DiagnosticRecorder { now }
+        val id = recorder.startAdmittedReceiver(91, setOf("audio.timing", "audio.timing.work"), now + 5_000_000_000L,
+            100, AtomicBoolean(true)).getString("captureId")
+        val timing = checkNotNull(recorder.audioTiming(91))
+        repeat(8) {
+            timing.record(now + 4_999_999_999L, Int.MAX_VALUE, Long.MAX_VALUE, DiagnosticAudioTiming.RECEIVED,
+                Long.MIN_VALUE, Long.MAX_VALUE)
+        }
+        recorder.fetch(id, 0, 32)
+        val records = recorder.fetch(id, 0, 32).getJSONArray("records")
+        val batch = (0 until records.length()).map { records.getJSONObject(it) }
+            .single { it.optString("kind") == "AUDIO_TIMING" }
+        assertEquals("audio_timing_v1", batch.getJSONObject("data").getString("schema"))
+        assertTrue(batch.toString().toByteArray(Charsets.UTF_8).size <= DiagnosticRecorder.MAX_RECORD_BYTES)
+        DiagnosticProxyWire.validateSource(batch, "receiver", "91", id, false, true)
+        assertThrows(org.screencopy.receiver.protocol.ProtocolException::class.java) {
+            DiagnosticProxyWire.validateSource(batch, "receiver", "91", id, false)
+        }
+        val invalidSchema = JSONObject(batch.toString())
+        invalidSchema.getJSONObject("data").put("schema", "audio_timing_v3")
+        val duplicated = JSONObject(batch.toString())
+        val events = duplicated.getJSONObject("data").getJSONArray("events")
+        events.put(1, events.getJSONArray(0))
+        val oversized = JSONObject(batch.toString()).put("padding", "x".repeat(2048))
+        listOf(invalidSchema, duplicated, oversized).forEach {
+            assertThrows(org.screencopy.receiver.protocol.ProtocolException::class.java) {
+                DiagnosticProxyWire.validateSource(it, "receiver", "91", id, false, true)
+            }
+        }
+        timing.record(now, 1, 0, DiagnosticAudioTiming.WORK_BEGIN, DiagnosticAudioTiming.RESAMPLING.toLong(), 100)
+        timing.record(now + 40_000_000, 1, 0, DiagnosticAudioTiming.WORK_END,
+            DiagnosticAudioTiming.RESAMPLING.toLong(), 4_000_100)
+        recorder.fetch(id, 0, 32)
+        val updated = recorder.fetch(id, 0, 32).getJSONArray("records")
+        val workBatch = (0 until updated.length()).map { updated.getJSONObject(it) }
+            .last { it.optString("kind") == "AUDIO_TIMING" }
+        assertEquals("audio_timing_v2", workBatch.getJSONObject("data").getString("schema"))
+        DiagnosticProxyWire.validateSource(workBatch, "receiver", "91", id, false, true, true)
+        assertEquals("4000100", workBatch.getJSONObject("data").getJSONArray("events")
+            .getJSONArray(1).getString(6))
+    }
+
     @Test fun activeAudioObservationSamplesAreRateLimitedWithSequenceIdentity() {
         val id = start()
         val timing = org.screencopy.receiver.media.AudioOutputTiming(48000, 4800, 100, 90, 80, 5,

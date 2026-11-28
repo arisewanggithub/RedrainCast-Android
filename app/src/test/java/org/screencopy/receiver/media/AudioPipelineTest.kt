@@ -14,6 +14,41 @@ import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
 
 class AudioPipelineTest {
+    @Test fun retainedPacketLimitClaimsFirstAudioTimingMarker() {
+        val diagnostics = RemoteDiagnostics.recorder
+        val clock = PlaybackClock({ System.nanoTime() }).apply { audioExpected = true }
+        diagnostics.grantConsent()
+        diagnostics.sessionStarted("receiver", 9800)
+        val id = diagnostics.start("receiver", 9800, setOf("audio.timing"), 10000, 1000).getString("captureId")
+        val player = testAudioPlayer(AudioFormat("pcm", 48000, 2, byteArrayOf()), clock,
+            { code, detail -> fail("$code: $detail") }, { BoundedOutput(AtomicLong()) }).apply {
+            recoveryCutoffUs = 1
+            diagnosticSession = 9800
+            diagnosticGeneration = 2
+        }
+        val field = AudioPlayer::class.java.getDeclaredField("recoveryAudio").apply { isAccessible = true }
+        @Suppress("UNCHECKED_CAST")
+        val retained = field.get(player) as MutableCollection<Any>
+        val decodedClass = Class.forName("org.screencopy.receiver.media.AudioPlayer\$DecodedAudio")
+        val constructor = decodedClass.declaredConstructors.single().apply { isAccessible = true }
+        val decoded = constructor.newInstance(ShortArray(2), TrimmedAudio(0, 1, 1), 1L, 1L, 0L, null, 1L)
+        val step = AudioPlayer::class.java.getDeclaredMethod("serviceStep").apply { isAccessible = true }
+        try {
+            repeat(256) { retained.add(decoded) }
+            step.invoke(player)
+            val marker = checkNotNull(diagnostics.audioPressure(id))
+            assertEquals(2, marker.generation)
+            assertEquals(DiagnosticAudioTiming.RESERVATION_PACKETS, marker.reason)
+            checkNotNull(diagnostics.audioTiming(9800)).pressure(System.nanoTime(), 9800, 3, 0)
+            assertEquals(marker, diagnostics.audioPressure(id))
+        } finally {
+            retained.clear()
+            player.close()
+            diagnostics.revoke()
+            diagnostics.sessionEnded("receiver", 9800)
+        }
+    }
+
     @Test fun recoveryStartReportsActualDecodedBytesWhileDecodeReservationIsActive() {
         val entered = CountDownLatch(1)
         val release = CountDownLatch(1)
@@ -106,6 +141,8 @@ class AudioPipelineTest {
                 it.stage == DiagnosticStage.REJECTED.ordinal }
             assertEquals(listOf(encodedCapacity.toLong(), 3840L, 1L, 524289L, 1L,
                 QueueLimit.BYTES.ordinal.toLong()), row.detail)
+            val metrics = batch.state.single { it.kind == DiagnosticKind.entries.size + 1 && it.track == 2 }
+            assertEquals(256L, metrics.detail[1])
             assertTrue(errors.toString(), errors.isEmpty())
         } finally {
             player.halt()
@@ -493,6 +530,8 @@ class AudioPipelineTest {
             assertEquals(505_000, pressure.encodedBytes)
             assertEquals(0, pressure.retainedDecodedBytes)
             assertTrue(pressure.attemptedBytes > 512 * 1024)
+            assertEquals(256, pressure.maxPackets)
+            assertEquals(DEFAULT_AUDIO_QUEUE_SPAN_US, pressure.maxSpanUs)
             assertEquals(1, player.queuedPackets())
             assertEquals(0, calls.get())
             assertTrue(errors.toString(), errors.isEmpty())
@@ -535,13 +574,13 @@ class AudioPipelineTest {
                 await { decoded.size > index || errors.isNotEmpty() }
                 assertTrue(errors.toString(), errors.isEmpty())
             }
-            repeat(13) { assertNull(player.tryOffer(unit(131 + it))) }
-            val pressure = checkNotNull(player.tryOffer(unit(144)))
+            repeat(51) { assertNull(player.tryOffer(unit(131 + it))) }
+            val pressure = checkNotNull(player.tryOffer(unit(182)))
             assertEquals(QueueLimit.PTS, pressure.limit)
             assertEquals(2, pressure.track)
             assertEquals(131 * 3840, pressure.retainedDecodedBytes)
             assertTrue(pressure.queuedBytes <= 512 * 1024)
-            assertEquals(13, player.queuedPackets())
+            assertEquals(51, player.queuedPackets())
             assertEquals((0 until 131).toList(), decoded.toList())
             assertEquals(0, output.samples.get())
             assertTrue(proofs.isEmpty())
@@ -549,20 +588,20 @@ class AudioPipelineTest {
             time.set(3_000_000_000)
             await { proofs.isNotEmpty() || errors.isNotEmpty() }
             assertEquals(listOf(4_000_000L), proofs.toList())
-            repeat(143) {
+            repeat(181) {
                 time.addAndGet(20_000_000)
-                await { player.sourceSubmittedFrames >= minOf((it + 2) * 960L, 144 * 960L) || errors.isNotEmpty() }
+                await { player.sourceSubmittedFrames >= minOf((it + 2) * 960L, 182 * 960L) || errors.isNotEmpty() }
                 assertTrue(errors.toString(), errors.isEmpty())
             }
             player.close()
-            assertEquals((0 until 144).toList(), decoded.toList())
-            assertEquals(144 * 960L, player.sourceSubmittedFrames)
+            assertEquals((0 until 182).toList(), decoded.toList())
+            assertEquals(182 * 960L, player.sourceSubmittedFrames)
             val samples = written.toList()
-            assertTrue(samples.size >= 144 * 1920)
-            samples.take(144 * 1920).forEachIndexed { index, sample ->
+            assertTrue(samples.size >= 182 * 1920)
+            samples.take(182 * 1920).forEachIndexed { index, sample ->
                 assertEquals("sample $index", (index / 1920 + 1).toShort(), sample)
             }
-            assertTrue(samples.drop(144 * 1920).all { it == 0.toShort() })
+            assertTrue(samples.drop(182 * 1920).all { it == 0.toShort() })
             assertEquals(0, retained.getInt(player))
             assertEquals(0, player.queuedPackets())
             assertTrue(time.get() < 10_000_000_000L)
@@ -671,7 +710,7 @@ class AudioPipelineTest {
                 for (index in 1..count) {
                     val previousWaits = waits.get()
                     time.addAndGet(20_000_000)
-                    assertNull("Recovery must drain the 250 ms encoded queue while awaiting source time",
+                    assertNull("Recovery must drain the encoded queue while awaiting source time",
                         player.tryOffer(packet(1_000_000 + delayUs + index * 20_000)))
                     tick.release()
                     await {
@@ -763,7 +802,7 @@ class AudioPipelineTest {
         assertTrue(output.closed.get())
     }
 
-    @Test fun waitingForFirstVideoConsumesAudioAsBoundedDecoderPreroll() {
+    @Test fun audioWorkerStartsBeforeFirstVideoAndKeepsConsumingPackets() {
         val time = AtomicLong()
         val clock = PlaybackClock(time::get, { time.addAndGet(it * 1_000_000) }).apply { audioExpected = true }
         val errors = ConcurrentLinkedQueue<String>()
@@ -774,15 +813,16 @@ class AudioPipelineTest {
             player.start()
             repeat(20) {
                 player.offer(packet(1_000_000L + it * 20_000))
-                // Use the real queue/decoder consumer, not a separately tested clock helper.
                 await { player.queuedPackets() == 0 || errors.isNotEmpty() }
                 time.addAndGet(20_000_000)
             }
 
-            assertFalse(output.playing.get())
+            await { output.playing.get() || errors.isNotEmpty() }
+            assertTrue(errors.toString(), errors.isEmpty())
+            assertTrue(output.playing.get())
             clock.anchorVideo(1_300_000)
             player.offer(packet(1_400_000))
-            await { output.playing.get() || errors.isNotEmpty() }
+            await { player.queuedPackets() == 0 || errors.isNotEmpty() }
             assertTrue(errors.toString(), errors.isEmpty())
         } finally { player.close() }
     }

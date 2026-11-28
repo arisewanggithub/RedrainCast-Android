@@ -15,7 +15,11 @@ internal class DiagnosticProxyIntake(
     private val captureId: String,
     private val clockId: String,
     private val videoTiming: Boolean,
-    bootstrap: JSONObject
+    bootstrap: JSONObject,
+    private val audioTiming: Boolean = false,
+    private val audioWork: Boolean = false,
+    private val audioDetail: Boolean = false,
+    private val audioOwner: Boolean = false
 ) {
     companion object {
         const val QUEUE_RECORDS = 64
@@ -23,13 +27,15 @@ internal class DiagnosticProxyIntake(
         const val TERMINAL_BYTES = DiagnosticProxyWire.FRAME_BYTES + 4
         const val BOOTSTRAP_BYTES = 4096
         const val SOURCE_LOSS_BYTES = 4096
+        const val AUDIO_TIMING_BYTES = 768 * 1024
         private const val CRITICAL_RECORDS = 8
         private const val CRITICAL_BYTES = 32 * 1024
     }
 
     private data class Item(
         val ordinal: Long, val sequence: Long, val sourceSession: String?,
-        val record: String, val stagedBytes: Int, val retainedBytes: Int
+        val record: String, val stagedBytes: Int, val retainedBytes: Int,
+        val timingStart: Long? = null, val timingEnd: Long? = null
     )
     private data class Terminal(val ordinal: Long, val value: String?, val confirmed: Boolean, val outcome: String?)
 
@@ -38,8 +44,12 @@ internal class DiagnosticProxyIntake(
     private val queueLoss = DiagnosticRecorder.SequenceLoss()
     private val forcedLoss = DiagnosticRecorder.SequenceLoss()
     private val retentionLoss = DiagnosticRecorder.SequenceLoss()
+    private var audioEvictedCount = 0L
+    private var audioEvictedFirst = Long.MAX_VALUE
+    private var audioEvictedLast = 0L
     private var queuedBytes = 0
     private var retainedBytes = 0
+    private var retainedTimingBytes = 0
     private var ordinal = 0L
     private var lastSequence = 0L
     private var committedSequence = 0L
@@ -48,9 +58,14 @@ internal class DiagnosticProxyIntake(
     @Volatile private var committedOutcome: String? = null
     @Volatile private var validity: AtomicBoolean? = null
     private var sourceLoss: String? = null
+    private var audioPressure: String? = null
+    private var audioPressureNs: Long? = null
     private val bootstrap: String
 
     init {
+        require(!audioWork || audioTiming) { "audio.timing.work requires audio.timing" }
+        require(!audioDetail || audioWork) { "audio.timing.detail requires audio.timing.work" }
+        require(!audioOwner || audioDetail) { "audio.timing.owner requires audio.timing.detail" }
         val boundSession = DiagnosticProxyWire.decimal(session)
         DiagnosticProxyNegotiation.validateBootstrap(bootstrap, boundSession, pairId, captureId, clockId)
         this.bootstrap = bootstrap.toString()
@@ -64,17 +79,73 @@ internal class DiagnosticProxyIntake(
         validity = valid
     }
 
+    fun audioPressure(marker: JSONObject) {
+        protocolRequire(audioTiming, "Unsolicited audio pressure marker")
+        protocolRequire(marker.keys().asSequence().toSet() == setOf("monoNs", "session", "generation", "reason"),
+            "Invalid audio pressure marker")
+        val monoNs = DiagnosticProxyWire.decimal(marker.opt("monoNs"))
+        protocolRequire(marker.opt("session") == session, "Invalid audio pressure session")
+        protocolRequire(marker.opt("generation") is Int && marker.getInt("generation") > 0 &&
+            marker.opt("reason") is Int && marker.getInt("reason") in 0..4, "Invalid audio pressure values")
+        val encoded = JSONObject().put("monoNs", monoNs.toString()).put("session", session)
+            .put("generation", marker.getInt("generation")).put("reason", marker.getInt("reason")).toString()
+        synchronized(this) {
+            protocolRequire(validity?.get() != false && terminal == null && !finished, "Retired proxy capture")
+            protocolRequire(audioPressure == null || audioPressure == encoded, "Conflicting audio pressure marker")
+            audioPressure = encoded
+            audioPressureNs = monoNs
+            evictOutsideAudioWindow()
+        }
+    }
+
+    private fun audioWindowStart(marker: Long): Long = (marker - 5_000_000_000L).coerceAtLeast(0)
+    private fun audioWindowEnd(marker: Long): Long =
+        if (marker > Long.MAX_VALUE - 10_000_000_000L) Long.MAX_VALUE else marker + 10_000_000_000L
+
+    private fun inAudioWindow(item: Item, marker: Long): Boolean =
+        item.timingStart == null || item.timingEnd!! >= audioWindowStart(marker) &&
+            item.timingStart <= audioWindowEnd(marker)
+
+    private fun removeRetained(iterator: MutableIterator<Item>, item: Item) {
+        iterator.remove()
+        retainedBytes -= item.retainedBytes
+        if (item.timingStart != null) {
+            retainedTimingBytes -= item.retainedBytes
+            audioEvicted(item.sequence)
+        } else retentionLoss.record(item.sequence)
+    }
+
+    private fun audioEvicted(sequence: Long) {
+        audioEvictedCount++
+        audioEvictedFirst = minOf(audioEvictedFirst, sequence)
+        audioEvictedLast = maxOf(audioEvictedLast, sequence)
+    }
+
+    private fun evictOutsideAudioWindow() {
+        val marker = audioPressureNs ?: return
+        val iterator = retained.iterator()
+        while (iterator.hasNext()) {
+            val item = iterator.next()
+            if (!inAudioWindow(item, marker)) removeRetained(iterator, item)
+        }
+    }
+
     /**
      * The caller supplies the complete lane frame length including its prefix.
      * Source validation/serialization occurs before taking the intake lock.
      */
     fun record(record: JSONObject, frameBytes: Int): Boolean {
-        val sourceSession = DiagnosticProxyWire.validateSource(record, "receiver", session, captureId, videoTiming)
+        val sourceSession = DiagnosticProxyWire.validateSource(record, "receiver", session, captureId, videoTiming,
+            audioTiming, audioWork, audioDetail, audioOwner)
         val source = record.toString()
         val sourceBytes = source.toByteArray(Charsets.UTF_8).size
         protocolRequire(frameBytes in 5..TERMINAL_BYTES, "Invalid source frame accounting")
         val sequence = DiagnosticProxyWire.decimal(record.opt("seq"))
         val kind = record.optString("kind")
+        val eventTimes = if (kind == "AUDIO_TIMING") {
+            val events = record.getJSONObject("data").getJSONArray("events")
+            (0 until events.length()).map { DiagnosticProxyWire.decimal(events.getJSONArray(it).opt(1)) }
+        } else emptyList()
         val stage = record.optJSONObject("data")?.optString("stage")
         val critical = kind == "SESSION_BOUND" || kind == "CAPTURE_STARTED" || kind == "CAPTURE_ENDED" ||
             kind == "SESSION" || kind == "RECOVERY" ||
@@ -89,7 +160,8 @@ internal class DiagnosticProxyIntake(
             protocolRequire(sequence > lastSequence && ordinal < Long.MAX_VALUE, "Out-of-order source record")
             lastSequence = sequence
             val staged = maxOf(frameBytes, sourceBytes + 4)
-            val item = Item(++ordinal, sequence, sourceSession, source, staged, retainedSize)
+            val item = Item(++ordinal, sequence, sourceSession, source, staged, retainedSize,
+                eventTimes.minOrNull(), eventTimes.maxOrNull())
             val recordLimit = QUEUE_RECORDS - if (critical) 0 else CRITICAL_RECORDS
             val byteLimit = QUEUE_BYTES - TERMINAL_BYTES - if (critical) 0 else CRITICAL_BYTES
             if (queue.size >= recordLimit || queuedBytes + staged > byteLimit) {
@@ -193,14 +265,36 @@ internal class DiagnosticProxyIntake(
                 forcedLoss.record(item.sequence)
                 continue
             }
+            val marker = audioPressureNs
+            if (marker != null && !inAudioWindow(item, marker)) {
+                audioEvicted(item.sequence)
+                continue
+            }
+            while (item.timingStart != null && retainedTimingBytes + item.retainedBytes > AUDIO_TIMING_BYTES) {
+                val iterator = retained.iterator()
+                var removed = false
+                while (iterator.hasNext()) {
+                    val old = iterator.next()
+                    if (old.timingStart != null) {
+                        removeRetained(iterator, old)
+                        removed = true
+                        break
+                    }
+                }
+                check(removed)
+            }
             while (retained.size >= DiagnosticRecorder.MAX_RECORDS ||
                 retainedBytes + item.retainedBytes > DiagnosticRecorder.MAX_BYTES - BOOTSTRAP_BYTES - SOURCE_LOSS_BYTES) {
                 val old = retained.removeFirst()
                 retainedBytes -= old.retainedBytes
-                retentionLoss.record(old.sequence)
+                if (old.timingStart != null) {
+                    retainedTimingBytes -= old.retainedBytes
+                    audioEvicted(old.sequence)
+                } else retentionLoss.record(old.sequence)
             }
             retained.addLast(item)
             retainedBytes += item.retainedBytes
+            if (item.timingStart != null) retainedTimingBytes += item.retainedBytes
         }
         committedSequence = lastSequence
         if (terminal != null) {
@@ -231,7 +325,9 @@ internal class DiagnosticProxyIntake(
             val next = selected.lastOrNull()?.sequence ?: after
             Snapshot(selected, next, retained.any { it.sequence > next }, retained.firstOrNull()?.sequence ?: 0,
                 committedSequence, queue.size, queueLoss.snapshot(), forcedLoss.snapshot(), retentionLoss.snapshot(),
-                terminal, finished, sourceLoss)
+                terminal, finished, sourceLoss, audioPressure, retainedTimingBytes,
+                retained.mapNotNull { it.timingStart }.minOrNull(), retained.mapNotNull { it.timingEnd }.maxOrNull(),
+                audioPressureNs, audioEvictedCount, audioEvictedFirst, audioEvictedLast)
         }
         val records = JSONArray()
         for (item in snapshot.items) {
@@ -248,6 +344,24 @@ internal class DiagnosticProxyIntake(
             .put("sourceLoss", snapshot.sourceLoss?.let {
                 StrictJson.decode(it.toByteArray(Charsets.UTF_8), maxDepth = DiagnosticProxyWire.SOURCE_DEPTH, trackSizes = false)
             } ?: JSONObject.NULL)
+            .apply {
+                if (audioTiming) put("audioTiming", JSONObject()
+                    .put("marker", snapshot.audioPressure?.let {
+                        StrictJson.decode(it.toByteArray(Charsets.UTF_8),
+                            maxDepth = DiagnosticProxyWire.SOURCE_DEPTH, trackSizes = false)
+                    } ?: JSONObject.NULL)
+                    .put("retainedBytes", snapshot.retainedTimingBytes)
+                    .put("oldestEventNs", snapshot.oldestTimingNs?.toString() ?: JSONObject.NULL)
+                    .put("latestEventNs", snapshot.latestTimingNs?.toString() ?: JSONObject.NULL)
+                    .put("windowStartNs", snapshot.pressureNs?.let { audioWindowStart(it).toString() } ?: JSONObject.NULL)
+                    .put("windowEndNs", snapshot.pressureNs?.let { audioWindowEnd(it).toString() } ?: JSONObject.NULL)
+                    .put("evictedCount", snapshot.audioEvictedCount.toString())
+                    .put("firstEvictedSeq", if (snapshot.audioEvictedCount == 0L) JSONObject.NULL
+                        else snapshot.audioEvictedFirst.toString())
+                    .put("lastEvictedSeq", if (snapshot.audioEvictedCount == 0L) JSONObject.NULL
+                        else snapshot.audioEvictedLast.toString())
+                    .put("tailUnknown", true))
+            }
             .put("state", if (snapshot.finished) "finished" else if (snapshot.terminal != null) "finishing" else "active")
             .put("cutoffOrdinal", snapshot.terminal?.ordinal?.toString() ?: JSONObject.NULL)
             .put("endConfirmed", snapshot.terminal?.confirmed ?: false)
@@ -270,7 +384,9 @@ internal class DiagnosticProxyIntake(
     private data class Snapshot(
         val items: List<Item>, val next: Long, val hasMore: Boolean, val oldest: Long, val latest: Long,
         val pending: Int, val queueLoss: Loss, val forcedLoss: Loss, val retentionLoss: Loss,
-        val terminal: Terminal?, val finished: Boolean, val sourceLoss: String?
+        val terminal: Terminal?, val finished: Boolean, val sourceLoss: String?, val audioPressure: String?,
+        val retainedTimingBytes: Int, val oldestTimingNs: Long?, val latestTimingNs: Long?, val pressureNs: Long?,
+        val audioEvictedCount: Long, val audioEvictedFirst: Long, val audioEvictedLast: Long
     )
 
     private data class Loss(val count: Long, val first: Long, val last: Long, val exact: Boolean) {

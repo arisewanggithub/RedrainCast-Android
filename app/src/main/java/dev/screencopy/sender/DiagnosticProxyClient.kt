@@ -96,7 +96,11 @@ internal class DiagnosticProxyClient(
                 claim.receiverFlags, claim.expiresNs, claim.samplePeriodMs)
             val bootstrap = DiagnosticProxyNegotiation.ready(StrictJson.decode(ready.payload), offer, accepted)
             val receiver = DiagnosticProxyIntake(claim.session.toString(), claim.pairId, accepted.captureId,
-                accepted.clockId, "video.timing" in claim.receiverFlags, bootstrap)
+                accepted.clockId, "video.timing" in claim.receiverFlags, bootstrap,
+                audioTiming = "audio.timing" in claim.receiverFlags,
+                audioWork = "audio.timing.work" in claim.receiverFlags,
+                audioDetail = "audio.timing.detail" in claim.receiverFlags,
+                audioOwner = "audio.timing.owner" in claim.receiverFlags)
             intake = receiver
             socket.soTimeout = 0
             val reader = Thread({ read(socket, receiver, accepted.captureId, accepted.clockId) },
@@ -202,6 +206,15 @@ internal class DiagnosticProxyClient(
                         val watermarks = frame.value.opt("watermarks") as? JSONObject
                             ?: throw IOException("PROTOCOL: missing diagnostic watermarks")
                         receiver.sourceLoss(watermarks)
+                    }
+                    "AUDIO_PRESSURE" -> {
+                        if ("audio.timing" !in claim.receiverFlags ||
+                            frame.value.keys().asSequence().toSet() != common + "marker")
+                            throw IOException("PROTOCOL: invalid audio pressure marker")
+                        val marker = frame.value.opt("marker") as? JSONObject
+                            ?: throw IOException("PROTOCOL: missing audio pressure marker")
+                        receiver.audioPressure(marker)
+                        onRecord()
                     }
                     "CLOCK_RESPONSE" -> {
                         if (frame.value.keys().asSequence().toSet() != common +

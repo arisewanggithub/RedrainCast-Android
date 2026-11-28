@@ -277,7 +277,8 @@ decode their codes. Detail counts for stages 0 through 8 are respectively
   Only decision/mode/target/revision/
   flag changes are retained as transitions, not every periodic wait observation.
   Signed delay uses int64-min for unavailable; -1 is a valid delay.
-* TRIM: reason (0 startup, 1 recovery, 2 recovery refresh, 3 clock preparation),
+* TRIM: reason (0 startup, 1 recovery, 2 recovery refresh, 3 clock preparation,
+  4 actually played audio),
   raw/trimmed PTS, cutoff/observed clock position, raw/remaining frames.
 * CAPTURE: layout revision, available-stage mask, omitted later transitions,
   later-transition sequence, trigger track (-1 before freezing). The CAPTURE
@@ -309,7 +310,7 @@ timestampAgeUs, outputClockSource, underruns, lastOutputProgressNs, queuedPacket
 `point` is the existing `AUDIO_START_WAIT` operation-point ordinal;
 `operationId` joins the in-flight BEGIN row (zero means unavailable).
 Decisions are 0 not waiting/new generation, 1 waiting for target time,
-2 retry because preroll is not ready, 3 retry because recovery audio is stale,
+2 retry because the initial audio clock is not prepared, 3 retry because recovery audio is stale,
 4 ready, 5 cancelled, 6 failed. Clock modes are 0 unavailable, 1 monotonic,
 2 initial audio without a source observation, 3 callback audio, 4 cached audio.
 Flags are bits 1 audio expected, 2 audio started, 4 resuming audio, 8 recovering
@@ -318,6 +319,9 @@ Unknown values are -1 except signed `delayUs`, whose unknown marker is signed
 int64 minimum. Unknown delay is not an enormous real clock difference.
 `releasedVideoPtsUs` is the latest decoder render-enabled release known to the
 clock, not a frame-rendered callback or physical-display observation.
+For audio-led initial startup, either video timestamp may be unavailable when
+audio is ready or playing; it is not evidence that audio is waiting for video.
+Older captures can reflect the former first-video gate.
 
 The clock snapshots while the wait is blocked, at most once per second unless
 decision, clock mode or mapping revision changes, and emits an exit decision.

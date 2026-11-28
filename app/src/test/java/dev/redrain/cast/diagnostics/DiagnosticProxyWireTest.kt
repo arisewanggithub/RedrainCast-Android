@@ -8,6 +8,47 @@ import java.io.ByteArrayOutputStream
 import java.io.EOFException
 
 class DiagnosticProxyWireTest {
+    @Test fun workerBoundariesRequireV2AndValidateStageAndCpuWithoutRejectingLegacy() {
+        fun source(schema: String, type: Int, stage: String, cpu: Any) = record()
+            .put("role", "receiver").put("session", "77").put("kind", "AUDIO_TIMING")
+            .put("data", JSONObject().put("schema", schema).put("attempted", "1")
+                .put("dropped", "0").put("droppedBeforeSequence", "0").put("batchDropped", "0")
+                .put("events", org.json.JSONArray().put(org.json.JSONArray()
+                    .put("1").put("200").put(1).put("0").put(type).put(stage).put(cpu))))
+        for (type in 22..24) {
+            DiagnosticProxyWire.validateSource(source("audio_timing_v2", type, "2", "-1"),
+                "receiver", "77", "capture", false, true, true)
+        }
+        DiagnosticProxyWire.validateSource(source("audio_timing_v1", 21, "1", "2"),
+            "receiver", "77", "capture", false, true)
+        assertThrows(IllegalArgumentException::class.java) {
+            DiagnosticProxyWire.validateSource(source("audio_timing_v3", 22, "13", "100"),
+                "receiver", "77", "capture", false, true, true)
+        }
+        for (type in listOf(22, 25, 26, 27, 28, 29)) {
+            DiagnosticProxyWire.validateSource(source("audio_timing_v3", type,
+                if (type == 22) "13" else "0", "100"),
+                "receiver", "77", "capture", false, true, true, true)
+        }
+        assertThrows(IllegalArgumentException::class.java) {
+            DiagnosticProxyWire.validateSource(source("audio_timing_v2", 22, "2", "100"),
+                "receiver", "77", "capture", false, true)
+        }
+        for (invalid in listOf(
+            source("audio_timing_v1", 22, "2", "100"),
+            source("audio_timing_v2", 25, "2", "100"),
+            source("audio_timing_v2", 22, "0", "100"),
+            source("audio_timing_v2", 22, "13", "100"),
+            source("audio_timing_v2", 22, "2", "-2"),
+            source("audio_timing_v2", 22, "2", 100)
+        )) {
+            try {
+                DiagnosticProxyWire.validateSource(invalid, "receiver", "77", "capture", false, true, true)
+                fail("$invalid")
+            } catch (_: IllegalArgumentException) {}
+        }
+    }
+
     private fun record() = JSONObject().put("captureId", "capture").put("seq", "9")
         .put("monoNs", "9223372036854775807").put("kind", "CAPTURE_STARTED").put("data", JSONObject())
 
@@ -108,6 +149,25 @@ class DiagnosticProxyWireTest {
         DiagnosticProxyWire.validateSource(source, "receiver", "77", "capture", false)
         val data = source.getJSONObject("data")
         data.put("operationId", 7)
+        try { DiagnosticProxyWire.validateSource(source, "receiver", "77", "capture", false); fail() }
+        catch (_: IllegalArgumentException) {}
+    }
+
+    @Test fun audioTimingTerminalRequiresValidSelectedSummary() {
+        val source = record().put("kind", "CAPTURE_ENDED")
+        val summary = JSONObject().put("attempted", "2").put("dropped", "1")
+            .put("droppedBeforeSequence", "0").put("batchDropped", "0")
+            .put("producersAtClose", "0").put("pendingProducers", "0")
+        source.getJSONObject("data").put("audioTiming", summary)
+        DiagnosticProxyWire.validateSource(source, "receiver", "77", "capture", false, true)
+        for (invalid in listOf(
+            JSONObject(source.toString()).also { it.getJSONObject("data").remove("audioTiming") },
+            JSONObject(source.toString()).also { it.getJSONObject("data").getJSONObject("audioTiming").put("dropped", "3") },
+            JSONObject(source.toString()).also { it.getJSONObject("data").getJSONObject("audioTiming").put("extra", "0") }
+        )) {
+            try { DiagnosticProxyWire.validateSource(invalid, "receiver", "77", "capture", false, true); fail("$invalid") }
+            catch (_: IllegalArgumentException) {}
+        }
         try { DiagnosticProxyWire.validateSource(source, "receiver", "77", "capture", false); fail() }
         catch (_: IllegalArgumentException) {}
     }
