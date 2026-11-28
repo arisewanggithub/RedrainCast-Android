@@ -4,6 +4,7 @@ import org.json.JSONArray
 import org.json.JSONObject
 import org.junit.Assert.*
 import org.junit.Test
+import org.mockito.Mockito
 import java.net.InetAddress
 import java.net.Socket
 import java.io.File
@@ -259,6 +260,66 @@ class DiagnosticListenerTest {
             completed.get(2, TimeUnit.SECONDS)
             assertNull(server.discovery)
         } finally { server.close(); reader.shutdownNow() }
+    }
+
+    @Test fun concurrentRevokeWaitsForAllNetworkResourcesToClose() {
+        concurrentShutdownWaitsForNetworkCleanup(close = false)
+    }
+
+    @Test fun concurrentCloseWaitsForAllNetworkResourcesToClose() {
+        concurrentShutdownWaitsForNetworkCleanup(close = true)
+    }
+
+    private fun concurrentShutdownWaitsForNetworkCleanup(close: Boolean) {
+        val revoking = CountDownLatch(1)
+        val release = CountDownLatch(1)
+        val registry = Mockito.mock(DiagnosticArmRegistry::class.java)
+        Mockito.doAnswer {
+            revoking.countDown()
+            check(release.await(5, TimeUnit.SECONDS)) { "Revocation was not released" }
+            null
+        }.`when`(registry).revoke()
+        val first = InetAddress.getByName("127.0.0.1")
+        val second = InetAddress.getByName("127.0.0.2")
+        val identity = DiagnosticIdentity(first, endpoints = listOf(
+            DiagnosticIdentity.Endpoint(first, false), DiagnosticIdentity.Endpoint(second, true)))
+        val server = DiagnosticListener(DiagnosticRecorder(), identity,
+            discoveryPort = 0, armRegistry = registry)
+        val callers = Executors.newFixedThreadPool(2)
+        try {
+            val port = checkNotNull(server.discovery).port
+            client(server).use { collector ->
+                command(collector, "HELLO")
+                val owner = callers.submit { server.revokeNetwork() }
+                assertTrue(revoking.await(3, TimeUnit.SECONDS))
+                assertNull(server.discovery)
+                val calling = CountDownLatch(1)
+                val concurrent = callers.submit {
+                    calling.countDown()
+                    if (close) server.close() else server.revokeNetwork()
+                }
+                assertTrue(calling.await(3, TimeUnit.SECONDS))
+                assertThrows(java.util.concurrent.TimeoutException::class.java) {
+                    concurrent.get(200, TimeUnit.MILLISECONDS)
+                }
+                release.countDown()
+                concurrent.get(3, TimeUnit.SECONDS)
+                owner.get(3, TimeUnit.SECONDS)
+                assertEquals(-1, collector.inputStream.read())
+                assertThrows(java.io.IOException::class.java) { Socket(first, port).close() }
+                assertThrows(java.io.IOException::class.java) { Socket(second, port).close() }
+                assertNull(server.endpointDiscoveryPort)
+                Mockito.verify(registry, Mockito.times(1)).revoke()
+                server.revokeNetwork()
+                Mockito.verifyNoMoreInteractions(registry)
+            }
+        } finally {
+            release.countDown()
+            callers.shutdown()
+            try {
+                assertTrue(callers.awaitTermination(3, TimeUnit.SECONDS))
+            } finally { server.close() }
+        }
     }
 
     @Test fun disconnectFreezesAndReconnectFetchesWithoutResuming() {
