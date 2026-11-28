@@ -87,10 +87,10 @@ class LaunchUpdateTest {
     @Test fun debugBuildComparesItsBaseVersionWithoutTreatingDebugAsAPrerelease() {
         result = null
         open()
-        assertEquals("0.5.4", checkedVersion)
+        assertEquals("0.5.5", checkedVersion)
         if (BuildConfig.DEBUG)
-            assertTrue(BuildConfig.VERSION_NAME.matches(Regex("0\\.5\\.4-debug-\\d{8}T\\d{9}Z-[0-9a-f]{8}")))
-        else assertEquals("0.5.4", BuildConfig.VERSION_NAME)
+            assertTrue(BuildConfig.VERSION_NAME.matches(Regex("0\\.5\\.5-debug-\\d{8}T\\d{9}Z-[0-9a-f]{8}")))
+        else assertEquals("0.5.5", BuildConfig.VERSION_NAME)
         assertEquals(1, checks)
         assertNull(ShadowAlertDialog.getLatestAlertDialog())
     }
