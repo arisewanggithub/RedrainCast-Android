@@ -1013,10 +1013,14 @@ class StreamRecoveryPipelineTest {
     @Test(timeout = 10_000) fun audioQueuePressureRequestsOnlyAudioRecoveryAndVideoStillDecodes() {
         val decoding = CountDownLatch(1)
         val release = CountDownLatch(1)
+        val time = AtomicLong(1_000_000_000)
+        val clocks = ConcurrentLinkedQueue<PlaybackClock>()
+        val recoveryDecoded = AtomicInteger()
         val decoders = ConcurrentLinkedQueue<Decoder>()
         val outputs = ConcurrentLinkedQueue<Output>()
         val failures = ConcurrentLinkedQueue<String>()
         ReceiverServer.forProtocolTests("Receiver", onFailure = { failures.add(it.logMessage()) },
+            clockFactory = { PlaybackClock(time::get).also(clocks::add) },
             videoFactory = { format, clock, failed, generation ->
                 VideoPlayer(format, clock, failed, Decoder(false).also(decoders::add), generation)
             },
@@ -1026,6 +1030,7 @@ class StreamRecoveryPipelineTest {
                     object : OpusPacketDecoder {
                         override fun decode(packet: ByteArray): ShortArray {
                             if (stall) { decoding.countDown(); release.await() }
+                            else recoveryDecoded.incrementAndGet()
                             return ShortArray(1920)
                         }
                         override fun close() {}
@@ -1052,13 +1057,20 @@ class StreamRecoveryPipelineTest {
                     assertEquals(2, expect(peer, Type.STREAM_READY).track)
                     assertFalse(decoders.single().closed)
                     assertTrue(outputs.first().closed)
+                    time.addAndGet(1_000_000_000)
                     repeat(5) { index ->
                         Wire.write(media.audio.outputStream, Message(Type.AUDIO_PACKET, 41, 2, 2,
                             1_320_000 + index * 20_000L, 0, byteArrayOf(8, 1)))
                     }
+                    val freshPts = checkNotNull(clocks.single().currentUs())
+                    assertTrue(freshPts > 1_420_000)
+                    Wire.write(media.audio.outputStream, Message(Type.AUDIO_PACKET, 41, 2, 2,
+                        freshPts, 0, byteArrayOf(8, 1)))
                     val complete = expect(peer, Type.STATUS).json()
                     assertEquals(2, complete.getInt("track"))
                     assertEquals(StreamRecoveryProtocol.COMPLETE, complete.getString("state"))
+                    assertTrue(StreamRecoveryProtocol.timestamp(complete, "audioPtsUs") >= freshPts)
+                    assertEquals(1, recoveryDecoded.get())
                     assertEquals(1, decoders.size)
                     assertTrue(failures.toString(), failures.isEmpty())
                     sendControl(peer, Type.STOP, JSONObject().put("reason", "audio pressure verified"))
