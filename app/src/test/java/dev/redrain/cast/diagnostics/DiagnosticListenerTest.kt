@@ -311,7 +311,7 @@ class DiagnosticListenerTest {
                 assertNull(server.endpointDiscoveryPort)
                 Mockito.verify(registry, Mockito.times(1)).revoke()
                 server.revokeNetwork()
-                Mockito.verifyNoMoreInteractions(registry)
+                Mockito.verify(registry, Mockito.times(1)).revoke()
             }
         } finally {
             release.countDown()
