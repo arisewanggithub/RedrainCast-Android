@@ -109,14 +109,18 @@ class DiagnosticListenerRuntimeTest {
         try {
             client(port).use {
                 command(it, "HELLO")
-                valid.set(false)
-                assertNull(DiagnosticAccess.discovery)
-                assertTrue(disabled.await(3, TimeUnit.SECONDS))
-                assertEquals(-1, it.inputStream.read())
-                drainControlWorker()
-                assertFalse(DiagnosticAccess.enabled)
-                assertNull(DiagnosticAccess.discovery)
-                assertThrows(java.io.IOException::class.java) { client(port).close() }
+                Socket().use { probe ->
+                    val address = InetAddress.getLoopbackAddress()
+                    probe.reserveDistinctSource(address, port)
+                    valid.set(false)
+                    assertNull(DiagnosticAccess.discovery)
+                    assertTrue(disabled.await(3, TimeUnit.SECONDS))
+                    assertEquals(-1, it.inputStream.read())
+                    drainControlWorker()
+                    assertFalse(DiagnosticAccess.enabled)
+                    assertNull(DiagnosticAccess.discovery)
+                    probe.assertConnectionRefused(address, port)
+                }
             }
         } finally {
             observer.close()
@@ -171,25 +175,29 @@ class DiagnosticListenerRuntimeTest {
             }
             assertTrue(DiagnosticAccess.enabled)
             assertFalse(RemoteDiagnostics.recorder.collecting)
-            client(port).use {
-                command(it, "HELLO")
-                val status = command(it, "STATUS")
-                assertEquals("frozen", status.getString("state"))
-                assertEquals(id, status.getString("pairId"))
-                assertEquals("client_disconnected", status.getString("endReason"))
-                val records = command(it, "FETCH", JSONObject().put("pairId", id)
-                    .put("afterSenderSeq", "0").put("afterReceiverSeq", "0").put("limit", 32)).getJSONArray("records")
-                assertTrue(records.length() >= 2)
-                assertFalse(RemoteDiagnostics.recorder.collecting)
-                DiagnosticAccess.setEnabled(context, false)
-                assertEquals(-1, it.inputStream.read())
+            Socket().use { probe ->
+                val address = InetAddress.getLoopbackAddress()
+                probe.reserveDistinctSource(address, port)
+                client(port).use {
+                    command(it, "HELLO")
+                    val status = command(it, "STATUS")
+                    assertEquals("frozen", status.getString("state"))
+                    assertEquals(id, status.getString("pairId"))
+                    assertEquals("client_disconnected", status.getString("endReason"))
+                    val records = command(it, "FETCH", JSONObject().put("pairId", id)
+                        .put("afterSenderSeq", "0").put("afterReceiverSeq", "0").put("limit", 32)).getJSONArray("records")
+                    assertTrue(records.length() >= 2)
+                    assertFalse(RemoteDiagnostics.recorder.collecting)
+                    DiagnosticAccess.setEnabled(context, false)
+                    assertEquals(-1, it.inputStream.read())
+                }
+                drainControlWorker()
+                assertFalse(DiagnosticAccess.enabled)
+                assertNull(DiagnosticAccess.discovery)
+                assertEquals("idle", RemoteDiagnostics.recorder.status().getString("state"))
+                assertTrue(RemoteDiagnostics.recorder.status().isNull("captureId"))
+                probe.assertConnectionRefused(address, port)
             }
-            drainControlWorker()
-            assertFalse(DiagnosticAccess.enabled)
-            assertNull(DiagnosticAccess.discovery)
-            assertEquals("idle", RemoteDiagnostics.recorder.status().getString("state"))
-            assertTrue(RemoteDiagnostics.recorder.status().isNull("captureId"))
-            assertThrows(java.io.IOException::class.java) { client(port).close() }
         } finally { disable() }
     }
 
